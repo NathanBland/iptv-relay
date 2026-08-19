@@ -1,0 +1,30 @@
+[
+  {
+    "num": "9.1",
+    "name": "KUSA 9NEWS",
+    "stream_type": "live",
+    "stream_id": "101",
+    "stream_icon": "https://img.example/kusa.png",
+    "epg_channel_id": "kusa.denver.example",
+    "added": "1789344000",
+    "category_id": 10,
+    "custom_sid": "abc",
+    "tv_archive": 1,
+    "tv_archive_duration": "7"
+  },
+  {
+    "num": 55,
+    "name": "Fútbol Internacional ⚽",
+    "stream_type": "live",
+    "stream_id": 202,
+    "stream_icon": "not a url",
+    "epg_channel_id": "football.example",
+    "category_id": "20",
+    "is_adult": "0",
+    "tv_archive": "false"
+  },
+  {
+    "name": "Missing identity"
+  },
+  "hostile non-object record"
+]

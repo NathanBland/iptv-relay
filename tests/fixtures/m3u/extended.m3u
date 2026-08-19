@@ -1,0 +1,9 @@
+#EXTM3U x-tvg-url="https://guide.example/guide.xml" refresh="3600"
+#EXTINF:-1 tvg-id="kusa.denver.example" tvg-name="KUSA" tvg-chno="9.1" tvg-logo="https://img.example/kusa.png" provider-custom="alpha",KUSA, Denver
+#KODIPROP:inputstream.adaptive.manifest_type=hls
+#EXTVLCOPT:http-user-agent=FixturePlayer/1.0
+#EXTGRP:Denver Locals
+https://media.example/kusa/master.m3u8?token=fixture
+#EXTINF:-1 tvg-id='espn.example' radio=false,ESPN
+#EXTGRP:Sports
+udp://239.1.1.1:1234

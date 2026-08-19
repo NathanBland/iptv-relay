@@ -1,0 +1,37 @@
+{
+  "rules": [
+    {
+      "name": "NFL live events",
+      "matcher": {
+        "name_regex": "(?i)\\bNFL\\b",
+        "group_regex": "(?i)NFL",
+        "categories_any": ["Football"]
+      },
+      "date_patterns": [
+        {
+          "regex": "(?<datetime>20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})",
+          "format": "%Y-%m-%d %H:%M",
+          "timezone": "America/Denver"
+        }
+      ],
+      "timezone": "America/Denver",
+      "channel": {
+        "group": "NFL Events",
+        "name": "{title}",
+        "number_start": 9000
+      }
+    },
+    {
+      "name": "Fallback sports",
+      "matcher": {
+        "group_regex": "(?i)sports"
+      },
+      "date_patterns": [
+        {
+          "regex": "(?<datetime>[0-9]{1,2}/[0-9]{1,2}/20[0-9]{2} [0-9]{1,2}:[0-9]{2} [AP]M)",
+          "format": "%m/%d/%Y %I:%M %p"
+        }
+      ]
+    }
+  ]
+}

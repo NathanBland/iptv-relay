@@ -1,0 +1,73 @@
+import { describe, expect, it } from 'vitest'
+import { MockIptvApiClient, apiClient } from '@/lib/api/client'
+import { apiQueries } from '@/lib/api/queries'
+import { cn, formatBitrate, formatRelativeTime } from '@/lib/utils'
+
+describe('typed API boundary', () => {
+  it('returns isolated snapshots for every dashboard resource', async () => {
+    const client = new MockIptvApiClient()
+    const [overview, sources, channels, programmes, events, sessions] = await Promise.all([
+      client.getOverview(), client.getSources(), client.getChannels(), client.getProgrammes(), client.getEvents(), client.getSessions(),
+    ])
+    expect(overview.providerConnections).toBe(3)
+    expect(sources).toHaveLength(3)
+    expect(channels.items.length).toBeGreaterThan(10)
+    expect(programmes.items.length).toBeGreaterThan(10)
+    expect(events[0]?.programmeTitle).toContain('Broncos')
+    expect(sessions).toHaveLength(3)
+    expect(sessions.reduce((total, session) => total + session.viewerCount, 0)).toBe(6)
+
+    sources[0]!.name = 'mutated'
+    expect((await client.getSources())[0]?.name).toBe('Prime IPTV')
+  })
+
+  it('validates and creates sources', async () => {
+    const client = new MockIptvApiClient()
+    await expect(client.createSource({ name: ' ', kind: 'M3U', endpoint: '' })).rejects.toThrow('required')
+    const source = await client.createSource({ name: '  Backup  ', kind: 'M3U', endpoint: ' https://backup.invalid/list.m3u ' })
+    expect(source).toMatchObject({ name: 'Backup', state: 'syncing', endpoint: 'https://backup.invalid/list.m3u' })
+    expect(await client.getSources()).toHaveLength(4)
+  })
+
+  it('models the complete sign-in and sign-out lifecycle', async () => {
+    const client = new MockIptvApiClient()
+    expect(await client.getAuthStatus()).toEqual({ authenticated: false })
+    await expect(client.login({ username: ' ', password: '' })).rejects.toThrow('required')
+    expect(await client.login({ username: '  operator  ', password: 'secret' })).toEqual({
+      authenticated: true,
+      user: { id: 'user-demo', username: 'operator', displayName: 'operator' },
+    })
+    expect(await client.getAuthStatus()).toMatchObject({ authenticated: true })
+    expect(await client.logout()).toEqual({ ok: true, message: 'Signed out.' })
+    expect(await client.getAuthStatus()).toEqual({ authenticated: false })
+  })
+
+  it('validates Jellyfin URLs', async () => {
+    const client = new MockIptvApiClient()
+    await expect(client.saveJellyfin({ baseUrl: 'not a url', publicBaseUrl: 'http://relay', tunerName: 'Relay', guideDays: 7 })).resolves.toEqual(expect.objectContaining({ ok: false }))
+    await expect(client.saveJellyfin({ baseUrl: 'http://jellyfin:8096', publicBaseUrl: 'http://relay:3000', tunerName: 'Relay', guideDays: 14 })).resolves.toEqual(expect.objectContaining({ ok: true, message: expect.stringContaining('14') }))
+  })
+
+  it('builds query definitions for default and injected clients', () => {
+    expect(apiQueries().overview.queryKey).toEqual(['overview'])
+    expect(apiQueries().authStatus.queryKey).toEqual(['auth', 'status'])
+    expect(apiQueries().authStatus.retry).toBe(false)
+    expect(apiQueries(apiClient).sessions.queryKey).toEqual(['sessions'])
+  })
+})
+
+describe('display utilities', () => {
+  it('merges classes and formats bitrate', () => {
+    expect(cn('px-2', false, 'px-4')).toBe('px-4')
+    expect(formatBitrate(800)).toBe('800 Kbps')
+    expect(formatBitrate(6_500)).toBe('6.5 Mbps')
+  })
+
+  it('formats relative times across each display band', () => {
+    const now = new Date('2026-08-19T18:00:00Z')
+    expect(formatRelativeTime('2026-08-19T18:00:00Z', now)).toBe('just now')
+    expect(formatRelativeTime('2026-08-19T17:42:00Z', now)).toBe('18m ago')
+    expect(formatRelativeTime('2026-08-19T15:00:00Z', now)).toBe('3h ago')
+    expect(formatRelativeTime('2026-08-17T18:00:00Z', now)).toBe('2d ago')
+  })
+})

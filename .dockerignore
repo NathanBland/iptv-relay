@@ -1,0 +1,11 @@
+.git
+.env
+target
+fuzz/artifacts
+fuzz/corpus
+fuzz/target
+apps/web/node_modules
+apps/web/.output
+apps/web/coverage
+data
+*.profraw

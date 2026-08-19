@@ -1,0 +1,1 @@
+DROP INDEX programmes_exact_dedupe_idx;

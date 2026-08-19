@@ -1,0 +1,15 @@
+/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
+/apps/web/.output/
+/apps/web/.tanstack/
+/apps/web/node_modules/
+/apps/web/coverage/
+/apps/web/playwright-report/
+/apps/web/test-results/
+/.env
+/.env.local
+/data/
+*.profraw
+lcov.info

@@ -1,0 +1,29 @@
+{
+  "epg_listings": [
+    {
+      "id": "epg-1",
+      "epg_id": "kusa.denver.example",
+      "title": "QnJvbmNvcyB2cyBDaGllZnM=",
+      "description": "TGl2ZSBmcm9tIERlbnZlcg==",
+      "lang": "en",
+      "start": "2026-09-14T00:20:00Z",
+      "end": "2026-09-14T03:30:00Z",
+      "channel_id": "101",
+      "event_id": "game-123"
+    },
+    {
+      "id": 2,
+      "title": "Plain title",
+      "description": "Descripción sin codificar",
+      "start_timestamp": "1789345200",
+      "stop_timestamp": 1789348800,
+      "stream_id": 202
+    },
+    {
+      "id": "bad-interval",
+      "title": "QmFk",
+      "start_timestamp": 1789348800,
+      "stop_timestamp": 1789345200
+    }
+  ]
+}

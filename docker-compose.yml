@@ -1,0 +1,154 @@
+name: iptv-gateway
+
+services:
+  gateway:
+    image: caddy:2.10-alpine
+    depends_on:
+      core:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./apps/web
+    environment:
+      CORE_INTERNAL_URL: http://core:8081
+      PORT: "3000"
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  core:
+    build:
+      context: .
+    command: ["serve"]
+    environment:
+      DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:-iptv-development}@postgres:5432/iptv
+      IPTV_BIND: 0.0.0.0:8081
+      IPTV_PUBLIC_BASE_URL: ${IPTV_PUBLIC_BASE_URL:-http://localhost:8080}
+      IPTV_OUTPUT_TOKEN: ${IPTV_OUTPUT_TOKEN:-development-output-token-change-me}
+      IPTV_ADMIN_BOOTSTRAP_TOKEN: ${IPTV_ADMIN_BOOTSTRAP_TOKEN:-development-bootstrap-token-change-me}
+      IPTV_ADMIN_PASSWORD: ${IPTV_ADMIN_PASSWORD:-development-admin-password-change-me}
+      IPTV_ADMIN_PASSWORD_HASH: ${IPTV_ADMIN_PASSWORD_HASH:-}
+      IPTV_MASTER_KEY: ${IPTV_MASTER_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8081/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+    command: ["worker"]
+    environment:
+      DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:-iptv-development}@postgres:5432/iptv
+      IPTV_WORKER_ID: compose-worker-1
+      IPTV_MASTER_KEY: ${IPTV_MASTER_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "127.0.0.1:${IPTV_POSTGRES_PORT:-54329}:5432"
+    environment:
+      POSTGRES_DB: iptv
+      POSTGRES_USER: iptv
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-iptv-development}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iptv -d iptv"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  fake-provider:
+    build:
+      context: .
+    entrypoint: ["test-provider"]
+    profiles: ["test"]
+    environment:
+      FAKE_PROVIDER_BIND: 0.0.0.0:8090
+      FAKE_PROVIDER_BASE_URL: http://fake-provider:8090
+      FAKE_PROVIDER_MAX_CONNECTIONS: "3"
+    expose:
+      - "8090"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8090/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: ["test"]
+    expose:
+      - "8474"
+      - "8666-8668"
+
+  media-acceptance:
+    build:
+      context: .
+    entrypoint: ["media-acceptance"]
+    profiles: ["test"]
+    environment:
+      FAKE_PROVIDER_URL: http://fake-provider:8090
+      MEDIA_ACCEPTANCE_SECONDS: ${MEDIA_ACCEPTANCE_SECONDS:-120}
+    depends_on:
+      fake-provider:
+        condition: service_healthy
+    restart: "no"
+
+  fault-acceptance:
+    build:
+      context: .
+    entrypoint: ["fault-acceptance"]
+    profiles: ["test"]
+    environment:
+      FAKE_PROVIDER_URL: http://fake-provider:8090
+      TOXIPROXY_URL: http://toxiproxy:8474
+      TOXIPROXY_PROXY_PORT: "8666"
+      FAULT_ACCEPTANCE_SECONDS: ${FAULT_ACCEPTANCE_SECONDS:-60}
+    depends_on:
+      fake-provider:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+    restart: "no"
+
+  live-acceptance:
+    build:
+      context: .
+    entrypoint: ["live-acceptance"]
+    profiles: ["test"]
+    environment:
+      IPTV_TEST_M3U_URL: ${IPTV_TEST_M3U_URL}
+      LIVE_ACCEPTANCE_SECONDS: ${LIVE_ACCEPTANCE_SECONDS:-30}
+    restart: "no"
+
+volumes:
+  postgres-data:

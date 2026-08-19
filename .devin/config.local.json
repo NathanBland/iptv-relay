@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Exec(docker-compose logs)",
+      "Exec(cargo test)",
+      "Exec(cargo clippy)",
+      "Exec(docker-compose stop)"
+    ]
+  }
+}

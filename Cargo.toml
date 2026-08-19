@@ -1,0 +1,70 @@
+[workspace]
+members = [
+  "apps/server",
+  "crates/api",
+  "crates/domain",
+  "crates/ingest",
+  "crates/media",
+  "crates/parsers",
+  "crates/persistence",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+argon2 = "0.5"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+bytes = { version = "1.10", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+dashmap = "6.1"
+futures-util = "0.3"
+flate2 = "1.1"
+getrandom = "0.4"
+http-body-util = "0.1"
+parking_lot = "0.12"
+proptest = "1.8"
+quick-xml = { version = "0.41", features = ["serialize"] }
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "http2", "rustls-tls", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["chrono", "json", "macros", "migrate", "postgres", "runtime-tokio-rustls", "uuid"] }
+tempfile = "3.20"
+thiserror = "2.0"
+tokio = { version = "1.49", features = ["full", "test-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["catch-panic", "compression-gzip", "request-id", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = { version = "2.5", features = ["serde"] }
+utoipa = { version = "5.4", features = ["axum_extras", "chrono", "uuid"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v7"] }
+xz2 = "0.1"
+zip = { version = "4.6", default-features = false, features = ["deflate"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

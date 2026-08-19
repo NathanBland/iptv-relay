@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tv generator-info-name="fixture-generator" source-info-url="https://guide.example">
+  <channel id="kusa.denver.example">
+    <display-name lang="en">KUSA &amp; 9NEWS</display-name>
+    <icon src="https://img.example/kusa.png" width="512" height="512"/>
+    <url>https://station.example/kusa</url>
+    <provider-channel-number system="fixture">9.1</provider-channel-number>
+  </channel>
+  <channel id="espn.example">
+    <display-name>ESPN</display-name>
+  </channel>
+  <programme channel="kusa.denver.example" start="20260913182000 -0600" stop="20260913220000 -0600">
+    <title lang="en">Broncos vs Chiefs</title>
+    <sub-title>Week 1</sub-title>
+    <desc lang="en"><![CDATA[Live from Denver & beyond.]]></desc>
+    <category lang="en">Football</category>
+    <episode-num system="xmltv_ns">0.0.</episode-num>
+    <credits>
+      <commentator>Example Announcer</commentator>
+    </credits>
+    <rating system="VCHIP">
+      <value>TV-PG</value>
+      <icon src="https://img.example/tv-pg.png"/>
+    </rating>
+    <new/>
+    <provider-data key="event-id">game-123</provider-data>
+  </programme>
+  <programme channel="espn.example" start="20260914002000 +0000" stop="20260914012000 +0000">
+    <title>SportsCenter</title>
+    <category>Sports</category>
+    <previously-shown/>
+  </programme>
+</tv>

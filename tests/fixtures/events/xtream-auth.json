@@ -1,0 +1,22 @@
+{
+  "user_info": {
+    "username": "fixture-user",
+    "password": "fixture-password",
+    "message": "Bienvenue 👋",
+    "auth": "1",
+    "status": "Active",
+    "exp_date": "1798761600",
+    "active_cons": "2",
+    "max_connections": "3",
+    "allowed_output_formats": ["m3u8", "ts"]
+  },
+  "server_info": {
+    "url": "tv.example",
+    "port": "80",
+    "https_port": "443",
+    "server_protocol": "https",
+    "timezone": "America/Denver",
+    "timestamp_now": 1789345200,
+    "custom_region": "us-mountain"
+  }
+}

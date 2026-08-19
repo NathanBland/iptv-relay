@@ -1,0 +1,24 @@
+{
+	auto_https off
+	admin off
+}
+
+:8080 {
+	encode zstd gzip
+
+	@sse path /api/v1/session-events /api/v1/catalog-events
+	handle @sse {
+		reverse_proxy core:8081 {
+			flush_interval -1
+		}
+	}
+
+	@core path /api/* /auth/* /health/* /metrics /out/*
+	handle @core {
+		reverse_proxy core:8081
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+}

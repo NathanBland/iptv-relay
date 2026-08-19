@@ -1,0 +1,33 @@
+[package]
+name = "iptv-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+axum.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+iptv-api = { path = "../../crates/api", version = "0.1.0" }
+iptv-domain = { path = "../../crates/domain", version = "0.1.0" }
+iptv-ingest = { path = "../../crates/ingest", version = "0.1.0" }
+iptv-media = { path = "../../crates/media", version = "0.1.0" }
+iptv-parsers = { path = "../../crates/parsers", version = "0.1.0" }
+iptv-persistence = { path = "../../crates/persistence", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+sqlx.workspace = true
+
+[lints]
+workspace = true

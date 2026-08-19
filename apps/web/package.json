@@ -1,0 +1,55 @@
+{
+  "name": "@iptv/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "vite dev --host 0.0.0.0",
+    "build": "vite build",
+    "lint": "oxlint --deny-warnings src tests e2e vite.config.ts vitest.config.ts playwright.config.ts",
+    "start": "node .output/server/index.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "test:e2e:real": "playwright test e2e/real-source-flow.spec.ts",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@tanstack/react-form": "1.33.5",
+    "@tanstack/react-query": "5.101.4",
+    "@tanstack/react-router": "1.170.31",
+    "@tanstack/react-start": "1.168.48",
+    "@tanstack/react-table": "9.1.2",
+    "@tanstack/react-virtual": "3.14.10",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "lucide-react": "1.33.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "tailwind-merge": "3.6.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "@tailwindcss/vite": "4.3.3",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.5",
+    "@types/node": "26.2.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "@vitest/coverage-v8": "4.1.11",
+    "jsdom": "30.0.1",
+    "nitro": "3.0.260610-beta",
+    "oxlint": "1.79.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "7.0.2",
+    "vite": "8.2.1",
+    "vitest": "4.1.11"
+  }
+}
