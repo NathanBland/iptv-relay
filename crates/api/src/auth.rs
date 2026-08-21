@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -29,6 +32,7 @@ pub(crate) struct AuthManager {
 struct AuthInner {
     password_hash: Arc<str>,
     bearer_hash: [u8; 32],
+    bootstrap_bearer_enabled: AtomicBool,
     secure_cookies: bool,
     sessions: Mutex<HashMap<[u8; 32], SessionRecord>>,
     login_csrf_tokens: Mutex<HashMap<[u8; 32], Instant>>,
@@ -40,6 +44,10 @@ impl fmt::Debug for AuthManager {
             .debug_struct("AuthManager")
             .field("password_hash", &"<redacted>")
             .field("bearer_hash", &"<redacted>")
+            .field(
+                "bootstrap_bearer_enabled",
+                &self.inner.bootstrap_bearer_enabled.load(Ordering::Acquire),
+            )
             .field("secure_cookies", &self.inner.secure_cookies)
             .field("active_sessions", &self.session_count())
             .finish()
@@ -74,6 +82,7 @@ impl AuthManager {
             inner: Arc::new(AuthInner {
                 password_hash: password_hash.into(),
                 bearer_hash: digest(bearer_token),
+                bootstrap_bearer_enabled: AtomicBool::new(true),
                 secure_cookies,
                 sessions: Mutex::new(HashMap::new()),
                 login_csrf_tokens: Mutex::new(HashMap::new()),
@@ -118,12 +127,12 @@ impl AuthManager {
         Some(self.csrf_cookie(&csrf_token, LOGIN_CSRF_TTL))
     }
 
-    pub(crate) async fn login(
+    pub(crate) async fn verify_login(
         &self,
         headers: &HeaderMap,
         username: String,
         password: String,
-    ) -> Result<IssuedSession, LoginError> {
+    ) -> Result<VerifiedLogin, LoginError> {
         let csrf_binding = self
             .csrf_binding(headers)
             .ok_or(LoginError::CsrfValidationFailed)?;
@@ -146,10 +155,17 @@ impl AuthManager {
             return Err(LoginError::InvalidCredentials);
         }
 
+        Ok(VerifiedLogin { csrf_binding })
+    }
+
+    pub(crate) fn complete_login(
+        &self,
+        verified: VerifiedLogin,
+    ) -> Result<IssuedSession, LoginError> {
         let session_token = random_token().map_err(|_| LoginError::Unavailable)?;
         let csrf_token = random_token().map_err(|_| LoginError::Unavailable)?;
         let mut sessions = self.lock_sessions();
-        if let CsrfBinding::Session(previous_session) = csrf_binding {
+        if let CsrfBinding::Session(previous_session) = verified.csrf_binding {
             sessions.remove(&previous_session);
         }
         sessions.insert(
@@ -160,7 +176,7 @@ impl AuthManager {
             },
         );
         drop(sessions);
-        if let CsrfBinding::Login(token) = csrf_binding {
+        if let CsrfBinding::Login(token) = verified.csrf_binding {
             self.lock_login_csrf_tokens().remove(&token);
         }
         Ok(IssuedSession {
@@ -174,8 +190,9 @@ impl AuthManager {
         headers: &HeaderMap,
         require_csrf: bool,
     ) -> Option<Authorization> {
-        if bearer_token(headers)
-            .is_some_and(|token| constant_time_eq(&digest(token), &self.inner.bearer_hash))
+        if self.inner.bootstrap_bearer_enabled.load(Ordering::Acquire)
+            && bearer_token(headers)
+                .is_some_and(|token| constant_time_eq(&digest(token), &self.inner.bearer_hash))
         {
             return Some(Authorization::Bearer);
         }
@@ -204,6 +221,12 @@ impl AuthManager {
         if let Some(token) = cookie(headers, SESSION_COOKIE) {
             self.lock_sessions().remove(&digest(token));
         }
+    }
+
+    pub(crate) fn disable_bootstrap_bearer(&self) {
+        self.inner
+            .bootstrap_bearer_enabled
+            .store(false, Ordering::Release);
     }
 
     pub(crate) fn clear_cookies(&self) -> [String; 2] {
@@ -292,6 +315,11 @@ impl AuthManager {
 enum CsrfBinding {
     Login([u8; 32]),
     Session([u8; 32]),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedLogin {
+    csrf_binding: CsrfBinding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -386,6 +414,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bootstrap_bearer_authorization_can_disable() {
+        let manager = AuthManager::new(
+            hash_admin_password("admin-password").unwrap(),
+            "bootstrap-token",
+            false,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer bootstrap-token".parse().unwrap(),
+        );
+        assert_eq!(
+            manager.authorize(&headers, false),
+            Some(Authorization::Bearer)
+        );
+
+        manager.disable_bootstrap_bearer();
+
+        assert_eq!(manager.authorize(&headers, false), None);
+    }
+
     #[tokio::test]
     async fn secure_login_rotates_an_existing_session() {
         let manager = AuthManager::new(
@@ -412,12 +462,16 @@ mod tests {
         assert!(!debug.contains("admin-password"));
 
         let first = manager
-            .login(
-                &login_headers,
-                "operator".to_owned(),
-                "admin-password".to_owned(),
+            .complete_login(
+                manager
+                    .verify_login(
+                        &login_headers,
+                        "operator".to_owned(),
+                        "admin-password".to_owned(),
+                    )
+                    .await
+                    .unwrap(),
             )
-            .await
             .unwrap();
         assert!(first.session_cookie.contains("HttpOnly"));
         assert!(first.session_cookie.contains("; Secure"));
@@ -440,12 +494,16 @@ mod tests {
         mismatched_headers.insert(CSRF_HEADER, "different-token".parse().unwrap());
         assert!(manager.authorize(&mismatched_headers, true).is_none());
         let second = manager
-            .login(
-                &session_headers,
-                "operator".to_owned(),
-                "admin-password".to_owned(),
+            .complete_login(
+                manager
+                    .verify_login(
+                        &session_headers,
+                        "operator".to_owned(),
+                        "admin-password".to_owned(),
+                    )
+                    .await
+                    .unwrap(),
             )
-            .await
             .unwrap();
         assert_ne!(first.session_cookie, second.session_cookie);
         assert_ne!(first.csrf_cookie, second.csrf_cookie);
