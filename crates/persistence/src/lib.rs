@@ -2,7 +2,7 @@
 
 mod catalog;
 
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
@@ -10,6 +10,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
 };
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
@@ -17,8 +18,18 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use catalog::{
-    CatalogRepository, ChannelPage, ChannelQuery, ChannelRow, EpgMappingStats, ProgrammePage,
-    ProgrammeQuery, ProgrammeRow, ReconcileStats, SystemCounts,
+    CatalogRepository, ChannelAliasRow, ChannelAliasStats, ChannelPage,
+    ChannelPlaybackCandidateRow, ChannelPlaybackPlan, ChannelQuery, ChannelRow,
+    ChannelStreamCandidateRow, ChannelStreamSourceRow, CreateChannelAliasInput,
+    CreateEventTemplate, CreateRecordingInput, CreateRecordingRuleInput, CreateStreamProfileInput,
+    CreateUserInput, ENVIRONMENT_OUTPUT_PROFILE_ID, ENVIRONMENT_OUTPUT_PROFILE_NAME,
+    EpgChannelSearchRow, EpgMappingPage, EpgMappingRow, EpgMappingStats, EventChannelRow,
+    EventTemplateQuery, EventTemplateRow, LineupApplyStats, LineupCategoryRow, LineupChannelRow,
+    LineupTemplateRow, OutputProfileRow, OutputProfileTokenHash, ProgrammePage, ProgrammeQuery,
+    ProgrammeRow, ReconcileStats, RecordingRow, RecordingRuleRow, RecordingStats,
+    ReviewCandidateRow, StreamHealthPage, StreamHealthRow, StreamHealthStats, StreamHealthUpdate,
+    StreamProfileRow, SystemCounts, UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput,
+    UserRow,
 };
 
 /// Embedded database migrations for the service schema.
@@ -46,6 +57,8 @@ pub enum PersistenceError {
     SourceConflict,
     #[error("job {0} was not found")]
     JobNotFound(Uuid),
+    #[error("output profile tuner count must be at least one")]
+    InvalidOutputProfileTunerCount,
 }
 
 const ENCRYPTED_VALUE_VERSION: u8 = 1;
@@ -91,6 +104,21 @@ impl MasterKey {
         associated_data: &[u8],
     ) -> Result<Vec<u8>, PersistenceError> {
         SourceCipher::new(self.clone()).encrypt(plaintext, associated_data)
+    }
+
+    /// Decrypts a secret previously encrypted with `encrypt_secret`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Decryption`] when the ciphertext is invalid
+    /// or the associated data does not match.
+    #[allow(clippy::missing_errors_doc)]
+    pub fn decrypt_secret(
+        &self,
+        ciphertext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>, PersistenceError> {
+        SourceCipher::new(self.clone()).decrypt(ciphertext, associated_data)
     }
 }
 
@@ -211,6 +239,36 @@ impl Database {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
+
+    /// Get the durable bootstrap bearer authorization state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] if the state cannot load.
+    pub async fn bootstrap_bearer_enabled(&self) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT bootstrap_bearer_enabled FROM authentication_state WHERE id = true",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(PersistenceError::from)
+    }
+
+    /// Disable bootstrap bearer authorization in durable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] if the state cannot update.
+    pub async fn disable_bootstrap_bearer(&self) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "UPDATE authentication_state \
+             SET bootstrap_bearer_enabled = false, updated_at = now() \
+             WHERE id = true AND bootstrap_bearer_enabled",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -277,6 +335,14 @@ pub struct NewSource {
     pub endpoint: String,
 }
 
+/// Partial update for a source. Only `Some` fields are applied.
+#[derive(Clone, Debug, Default)]
+pub struct SourceUpdate {
+    pub max_connections: Option<i32>,
+    pub timezone: Option<String>,
+    pub enabled: Option<bool>,
+}
+
 impl fmt::Debug for NewSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -299,6 +365,11 @@ pub struct SourceSummary {
     pub last_sync: DateTime<Utc>,
     pub endpoint: String,
     pub revision: i64,
+    pub refresh_interval_seconds: i32,
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+    pub max_connections: i32,
+    pub timezone: String,
+    pub enabled: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -342,6 +413,11 @@ struct SourceSummaryRow {
     activated_at: Option<DateTime<Utc>>,
     record_count: i64,
     job_status: Option<String>,
+    refresh_interval_seconds: i32,
+    last_refreshed_at: Option<DateTime<Utc>>,
+    max_connections: i32,
+    timezone: String,
+    enabled: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -358,6 +434,35 @@ struct EncryptedSourceRow {
 pub struct SourceRepository {
     pool: PgPool,
     cipher: SourceCipher,
+}
+
+/// A source that is due for a scheduled refresh.
+#[derive(Clone, Debug)]
+pub struct DueSource {
+    pub id: Uuid,
+    pub kind: SourceKind,
+    pub refresh_interval_seconds: i32,
+    pub last_refreshed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, FromRow)]
+struct DueSourceRow {
+    id: Uuid,
+    kind: String,
+    refresh_interval_seconds: i32,
+    last_refreshed_at: Option<DateTime<Utc>>,
+}
+
+impl DueSource {
+    fn try_from_row(row: &DueSourceRow) -> Result<Self, PersistenceError> {
+        let kind = SourceKind::from_database(&row.kind)?;
+        Ok(Self {
+            id: row.id,
+            kind,
+            refresh_interval_seconds: row.refresh_interval_seconds,
+            last_refreshed_at: row.last_refreshed_at,
+        })
+    }
 }
 
 impl SourceRepository {
@@ -379,12 +484,14 @@ impl SourceRepository {
             r"
             WITH source_rows AS (
                 SELECT id, name, source_type AS kind, base_url_template AS endpoint,
-                       revision, updated_at
+                       revision, updated_at, refresh_interval_seconds, last_refreshed_at,
+                       max_connections, source_timezone AS timezone, enabled
                 FROM provider_accounts
                 WHERE enabled = true
                 UNION ALL
                 SELECT id, name, 'xmltv' AS kind, url_template AS endpoint,
-                       revision, updated_at
+                       revision, updated_at, refresh_interval_seconds, last_refreshed_at,
+                       1 AS max_connections, timezone, enabled
                 FROM epg_sources
                 WHERE enabled = true
             )
@@ -392,7 +499,12 @@ impl SourceRepository {
                    sources.revision, sources.updated_at,
                    snapshot.activated_at,
                    COALESCE(snapshot.record_count, 0) AS record_count,
-                   latest_job.status AS job_status
+                   latest_job.status AS job_status,
+                   sources.refresh_interval_seconds,
+                   sources.last_refreshed_at,
+                   sources.max_connections,
+                   sources.timezone,
+                   sources.enabled
             FROM source_rows AS sources
             LEFT JOIN LATERAL (
                 SELECT activated_at, record_count
@@ -431,7 +543,24 @@ impl SourceRepository {
         source: &NewSource,
         actor: &str,
     ) -> Result<CreatedSource, PersistenceError> {
+        self.create_with_timezone(source, actor, None).await
+    }
+
+    /// Creates a source with its timezone before the initial refresh job runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, encryption, conflict, or database errors. The
+    /// transaction is rolled back if any insert fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn create_with_timezone(
+        &self,
+        source: &NewSource,
+        actor: &str,
+        timezone: Option<&str>,
+    ) -> Result<CreatedSource, PersistenceError> {
         validate_source(source)?;
+        let timezone = validate_timezone(timezone.unwrap_or("UTC"))?;
         let safe_endpoint = redact_source_endpoint(&source.endpoint)?;
         let source_id = Uuid::now_v7();
         let associated_data = source_associated_data(source_id, source.kind);
@@ -464,14 +593,15 @@ impl SourceRepository {
                 sqlx::query(
                     r"
                     INSERT INTO epg_sources
-                        (id, name, url_template, secret_ciphertext, updated_at)
-                    VALUES ($1, $2, $3, $4, $5)
+                        (id, name, url_template, secret_ciphertext, timezone, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6)
                     ",
                 )
                 .bind(source_id)
                 .bind(source.name.trim())
                 .bind(&safe_endpoint)
                 .bind(&ciphertext)
+                .bind(&timezone)
                 .bind(now)
                 .execute(&mut *transaction)
                 .await?;
@@ -480,8 +610,9 @@ impl SourceRepository {
                 sqlx::query(
                     r"
                     INSERT INTO provider_accounts
-                        (id, name, source_type, base_url_template, secret_ciphertext, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                        (id, name, source_type, base_url_template, secret_ciphertext,
+                         source_timezone, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
                     ",
                 )
                 .bind(source_id)
@@ -489,6 +620,7 @@ impl SourceRepository {
                 .bind(source.kind.database_name())
                 .bind(&safe_endpoint)
                 .bind(&ciphertext)
+                .bind(&timezone)
                 .bind(now)
                 .execute(&mut *transaction)
                 .await?;
@@ -541,6 +673,11 @@ impl SourceRepository {
                 last_sync: now,
                 endpoint: safe_endpoint,
                 revision: 1,
+                refresh_interval_seconds: 0,
+                last_refreshed_at: None,
+                max_connections: 1,
+                timezone,
+                enabled: true,
             },
             refresh_job,
         })
@@ -586,6 +723,230 @@ impl SourceRepository {
             revision: row.revision,
         })
     }
+
+    /// Returns source IDs that are due for a scheduled refresh.
+    ///
+    /// A source is due when `refresh_interval_seconds` is greater than zero
+    /// and either `last_refreshed_at` is null or the interval has elapsed
+    /// since the last refresh. Sources with an active or queued refresh job
+    /// are excluded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn list_due_sources(&self) -> Result<Vec<DueSource>, PersistenceError> {
+        let rows = sqlx::query_as::<_, DueSourceRow>(
+            r"
+            WITH due AS (
+                SELECT id, 'm3u' AS kind, refresh_interval_seconds, last_refreshed_at
+                FROM provider_accounts
+                WHERE enabled = true AND refresh_interval_seconds > 0
+                  AND (last_refreshed_at IS NULL
+                       OR last_refreshed_at + (refresh_interval_seconds || ' seconds')::interval <= now())
+                UNION ALL
+                SELECT id, 'xmltv' AS kind, refresh_interval_seconds, last_refreshed_at
+                FROM epg_sources
+                WHERE enabled = true AND refresh_interval_seconds > 0
+                  AND (last_refreshed_at IS NULL
+                       OR last_refreshed_at + (refresh_interval_seconds || ' seconds')::interval <= now())
+            )
+            SELECT d.id, d.kind, d.refresh_interval_seconds, d.last_refreshed_at
+            FROM due d
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs j
+                WHERE j.kind = 'refresh-source'
+                  AND j.payload->>'sourceId' = d.id::text
+                  AND j.status IN ('queued', 'running')
+            )
+            ",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(DueSource::try_from_row).collect()
+    }
+
+    /// Updates the refresh interval for a source.
+    ///
+    /// Set the interval to 0 to disable automatic refresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::SourceNotFound`] or [`PersistenceError::Database`].
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn update_refresh_interval(
+        &self,
+        source_id: Uuid,
+        interval_seconds: i32,
+    ) -> Result<(), PersistenceError> {
+        if interval_seconds < 0 {
+            return Err(PersistenceError::SourceConflict);
+        }
+        let provider_result = sqlx::query(
+            "UPDATE provider_accounts SET refresh_interval_seconds = $2, updated_at = now() WHERE id = $1",
+        )
+        .bind(source_id)
+        .bind(interval_seconds)
+        .execute(&self.pool)
+        .await?;
+        if provider_result.rows_affected() > 0 {
+            return Ok(());
+        }
+        let epg_result = sqlx::query(
+            "UPDATE epg_sources SET refresh_interval_seconds = $2, updated_at = now() WHERE id = $1",
+        )
+        .bind(source_id)
+        .bind(interval_seconds)
+        .execute(&self.pool)
+        .await?;
+        if epg_result.rows_affected() > 0 {
+            return Ok(());
+        }
+        Err(PersistenceError::SourceNotFound(source_id))
+    }
+
+    /// Records the time a source refresh completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the update fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn mark_source_refreshed(
+        &self,
+        source_id: Uuid,
+        refreshed_at: DateTime<Utc>,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query("UPDATE provider_accounts SET last_refreshed_at = $2 WHERE id = $1")
+            .bind(source_id)
+            .bind(refreshed_at)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("UPDATE epg_sources SET last_refreshed_at = $2 WHERE id = $1")
+            .bind(source_id)
+            .bind(refreshed_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Updates configurable fields on a source.
+    ///
+    /// Only fields that are `Some` are updated. This lets the caller
+    /// patch a single field without overwriting others.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::SourceNotFound`] or [`PersistenceError::Database`].
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn update_source(
+        &self,
+        source_id: Uuid,
+        update: &SourceUpdate,
+    ) -> Result<(), PersistenceError> {
+        if let Some(timezone) = update.timezone.as_deref() {
+            validate_timezone(timezone)?;
+        }
+        let provider_result = sqlx::query(
+            "UPDATE provider_accounts
+             SET max_connections = COALESCE($2, max_connections),
+                 source_timezone = COALESCE($3, source_timezone),
+                 enabled = COALESCE($4, enabled),
+                 updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(source_id)
+        .bind(update.max_connections)
+        .bind(update.timezone.as_deref())
+        .bind(update.enabled)
+        .execute(&self.pool)
+        .await?;
+        if provider_result.rows_affected() > 0 {
+            return Ok(());
+        }
+        let epg_result = sqlx::query(
+            "UPDATE epg_sources
+             SET timezone = COALESCE($2, timezone),
+                 enabled = COALESCE($3, enabled),
+                 updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(source_id)
+        .bind(update.timezone.as_deref())
+        .bind(update.enabled)
+        .execute(&self.pool)
+        .await?;
+        if epg_result.rows_affected() > 0 {
+            return Ok(());
+        }
+        Err(PersistenceError::SourceNotFound(source_id))
+    }
+
+    /// Deletes a source and all related data in one transaction.
+    ///
+    /// Removes the provider account or EPG source, cancels pending refresh
+    /// jobs, and records an audit event. Cascade deletes remove snapshots,
+    /// provider streams, programmes, and channel associations.
+    ///
+    /// # Errors
+    ///
+    /// Returns not-found or database errors.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn delete(&self, source_id: Uuid, actor: &str) -> Result<(), PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+
+        let existed: bool = sqlx::query_scalar(
+            r"
+            SELECT EXISTS (SELECT 1 FROM provider_accounts WHERE id = $1)
+             OR EXISTS (SELECT 1 FROM epg_sources WHERE id = $1)
+            ",
+        )
+        .bind(source_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !existed {
+            return Err(PersistenceError::SourceNotFound(source_id));
+        }
+
+        sqlx::query("UPDATE jobs SET status = 'cancelled' WHERE kind = 'refresh-source' AND payload->>'sourceId' = $1 AND status IN ('queued', 'running')")
+            .bind(source_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+
+        sqlx::query(
+            "DELETE FROM channels WHERE provider_account_id = $1 AND managed_by = 'automatic'",
+        )
+        .bind(source_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+            .bind(source_id)
+            .execute(&mut *transaction)
+            .await?;
+
+        sqlx::query("DELETE FROM epg_sources WHERE id = $1")
+            .bind(source_id)
+            .execute(&mut *transaction)
+            .await?;
+
+        sqlx::query(
+            r"
+            INSERT INTO audit_events
+                (id, actor, action, resource_type, resource_id, correlation_id, details)
+            VALUES ($1, $2, 'source.delete', 'source', $3, $4, $5)
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(actor)
+        .bind(source_id)
+        .bind(Uuid::now_v7())
+        .bind(serde_json::json!({}))
+        .execute(&mut *transaction)
+        .await?;
+
+        transaction.commit().await?;
+        Ok(())
+    }
 }
 
 fn validate_source(source: &NewSource) -> Result<(), PersistenceError> {
@@ -601,6 +962,27 @@ fn validate_source(source: &NewSource) -> Result<(), PersistenceError> {
         ));
     }
     redact_source_endpoint(&source.endpoint).map(|_| ())
+}
+
+fn validate_timezone(value: &str) -> Result<String, PersistenceError> {
+    let timezone = value.trim();
+    if timezone != value || timezone.is_empty() {
+        return Err(PersistenceError::InvalidSource(
+            "timezone must be a nonblank IANA timezone".to_owned(),
+        ));
+    }
+    if timezone == "UTC" {
+        return Ok(timezone.to_owned());
+    }
+    if !timezone.contains('/') {
+        return Err(PersistenceError::InvalidSource(
+            "timezone must be UTC or an IANA timezone".to_owned(),
+        ));
+    }
+    Tz::from_str(timezone).map_err(|_| {
+        PersistenceError::InvalidSource("timezone must be a valid IANA timezone".to_owned())
+    })?;
+    Ok(timezone.to_owned())
 }
 
 fn source_associated_data(source_id: Uuid, kind: SourceKind) -> String {
@@ -647,6 +1029,11 @@ fn source_summary_from_row(row: SourceSummaryRow) -> Result<SourceSummary, Persi
         last_sync: row.activated_at.unwrap_or(row.updated_at),
         endpoint: row.endpoint,
         revision: row.revision,
+        refresh_interval_seconds: row.refresh_interval_seconds,
+        last_refreshed_at: row.last_refreshed_at,
+        max_connections: row.max_connections,
+        timezone: row.timezone,
+        enabled: row.enabled,
     })
 }
 
@@ -805,7 +1192,14 @@ impl JobRepository {
     pub async fn claim(&self, worker_id: &str) -> Result<Option<JobRecord>, PersistenceError> {
         let record = sqlx::query_as::<_, JobRecord>(
             r"
-            WITH candidate AS (
+            UPDATE jobs
+            SET status = 'running',
+                locked_by = $1,
+                locked_at = now(),
+                heartbeat_at = now(),
+                attempts = attempts + 1,
+                updated_at = now()
+            WHERE id = (
                 SELECT id
                 FROM jobs
                 WHERE status = 'queued'
@@ -815,16 +1209,7 @@ impl JobRepository {
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
             )
-            UPDATE jobs
-            SET status = 'running',
-                locked_by = $1,
-                locked_at = now(),
-                heartbeat_at = now(),
-                attempts = attempts + 1,
-                updated_at = now()
-            FROM candidate
-            WHERE jobs.id = candidate.id
-            RETURNING jobs.*
+            RETURNING *
             ",
         )
         .bind(worker_id)
@@ -884,19 +1269,29 @@ impl JobRepository {
 
     /// Records a redacted job failure and either retries or finalizes it.
     ///
+    /// The retry delay uses exponential backoff based on the attempt count.
+    /// The delay is `2^attempts` seconds, capped at 300 seconds.
+    ///
     /// # Errors
     ///
     /// Returns [`PersistenceError::JobOwnership`] for a stale owner and
     /// [`PersistenceError::Database`] when the update fails.
     pub async fn fail(
         &self,
-        job: &JobRecord,
+        job_id: Uuid,
         worker_id: &str,
-        error: &str,
-        retry_at: DateTime<Utc>,
+        attempts: i32,
+        max_attempts: i32,
+        error_summary: &str,
     ) -> Result<(), PersistenceError> {
-        let retry = job.attempts < job.max_attempts;
-        let status = if retry { "queued" } else { "failed" };
+        let will_retry = attempts < max_attempts;
+        let status = if will_retry { "queued" } else { "failed" };
+        let delay_seconds = if will_retry {
+            2_i64.pow(attempts.max(0).cast_unsigned()).min(300)
+        } else {
+            0
+        };
+        let available_at = Utc::now() + chrono::Duration::seconds(delay_seconds);
         let result = sqlx::query(
             r"
             UPDATE jobs
@@ -906,14 +1301,74 @@ impl JobRepository {
             WHERE id = $1 AND status = 'running' AND locked_by = $2
             ",
         )
-        .bind(job.id)
+        .bind(job_id)
         .bind(worker_id)
         .bind(status)
-        .bind(redact_error(error))
-        .bind(retry_at)
+        .bind(redact_error(error_summary))
+        .bind(available_at)
         .execute(&self.pool)
         .await?;
-        ensure_owned(result.rows_affected(), job.id, worker_id)
+        ensure_owned(result.rows_affected(), job_id, worker_id)
+    }
+
+    /// Resets stale running jobs back to queued so they can be reclaimed.
+    ///
+    /// A job is stale when its `heartbeat_at` is older than the lease timeout.
+    /// It is also stale when `heartbeat_at` is null and `locked_at` is old.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn reap_stale_jobs(
+        &self,
+        lease_timeout_seconds: i64,
+    ) -> Result<u64, PersistenceError> {
+        let result = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'queued',
+                locked_by = NULL,
+                locked_at = NULL,
+                heartbeat_at = NULL,
+                updated_at = now()
+            WHERE status = 'running'
+              AND (
+                heartbeat_at IS NOT NULL
+                AND heartbeat_at < now() - make_interval(secs => $1)
+              )
+              OR (
+                heartbeat_at IS NULL
+                AND locked_at IS NOT NULL
+                AND locked_at < now() - make_interval(secs => $1)
+              )
+            ",
+        )
+        .bind(lease_timeout_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Lists failed jobs for operator inspection (dead-letter queue).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn list_failed_jobs(&self, limit: i64) -> Result<Vec<JobRecord>, PersistenceError> {
+        let rows = sqlx::query_as::<_, JobRecord>(
+            r"
+            SELECT * FROM jobs
+            WHERE status = 'failed'
+            ORDER BY updated_at DESC
+            LIMIT $1
+            ",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }
 
@@ -1084,6 +1539,24 @@ mod tests {
     }
 
     #[test]
+    fn source_timezone_validation_accepts_iana_names_and_rejects_unsafe_values() {
+        assert_eq!(validate_timezone("UTC").unwrap(), "UTC");
+        assert_eq!(
+            validate_timezone("America/Denver").unwrap(),
+            "America/Denver"
+        );
+        for timezone in [
+            "",
+            " America/Denver",
+            "America/Denver ",
+            "MST",
+            "not-a-zone",
+        ] {
+            assert!(validate_timezone(timezone).is_err(), "{timezone:?}");
+        }
+    }
+
+    #[test]
     fn source_kinds_round_trip_between_api_and_database_names() {
         for (api, database, expected) in [
             ("M3U", "m3u", SourceKind::M3u),
@@ -1141,5 +1614,98 @@ mod tests {
         let job_id = Uuid::nil();
         let error = ensure_owned(0, job_id, "worker-a").unwrap_err();
         assert!(matches!(error, PersistenceError::JobOwnership { .. }));
+        ensure_owned(1, job_id, "worker-a").unwrap();
+    }
+
+    #[test]
+    fn source_rows_convert_states_counts_and_due_kinds() {
+        let now = Utc::now();
+        for (status, expected) in [
+            (Some("queued"), "syncing"),
+            (Some("running"), "syncing"),
+            (Some("failed"), "degraded"),
+            (Some("cancelled"), "offline"),
+            (Some("succeeded"), "healthy"),
+            (None, "healthy"),
+        ] {
+            let summary = source_summary_from_row(SourceSummaryRow {
+                id: Uuid::nil(),
+                name: "Source".to_owned(),
+                kind: "m3u".to_owned(),
+                endpoint: "https://provider.test/".to_owned(),
+                revision: 2,
+                updated_at: now,
+                activated_at: None,
+                record_count: -1,
+                job_status: status.map(str::to_owned),
+                refresh_interval_seconds: 60,
+                last_refreshed_at: None,
+                max_connections: 3,
+                timezone: "UTC".to_owned(),
+                enabled: true,
+            })
+            .unwrap();
+            assert_eq!(summary.state, expected);
+            assert_eq!(summary.channels, 0);
+            assert_eq!(summary.last_sync, now);
+        }
+
+        let refreshed_at = now - chrono::Duration::minutes(5);
+        let due = DueSource::try_from_row(&DueSourceRow {
+            id: Uuid::nil(),
+            kind: "xmltv".to_owned(),
+            refresh_interval_seconds: 300,
+            last_refreshed_at: Some(refreshed_at),
+        })
+        .unwrap();
+        assert_eq!(due.kind, SourceKind::Xmltv);
+        assert_eq!(due.last_refreshed_at, Some(refreshed_at));
+        assert!(
+            DueSource::try_from_row(&DueSourceRow {
+                id: Uuid::nil(),
+                kind: "unsupported".to_owned(),
+                refresh_interval_seconds: 300,
+                last_refreshed_at: None,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn redaction_handles_individual_fields_arrays_and_scalars() {
+        let redacted = redact_error(
+            "PASSWORD=first&token=second auth=third key=fourth secret=fifth username=sixth",
+        );
+        for secret in ["first", "second", "third", "fourth", "fifth", "sixth"] {
+            assert!(!redacted.contains(secret));
+        }
+
+        let input = serde_json::json!([
+            "GET HTTPS://provider.test/live?token=value failed",
+            true,
+            null,
+            {"safe": "password=hidden"}
+        ]);
+        let output = redact_diagnostics(&input);
+        assert_eq!(output[1], true);
+        assert!(output[2].is_null());
+        assert!(!output.to_string().contains("provider.test"));
+        assert!(!output.to_string().contains("hidden"));
+    }
+
+    #[test]
+    fn public_decryption_and_cipher_debug_keep_secrets_private() {
+        let key = test_key(9);
+        let plaintext = b"provider password";
+        let ciphertext = key.encrypt_secret(plaintext, b"source").unwrap();
+        assert_eq!(
+            key.decrypt_secret(&ciphertext, b"source").unwrap(),
+            plaintext
+        );
+        assert!(key.decrypt_secret(&ciphertext, b"other").is_err());
+
+        let debug = format!("{:?}", SourceCipher::new(key));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("provider password"));
     }
 }
