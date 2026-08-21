@@ -4,7 +4,9 @@ use crate::{
     PreparedProgramme, PreparedProviderStream, PreparedSnapshot, ProtectedEndpoint, SnapshotOwner,
     StagedRows, download_stream, parse_artifact, unpack_artifact,
 };
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use iptv_domain::{EpgChannel, Programme};
 use iptv_parsers::{
     Diagnostic, ParseError, ParseLimits, XmltvParseOptions, parse_m3u_visit,
@@ -13,10 +15,59 @@ use iptv_parsers::{
 use reqwest::{Client, redirect::Policy};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::{cell::RefCell, collections::HashMap, fmt, io::BufReader, sync::Arc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fmt,
+    io::{BufReader, Read},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, info};
 use url::Url;
 use uuid::Uuid;
+
+/// Bridges async chunk delivery to a sync `Read` interface for the parser.
+///
+/// The download loop sends `Bytes` chunks through a bounded tokio channel.
+/// The parser task calls `blocking_recv()` in `spawn_blocking`, pulling
+/// chunks as they arrive. Backpressure is natural: if the parser is slow,
+/// the channel fills and the download loop yields on `send().await`.
+struct ChannelReader {
+    receiver: tokio::sync::mpsc::Receiver<Bytes>,
+    current: Bytes,
+    pos: usize,
+}
+
+impl ChannelReader {
+    fn new(receiver: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
+        Self {
+            receiver,
+            current: Bytes::new(),
+            pos: 0,
+        }
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.current.len() {
+            match self.receiver.blocking_recv() {
+                Some(chunk) => {
+                    self.current = chunk;
+                    self.pos = 0;
+                }
+                None => return Ok(0),
+            }
+        }
+        let available = &self.current[self.pos..];
+        let n = buf.len().min(available.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
 
 pub trait EndpointProtector: Send + Sync {
     #[allow(clippy::missing_errors_doc)]
@@ -116,12 +167,231 @@ where
             "ingestion started"
         );
         self.checkpoint("downloading", 0, 0, 0, 0).await?;
+
+        // M3U and XMLTV are line/event-based formats that the parsers can
+        // consume incrementally. Try to overlap download and parse by
+        // feeding chunks to the parser as they arrive. If the response is
+        // compressed or the format is Xtream, fall back to the sequential
+        // download-then-parse path.
+        if matches!(request.format, IngestFormat::M3u | IngestFormat::Xmltv)
+            && let Some(result) = self.try_streaming_run(request).await?
+        {
+            return Ok(result);
+        }
+
         let artifact = self.download_with_progress(&request.download).await?;
         info!(
             downloaded_bytes = artifact.byte_count,
             "download completed"
         );
         self.run_downloaded(request, artifact).await
+    }
+
+    /// Attempts to download and parse concurrently for uncompressed M3U/XMLTV.
+    ///
+    /// Returns `Ok(None)` if the response is compressed and the caller should
+    /// fall back to the sequential path.
+    #[allow(clippy::too_many_lines)]
+    async fn try_streaming_run(
+        &self,
+        request: &IngestRequest,
+    ) -> Result<Option<IngestResult>, IngestError> {
+        let download = &request.download;
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .gzip(false)
+            .build()
+            .map_err(|error| {
+                debug!(error = %error, "HTTP client construction failed");
+                IngestError::HttpRequest
+            })?;
+        let response = client
+            .get(download.endpoint().clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .map_err(|error| {
+                debug!(error = %error, "streaming: HTTP request failed");
+                IngestError::HttpRequest
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            debug!(status = status.as_u16(), "streaming: non-success status");
+            return Err(IngestError::HttpStatus(status.as_u16()));
+        }
+
+        // Peek at the first chunk to detect compression.
+        let mut stream = response.bytes_stream();
+        let first_chunk = futures_util::StreamExt::next(&mut stream)
+            .await
+            .ok_or(IngestError::HttpRequest)?
+            .map_err(|_error| {
+                debug!("streaming: first chunk failed");
+                IngestError::HttpRequest
+            })?;
+
+        let is_compressed = first_chunk.starts_with(&[0x1f, 0x8b])
+            || first_chunk.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00])
+            || first_chunk.starts_with(b"PK\x03\x04");
+
+        if is_compressed {
+            debug!("streaming: response is compressed, falling back to sequential path");
+            return Ok(None);
+        }
+
+        info!("streaming: download and parse will overlap");
+
+        // Set up the parser channel and task.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+        let reader = ChannelReader::new(rx);
+
+        let format = request.format;
+        let owner = request.owner;
+        let source_timezone = request.source_timezone.clone();
+        let protector = Arc::clone(&self.protector);
+        let parse_limits = self.parse_limits;
+        let max_download_bytes = self.artifact_limits.max_download_bytes;
+
+        let parse_task = tokio::task::spawn_blocking(move || {
+            streaming_parse(
+                reader,
+                format,
+                owner,
+                source_timezone,
+                protector.as_ref(),
+                parse_limits,
+            )
+        });
+
+        // Download loop: write to tempfile, hash, enforce limits, and feed
+        // chunks to the parser channel. The parser runs concurrently in
+        // spawn_blocking, pulling from the channel as chunks arrive.
+        let file = tempfile::tempfile()?;
+        let mut file = tokio::fs::File::from_std(file);
+        let mut hasher = Sha256::new();
+        let mut byte_count = 0_u64;
+        let mut last_checkpoint = std::time::Instant::now();
+        let stall_timeout = download.stall_timeout;
+        let max_timeout = download.max_timeout;
+        let start = std::time::Instant::now();
+
+        // Feed the first chunk we already peeked at.
+        let mut pending = Some(first_chunk);
+
+        loop {
+            // Check max timeout.
+            if start.elapsed() >= max_timeout {
+                debug!(
+                    byte_count,
+                    elapsed = ?start.elapsed(),
+                    "streaming: exceeded max timeout"
+                );
+                return Err(IngestError::HttpRequest);
+            }
+
+            // Get the next chunk, either from the pending buffer or the stream.
+            let chunk = if let Some(c) = pending.take() {
+                c
+            } else {
+                let remaining = max_timeout.checked_sub(start.elapsed()).unwrap_or_default();
+                let chunk_timeout = stall_timeout.min(remaining);
+                match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                    Ok(Some(result)) => result.map_err(|_error| {
+                        debug!(byte_count, "streaming: chunk failed");
+                        IngestError::HttpRequest
+                    })?,
+                    Ok(None) => break, // EOF
+                    Err(_) => {
+                        debug!(byte_count, stall_timeout = ?stall_timeout, "streaming: stalled");
+                        return Err(IngestError::HttpRequest);
+                    }
+                }
+            };
+
+            let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            byte_count = byte_count
+                .checked_add(chunk_len)
+                .ok_or(IngestError::DownloadTooLarge {
+                    limit: max_download_bytes,
+                })?;
+            if byte_count > max_download_bytes {
+                return Err(IngestError::DownloadTooLarge {
+                    limit: max_download_bytes,
+                });
+            }
+
+            // Write to tempfile for the audit trail / checksum.
+            file.write_all(&chunk).await?;
+            hasher.update(&chunk);
+
+            // Feed to parser. If the parser task died (error), send fails.
+            if tx.send(chunk).await.is_err() {
+                debug!("streaming: parser task ended early");
+                break;
+            }
+
+            // Periodic progress checkpoint (every 5 seconds).
+            if last_checkpoint.elapsed() >= Duration::from_secs(5) {
+                last_checkpoint = std::time::Instant::now();
+                if let Err(error) = self.checkpoint("downloading", byte_count, 0, 0, 0).await {
+                    debug!(error = ?error, "streaming: checkpoint failed");
+                }
+            }
+        }
+
+        // Close the channel to signal EOF to the parser.
+        drop(tx);
+
+        // Report download completion.
+        let _ = self.checkpoint("downloaded", byte_count, 0, 0, 0).await;
+
+        // Flush and finalize the tempfile (for checksum).
+        file.flush().await?;
+        let sha256 = format!("{:x}", hasher.finalize());
+
+        // Wait for the parser to finish.
+        let (mut snapshot, records_seen) = parse_task
+            .await
+            .map_err(|_| IngestError::ArtifactIo(std::io::Error::other("parse task panicked")))??;
+
+        info!(
+            downloaded_bytes = byte_count,
+            records_seen,
+            "streaming: download and parse completed"
+        );
+
+        // Finalize and activate the snapshot.
+        snapshot.checksum_sha256 = sha256.clone();
+        snapshot.byte_count = byte_count;
+        finalize_snapshot(&mut snapshot)?;
+
+        let _ = self
+            .checkpoint("parsed", byte_count, byte_count, records_seen, 0)
+            .await;
+        let records = snapshot.record_count;
+        let _ = self
+            .checkpoint("staging", byte_count, byte_count, records_seen, records)
+            .await;
+
+        let snapshot_id = self.store.activate(&snapshot).await?;
+        let _ = self
+            .checkpoint("activated", byte_count, byte_count, records_seen, records)
+            .await;
+
+        info!(
+            records,
+            downloaded_bytes = byte_count,
+            decoded_bytes = byte_count,
+            "ingestion completed"
+        );
+
+        Ok(Some(IngestResult {
+            snapshot_id,
+            checksum_sha256: sha256,
+            downloaded_bytes: byte_count,
+            decoded_bytes: byte_count,
+            records,
+        }))
     }
 
     /// Performs the HTTP GET, then streams the response body into a tempfile
@@ -325,6 +595,118 @@ where
             })
             .await
     }
+}
+
+/// Parses M3U/XMLTV from a `ChannelReader` that is fed concurrently by the
+/// download loop. This is the core of the streaming parse-during-download
+/// optimization: the parser processes records as chunks arrive, rather than
+/// waiting for the full download to complete.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn streaming_parse<P: EndpointProtector>(
+    reader: ChannelReader,
+    format: IngestFormat,
+    owner: SnapshotOwner,
+    source_timezone: String,
+    protector: &P,
+    limits: ParseLimits,
+) -> Result<(PreparedSnapshot, u64), IngestError> {
+    // For streaming, we don't know the total size ahead of time. Use the
+    // configured limit as the cap; the download loop enforces it too.
+    let mut snapshot = empty_snapshot(owner, format, String::new(), 0);
+    let records_seen = match format {
+        IngestFormat::M3u => {
+            let mut callback_error = None;
+            let mut stable_keys = HashMap::new();
+            let summary = parse_m3u_visit(BufReader::new(reader), limits, |entry| {
+                match stage_m3u_entry(&mut snapshot, entry, protector, &mut stable_keys) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        callback_error = Some(error);
+                        Err(ParseError::Io(std::io::Error::other("M3U staging visitor failed")))
+                    }
+                }
+            });
+            let summary = match summary {
+                Ok(summary) => summary,
+                Err(_) if callback_error.is_some() => {
+                    return Err(callback_error.expect("checked callback error"));
+                }
+                Err(source) => {
+                    return Err(IngestError::Parse { format: "M3U", source });
+                }
+            };
+            snapshot.diagnostic_count = summary.stats.warnings + summary.stats.errors;
+            snapshot.diagnostics = diagnostics_json(&summary.diagnostics);
+            summary.stats.records_seen
+        }
+        IngestFormat::Xmltv => {
+            let state = RefCell::new(XmlStreamState::new());
+            let options = XmltvParseOptions {
+                default_timezone: source_timezone,
+            };
+            let summary = parse_xmltv_visit_with_options(
+                BufReader::new(reader),
+                limits,
+                &options,
+                |channel| {
+                    state.borrow_mut().merge_channel(channel);
+                    Ok(())
+                },
+                |programme| {
+                    let mut state = state.borrow_mut();
+                    if state.error.is_some() {
+                        return Err(ParseError::Io(std::io::Error::other(
+                            "XMLTV staging visitor failed",
+                        )));
+                    }
+                    let channel_id = state.channel_id(&programme.channel_id);
+                    if let Err(error) = state.programmes.push(prepared_programme(programme, channel_id)) {
+                        state.error = Some(error);
+                        return Err(ParseError::Io(std::io::Error::other(
+                            "XMLTV staging visitor failed",
+                        )));
+                    }
+                    Ok(())
+                },
+            );
+            let mut state = state.into_inner();
+            let summary = match summary {
+                Ok(summary) => summary,
+                Err(_) if state.error.is_some() => {
+                    return Err(state.error.take().expect("checked callback error"));
+                }
+                Err(source) => {
+                    return Err(IngestError::Parse { format: "XMLTV", source });
+                }
+            };
+            let channels = std::mem::take(&mut state.channels);
+            for channel in channels {
+                let id = state.channel_id(&channel.id);
+                snapshot.epg_channels.push(prepared_epg_channel(channel, id))?;
+            }
+            for (xmltv_id, id) in state.ids {
+                if !state.declared.contains_key(&xmltv_id) {
+                    snapshot.epg_channels.push(PreparedEpgChannel {
+                        id,
+                        xmltv_id,
+                        display_names: json!([]),
+                        icon_urls: json!([]),
+                        metadata: json!({"undeclared": true}),
+                    })?;
+                }
+            }
+            snapshot.programmes = state.programmes;
+            snapshot.diagnostic_count = summary.stats.warnings + summary.stats.errors;
+            snapshot.diagnostics = diagnostics_json(&summary.diagnostics);
+            summary.stats.records_seen
+        }
+        IngestFormat::Xtream(_) => {
+            return Err(IngestError::InvalidRequest(
+                "Xtream does not support streaming parse",
+            ));
+        }
+    };
+    Ok((snapshot, records_seen))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
