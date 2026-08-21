@@ -1,0 +1,80 @@
+# Output API
+
+The output endpoints deliver M3U, XMLTV, and HDHomeRun-compatible data to clients. All output endpoints use a token in the path.
+
+Replace `{token}` with the value of `IPTV_OUTPUT_TOKEN`.
+
+At startup, the core stores the token hash in the environment output profile.
+
+The initial profile includes all enabled channels. Output requests use the channel selection and tuner count from this profile.
+
+After a token change, restart the core. The prior token stays valid for five minutes.
+
+The current UI does not configure output-profile channel selections.
+
+## Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/out/{token}/playlist.m3u` | Return the M3U playlist. |
+| GET | `/out/{token}/xmltv.xml` | Return the XMLTV guide. |
+| GET | `/out/{token}/stream/{*channel_path}` | Stream a channel as MPEG-TS. |
+| GET | `/out/{token}/hdhr/discover.json` | Return the HDHomeRun discovery document. |
+| GET | `/out/{token}/hdhr/lineup.json` | Return the HDHomeRun lineup. |
+| GET | `/out/{token}/hdhr/lineup_status.json` | Return the HDHomeRun lineup status. |
+| GET | `/out/{token}/hdhr/device.xml` | Return the HDHomeRun device XML. |
+
+## M3U playlist
+
+```bash
+curl http://localhost:8080/out/{token}/playlist.m3u
+```
+
+The playlist includes selected channels where `enabled = true`. Stream URLs use `IPTV_PUBLIC_BASE_URL` as the base.
+
+## XMLTV guide
+
+```bash
+curl http://localhost:8080/out/{token}/xmltv.xml
+```
+
+The guide includes programmes for selected and enabled channels only.
+The output writes normalized UTC times with a `+0000` offset.
+The output includes imported programmes and active generated event or filler programmes.
+
+## Stream a channel
+
+```bash
+curl http://localhost:8080/out/{token}/stream/{channel_path}
+```
+
+The endpoint delivers the raw MPEG-TS stream. The media plane shares one upstream provider session across multiple viewers.
+
+## HDHomeRun emulation
+
+The HDHomeRun endpoints emulate an HDHomeRun device. Clients that require HDHomeRun discovery use these endpoints.
+
+```bash
+curl http://localhost:8080/out/{token}/hdhr/discover.json
+```
+
+```bash
+curl http://localhost:8080/out/{token}/hdhr/lineup.json
+```
+
+## Jellyfin configuration
+
+Save the Jellyfin configuration:
+
+```bash
+curl -X PUT http://localhost:8080/api/v1/jellyfin \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "http://jellyfin:8096"}'
+```
+
+## Security
+
+The output token protects all output endpoints. Use a random 256-bit value for `IPTV_OUTPUT_TOKEN`. Do not expose the token in logs.
+
+The database stores only the token hash. Output URLs contain the plaintext token in the path.

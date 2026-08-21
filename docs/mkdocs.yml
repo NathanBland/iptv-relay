@@ -1,0 +1,61 @@
+site_name: IPTV Gateway
+site_description: IPTV management and media gateway
+site_url: https://nathanbland.github.io/iptv/
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - search.suggest
+    - content.code.copy
+  palette:
+    - scheme: slate
+      primary: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - scheme: default
+      primary: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+nav:
+  - Home: index.md
+  - Quick Start: quick-start.md
+  - Configuration:
+      - Docker Compose: configuration/docker-compose.md
+      - Environment Variables: configuration/environment-variables.md
+      - Sources: configuration/sources.md
+      - EPG: configuration/epg.md
+      - Channels and Groups: configuration/channels-groups.md
+      - Dynamic Events: configuration/dynamic-events.md
+      - Lineup Templates: configuration/lineup-templates.md
+      - Stream Health: configuration/stream-health.md
+      - Stream Profiles: configuration/stream-profiles.md
+      - Multi-User Access: configuration/multi-user.md
+      - DVR: configuration/dvr.md
+      - Channel Aliases: configuration/channel-aliases.md
+      - Jellyfin: configuration/jellyfin.md
+  - API Reference:
+      - Authentication: api/authentication.md
+      - Sources: api/sources.md
+      - Channels: api/channels.md
+      - EPG: api/epg.md
+      - Events: api/events.md
+      - Sessions: api/sessions.md
+      - Output: api/output.md
+  - Development:
+      - Local Setup: development/local-setup.md
+      - Testing: development/testing.md
+      - Architecture: development/architecture.md
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - codehilite
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
