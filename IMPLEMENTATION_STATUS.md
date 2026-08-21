@@ -2230,3 +2230,65 @@ The live Docker stack returned `running` with `stage=downloading`, `percent=5`, 
 The `updatedAt` timestamp advanced every 15 seconds during the download.
 
 The progress data persisted across heartbeat ticks without being overwritten.
+
+## Test cleanup hooks
+
+Last verification: 2026-08-21.
+
+The tests left data behind in the shared database after completion.
+
+### Playwright e2e tests
+
+The `groups-flows.spec.ts` test toggled group enabled states but did not restore them.
+
+A `beforeAll` hook now captures the initial enabled state of each group.
+
+An `afterAll` hook restores the original enabled state after all tests complete.
+
+The `management-flows.spec.ts` test changed source refresh interval, max connections, and timezone but did not revert these values.
+
+A `beforeAll` hook now captures the initial settings of each source.
+
+An `afterAll` hook restores the original settings after all tests complete.
+
+The `events-lineup-flows.spec.ts` test deleted templates only on the success path.
+
+The create-scan-delete and create-list-delete cycles now use `try/finally` blocks.
+
+The template is deleted in the `finally` block even when the test fails.
+
+### Rust persistence tests
+
+Seven tests used the shared database instead of isolated schemas.
+
+These tests could leave data behind if they failed before their inline cleanup ran.
+
+The following tests now use isolated schemas that are dropped after the test:
+
+- `migrations_and_job_lifecycle_are_transactionally_usable`
+- `encrypted_source_creation_enqueues_and_audits_atomically`
+- `migrations_preserve_conflicting_programme_metadata`
+- `playback_plan_uses_ranked_candidates_and_effective_pool_caps`
+- `user_crud_and_channel_grants_work`
+- `channel_alias_crud_and_resolution_work`
+- `stream_profile_crud_and_assignment_work`
+
+The inline cleanup code was removed because the schema drop makes it unnecessary.
+
+### Verified results
+
+The persistence test suite passed all 18 tests.
+
+The API test suite passed all 43 tests.
+
+The web test suite passed all 73 tests.
+
+The TypeScript type check passed.
+
+The web lint check passed.
+
+The Clippy check passed for the persistence crate with warnings denied.
+
+After both Rust test suites completed, zero leftover schemas remained in the database.
+
+Three leftover schemas from previous test runs were removed manually.

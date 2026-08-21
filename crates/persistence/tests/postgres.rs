@@ -42,7 +42,7 @@ async fn migrations_and_job_lifecycle_are_transactionally_usable() {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
-    let database = Database::connect(&database_url, 4).await.unwrap();
+    let (admin, database, schema) = isolated_database(&database_url).await;
     database.migrate().await.unwrap();
     database.migrate().await.unwrap();
     database.health().await.unwrap();
@@ -112,6 +112,9 @@ async fn migrations_and_job_lifecycle_are_transactionally_usable() {
     assert!(!error.contains("alice"));
     assert!(!error.contains("secret"));
     assert!(!error.contains("value"));
+
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
 }
 
 #[tokio::test]
@@ -137,8 +140,7 @@ async fn encrypted_source_creation_enqueues_and_audits_atomically() {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
-    let database = Database::connect(&database_url, 4).await.unwrap();
-    database.migrate().await.unwrap();
+    let (admin, database, schema) = isolated_database(&database_url).await;
     let source_repository =
         SourceRepository::new(database.pool().clone(), MasterKey::from_bytes([42_u8; 32]));
     let suffix = uuid::Uuid::now_v7();
@@ -214,23 +216,9 @@ async fn encrypted_source_creation_enqueues_and_audits_atomically() {
         Err(PersistenceError::Decryption)
     ));
 
-    let mut transaction = database.pool().begin().await.unwrap();
-    sqlx::query("DELETE FROM jobs WHERE payload->>'sourceId' = $1")
-        .bind(created.source.id.to_string())
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM audit_events WHERE resource_id = $1")
-        .bind(created.source.id)
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
-        .bind(created.source.id)
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-    transaction.commit().await.unwrap();
+    drop(source_repository);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
 }
 
 #[tokio::test]
@@ -239,7 +227,7 @@ async fn migrations_preserve_conflicting_programme_metadata() {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
-    let database = Database::connect(&database_url, 4).await.unwrap();
+    let (admin, database, schema) = isolated_database(&database_url).await;
     database.migrate().await.unwrap();
     let mut transaction = database.pool().begin().await.unwrap();
     let source_id = uuid::Uuid::now_v7();
@@ -301,6 +289,9 @@ async fn migrations_preserve_conflicting_programme_metadata() {
             .unwrap();
     assert_eq!(count, 2);
     transaction.rollback().await.unwrap();
+
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
 }
 
 #[tokio::test]
@@ -852,8 +843,7 @@ async fn playback_plan_uses_ranked_candidates_and_effective_pool_caps() {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
-    let database = Database::connect(&database_url, 4).await.unwrap();
-    database.migrate().await.unwrap();
+    let (admin, database, schema) = isolated_database(&database_url).await;
     let pool = database.pool().clone();
     let catalog = CatalogRepository::new(pool.clone());
     let suffix = uuid::Uuid::now_v7();
@@ -1000,21 +990,10 @@ async fn playback_plan_uses_ranked_candidates_and_effective_pool_caps() {
     assert_eq!(plan.candidates[2].provider_pool_id, third_account_id);
     assert_eq!(plan.candidates[2].max_connections, 5);
 
-    sqlx::query("DELETE FROM channels WHERE id = $1")
-        .bind(channel_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM provider_accounts WHERE id = ANY($1)")
-        .bind([first_account_id, second_account_id, third_account_id])
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM connection_pools WHERE id = $1")
-        .bind(shared_pool_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
 }
 
 #[tokio::test]
@@ -1204,8 +1183,7 @@ async fn user_crud_and_channel_grants_work() {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
-    let database = Database::connect(&database_url, 4).await.unwrap();
-    database.migrate().await.unwrap();
+    let (admin, database, schema) = isolated_database(&database_url).await;
     let pool = database.pool().clone();
     let catalog = CatalogRepository::new(pool.clone());
     let suffix = uuid::Uuid::now_v7();
@@ -1294,13 +1272,10 @@ async fn user_crud_and_channel_grants_work() {
     assert!(!catalog.delete_user(created.id).await.unwrap());
     assert!(catalog.get_user(created.id).await.unwrap().is_none());
 
-    let mut transaction = pool.begin().await.unwrap();
-    sqlx::query("DELETE FROM channels WHERE id = $1")
-        .bind(channel_id)
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-    transaction.commit().await.unwrap();
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
 }
 
 #[tokio::test]
@@ -1310,8 +1285,7 @@ async fn channel_alias_crud_and_resolution_work() {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
-    let database = Database::connect(&database_url, 4).await.unwrap();
-    database.migrate().await.unwrap();
+    let (admin, database, schema) = isolated_database(&database_url).await;
     let pool = database.pool().clone();
     let catalog = CatalogRepository::new(pool.clone());
     let suffix = uuid::Uuid::now_v7();
@@ -1367,6 +1341,11 @@ async fn channel_alias_crud_and_resolution_work() {
 
     assert!(catalog.delete_channel_alias(created.id).await.unwrap());
     assert!(!catalog.delete_channel_alias(created.id).await.unwrap());
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
 }
 
 #[tokio::test]
@@ -1483,8 +1462,7 @@ async fn stream_profile_crud_and_assignment_work() {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
-    let database = Database::connect(&database_url, 4).await.unwrap();
-    database.migrate().await.unwrap();
+    let (admin, database, schema) = isolated_database(&database_url).await;
     let pool = database.pool().clone();
     let catalog = CatalogRepository::new(pool.clone());
     let suffix = uuid::Uuid::now_v7();
@@ -1568,13 +1546,10 @@ async fn stream_profile_crud_and_assignment_work() {
     assert!(catalog.delete_stream_profile(profile.id).await.unwrap());
     assert!(!catalog.delete_stream_profile(profile.id).await.unwrap());
 
-    let mut transaction = pool.begin().await.unwrap();
-    sqlx::query("DELETE FROM channels WHERE id = $1")
-        .bind(channel_id)
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-    transaction.commit().await.unwrap();
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
 }
 
 #[tokio::test]

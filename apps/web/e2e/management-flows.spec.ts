@@ -3,7 +3,52 @@ import { expect, test } from '@playwright/test'
 const adminUsername = process.env.IPTV_ADMIN_USERNAME ?? 'operator'
 const adminPassword = process.env.IPTV_ADMIN_PASSWORD ?? ''
 
+type SourceState = {
+  id: string
+  refreshIntervalSeconds: number
+  maxConnections: number
+  timezone: string
+  enabled: boolean
+}
+
 test.describe.serial('source deletion and channel filtering', () => {
+  let initialSourceStates: SourceState[] = []
+
+  test.beforeAll(async ({ request }) => {
+    const response = await request.get('/api/v1/sources')
+    if (response.ok()) {
+      initialSourceStates = await response.json()
+    }
+  })
+
+  test.afterAll(async ({ request }) => {
+    const csrfResponse = await request.get('/api/v1/auth/status')
+    const setCookie = csrfResponse.headers()['set-cookie'] ?? ''
+    const csrfMatch = setCookie.match(/iptv_csrf=([^;]+)/)
+    const csrfToken = csrfMatch?.[1] ?? ''
+
+    for (const source of initialSourceStates) {
+      await request.patch(`/api/v1/sources/${source.id}`, {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': csrfToken,
+        },
+        data: {
+          maxConnections: source.maxConnections,
+          timezone: source.timezone,
+          enabled: source.enabled,
+        },
+      })
+      await request.patch(`/api/v1/sources/${source.id}/refresh-interval`, {
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': csrfToken,
+        },
+        data: { refreshIntervalSeconds: source.refreshIntervalSeconds },
+      })
+    }
+  })
+
   test.beforeEach(async ({ page, context }) => {
     await context.request.get('/health/ready')
     await page.goto('/login')

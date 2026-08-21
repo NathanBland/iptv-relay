@@ -2,7 +2,36 @@ import { expect, test } from '@playwright/test'
 
 const bootstrapToken = process.env.IPTV_ADMIN_BOOTSTRAP_TOKEN ?? ''
 
+type GroupState = { name: string; enabledCount: number; channelCount: number }
+
 test.describe.serial('groups management API and UI', () => {
+  let initialGroupStates: GroupState[] = []
+
+  test.beforeAll(async ({ request }) => {
+    const response = await request.get('/api/v1/groups', {
+      headers: { Authorization: `Bearer ${bootstrapToken}` },
+    })
+    if (response.ok()) {
+      initialGroupStates = await response.json()
+    }
+  })
+
+  test.afterAll(async ({ request }) => {
+    for (const group of initialGroupStates) {
+      const wasFullyEnabled = group.enabledCount === group.channelCount
+      const wasFullyDisabled = group.enabledCount === 0
+      if (wasFullyEnabled || wasFullyDisabled) {
+        await request.patch(`/api/v1/groups/${encodeURIComponent(group.name)}/enabled`, {
+          headers: {
+            Authorization: `Bearer ${bootstrapToken}`,
+            'Content-Type': 'application/json',
+          },
+          data: { enabled: wasFullyEnabled },
+        })
+      }
+    }
+  })
+
   test('groups API returns real data with enabled and total counts', async ({ request }) => {
     const response = await request.get('/api/v1/groups', {
       headers: { Authorization: `Bearer ${bootstrapToken}` },

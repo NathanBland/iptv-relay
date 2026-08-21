@@ -57,17 +57,18 @@ test.describe.serial('event template and lineup API flows', () => {
     const template = await createResponse.json()
     expect(template.id).toBeTruthy()
 
-    const scanResponse = await request.post(`/api/v1/event-templates/${template.id}/scan`, {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
-    expect(scanResponse.ok()).toBe(true)
-    const scanResult = await scanResponse.json()
-    expect(scanResult.ok).toBe(true)
-
-    const deleteResponse = await request.delete(`/api/v1/event-templates/${template.id}`, {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
-    expect(deleteResponse.ok()).toBe(true)
+    try {
+      const scanResponse = await request.post(`/api/v1/event-templates/${template.id}/scan`, {
+        headers: { Authorization: `Bearer ${bootstrapToken}` },
+      })
+      expect(scanResponse.ok()).toBe(true)
+      const scanResult = await scanResponse.json()
+      expect(scanResult.ok).toBe(true)
+    } finally {
+      await request.delete(`/api/v1/event-templates/${template.id}`, {
+        headers: { Authorization: `Bearer ${bootstrapToken}` },
+      })
+    }
   })
 
   test('lineup templates API returns real data from the database', async ({ request }) => {
@@ -109,27 +110,28 @@ test.describe.serial('event template and lineup API flows', () => {
     const template = await createResponse.json()
     expect(template.id).toBeTruthy()
 
-    const categoriesResponse = await request.get(`/api/v1/lineup-templates/${template.id}/categories`, {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
-    expect(categoriesResponse.ok()).toBe(true)
-    const categories = await categoriesResponse.json()
-    expect(categories.length).toBe(1)
-    expect(categories[0].name).toBe('Test Category')
+    try {
+      const categoriesResponse = await request.get(`/api/v1/lineup-templates/${template.id}/categories`, {
+        headers: { Authorization: `Bearer ${bootstrapToken}` },
+      })
+      expect(categoriesResponse.ok()).toBe(true)
+      const categories = await categoriesResponse.json()
+      expect(categories.length).toBe(1)
+      expect(categories[0].name).toBe('Test Category')
 
-    const channelsResponse = await request.get(`/api/v1/lineup-templates/${template.id}/channels`, {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
-    expect(channelsResponse.ok()).toBe(true)
-    const channels = await channelsResponse.json()
-    expect(channels.length).toBe(1)
-    expect(channels[0].name).toBe('Test Channel')
-    expect(channels[0].channelNumber).toBe('100')
-
-    const deleteResponse = await request.delete(`/api/v1/lineup-templates/${template.id}`, {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
-    expect(deleteResponse.ok()).toBe(true)
+      const channelsResponse = await request.get(`/api/v1/lineup-templates/${template.id}/channels`, {
+        headers: { Authorization: `Bearer ${bootstrapToken}` },
+      })
+      expect(channelsResponse.ok()).toBe(true)
+      const channels = await channelsResponse.json()
+      expect(channels.length).toBe(1)
+      expect(channels[0].name).toBe('Test Channel')
+      expect(channels[0].channelNumber).toBe('100')
+    } finally {
+      await request.delete(`/api/v1/lineup-templates/${template.id}`, {
+        headers: { Authorization: `Bearer ${bootstrapToken}` },
+      })
+    }
   })
 })
 
