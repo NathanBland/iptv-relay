@@ -20,7 +20,10 @@ use std::{
     collections::HashMap,
     fmt,
     io::{BufReader, Read},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::io::AsyncWriteExt;
@@ -251,6 +254,8 @@ where
         let protector = Arc::clone(&self.protector);
         let parse_limits = self.parse_limits;
         let max_download_bytes = self.artifact_limits.max_download_bytes;
+        let records_counter = Arc::new(AtomicU64::new(0));
+        let counter_for_parse = Arc::clone(&records_counter);
 
         let parse_task = tokio::task::spawn_blocking(move || {
             streaming_parse(
@@ -260,6 +265,7 @@ where
                 source_timezone,
                 protector.as_ref(),
                 parse_limits,
+                &counter_for_parse,
             )
         });
 
@@ -333,7 +339,8 @@ where
             // Periodic progress checkpoint (every 5 seconds).
             if last_checkpoint.elapsed() >= Duration::from_secs(5) {
                 last_checkpoint = std::time::Instant::now();
-                if let Err(error) = self.checkpoint("downloading", byte_count, 0, 0, 0).await {
+                let records = records_counter.load(Ordering::Relaxed);
+                if let Err(error) = self.checkpoint("downloading", byte_count, 0, records, 0).await {
                     debug!(error = ?error, "streaming: checkpoint failed");
                 }
             }
@@ -342,8 +349,9 @@ where
         // Close the channel to signal EOF to the parser.
         drop(tx);
 
-        // Report download completion.
-        let _ = self.checkpoint("downloaded", byte_count, 0, 0, 0).await;
+        // Report download completion with records parsed so far.
+        let records_so_far = records_counter.load(Ordering::Relaxed);
+        let _ = self.checkpoint("downloaded", byte_count, 0, records_so_far, 0).await;
 
         // Flush and finalize the tempfile (for checksum).
         file.flush().await?;
@@ -609,6 +617,7 @@ fn streaming_parse<P: EndpointProtector>(
     source_timezone: String,
     protector: &P,
     limits: ParseLimits,
+    records_counter: &AtomicU64,
 ) -> Result<(PreparedSnapshot, u64), IngestError> {
     // For streaming, we don't know the total size ahead of time. Use the
     // configured limit as the cap; the download loop enforces it too.
@@ -619,7 +628,10 @@ fn streaming_parse<P: EndpointProtector>(
             let mut stable_keys = HashMap::new();
             let summary = parse_m3u_visit(BufReader::new(reader), limits, |entry| {
                 match stage_m3u_entry(&mut snapshot, entry, protector, &mut stable_keys) {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        records_counter.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
                     Err(error) => {
                         callback_error = Some(error);
                         Err(ParseError::Io(std::io::Error::other("M3U staging visitor failed")))
@@ -650,6 +662,7 @@ fn streaming_parse<P: EndpointProtector>(
                 &options,
                 |channel| {
                     state.borrow_mut().merge_channel(channel);
+                    records_counter.fetch_add(1, Ordering::Relaxed);
                     Ok(())
                 },
                 |programme| {
@@ -666,6 +679,7 @@ fn streaming_parse<P: EndpointProtector>(
                             "XMLTV staging visitor failed",
                         )));
                     }
+                    records_counter.fetch_add(1, Ordering::Relaxed);
                     Ok(())
                 },
             );
