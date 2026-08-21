@@ -1,4 +1,4 @@
-CREATE TABLE connection_pools (
+CREATE TABLE IF NOT EXISTS connection_pools (
     id uuid PRIMARY KEY,
     name text NOT NULL UNIQUE,
     max_connections integer NOT NULL CHECK (max_connections > 0),
@@ -6,7 +6,7 @@ CREATE TABLE connection_pools (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE provider_accounts (
+CREATE TABLE IF NOT EXISTS provider_accounts (
     id uuid PRIMARY KEY,
     name text NOT NULL UNIQUE,
     source_type text NOT NULL CHECK (source_type IN ('m3u', 'xtream')),
@@ -23,7 +23,7 @@ CREATE TABLE provider_accounts (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE source_snapshots (
+CREATE TABLE IF NOT EXISTS source_snapshots (
     id uuid PRIMARY KEY,
     provider_account_id uuid NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE,
     kind text NOT NULL CHECK (kind IN ('m3u', 'xtream', 'xmltv')),
@@ -38,11 +38,11 @@ CREATE TABLE source_snapshots (
     UNIQUE (provider_account_id, kind, checksum_sha256)
 );
 
-CREATE UNIQUE INDEX one_active_snapshot_per_provider_kind
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_snapshot_per_provider_kind
     ON source_snapshots(provider_account_id, kind)
     WHERE status = 'active';
 
-CREATE TABLE provider_streams (
+CREATE TABLE IF NOT EXISTS provider_streams (
     id uuid PRIMARY KEY,
     snapshot_id uuid NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
     provider_account_id uuid NOT NULL REFERENCES provider_accounts(id) ON DELETE CASCADE,
@@ -64,14 +64,14 @@ CREATE TABLE provider_streams (
     UNIQUE (snapshot_id, stable_key)
 );
 
-CREATE INDEX provider_streams_account_stable_key_idx
+CREATE INDEX IF NOT EXISTS provider_streams_account_stable_key_idx
     ON provider_streams(provider_account_id, stable_key);
-CREATE INDEX provider_streams_tvg_id_idx
+CREATE INDEX IF NOT EXISTS provider_streams_tvg_id_idx
     ON provider_streams(provider_account_id, tvg_id)
     WHERE tvg_id IS NOT NULL AND tvg_id <> '';
-CREATE INDEX provider_streams_group_idx ON provider_streams(group_name);
+CREATE INDEX IF NOT EXISTS provider_streams_group_idx ON provider_streams(group_name);
 
-CREATE TABLE channels (
+CREATE TABLE IF NOT EXISTS channels (
     id uuid PRIMARY KEY,
     channel_number text NOT NULL,
     name text NOT NULL,
@@ -86,7 +86,7 @@ CREATE TABLE channels (
     UNIQUE (channel_number)
 );
 
-CREATE TABLE channel_streams (
+CREATE TABLE IF NOT EXISTS channel_streams (
     channel_id uuid NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
     provider_stream_id uuid NOT NULL REFERENCES provider_streams(id) ON DELETE CASCADE,
     priority integer NOT NULL CHECK (priority >= 0),
@@ -95,7 +95,7 @@ CREATE TABLE channel_streams (
     UNIQUE (channel_id, priority)
 );
 
-CREATE TABLE epg_sources (
+CREATE TABLE IF NOT EXISTS epg_sources (
     id uuid PRIMARY KEY,
     name text NOT NULL UNIQUE,
     url_template text NOT NULL,
@@ -108,7 +108,7 @@ CREATE TABLE epg_sources (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE epg_channels (
+CREATE TABLE IF NOT EXISTS epg_channels (
     id uuid PRIMARY KEY,
     source_snapshot_id uuid NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
     epg_source_id uuid NOT NULL REFERENCES epg_sources(id) ON DELETE CASCADE,
@@ -119,9 +119,9 @@ CREATE TABLE epg_channels (
     UNIQUE (source_snapshot_id, xmltv_id)
 );
 
-CREATE INDEX epg_channels_source_xmltv_idx ON epg_channels(epg_source_id, xmltv_id);
+CREATE INDEX IF NOT EXISTS epg_channels_source_xmltv_idx ON epg_channels(epg_source_id, xmltv_id);
 
-CREATE TABLE programmes (
+CREATE TABLE IF NOT EXISTS programmes (
     id uuid PRIMARY KEY,
     source_snapshot_id uuid NOT NULL REFERENCES source_snapshots(id) ON DELETE CASCADE,
     epg_channel_id uuid NOT NULL REFERENCES epg_channels(id) ON DELETE CASCADE,
@@ -136,11 +136,13 @@ CREATE TABLE programmes (
     metadata jsonb NOT NULL DEFAULT '{}'::jsonb
 );
 
-CREATE UNIQUE INDEX programmes_exact_dedupe_idx
-    ON programmes(epg_channel_id, starts_at, COALESCE(stops_at, 'infinity'::timestamptz), title);
-CREATE INDEX programmes_channel_time_idx ON programmes(epg_channel_id, starts_at, stops_at);
+-- The programmes_exact_dedupe_idx was originally created here and dropped
+-- by migration 0003 to allow conflicting programmes. It is omitted so
+-- that re-application of this migration does not fail on data that
+-- contains conflicts.
+CREATE INDEX IF NOT EXISTS programmes_channel_time_idx ON programmes(epg_channel_id, starts_at, stops_at);
 
-CREATE TABLE channel_epg_mappings (
+CREATE TABLE IF NOT EXISTS channel_epg_mappings (
     channel_id uuid PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
     epg_channel_id uuid NOT NULL REFERENCES epg_channels(id) ON DELETE CASCADE,
     method text NOT NULL CHECK (method IN ('manual', 'previous', 'tvg-id', 'callsign', 'alias', 'exact-name', 'fuzzy', 'generated')),
@@ -150,7 +152,7 @@ CREATE TABLE channel_epg_mappings (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE event_rule_sets (
+CREATE TABLE IF NOT EXISTS event_rule_sets (
     id uuid PRIMARY KEY,
     name text NOT NULL UNIQUE,
     group_selector jsonb NOT NULL,
@@ -164,7 +166,7 @@ CREATE TABLE event_rule_sets (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE output_profiles (
+CREATE TABLE IF NOT EXISTS output_profiles (
     id uuid PRIMARY KEY,
     name text NOT NULL UNIQUE,
     token_hash bytea NOT NULL UNIQUE,
@@ -177,7 +179,7 @@ CREATE TABLE output_profiles (
     updated_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE output_profile_channels (
+CREATE TABLE IF NOT EXISTS output_profile_channels (
     output_profile_id uuid NOT NULL REFERENCES output_profiles(id) ON DELETE CASCADE,
     channel_id uuid NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
     position integer NOT NULL CHECK (position >= 0),
@@ -185,7 +187,7 @@ CREATE TABLE output_profile_channels (
     UNIQUE (output_profile_id, position)
 );
 
-CREATE TABLE jobs (
+CREATE TABLE IF NOT EXISTS jobs (
     id uuid PRIMARY KEY,
     kind text NOT NULL,
     status text NOT NULL DEFAULT 'queued'
@@ -205,12 +207,12 @@ CREATE TABLE jobs (
     completed_at timestamptz
 );
 
-CREATE INDEX jobs_claim_idx ON jobs(priority DESC, created_at)
+CREATE INDEX IF NOT EXISTS jobs_claim_idx ON jobs(priority DESC, created_at)
     WHERE status = 'queued';
-CREATE INDEX jobs_running_heartbeat_idx ON jobs(heartbeat_at)
+CREATE INDEX IF NOT EXISTS jobs_running_heartbeat_idx ON jobs(heartbeat_at)
     WHERE status = 'running';
 
-CREATE TABLE revisions (
+CREATE TABLE IF NOT EXISTS revisions (
     id uuid PRIMARY KEY,
     resource_type text NOT NULL,
     resource_id uuid NOT NULL,
@@ -222,7 +224,7 @@ CREATE TABLE revisions (
     UNIQUE (resource_type, resource_id, revision)
 );
 
-CREATE TABLE audit_events (
+CREATE TABLE IF NOT EXISTS audit_events (
     id uuid PRIMARY KEY,
     actor text NOT NULL,
     action text NOT NULL,
@@ -233,5 +235,4 @@ CREATE TABLE audit_events (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX audit_events_created_idx ON audit_events(created_at DESC);
-
+CREATE INDEX IF NOT EXISTS audit_events_created_idx ON audit_events(created_at DESC);

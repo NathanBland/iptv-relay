@@ -1,1 +1,1 @@
-DROP INDEX programmes_exact_dedupe_idx;
+DROP INDEX IF EXISTS programmes_exact_dedupe_idx;
