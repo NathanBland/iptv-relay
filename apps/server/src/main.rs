@@ -12,7 +12,7 @@ use iptv_persistence::{
 };
 use reqwest::Url;
 use tokio::{net::TcpListener, process::Command, signal, time::sleep};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -440,6 +440,7 @@ async fn process_job(
             }
             let summary = error.persisted_summary();
             warn!(job_id = %job.id, error = summary, "source refresh failed");
+            debug!(job_id = %job.id, error = ?error, "source refresh failure detail");
             jobs.fail(job.id, worker_id, job.attempts, job.max_attempts, summary)
                 .await?;
         }
@@ -465,7 +466,18 @@ async fn run_source_refresh(
             RefreshError::SourceLoad
         })?;
     let (owner, format) = refresh_target(source.kind, source.id)?;
-    let endpoint = Url::parse(&source.endpoint).map_err(|_| RefreshError::InvalidEndpoint)?;
+    let endpoint = Url::parse(&source.endpoint).map_err(|_| {
+        debug!(source_id = %source_id, endpoint_len = source.endpoint.len(), "source endpoint is not a valid URL");
+        RefreshError::InvalidEndpoint
+    })?;
+    debug!(
+        job_id = %job.id,
+        source_id = %source_id,
+        format = ?format,
+        stall_timeout = ?Duration::from_mins(1),
+        max_timeout = ?Duration::from_mins(10),
+        "starting source download"
+    );
     let control = WorkerJobControl {
         repository: jobs.clone(),
         job_id: job.id,
@@ -629,13 +641,27 @@ impl JobControl for WorkerJobControl {
 /// Maps an ingest phase to the stage-based progress JSON reported through
 /// `JobRepository::heartbeat`. The stage names align with the public
 /// `GET /api/v1/sources/{source_id}/sync-status` contract.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn refresh_progress_json(
     phase: &str,
     downloaded_bytes: u64,
     records_seen: u64,
 ) -> serde_json::Value {
     let (stage, percent, message): (&'static str, u8, &'static str) = match phase {
-        "downloading" => ("downloading", 5, "Downloading source data"),
+        "downloading" => {
+            // Scale the percent from 1 to 14 based on downloaded bytes so the
+            // UI shows progress during long downloads even without a
+            // content-length header. 1 MB maps to ~3%, 50 MB to ~12%.
+            let scaled = if downloaded_bytes == 0 {
+                1_u8
+            } else {
+                let mb = (downloaded_bytes as f64) / 1_048_576.0;
+                let log_mb = mb.log2().max(0.0);
+                let raw = 1.0 + log_mb * 1.5;
+                raw.clamp(1.0, 14.0) as u8
+            };
+            ("downloading", scaled, "Downloading source data")
+        }
         "downloaded" => ("downloading", 15, "Downloaded source data"),
         "decoded" => ("parsing", 30, "Decoded source artifact"),
         "parsed" => ("parsing", 45, "Parsed source records"),
@@ -1489,8 +1515,9 @@ mod tests {
 
     #[test]
     fn refresh_progress_maps_each_ingest_phase_to_the_public_stage_contract() {
+        // 123 bytes maps to percent=1 during downloading (log scale, clamped).
         for (phase, stage, percent, message) in [
-            ("downloading", "downloading", 5, "Downloading source data"),
+            ("downloading", "downloading", 1, "Downloading source data"),
             ("downloaded", "downloading", 15, "Downloaded source data"),
             ("decoded", "parsing", 30, "Decoded source artifact"),
             ("parsed", "parsing", 45, "Parsed source records"),
@@ -1505,6 +1532,20 @@ mod tests {
             assert_eq!(progress["recordsProcessed"], 7);
             assert_eq!(progress["message"], message);
         }
+    }
+
+    #[test]
+    fn refresh_progress_download_percent_scales_with_bytes() {
+        // 0 bytes = 1%, 1 MB = 1%, 4 MB = 4%, 50 MB = ~9%, 100 MB = ~11%.
+        let zero = refresh_progress_json("downloading", 0, 0);
+        assert_eq!(zero["percent"], 1);
+        let one_mb = refresh_progress_json("downloading", 1_048_576, 0);
+        assert_eq!(one_mb["percent"], 1);
+        let fifty_mb = refresh_progress_json("downloading", 50 * 1_048_576, 0);
+        let pct = fifty_mb["percent"].as_u64().unwrap();
+        assert!(pct >= 8 && pct <= 14, "50MB should map to 8-14%, got {pct}");
+        let huge = refresh_progress_json("downloading", 500 * 1_048_576, 0);
+        assert_eq!(huge["percent"], 14);
     }
 
     #[tokio::test]

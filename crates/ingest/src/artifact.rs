@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tracing::debug;
 use url::Url;
 use xz2::read::XzDecoder;
 use zip::ZipArchive;
@@ -36,15 +37,27 @@ impl Default for ArtifactLimits {
 
 pub struct DownloadRequest {
     endpoint: Url,
-    pub timeout: Duration,
+    /// Maximum duration to wait without receiving any new data.
+    /// Resets each time a chunk arrives.
+    pub stall_timeout: Duration,
+    /// Overall maximum download duration regardless of progress.
+    pub max_timeout: Duration,
 }
 
 impl DownloadRequest {
     pub fn new(endpoint: Url) -> Self {
         Self {
             endpoint,
-            timeout: Duration::from_mins(2),
+            stall_timeout: Duration::from_mins(1),
+            max_timeout: Duration::from_mins(10),
         }
+    }
+
+    #[must_use]
+    pub fn with_timeouts(mut self, stall: Duration, max: Duration) -> Self {
+        self.stall_timeout = stall;
+        self.max_timeout = max;
+        self
     }
 
     pub fn endpoint(&self) -> &Url {
@@ -57,7 +70,8 @@ impl fmt::Debug for DownloadRequest {
         formatter
             .debug_struct("DownloadRequest")
             .field("endpoint", &RedactedEndpoint(&self.endpoint))
-            .field("timeout", &self.timeout)
+            .field("stall_timeout", &self.stall_timeout)
+            .field("max_timeout", &self.max_timeout)
             .finish()
     }
 }
@@ -151,6 +165,10 @@ impl DecodedArtifact {
 }
 
 /// Downloads an HTTP response without redirects or transparent content decoding.
+///
+/// The download uses a dynamic stall-based timeout: the timer resets each time
+/// new data arrives, so a slow but steady connection will not be killed. An
+/// overall `max_timeout` caps the total download duration as a safety valve.
 #[allow(clippy::missing_errors_doc)]
 pub async fn download_http(
     request: &DownloadRequest,
@@ -159,17 +177,32 @@ pub async fn download_http(
     let client = Client::builder()
         .redirect(Policy::none())
         .gzip(false)
-        .timeout(request.timeout)
         .build()
-        .map_err(|_| IngestError::HttpRequest)?;
+        .map_err(|error| {
+            debug!(error = %error, "HTTP client construction failed");
+            IngestError::HttpRequest
+        })?;
     let response = client
         .get(request.endpoint().clone())
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .send()
         .await
-        .map_err(|_| IngestError::HttpRequest)?;
-    if !response.status().is_success() {
-        return Err(IngestError::HttpStatus(response.status().as_u16()));
+        .map_err(|error| {
+            debug!(
+                error = %error,
+                stall_timeout = ?request.stall_timeout,
+                "HTTP request failed before a response was received"
+            );
+            IngestError::HttpRequest
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        debug!(
+            status = status.as_u16(),
+            content_length = ?response.content_length(),
+            "HTTP source returned an unsuccessful status"
+        );
+        return Err(IngestError::HttpStatus(status.as_u16()));
     }
     let declared_length = response.content_length();
     let extension_hint = extension_hint(request.endpoint());
@@ -178,20 +211,32 @@ pub async fn download_http(
         declared_length,
         extension_hint,
         limits,
+        request.stall_timeout,
+        request.max_timeout,
+        |_| {},
     )
     .await
 }
 
 /// Streams chunks into an anonymous tempfile while hashing and enforcing a hard byte limit.
-#[allow(clippy::missing_errors_doc)]
-pub async fn download_stream<S, E>(
+///
+/// The `stall_timeout` resets each time a chunk arrives. If no data arrives
+/// for that duration, the download fails. The `max_timeout` caps the total
+/// download time regardless of progress. The `on_progress` callback is called
+/// each time a chunk is written, with the cumulative byte count.
+#[allow(clippy::missing_errors_doc, clippy::too_many_arguments)]
+pub async fn download_stream<S, E, F>(
     stream: S,
     declared_length: Option<u64>,
     extension_hint: Option<String>,
     limits: ArtifactLimits,
+    stall_timeout: Duration,
+    max_timeout: Duration,
+    mut on_progress: F,
 ) -> Result<DownloadedArtifact, IngestError>
 where
     S: Stream<Item = Result<Bytes, E>>,
+    F: FnMut(u64),
 {
     if declared_length.is_some_and(|length| length > limits.max_download_bytes) {
         return Err(IngestError::DeclaredTooLarge {
@@ -203,9 +248,40 @@ where
     let mut file = tokio::fs::File::from_std(file);
     let mut hasher = Sha256::new();
     let mut byte_count = 0_u64;
+    let start = std::time::Instant::now();
     pin_mut!(stream);
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| IngestError::HttpRequest)?;
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= max_timeout {
+            debug!(
+                byte_count,
+                elapsed = ?elapsed,
+                max_timeout = ?max_timeout,
+                "download exceeded the maximum timeout"
+            );
+            return Err(IngestError::HttpRequest);
+        }
+        let remaining = max_timeout.checked_sub(elapsed).unwrap_or_default();
+        let chunk_timeout = stall_timeout.min(remaining);
+        let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
+            Ok(Some(result)) => result.map_err(|_error| {
+                debug!(
+                    bytes_so_far = byte_count,
+                    "download stream chunk failed"
+                );
+                IngestError::HttpRequest
+            })?,
+            Ok(None) => break,
+            Err(_) => {
+                debug!(
+                    bytes_so_far = byte_count,
+                    stall_timeout = ?stall_timeout,
+                    elapsed = ?start.elapsed(),
+                    "download stalled: no data received within the stall timeout"
+                );
+                return Err(IngestError::HttpRequest);
+            }
+        };
         let chunk_length = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
         byte_count = byte_count
             .checked_add(chunk_length)
@@ -219,6 +295,7 @@ where
         }
         file.write_all(&chunk).await?;
         hasher.update(&chunk);
+        on_progress(byte_count);
     }
     file.flush().await?;
     file.seek(SeekFrom::Start(0)).await?;
@@ -346,6 +423,10 @@ fn unpack_zip(input: File, output: &mut File, limit: u64) -> Result<u64, IngestE
     bounded_copy(&mut file, output, limit)
 }
 
+pub(crate) fn extension_hint_public(endpoint: &Url) -> Option<String> {
+    extension_hint(endpoint)
+}
+
 fn extension_hint(endpoint: &Url) -> Option<String> {
     Path::new(endpoint.path())
         .extension()
@@ -407,6 +488,9 @@ mod tests {
             Some(6),
             Some("m3u".into()),
             ArtifactLimits::default(),
+            Duration::from_mins(1),
+            Duration::from_mins(10),
+            |_| {},
         )
         .await
         .expect("download");
@@ -428,7 +512,16 @@ mod tests {
             max_decoded_bytes: 3,
         };
         assert!(matches!(
-            download_stream(stream::empty::<Result<Bytes, ()>>(), Some(4), None, limits).await,
+            download_stream(
+                stream::empty::<Result<Bytes, ()>>(),
+                Some(4),
+                None,
+                limits,
+                Duration::from_mins(1),
+                Duration::from_mins(10),
+                |_| {},
+            )
+            .await,
             Err(IngestError::DeclaredTooLarge { limit: 3 })
         ));
         assert!(matches!(
@@ -436,7 +529,10 @@ mod tests {
                 stream::iter([Ok::<_, ()>(Bytes::from_static(b"four"))]),
                 None,
                 None,
-                limits
+                limits,
+                Duration::from_mins(1),
+                Duration::from_mins(10),
+                |_| {},
             )
             .await,
             Err(IngestError::DownloadTooLarge { limit: 3 })
@@ -450,6 +546,9 @@ mod tests {
             None,
             None,
             ArtifactLimits::default(),
+            Duration::from_mins(1),
+            Duration::from_mins(10),
+            |_| {},
         )
         .await
         .expect_err("network error");

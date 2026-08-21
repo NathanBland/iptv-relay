@@ -2,7 +2,7 @@ use crate::{
     ArtifactLimits, DecodedArtifact, DownloadRequest, DownloadedArtifact, IngestError,
     IngestFormat, IngestProgress, ParsedArtifact, PgSnapshotStore, PreparedEpgChannel,
     PreparedProgramme, PreparedProviderStream, PreparedSnapshot, ProtectedEndpoint, SnapshotOwner,
-    StagedRows, download_http, parse_artifact, unpack_artifact,
+    StagedRows, download_stream, parse_artifact, unpack_artifact,
 };
 use chrono::{DateTime, Utc};
 use iptv_domain::{EpgChannel, Programme};
@@ -10,9 +10,11 @@ use iptv_parsers::{
     Diagnostic, ParseError, ParseLimits, XmltvParseOptions, parse_m3u_visit,
     parse_xmltv_visit_with_options,
 };
+use reqwest::{Client, redirect::Policy};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::{cell::RefCell, collections::HashMap, fmt, io::BufReader, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, fmt, io::BufReader, sync::Arc, time::Duration};
+use tracing::{debug, info};
 use url::Url;
 use uuid::Uuid;
 
@@ -109,9 +111,88 @@ where
 
     #[allow(clippy::missing_errors_doc)]
     pub async fn run(&self, request: &IngestRequest) -> Result<IngestResult, IngestError> {
+        info!(
+            format = ?request.format,
+            "ingestion started"
+        );
         self.checkpoint("downloading", 0, 0, 0, 0).await?;
-        let artifact = download_http(&request.download, self.artifact_limits).await?;
+        let artifact = self.download_with_progress(&request.download).await?;
+        info!(
+            downloaded_bytes = artifact.byte_count,
+            "download completed"
+        );
         self.run_downloaded(request, artifact).await
+    }
+
+    /// Performs the HTTP GET, then streams the response body into a tempfile
+    /// while reporting byte-count progress through the job control channel.
+    async fn download_with_progress(
+        &self,
+        request: &DownloadRequest,
+    ) -> Result<DownloadedArtifact, IngestError> {
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .gzip(false)
+            .build()
+            .map_err(|error| {
+                debug!(error = %error, "HTTP client construction failed");
+                IngestError::HttpRequest
+            })?;
+        let response = client
+            .get(request.endpoint().clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .send()
+            .await
+            .map_err(|error| {
+                debug!(
+                    error = %error,
+                    stall_timeout = ?request.stall_timeout,
+                    "HTTP request failed before a response was received"
+                );
+                IngestError::HttpRequest
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            debug!(
+                status = status.as_u16(),
+                content_length = ?response.content_length(),
+                "HTTP source returned an unsuccessful status"
+            );
+            return Err(IngestError::HttpStatus(status.as_u16()));
+        }
+        let declared_length = response.content_length();
+        let extension_hint = crate::artifact::extension_hint_public(request.endpoint());
+        let limits = self.artifact_limits;
+        let bytes_seen = std::sync::atomic::AtomicU64::new(0);
+        let download_fut = download_stream(
+            response.bytes_stream(),
+            declared_length,
+            extension_hint,
+            limits,
+            request.stall_timeout,
+            request.max_timeout,
+            |bytes_downloaded| {
+                bytes_seen.store(bytes_downloaded, std::sync::atomic::Ordering::Relaxed);
+            },
+        );
+        tokio::pin!(download_fut);
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.tick().await;
+        let result = loop {
+            tokio::select! {
+                result = &mut download_fut => break result,
+                _ = interval.tick() => {
+                    let bytes = bytes_seen.load(std::sync::atomic::Ordering::Relaxed);
+                    if let Err(error) = self.checkpoint("downloading", bytes, 0, 0, 0).await {
+                        debug!(error = ?error, "progress checkpoint failed during download");
+                    }
+                }
+            }
+        };
+        // Report the final byte count before returning.
+        let final_bytes = bytes_seen.load(std::sync::atomic::Ordering::Relaxed);
+        let _ = self.checkpoint("downloading", final_bytes, 0, 0, 0).await;
+        result
     }
 
     #[allow(clippy::missing_errors_doc)]
@@ -203,6 +284,12 @@ where
             records,
         )
         .await?;
+        info!(
+            records,
+            downloaded_bytes,
+            decoded_bytes,
+            "ingestion completed"
+        );
         Ok(IngestResult {
             snapshot_id,
             checksum_sha256,
@@ -220,6 +307,14 @@ where
         records_seen: u64,
         records_prepared: u64,
     ) -> Result<(), IngestError> {
+        debug!(
+            phase,
+            downloaded_bytes,
+            decoded_bytes,
+            records_seen,
+            records_prepared,
+            "ingestion checkpoint"
+        );
         self.control
             .checkpoint(&IngestProgress {
                 phase: phase.to_owned(),
