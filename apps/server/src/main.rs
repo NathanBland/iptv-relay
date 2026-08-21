@@ -374,9 +374,9 @@ async fn process_job(
 
     // Spawn a heartbeat task that keeps the job lease fresh during long
     // downloads. The ingest pipeline reports progress through checkpoints,
-    // but a slow download can leave the heartbeat stale. This task writes an
-    // empty progress payload every 15 seconds so the reaper does not reset
-    // the job while it is still active.
+    // but a slow download can leave the heartbeat stale. This task touches
+    // the heartbeat timestamp every 15 seconds without overwriting the
+    // progress data from the last checkpoint.
     let heartbeat_repository = jobs.clone();
     let heartbeat_job_id = job.id;
     let heartbeat_worker_id = worker_id.to_owned();
@@ -386,11 +386,7 @@ async fn process_job(
         loop {
             interval.tick().await;
             if heartbeat_repository
-                .heartbeat(
-                    heartbeat_job_id,
-                    &heartbeat_worker_id,
-                    &serde_json::json!({}),
-                )
+                .touch_heartbeat(heartbeat_job_id, &heartbeat_worker_id)
                 .await
                 .is_err()
             {
@@ -464,7 +460,10 @@ async fn run_source_refresh(
     let source = sources
         .load_for_job(source_id)
         .await
-        .map_err(|_| RefreshError::SourceLoad)?;
+        .map_err(|error| {
+            warn!(source_id = %source_id, error = %error, "failed to load source for refresh");
+            RefreshError::SourceLoad
+        })?;
     let (owner, format) = refresh_target(source.kind, source.id)?;
     let endpoint = Url::parse(&source.endpoint).map_err(|_| RefreshError::InvalidEndpoint)?;
     let control = WorkerJobControl {

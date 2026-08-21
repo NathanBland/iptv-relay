@@ -33,6 +33,17 @@ function formatBytes(value: number): string {
   return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
+function formatElapsed(startedAt: string): string {
+  const seconds = Math.floor((Date.now() - new Date(startedAt).getTime()) / 1000)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const remainingSeconds = seconds % 60
+  if (minutes < 60) return `${minutes}m ${remainingSeconds}s`
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+  return `${hours}h ${remainingMinutes}m`
+}
+
 const stageLabel: Record<SourceSyncStatus['stage'], string> = {
   downloading: 'Download',
   parsing: 'Parse',
@@ -261,6 +272,11 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
                   <TableCell>
                     {syncingSourceIds.has(source.id) ? (
                       <SourceSyncProgress client={client} sourceId={source.id} enabled={syncingSourceIds.has(source.id)} onComplete={removeSyncing} />
+                    ) : source.state === 'syncing' ? (
+                      <div className="inline-flex items-center gap-1.5" aria-live="polite">
+                        <RefreshCw aria-hidden="true" className="size-3.5 animate-spin text-cyan-400" />
+                        <span className="text-xs font-medium text-cyan-200">Starting…</span>
+                      </div>
                     ) : (
                       <HealthBadge state={source.state} />
                     )}
@@ -489,6 +505,7 @@ function SourceSyncProgress({
         <div className="flex min-w-[8rem] flex-1 items-center gap-2">
           <RefreshCw aria-hidden="true" className="size-3.5 animate-spin text-cyan-400" />
           <span className="text-xs font-medium text-cyan-200">Queued</span>
+          {data.startedAt ? <span className="text-[0.68rem] text-slate-500">{formatElapsed(data.startedAt)}</span> : null}
         </div>
         <Button
           variant="ghost"
@@ -508,13 +525,14 @@ function SourceSyncProgress({
   const stage = stageLabel[data.stage] || 'Processing'
   const hasBytes = data.bytesDownloaded !== undefined && data.bytesDownloaded > 0
   const hasRecords = data.recordsProcessed !== undefined && data.recordsProcessed > 0
+  const elapsed = data.startedAt ? formatElapsed(data.startedAt) : null
 
   return (
     <div className="flex w-full items-center gap-2" role="status" aria-live="polite">
       <div className="min-w-[8rem] flex-1">
         <div className="mb-1 flex items-center justify-between text-xs">
           <span className="font-medium text-cyan-200">{stage}</span>
-          <span className="text-cyan-200">{data.percent}%</span>
+          <span className="text-cyan-200">{data.percent}%{elapsed ? <span className="text-slate-500"> · {elapsed}</span> : null}</span>
         </div>
         <div
           className="h-1.5 w-full overflow-hidden rounded-full bg-slate-700"

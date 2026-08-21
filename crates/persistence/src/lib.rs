@@ -1245,6 +1245,35 @@ impl JobRepository {
         ensure_owned(result.rows_affected(), job_id, worker_id)
     }
 
+    /// Refreshes the heartbeat timestamp without overwriting progress.
+    ///
+    /// Use this during long downloads when the ingest pipeline has already
+    /// reported checkpoint progress and the heartbeat only needs to keep the
+    /// job lease fresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::JobOwnership`] for a stale owner and
+    /// [`PersistenceError::Database`] when the update fails.
+    pub async fn touch_heartbeat(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+    ) -> Result<(), PersistenceError> {
+        let result = sqlx::query(
+            r"
+            UPDATE jobs
+            SET heartbeat_at = now(), updated_at = now()
+            WHERE id = $1 AND status = 'running' AND locked_by = $2
+            ",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await?;
+        ensure_owned(result.rows_affected(), job_id, worker_id)
+    }
+
     /// Marks an owned job as successfully completed.
     ///
     /// # Errors

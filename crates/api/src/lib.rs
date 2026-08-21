@@ -1676,10 +1676,20 @@ async fn source_sync_status(
         Err(error) => return persistence_error_response(error),
     };
     let target = source_id.to_string();
-    let most_recent = jobs.iter().find(|job| {
-        job.kind == "refresh-source"
-            && job.payload.get("sourceId").and_then(|v| v.as_str()) == Some(&target)
-    });
+    let matches: Vec<_> = jobs
+        .iter()
+        .filter(|job| {
+            job.kind == "refresh-source"
+                && job.payload.get("sourceId").and_then(|v| v.as_str()) == Some(&target)
+        })
+        .collect();
+    // Prefer an active job (running or queued) over a terminal one so the
+    // UI shows live progress even when a retry or scheduled refresh created
+    // a newer terminal job.
+    let most_recent = matches
+        .iter()
+        .find(|job| job.status == "running" || job.status == "queued")
+        .or_else(|| matches.first());
     match most_recent {
         Some(job) => Json(SourceSyncStatusResponse::from_job(job)).into_response(),
         None => ProblemDetails::new(
@@ -3342,6 +3352,10 @@ async fn catalog_events(State(state): State<AppState>, headers: HeaderMap) -> Re
             if let Some(jobs) = &job_repository
                 && let Ok(recent) = jobs.list_recent(200).await
             {
+                // Deduplicate by source ID, preferring running over queued
+                // so the UI sees the most progressed job for each source.
+                let mut seen: std::collections::HashMap<&str, &JobRecord> =
+                    std::collections::HashMap::new();
                 for job in recent.iter().filter(|job| {
                     job.kind == "refresh-source"
                         && (job.status == "queued"
@@ -3353,6 +3367,15 @@ async fn catalog_events(State(state): State<AppState>, headers: HeaderMap) -> Re
                         .get("sourceId")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("");
+                    let existing = seen.get(source_id);
+                    if existing.is_none()
+                        || (existing.is_some_and(|e| e.status == "queued")
+                            && job.status == "running")
+                    {
+                        seen.insert(source_id, job);
+                    }
+                }
+                for (source_id, job) in &seen {
                     let status = SourceSyncStatusResponse::from_job(job);
                     let payload = serde_json::json!({
                         "sourceId": source_id,

@@ -1,6 +1,6 @@
 # IPTV Gateway Implementation Status
 
-Last update: 2026-08-20 (session 2)
+Last update: 2026-08-21 (session 3)
 
 ## Ingest store coverage
 
@@ -2180,3 +2180,53 @@ The gate counted 42,545 changed lines and 4,292 uncovered lines.
 The 95 percent changed-line requirement does not yet pass.
 
 The final plan, status, README, and workspace diff checks passed.
+
+## Sync progress preservation and active-job selection
+
+Last verification: 2026-08-21.
+
+The periodic heartbeat task overwrote job progress with an empty JSON object.
+
+This caused the sync status to lose stage, percent, bytes, and records data during long downloads.
+
+The `JobRepository::touch_heartbeat` method refreshes the heartbeat timestamp without overwriting progress.
+
+The worker heartbeat task now calls `touch_heartbeat` instead of `heartbeat` with an empty payload.
+
+The `source_sync_status` endpoint returned the most recent job for a source.
+
+When a retry created a newer terminal job, the endpoint returned `failed` while an older job was still `running`.
+
+The endpoint now prefers active jobs over terminal jobs.
+
+The SSE `catalog-events` stream now deduplicates jobs by source ID.
+
+It prefers `running` over `queued` so the UI sees the most progressed job for each source.
+
+The sources page shows a `Starting…` indicator with a spinner when the source state is `syncing` but no active job is found yet.
+
+The `SourceSyncProgress` component shows elapsed time alongside the percent value.
+
+The `Queued` state also shows elapsed time.
+
+### Verified results
+
+The API test suite passed all 43 tests with the PostgreSQL test database.
+
+The gateway test suite passed all 61 tests.
+
+The persistence library test suite passed all 17 tests.
+
+The web test suite passed all 73 tests.
+
+The TypeScript type check passed.
+
+The web lint check passed.
+
+The Clippy check passed for the persistence, API, and gateway crates with warnings denied.
+
+The live Docker stack returned `running` with `stage=downloading`, `percent=5`, and `message=Downloading source data` during an M3U sync.
+
+The `updatedAt` timestamp advanced every 15 seconds during the download.
+
+The progress data persisted across heartbeat ticks without being overwritten.
