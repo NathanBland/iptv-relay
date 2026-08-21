@@ -89,6 +89,12 @@ pub struct Programme {
     pub start: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<DateTime<Utc>>,
+    /// Literal XMLTV start value before timezone normalization.
+    #[serde(default)]
+    pub original_start: String,
+    /// Literal XMLTV stop value before timezone normalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_stop: Option<String>,
     #[serde(default)]
     pub titles: Vec<LocalizedText>,
     #[serde(default)]
@@ -131,6 +137,8 @@ mod tests {
             channel_id: "example".into(),
             start,
             stop: Some(start + chrono::Duration::hours(1)),
+            original_start: "20260101120000 +0000".into(),
+            original_stop: Some("20260101130000 +0000".into()),
             titles: vec![],
             sub_titles: vec![],
             descriptions: vec![],

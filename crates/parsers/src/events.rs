@@ -53,6 +53,16 @@ pub struct GeneratedProgramme {
     pub source_title: String,
 }
 
+/// One source title and its matching rule for guide schedule generation.
+///
+/// The caller supplies entries for one logical channel only. The generator
+/// sorts entries by their effective start time and removes later collisions.
+#[derive(Clone, Debug)]
+pub struct EventGuideInput<'a> {
+    pub matched: &'a MatchedEvent<'a>,
+    pub source_title: &'a str,
+}
+
 #[derive(Debug)]
 struct CompiledRule {
     rule: EventRule,
@@ -93,6 +103,8 @@ pub enum EventGuideError {
     InvalidWindow,
     #[error("event duration must be greater than zero")]
     InvalidDuration,
+    #[error("captured event duration {0:?} is invalid")]
+    InvalidCapturedDuration(String),
     #[error("title template references unknown capture {0:?}")]
     UnknownTemplateField(String),
     #[error("event interval exceeds the supported date range")]
@@ -379,12 +391,122 @@ pub fn generate_event_guide(
     if window_end <= window_start {
         return Err(EventGuideError::InvalidWindow);
     }
-    if matched.rule.guide.duration_seconds == 0 {
-        return Err(EventGuideError::InvalidDuration);
+    let event = build_event_programme(matched, source_title)?;
+
+    let mut programmes = Vec::with_capacity(3);
+    if event.stops_at <= window_start || event.starts_at >= window_end {
+        programmes.push(filler(
+            window_start,
+            window_end,
+            &matched.rule.guide.filler_title,
+            source_title,
+        ));
+        return Ok(programmes);
     }
+    let clipped_start = event.starts_at.max(window_start);
+    let clipped_end = event.stops_at.min(window_end);
+    if clipped_start > window_start {
+        programmes.push(filler(
+            window_start,
+            clipped_start,
+            &matched.rule.guide.filler_title,
+            source_title,
+        ));
+    }
+    if clipped_end > clipped_start {
+        programmes.push(GeneratedProgramme {
+            starts_at: clipped_start,
+            stops_at: clipped_end,
+            ..event
+        });
+    }
+    let filler_start = clipped_end.max(window_start);
+    if filler_start < window_end {
+        programmes.push(filler(
+            filler_start,
+            window_end,
+            &matched.rule.guide.filler_title,
+            source_title,
+        ));
+    }
+    Ok(programmes)
+}
+
+/// Builds one contiguous guide for multiple dynamic-event source titles.
+///
+/// Entries must belong to one logical channel. The first interval wins when
+/// two intervals overlap. The sort order makes that decision deterministic.
+/// The returned intervals cover the complete requested window without gaps.
+///
+/// # Errors
+///
+/// Returns [`EventGuideError`] for an invalid window, unscheduled event,
+/// invalid duration, invalid template, or date arithmetic overflow.
+pub fn generate_event_schedule(
+    inputs: &[EventGuideInput<'_>],
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    filler_title: &str,
+) -> Result<Vec<GeneratedProgramme>, EventGuideError> {
+    if window_end <= window_start {
+        return Err(EventGuideError::InvalidWindow);
+    }
+
+    let mut events = inputs
+        .iter()
+        .map(|input| build_event_programme(input.matched, input.source_title))
+        .collect::<Result<Vec<_>, _>>()?;
+    events.sort_by(|left, right| {
+        (
+            left.starts_at,
+            left.stops_at,
+            left.stable_event_key.as_deref().unwrap_or_default(),
+            left.source_title.as_str(),
+        )
+            .cmp(&(
+                right.starts_at,
+                right.stops_at,
+                right.stable_event_key.as_deref().unwrap_or_default(),
+                right.source_title.as_str(),
+            ))
+    });
+
+    let mut schedule = Vec::with_capacity(events.len().saturating_mul(2).saturating_add(1));
+    let mut cursor = window_start;
+    for mut event in events {
+        if event.stops_at <= cursor
+            || event.stops_at <= window_start
+            || event.starts_at >= window_end
+        {
+            continue;
+        }
+        let starts_at = event.starts_at.max(window_start);
+        if starts_at < cursor {
+            // A prior event owns this interval. Drop the later event instead
+            // of altering its start time or publishing an overlap.
+            continue;
+        }
+        if starts_at > cursor {
+            schedule.push(filler(cursor, starts_at, filler_title, ""));
+        }
+        event.starts_at = starts_at;
+        event.stops_at = event.stops_at.min(window_end);
+        cursor = event.stops_at;
+        schedule.push(event);
+    }
+    if cursor < window_end {
+        schedule.push(filler(cursor, window_end, filler_title, ""));
+    }
+    Ok(schedule)
+}
+
+fn build_event_programme(
+    matched: &MatchedEvent<'_>,
+    source_title: &str,
+) -> Result<GeneratedProgramme, EventGuideError> {
     let starts_at = matched.starts_at.ok_or(EventGuideError::MissingStart)?;
     let pre_roll = signed_seconds(matched.rule.lifecycle.pre_roll_seconds)?;
-    let duration = signed_seconds(matched.rule.guide.duration_seconds)?;
+    let duration = signed_seconds(event_duration_seconds(matched)?)?;
     let post_roll = signed_seconds(matched.rule.lifecycle.post_roll_seconds)?;
     let event_start = starts_at
         .checked_sub_signed(pre_roll)
@@ -398,47 +520,81 @@ pub fn generate_event_guide(
         source_title,
         &matched.captures,
     )?;
+    Ok(GeneratedProgramme {
+        starts_at: event_start,
+        stops_at: event_end,
+        title,
+        kind: GeneratedProgrammeKind::Event,
+        stable_event_key: Some(stable_event_key(matched, source_title, starts_at)),
+        source_title: source_title.to_owned(),
+    })
+}
 
-    let mut programmes = Vec::with_capacity(3);
-    if event_end <= window_start || event_start >= window_end {
-        programmes.push(filler(
-            window_start,
-            window_end,
-            &matched.rule.guide.filler_title,
-            source_title,
-        ));
-        return Ok(programmes);
+fn event_duration_seconds(matched: &MatchedEvent<'_>) -> Result<u64, EventGuideError> {
+    let configured = matched.rule.guide.duration_seconds;
+    let duration = matched
+        .captures
+        .get("duration_seconds")
+        .map(String::as_str)
+        .map(parse_seconds)
+        .or_else(|| {
+            matched
+                .captures
+                .get("duration")
+                .map(|value| parse_duration(value))
+        })
+        .transpose()?
+        .unwrap_or(configured);
+    if duration == 0 {
+        return Err(EventGuideError::InvalidDuration);
     }
-    let clipped_start = event_start.max(window_start);
-    let clipped_end = event_end.min(window_end);
-    if clipped_start > window_start {
-        programmes.push(filler(
-            window_start,
-            clipped_start,
-            &matched.rule.guide.filler_title,
-            source_title,
-        ));
+    Ok(duration)
+}
+
+fn parse_seconds(value: &str) -> Result<u64, EventGuideError> {
+    value
+        .trim()
+        .parse()
+        .ok()
+        .filter(|seconds: &u64| *seconds > 0)
+        .ok_or_else(|| EventGuideError::InvalidCapturedDuration(value.to_owned()))
+}
+
+fn parse_duration(value: &str) -> Result<u64, EventGuideError> {
+    let normalized = value.trim().to_ascii_lowercase().replace(' ', "");
+    let invalid = || EventGuideError::InvalidCapturedDuration(value.to_owned());
+    if let Some((hours, minutes)) = normalized.split_once(':') {
+        let hours: u64 = hours.parse().map_err(|_| invalid())?;
+        let minutes: u64 = minutes.parse().map_err(|_| invalid())?;
+        if minutes >= 60 {
+            return Err(invalid());
+        }
+        return hours
+            .checked_mul(3_600)
+            .and_then(|seconds| {
+                minutes
+                    .checked_mul(60)
+                    .and_then(|extra| seconds.checked_add(extra))
+            })
+            .filter(|seconds| *seconds > 0)
+            .ok_or_else(invalid);
     }
-    if clipped_end > clipped_start {
-        programmes.push(GeneratedProgramme {
-            starts_at: clipped_start,
-            stops_at: clipped_end,
-            title,
-            kind: GeneratedProgrammeKind::Event,
-            stable_event_key: Some(stable_event_key(matched, source_title, starts_at)),
-            source_title: source_title.to_owned(),
-        });
-    }
-    let filler_start = clipped_end.max(window_start);
-    if filler_start < window_end {
-        programmes.push(filler(
-            filler_start,
-            window_end,
-            &matched.rule.guide.filler_title,
-            source_title,
-        ));
-    }
-    Ok(programmes)
+    let (number, unit) = normalized
+        .chars()
+        .position(|character| !character.is_ascii_digit())
+        .map(|index| normalized.split_at(index))
+        .ok_or_else(invalid)?;
+    let amount: u64 = number.parse().map_err(|_| invalid())?;
+    let multiplier = match unit {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+        _ => return Err(invalid()),
+    };
+    amount
+        .checked_mul(multiplier)
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(invalid)
 }
 
 fn signed_seconds(seconds: u64) -> Result<Duration, EventGuideError> {
@@ -588,6 +744,11 @@ fn parse_candidate_date(
                 .definition
                 .timezone
                 .as_deref()
+                .or_else(|| {
+                    captures
+                        .name("timezone")
+                        .map(|capture| capture.as_str().trim())
+                })
                 .unwrap_or(&compiled.rule.timezone);
             return parse_event_local_datetime(value, &pattern.definition.format, timezone)
                 .map(Some);
@@ -902,6 +1063,39 @@ mod tests {
     }
 
     #[test]
+    fn builtin_sports_rules_support_v_and_versus_separators() {
+        let compiled = CompiledEventRules::new(builtin_sports_event_rules()).unwrap();
+        for (source, expected) in [
+            ("Broncos v Chiefs 2026-09-13 18:20", "Broncos vs Chiefs"),
+            (
+                "Broncos versus Chiefs 2026-09-13 18:20",
+                "Broncos vs Chiefs",
+            ),
+        ] {
+            let candidate = EventCandidate {
+                name: source,
+                group: Some("Sports"),
+                epg_title: None,
+                categories: &[],
+                metadata: &EMPTY_METADATA,
+            };
+            let matched = compiled.first_match(&candidate).unwrap().unwrap();
+            let guide = generate_event_guide(
+                &matched,
+                source,
+                "2026-09-13T18:00:00Z".parse().unwrap(),
+                "2026-09-13T22:00:00Z".parse().unwrap(),
+            )
+            .unwrap();
+            let event = guide
+                .iter()
+                .find(|programme| programme.kind == GeneratedProgrammeKind::Event)
+                .unwrap();
+            assert_eq!(event.title, expected);
+        }
+    }
+
+    #[test]
     fn generated_guide_clips_event_and_fills_an_outside_window() {
         let (compiled, candidate) = scheduled_match("{source}");
         let matched = compiled.first_match(&candidate).unwrap().unwrap();
@@ -945,5 +1139,436 @@ mod tests {
             generate_event_guide(&matched, candidate.name, start, end),
             Err(EventGuideError::MissingStart)
         ));
+    }
+
+    #[test]
+    fn duration_captures_override_the_configured_duration() {
+        let input = serde_json::json!([{
+            "name": "duration",
+            "matcher": {
+                "name_regex": "^(?P<event>Match) (?P<duration>[0-9]+(?:m|h)) (?P<datetime>20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})$"
+            },
+            "date_patterns": [{
+                "regex": "(?P<datetime>20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})",
+                "format": "%Y-%m-%d %H:%M"
+            }],
+            "guide": {"duration_seconds": 10800, "title_template": "{event}"}
+        }])
+        .to_string();
+        let document = parse_event_rules(Cursor::new(input), ParseLimits::default()).unwrap();
+        let compiled = CompiledEventRules::new(document.rules).unwrap();
+        let candidate = EventCandidate {
+            name: "Match 90m 2026-09-14 00:20",
+            group: None,
+            epg_title: None,
+            categories: &[],
+            metadata: &EMPTY_METADATA,
+        };
+        let matched = compiled.first_match(&candidate).unwrap().unwrap();
+        let guide = generate_event_guide(
+            &matched,
+            candidate.name,
+            "2026-09-14T00:00:00Z".parse().unwrap(),
+            "2026-09-14T03:00:00Z".parse().unwrap(),
+        )
+        .unwrap();
+        let event = guide
+            .iter()
+            .find(|programme| programme.kind == GeneratedProgrammeKind::Event)
+            .unwrap();
+        assert_eq!(event.stops_at - event.starts_at, Duration::minutes(90));
+    }
+
+    #[test]
+    fn malformed_duration_capture_fails_closed() {
+        let (compiled, candidate) = scheduled_match("{source}");
+        let mut matched = compiled.first_match(&candidate).unwrap().unwrap();
+        matched
+            .captures
+            .insert("duration".to_owned(), "ninety minutes".to_owned());
+        assert!(matches!(
+            generate_event_guide(
+                &matched,
+                candidate.name,
+                "2026-09-14T00:00:00Z".parse().unwrap(),
+                "2026-09-14T03:00:00Z".parse().unwrap(),
+            ),
+            Err(EventGuideError::InvalidCapturedDuration(value)) if value == "ninety minutes"
+        ));
+    }
+
+    #[test]
+    fn named_timezone_capture_is_used_when_date_pattern_has_no_timezone() {
+        let input = serde_json::json!([{
+            "name": "time zone",
+            "matcher": {"name_regex": "Game"},
+            "date_patterns": [{
+                "regex": "(?P<datetime>20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}) (?P<timezone>America/Denver)",
+                "format": "%Y-%m-%d %H:%M"
+            }],
+            "timezone": "UTC"
+        }])
+        .to_string();
+        let document = parse_event_rules(Cursor::new(input), ParseLimits::default()).unwrap();
+        let compiled = CompiledEventRules::new(document.rules).unwrap();
+        let candidate = EventCandidate {
+            name: "Game 2026-09-13 18:20 America/Denver",
+            group: None,
+            epg_title: None,
+            categories: &[],
+            metadata: &EMPTY_METADATA,
+        };
+        let matched = compiled.first_match(&candidate).unwrap().unwrap();
+        assert_eq!(
+            matched.starts_at.unwrap().to_rfc3339(),
+            "2026-09-14T00:20:00+00:00"
+        );
+    }
+
+    #[test]
+    fn nonexistent_daylight_saving_time_fails_closed() {
+        let error =
+            parse_event_local_datetime("2026-03-08 02:30", "%Y-%m-%d %H:%M", "America/Denver")
+                .expect_err("nonexistent");
+        assert!(matches!(error, EventDateError::NonexistentLocalTime { .. }));
+    }
+
+    #[test]
+    fn schedule_is_contiguous_and_order_independent_for_overlapping_events() {
+        let (compiled, first_candidate) = scheduled_match("{home} vs {away}");
+        let first = compiled.first_match(&first_candidate).unwrap().unwrap();
+        let second_candidate = EventCandidate {
+            name: "NFL: Rams vs Seahawks 2026-09-14 00:30",
+            group: None,
+            epg_title: None,
+            categories: &[],
+            metadata: &EMPTY_METADATA,
+        };
+        let second = compiled.first_match(&second_candidate).unwrap().unwrap();
+        let window_start = "2026-09-14T00:00:00Z".parse().unwrap();
+        let window_end = "2026-09-14T04:00:00Z".parse().unwrap();
+        let forward = generate_event_schedule(
+            &[
+                EventGuideInput {
+                    matched: &first,
+                    source_title: first_candidate.name,
+                },
+                EventGuideInput {
+                    matched: &second,
+                    source_title: second_candidate.name,
+                },
+            ],
+            window_start,
+            window_end,
+            "Stand by",
+        )
+        .unwrap();
+        let reverse = generate_event_schedule(
+            &[
+                EventGuideInput {
+                    matched: &second,
+                    source_title: second_candidate.name,
+                },
+                EventGuideInput {
+                    matched: &first,
+                    source_title: first_candidate.name,
+                },
+            ],
+            window_start,
+            window_end,
+            "Stand by",
+        )
+        .unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.first().unwrap().starts_at, window_start);
+        assert_eq!(forward.last().unwrap().stops_at, window_end);
+        assert!(
+            forward
+                .windows(2)
+                .all(|pair| pair[0].stops_at == pair[1].starts_at)
+        );
+        let events: Vec<_> = forward
+            .iter()
+            .filter(|programme| programme.kind == GeneratedProgrammeKind::Event)
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "Broncos vs Chiefs");
+        assert_eq!(events[0].source_title, first_candidate.name);
+    }
+
+    #[test]
+    fn parser_reports_malformed_json_and_compiler_rejects_unvalidated_regexes() {
+        assert!(matches!(
+            parse_event_rules(Cursor::new("{"), ParseLimits::default()),
+            Err(ParseError::MalformedEventRules(_))
+        ));
+        let mut rule: EventRule =
+            serde_json::from_value(serde_json::json!({"name": "bad"})).unwrap();
+        rule.matcher.name_regex = Some("(".to_owned());
+        assert!(matches!(
+            CompiledEventRules::new(EventRuleSet(vec![rule])),
+            Err(ParseError::MalformedEventRules(_))
+        ));
+        let mut rule: EventRule =
+            serde_json::from_value(serde_json::json!({"name": "bad"})).unwrap();
+        rule.date_patterns = vec![DatePattern {
+            regex: "(".to_owned(),
+            format: "%Y".to_owned(),
+            timezone: None,
+        }];
+        assert!(matches!(
+            CompiledEventRules::new(EventRuleSet(vec![rule])),
+            Err(ParseError::MalformedEventRules(_))
+        ));
+    }
+
+    #[test]
+    fn rule_scopes_collect_name_group_epg_and_positional_date_captures() {
+        let input = serde_json::json!([{
+            "name": "scoped",
+            "matcher": {
+                "name_regex": "^(?P<event>Game)$",
+                "group_regex": "^(?P<group>Sports)$",
+                "epg_title_regex": "^(?P<guide>Guide) (?P<league>NFL) 20",
+                "categories_any": ["Football"],
+                "metadata": {"region": "US"}
+            },
+            "date_patterns": [{
+                "regex": "(20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2})",
+                "format": "%Y-%m-%d %H:%M"
+            }]
+        }])
+        .to_string();
+        let document = parse_event_rules(Cursor::new(input), ParseLimits::default()).unwrap();
+        let compiled = CompiledEventRules::new(document.rules).unwrap();
+        let categories = vec!["Football".to_owned()];
+        let metadata = BTreeMap::from([(String::from("region"), String::from("US"))]);
+        let candidate = EventCandidate {
+            name: "Game",
+            group: Some("Sports"),
+            epg_title: Some("Guide NFL 2026-09-14 00:20"),
+            categories: &categories,
+            metadata: &metadata,
+        };
+        let matched = compiled.first_match(&candidate).unwrap().unwrap();
+        assert_eq!(matched.captures.get("event").unwrap(), "Game");
+        assert_eq!(matched.captures.get("group").unwrap(), "Sports");
+        assert_eq!(matched.captures.get("guide").unwrap(), "Guide");
+        assert_eq!(matched.captures.get("league").unwrap(), "NFL");
+        assert_eq!(
+            matched.starts_at.unwrap().to_rfc3339(),
+            "2026-09-14T00:20:00+00:00"
+        );
+    }
+
+    #[test]
+    fn rule_scopes_fail_closed_when_each_required_value_is_missing_or_wrong() {
+        let input = serde_json::json!([{
+            "name": "scoped",
+            "matcher": {
+                "name_regex": "Game",
+                "group_regex": "Sports",
+                "epg_title_regex": "Guide",
+                "categories_any": ["Football"],
+                "metadata": {"region": "US"}
+            }
+        }])
+        .to_string();
+        let document = parse_event_rules(Cursor::new(input), ParseLimits::default()).unwrap();
+        let compiled = CompiledEventRules::new(document.rules).unwrap();
+        let categories = vec!["Football".to_owned()];
+        let metadata = BTreeMap::from([(String::from("region"), String::from("US"))]);
+        let valid = EventCandidate {
+            name: "Game",
+            group: Some("Sports"),
+            epg_title: Some("Guide"),
+            categories: &categories,
+            metadata: &metadata,
+        };
+        assert!(compiled.first_match(&valid).unwrap().is_some());
+        for candidate in [
+            EventCandidate {
+                name: "Other",
+                ..valid.clone()
+            },
+            EventCandidate {
+                group: None,
+                ..valid.clone()
+            },
+            EventCandidate {
+                epg_title: None,
+                ..valid.clone()
+            },
+        ] {
+            assert!(compiled.first_match(&candidate).unwrap().is_none());
+        }
+        let wrong_categories = Vec::new();
+        let wrong_category = EventCandidate {
+            categories: &wrong_categories,
+            ..valid.clone()
+        };
+        assert!(compiled.first_match(&wrong_category).unwrap().is_none());
+        let wrong_metadata = BTreeMap::new();
+        let wrong_metadata = EventCandidate {
+            metadata: &wrong_metadata,
+            ..valid
+        };
+        assert!(compiled.first_match(&wrong_metadata).unwrap().is_none());
+    }
+
+    #[test]
+    fn disabled_rules_and_unmatched_dates_produce_no_match_or_no_schedule() {
+        let input = serde_json::json!([{
+            "name": "disabled",
+            "enabled": false,
+            "matcher": {"name_regex": "Game"}
+        }, {
+            "name": "date",
+            "matcher": {"name_regex": "Game"},
+            "date_patterns": [{
+                "regex": "(?P<datetime>20[0-9]{2}-[0-9]{2}-[0-9]{2})",
+                "format": "%Y-%m-%d"
+            }]
+        }])
+        .to_string();
+        let document = parse_event_rules(Cursor::new(input), ParseLimits::default()).unwrap();
+        let compiled = CompiledEventRules::new(document.rules).unwrap();
+        let candidate = EventCandidate {
+            name: "Game",
+            group: None,
+            epg_title: None,
+            categories: &[],
+            metadata: &EMPTY_METADATA,
+        };
+        let matched = compiled.first_match(&candidate).unwrap().unwrap();
+        assert!(matched.starts_at.is_none());
+        assert!(matches!(
+            generate_event_guide(
+                &matched,
+                candidate.name,
+                "2026-09-14T00:00:00Z".parse().unwrap(),
+                "2026-09-14T01:00:00Z".parse().unwrap(),
+            ),
+            Err(EventGuideError::MissingStart)
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_invalid_date_and_timezone_values() {
+        assert!(matches!(
+            parse_event_local_datetime("bad", "%Y-%m-%d", "UTC"),
+            Err(EventDateError::InvalidDate { .. })
+        ));
+        assert!(matches!(
+            parse_event_local_datetime("2026-09-14", "%Y-%m-%d", "Mars/Olympus"),
+            Err(EventDateError::UnknownTimezone(value)) if value == "Mars/Olympus"
+        ));
+        assert_eq!(
+            parse_event_local_datetime("2026-09-14T00:20:00+02:00", "%Y-%m-%dT%H:%M:%S%z", "UTC",)
+                .unwrap()
+                .to_rfc3339(),
+            "2026-09-13T22:20:00+00:00"
+        );
+    }
+
+    #[test]
+    fn duration_forms_and_error_paths_are_deterministic() {
+        for (value, seconds) in [
+            ("1s", 1),
+            ("2 sec", 2),
+            ("3seconds", 3),
+            ("4min", 240),
+            ("5 minutes", 300),
+            ("2h", 7_200),
+            ("1:30", 5_400),
+        ] {
+            assert_eq!(parse_duration(value).unwrap(), seconds);
+        }
+        for value in ["", "90", "1:60", "x:30", "1fortnight", "0m"] {
+            assert!(matches!(
+                parse_duration(value),
+                Err(EventGuideError::InvalidCapturedDuration(_))
+            ));
+        }
+        assert!(matches!(
+            parse_seconds("0"),
+            Err(EventGuideError::InvalidCapturedDuration(_))
+        ));
+        assert!(matches!(
+            parse_seconds("not a number"),
+            Err(EventGuideError::InvalidCapturedDuration(_))
+        ));
+    }
+
+    #[test]
+    fn guide_handles_template_variants_zero_duration_and_date_overflow() {
+        let (compiled, candidate) = scheduled_match("{title}: {source} {{");
+        let matched = compiled.first_match(&candidate).unwrap().unwrap();
+        assert!(matches!(
+            generate_event_guide(
+                &matched,
+                candidate.name,
+                "2026-09-14T00:00:00Z".parse().unwrap(),
+                "2026-09-14T03:00:00Z".parse().unwrap(),
+            ),
+            Err(EventGuideError::UnknownTemplateField(_))
+        ));
+        let mut zero_rule = matched.rule.clone();
+        zero_rule.guide.duration_seconds = 0;
+        let zero_duration = MatchedEvent {
+            rule: &zero_rule,
+            ..matched.clone()
+        };
+        assert!(matches!(
+            generate_event_guide(
+                &zero_duration,
+                candidate.name,
+                "2026-09-14T00:00:00Z".parse().unwrap(),
+                "2026-09-14T03:00:00Z".parse().unwrap(),
+            ),
+            Err(EventGuideError::InvalidDuration)
+        ));
+        let mut overflow_rule = matched.rule.clone();
+        overflow_rule.guide.duration_seconds = u64::MAX;
+        let overflow = MatchedEvent {
+            rule: &overflow_rule,
+            ..matched
+        };
+        assert!(matches!(
+            generate_event_guide(
+                &overflow,
+                candidate.name,
+                "2026-09-14T00:00:00Z".parse().unwrap(),
+                "2026-09-14T03:00:00Z".parse().unwrap(),
+            ),
+            Err(EventGuideError::DateOverflow)
+        ));
+    }
+
+    #[test]
+    fn schedule_handles_empty_outside_and_window_edge_events() {
+        let (compiled, candidate) = scheduled_match("{source}");
+        let matched = compiled.first_match(&candidate).unwrap().unwrap();
+        let window_start = "2026-09-14T00:00:00Z".parse().unwrap();
+        let window_end = "2026-09-14T03:00:00Z".parse().unwrap();
+        assert!(matches!(
+            generate_event_schedule(&[], window_end, window_start, "Stand by"),
+            Err(EventGuideError::InvalidWindow)
+        ));
+        let empty = generate_event_schedule(&[], window_start, window_end, "Stand by").unwrap();
+        assert_eq!(empty.len(), 1);
+        assert_eq!(empty[0].kind, GeneratedProgrammeKind::Filler);
+        let outside = generate_event_schedule(
+            &[EventGuideInput {
+                matched: &matched,
+                source_title: candidate.name,
+            }],
+            "2026-09-15T00:00:00Z".parse().unwrap(),
+            "2026-09-15T01:00:00Z".parse().unwrap(),
+            "Stand by",
+        )
+        .unwrap();
+        assert_eq!(outside.len(), 1);
+        assert_eq!(outside[0].kind, GeneratedProgrammeKind::Filler);
     }
 }

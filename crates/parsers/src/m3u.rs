@@ -588,6 +588,85 @@ mod tests {
     }
 
     #[test]
+    fn recovers_missing_header_empty_input_and_trailing_pending_entries() {
+        let missing = parse_m3u(
+            Cursor::new("\u{feff}\n#EXTINF:NaN broken custom=\"unterminated\"\n"),
+            ParseLimits::default(),
+        )
+        .expect("recover malformed entry");
+        assert!(missing.entries.is_empty());
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|item| { item.code == DiagnosticCode::MissingHeader && item.line == Some(2) })
+        );
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DiagnosticCode::InvalidDuration)
+        );
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DiagnosticCode::InvalidAttribute)
+        );
+        assert!(
+            missing
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DiagnosticCode::OrphanMetadata)
+        );
+
+        let empty = parse_m3u(Cursor::new("\n \r\n"), ParseLimits::default()).expect("empty");
+        assert!(empty.entries.is_empty());
+        assert_eq!(empty.diagnostics[0].code, DiagnosticCode::MissingHeader);
+    }
+
+    #[test]
+    fn handles_global_directives_quoted_commas_invalid_urls_and_bare_lines() {
+        let input = "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:1.5 custom='a,b' bare,Title, with comma\nhttps://example.test/final.ts\nnot-a-url";
+        let playlist = parse_m3u(Cursor::new(input), ParseLimits::default()).expect("recover");
+        assert_eq!(playlist.global_directives[0].value.as_deref(), Some("3"));
+        assert_eq!(playlist.entries.len(), 1);
+        assert_eq!(playlist.entries[0].title, "Title, with comma");
+        assert_eq!(playlist.entries[0].duration_seconds, Some(1.5));
+        assert!(
+            playlist
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DiagnosticCode::InvalidUrl)
+        );
+        assert!(
+            playlist
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DiagnosticCode::InvalidAttribute)
+        );
+    }
+
+    #[test]
+    fn visitor_errors_are_returned_and_final_unterminated_line_is_counted() {
+        let error = parse_m3u_visit(
+            Cursor::new("#EXTM3U\n#EXTINF:-1,One\nhttps://example.test/one.ts"),
+            ParseLimits::default(),
+            |_| Err(ParseError::MalformedM3u("visitor stopped".to_owned())),
+        )
+        .expect_err("visitor error");
+        assert!(matches!(error, ParseError::MalformedM3u(message) if message == "visitor stopped"));
+
+        let playlist = parse_m3u(
+            Cursor::new("#EXTM3U\nhttps://example.test/no-newline.ts"),
+            ParseLimits::default(),
+        )
+        .expect("final line");
+        assert_eq!(playlist.entries.len(), 1);
+        assert_eq!(playlist.stats.lines_read, 2);
+    }
+
+    #[test]
     fn visitor_output_is_equivalent_and_not_retained_by_summary() {
         let collected = parse_m3u(Cursor::new(FIXTURE), ParseLimits::default()).expect("collect");
         let mut visited = Vec::new();

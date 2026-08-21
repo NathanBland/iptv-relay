@@ -4,6 +4,7 @@ use crate::{
     PreparedProgramme, PreparedProviderStream, PreparedSnapshot, ProtectedEndpoint, SnapshotOwner,
     StagedRows, download_http, parse_artifact, unpack_artifact,
 };
+use chrono::{DateTime, Utc};
 use iptv_domain::{EpgChannel, Programme};
 use iptv_parsers::{
     Diagnostic, ParseError, ParseLimits, XmltvParseOptions, parse_m3u_visit,
@@ -500,6 +501,11 @@ fn prepared_epg_channel(channel: EpgChannel, id: Uuid) -> PreparedEpgChannel {
 }
 
 fn prepared_programme(programme: Programme, epg_channel_id: Uuid) -> PreparedProgramme {
+    let original_start = original_timestamp(&programme.original_start, programme.start);
+    let original_stop = programme
+        .original_stop
+        .clone()
+        .or_else(|| programme.stop.map(|value| value.to_rfc3339()));
     let title = programme
         .titles
         .first()
@@ -509,8 +515,8 @@ fn prepared_programme(programme: Programme, epg_channel_id: Uuid) -> PreparedPro
         epg_channel_id,
         starts_at: programme.start,
         stops_at: programme.stop,
-        original_start: programme.start.to_rfc3339(),
-        original_stop: programme.stop.map(|value| value.to_rfc3339()),
+        original_start,
+        original_stop,
         title,
         subtitle: programme
             .sub_titles
@@ -526,6 +532,14 @@ fn prepared_programme(programme: Programme, epg_channel_id: Uuid) -> PreparedPro
             "previously_shown": programme.previously_shown,
             "episode_numbers": programme.episode_numbers,
         }),
+    }
+}
+
+fn original_timestamp(value: &str, normalized: DateTime<Utc>) -> String {
+    if value.is_empty() {
+        normalized.to_rfc3339()
+    } else {
+        value.to_owned()
     }
 }
 
@@ -627,6 +641,11 @@ fn prepare_snapshot<P: EndpointProtector>(
                 let Some(epg_channel_id) = ids.get(&programme.channel_id).copied() else {
                     continue;
                 };
+                let original_start = original_timestamp(&programme.original_start, programme.start);
+                let original_stop = programme
+                    .original_stop
+                    .clone()
+                    .or_else(|| programme.stop.map(|value| value.to_rfc3339()));
                 let title = programme
                     .titles
                     .first()
@@ -636,8 +655,8 @@ fn prepare_snapshot<P: EndpointProtector>(
                     epg_channel_id,
                     starts_at: programme.start,
                     stops_at: programme.stop,
-                    original_start: programme.start.to_rfc3339(),
-                    original_stop: programme.stop.map(|value| value.to_rfc3339()),
+                    original_start,
+                    original_stop,
                     title,
                     subtitle: programme
                         .sub_titles
@@ -934,6 +953,7 @@ fn diagnostics_json(diagnostics: &[Diagnostic]) -> Value {
 mod tests {
     use super::*;
     use crate::{ArtifactLimits, DownloadedArtifact, XtreamPayloadKind};
+    use chrono::TimeZone;
     use std::{io::Write, sync::Mutex};
 
     #[derive(Debug)]
@@ -949,6 +969,15 @@ mod tests {
                 ),
                 secret_ciphertext: Some(Sha256::digest(endpoint.as_str()).to_vec()),
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RejectingProtector;
+
+    impl EndpointProtector for RejectingProtector {
+        fn protect(&self, _endpoint: &Url) -> Result<ProtectedEndpoint, IngestError> {
+            Err(IngestError::EndpointProtection)
         }
     }
 
@@ -1063,6 +1092,41 @@ mod tests {
         assert!(ingestor.store.ids.lock().expect("lock").is_empty());
     }
 
+    #[tokio::test]
+    async fn cancellation_before_download_skips_http_request() {
+        let ingestor = Ingestor::new(
+            TestProtector,
+            TestControl {
+                phases: Mutex::default(),
+                cancel_at: Some("downloading"),
+            },
+            TestStore::default(),
+        );
+        let error = ingestor
+            .run(&request(IngestFormat::M3u))
+            .await
+            .expect_err("cancel");
+        assert!(matches!(error, IngestError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn pg_snapshot_activator_delegates_empty_snapshot_validation() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://invalid@127.0.0.1/invalid")
+            .expect("lazy pool");
+        let store = PgSnapshotStore::new(pool);
+        let snapshot = empty_snapshot(
+            SnapshotOwner::ProviderAccount(Uuid::now_v7()),
+            IngestFormat::M3u,
+            "checksum".to_owned(),
+            0,
+        );
+        let error = SnapshotActivator::activate(&store, &snapshot)
+            .await
+            .expect_err("empty snapshot");
+        assert!(matches!(error, IngestError::EmptySnapshot { .. }));
+    }
+
     #[test]
     fn sanitizers_remove_url_and_metadata_credentials() {
         assert_eq!(
@@ -1080,6 +1144,10 @@ mod tests {
         let text = sanitized.to_string();
         assert!(!text.contains("secret"));
         assert!(text.contains("REDACTED"));
+        assert_eq!(
+            sanitize_json(json!(["plain", 7, true])),
+            json!(["plain", 7, true])
+        );
     }
 
     #[test]
@@ -1190,6 +1258,73 @@ mod tests {
         assert!(matches!(error, IngestError::EmptySnapshot { .. }));
     }
 
+    #[test]
+    fn prepare_snapshot_stages_m3u_entries_and_xmltv_records() {
+        let m3u = b"#EXTM3U\n#EXTINF:-1 tvg-id=\"one\" tvg-name=\"One\" tvg-logo=\"https://example.test/logo.png\" tvg-chno=\"12\" channel-id=\"stream-1\" group-title=\"News\",One\n#KODIPROP:inputstream.adaptive.manifest_type=hls\nhttps://example.test/live/one.ts\n";
+        let decoded = unpack_artifact(downloaded(m3u), ArtifactLimits::default()).expect("decode");
+        let parsed =
+            parse_artifact(&decoded, IngestFormat::M3u, ParseLimits::default()).expect("M3U parse");
+        let snapshot = prepare_snapshot(
+            &request(IngestFormat::M3u),
+            parsed,
+            "checksum".to_owned(),
+            m3u.len() as u64,
+            &TestProtector,
+        )
+        .expect("M3U snapshot");
+        assert_eq!(snapshot.record_count, 1);
+        let streams = snapshot
+            .provider_streams
+            .batches(100)
+            .expect("batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read streams")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(streams[0].provider_stream_id.as_deref(), Some("stream-1"));
+        assert_eq!(streams[0].channel_number.as_deref(), Some("12"));
+        assert_eq!(streams[0].directives[0]["name"], "KODIPROP");
+
+        let xml = b"<tv><channel id=\"ch1\"><display-name>One</display-name><icon src=\"https://example.test/icon.png\"/></channel><programme start=\"20240101000000 +0000\" channel=\"ch1\"><title>News</title></programme></tv>";
+        let decoded = unpack_artifact(downloaded(xml), ArtifactLimits::default()).expect("decode");
+        let parsed = parse_artifact(&decoded, IngestFormat::Xmltv, ParseLimits::default())
+            .expect("XMLTV parse");
+        let snapshot = prepare_snapshot(
+            &request(IngestFormat::Xmltv),
+            parsed,
+            "checksum".to_owned(),
+            xml.len() as u64,
+            &TestProtector,
+        )
+        .expect("XMLTV snapshot");
+        assert_eq!(snapshot.record_count, 2);
+    }
+
+    #[test]
+    fn prepare_snapshot_reuses_xtream_epg_channel_ids_and_supports_epg_id() {
+        let payload = br#"{"epg_listings":[{"title":"Tm9uZQ==","description":"","start_timestamp":1700000000,"stop_timestamp":1700003600,"channel_id":"ch1"},{"title":"VHdv","description":"","start_timestamp":1700003600,"stop_timestamp":1700007200,"epg_id":"ch1"}]}"#;
+        let decoded =
+            unpack_artifact(downloaded(payload), ArtifactLimits::default()).expect("decode");
+        let parsed = parse_artifact(
+            &decoded,
+            IngestFormat::Xtream(XtreamPayloadKind::ShortEpg),
+            ParseLimits::default(),
+        )
+        .expect("Xtream EPG parse");
+        let snapshot = prepare_snapshot(
+            &xtream_request(XtreamPayloadKind::ShortEpg),
+            parsed,
+            "checksum".to_owned(),
+            payload.len() as u64,
+            &TestProtector,
+        )
+        .expect("Xtream EPG snapshot");
+        assert_eq!(snapshot.epg_channels.len(), 1);
+        assert_eq!(snapshot.programmes.len(), 2);
+        assert_eq!(snapshot.record_count, 3);
+    }
+
     #[tokio::test]
     async fn xtream_live_streams_pipeline_stages_protected_endpoints() {
         let ingestor = Ingestor::new(TestProtector, TestControl::default(), TestStore::default());
@@ -1295,6 +1430,64 @@ mod tests {
         )
         .expect_err("xtream in streaming path");
         assert!(matches!(error, IngestError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn prepare_streaming_snapshot_reports_parser_and_protector_errors() {
+        let malformed_m3u =
+            unpack_artifact(downloaded(b"#EXTM3U\n\xff\n"), ArtifactLimits::default())
+                .expect("decode");
+        let error = prepare_streaming_snapshot(
+            SnapshotOwner::ProviderAccount(Uuid::now_v7()),
+            IngestFormat::M3u,
+            "UTC".to_owned(),
+            &malformed_m3u,
+            "checksum".to_owned(),
+            0,
+            &TestProtector,
+            ParseLimits::default(),
+        )
+        .expect_err("malformed M3U");
+        assert!(matches!(error, IngestError::Parse { format: "M3U", .. }));
+
+        let valid_m3u = unpack_artifact(
+            downloaded(b"#EXTM3U\n#EXTINF:-1,One\nhttps://example.test/one\n"),
+            ArtifactLimits::default(),
+        )
+        .expect("decode");
+        let error = prepare_streaming_snapshot(
+            SnapshotOwner::ProviderAccount(Uuid::now_v7()),
+            IngestFormat::M3u,
+            "UTC".to_owned(),
+            &valid_m3u,
+            "checksum".to_owned(),
+            0,
+            &RejectingProtector,
+            ParseLimits::default(),
+        )
+        .expect_err("protector error");
+        assert!(matches!(error, IngestError::EndpointProtection));
+
+        let malformed_xml =
+            unpack_artifact(downloaded(b"<tv"), ArtifactLimits::default()).expect("decode");
+        let error = prepare_streaming_snapshot(
+            SnapshotOwner::EpgSource(Uuid::now_v7()),
+            IngestFormat::Xmltv,
+            "UTC".to_owned(),
+            &malformed_xml,
+            "checksum".to_owned(),
+            0,
+            &TestProtector,
+            ParseLimits::default(),
+        )
+        .expect_err("malformed XMLTV");
+        assert!(matches!(
+            error,
+            IngestError::Parse {
+                format: "XMLTV",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1419,6 +1612,8 @@ mod tests {
             channel_id: "ch1".to_owned(),
             start: chrono::Utc::now(),
             stop: None,
+            original_start: String::new(),
+            original_stop: None,
             titles: Vec::new(),
             sub_titles: Vec::new(),
             descriptions: Vec::new(),
@@ -1435,6 +1630,39 @@ mod tests {
         assert_eq!(result.title, "Untitled");
         assert!(result.subtitle.is_none());
         assert!(result.description.is_none());
+    }
+
+    #[test]
+    fn prepared_programme_preserves_literal_xmltv_timestamps() {
+        let start = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 1, 18, 0, 0)
+            .single()
+            .expect("UTC timestamp");
+        let programme = Programme {
+            channel_id: "ch1".to_owned(),
+            start,
+            stop: Some(start + chrono::Duration::hours(1)),
+            original_start: "20260701120000 America/Denver".to_owned(),
+            original_stop: Some("20260701130000 America/Denver".to_owned()),
+            titles: Vec::new(),
+            sub_titles: Vec::new(),
+            descriptions: Vec::new(),
+            categories: Vec::new(),
+            episode_numbers: Vec::new(),
+            icons: Vec::new(),
+            ratings: Vec::new(),
+            credits: iptv_domain::Credits::default(),
+            previously_shown: false,
+            new: false,
+            extensions: Vec::new(),
+        };
+        let prepared = prepared_programme(programme, Uuid::now_v7());
+        assert_eq!(prepared.starts_at, start);
+        assert_eq!(prepared.original_start, "20260701120000 America/Denver");
+        assert_eq!(
+            prepared.original_stop.as_deref(),
+            Some("20260701130000 America/Denver")
+        );
     }
 
     #[test]

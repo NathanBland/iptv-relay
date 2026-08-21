@@ -824,7 +824,7 @@ fn finish_programme(
         return None;
     };
     let start = match parse_xmltv_timestamp_in_timezone(&start_raw, default_timezone) {
-        Ok(value) => value.utc,
+        Ok(value) => value,
         Err(error) => {
             invalid_record(
                 document,
@@ -836,7 +836,7 @@ fn finish_programme(
     };
     let stop = match builder.stop {
         Some(raw) => match parse_xmltv_timestamp_in_timezone(&raw, default_timezone) {
-            Ok(value) => Some(value.utc),
+            Ok(value) => Some(value),
             Err(error) => {
                 invalid_record(document, offset, format!("invalid programme stop: {error}"));
                 return None;
@@ -844,14 +844,16 @@ fn finish_programme(
         },
         None => None,
     };
-    if stop.is_some_and(|stop| stop <= start) {
+    if stop.as_ref().is_some_and(|stop| stop.utc <= start.utc) {
         invalid_record(document, offset, "XMLTV programme stop must be after start");
         return None;
     }
     let programme = Programme {
         channel_id,
-        start,
-        stop,
+        start: start.utc,
+        stop: stop.as_ref().map(|value| value.utc),
+        original_start: start.original,
+        original_stop: stop.map(|value| value.original),
         titles: builder.titles,
         sub_titles: builder.sub_titles,
         descriptions: builder.descriptions,
@@ -1103,6 +1105,42 @@ mod tests {
     }
 
     #[test]
+    fn timestamps_keep_literal_values_and_normalize_fixed_instants() {
+        for (raw, timezone, expected) in [
+            ("20260101190000 Z", "UTC", "2026-01-01T19:00:00+00:00"),
+            (
+                "20260101120000",
+                "America/Denver",
+                "2026-01-01T19:00:00+00:00",
+            ),
+            (
+                "20260701120000",
+                "America/Denver",
+                "2026-07-01T18:00:00+00:00",
+            ),
+        ] {
+            let timestamp = parse_xmltv_timestamp_in_timezone(raw, timezone).expect("timestamp");
+            assert_eq!(timestamp.original, raw);
+            assert_eq!(timestamp.utc.to_rfc3339(), expected);
+        }
+
+        let document = parse_xmltv_with_options(
+            Cursor::new(
+                r#"<tv><channel id="denver"/><programme channel="denver" start="20260701120000" stop="20260701130000"><title>Local noon</title></programme></tv>"#,
+            ),
+            ParseLimits::default(),
+            &XmltvParseOptions {
+                default_timezone: "America/Denver".to_owned(),
+            },
+        )
+        .expect("guide");
+        let programme = &document.programmes[0];
+        assert_eq!(programme.start.to_rfc3339(), "2026-07-01T18:00:00+00:00");
+        assert_eq!(programme.original_start, "20260701120000");
+        assert_eq!(programme.original_stop.as_deref(), Some("20260701130000"));
+    }
+
+    #[test]
     fn accepts_external_xmltv_doctype_and_rejects_unsafe_declarations() {
         let xml = "<!DOCTYPE tv SYSTEM \"http://example.test/xmltv.dtd\"><tv/>";
         assert!(parse_xmltv(Cursor::new(xml), ParseLimits::default()).is_ok());
@@ -1283,6 +1321,156 @@ mod tests {
         assert_eq!(summary.generator, collected.generator);
         assert_eq!(summary.diagnostics, collected.diagnostics);
         assert_eq!(summary.stats, collected.stats);
+    }
+
+    #[test]
+    fn skips_invalid_records_and_preserves_empty_and_cdata_metadata() {
+        let xml = r#"<tv generator-info-name="test">
+          <channel><display-name>Missing id</display-name><url>not a url</url><icon src="bad"/><channel-extra>extra</channel-extra></channel>
+          <channel id="  "/>
+          <channel id="a"><display-name><![CDATA[Alpha & More]]></display-name><icon/></channel>
+          <programme start="20260101120000 +0000"><title>No channel</title></programme>
+          <programme channel="a"><title>No start</title></programme>
+          <programme channel="a" start="not-a-time"><title>Bad start</title></programme>
+          <programme channel="a" start="20260101120000 +0000" stop="bad"><title>Bad stop</title></programme>
+          <programme channel="a" start="20260101120000 +0000" stop="20260101120000 +0000"><title>Equal stop</title></programme>
+          <programme channel="a" start="20260101120000 +0000">
+            <title lang="en">Good</title><sub-title>Part one</sub-title><desc><![CDATA[Description]]></desc>
+            <category>News</category><episode-num system="onscreen">S1E2</episode-num>
+            <credits><writer role="author">Writer</writer><actor></actor></credits>
+            <rating system="age"><value>PG</value><icon src="bad"/></rating><rating/>
+            <previously-shown/><new/><programme-extra/>
+          </programme>
+        </tv>"#;
+        let document = parse_xmltv(Cursor::new(xml), ParseLimits::default()).expect("parse");
+        assert_eq!(document.channels.len(), 1);
+        assert_eq!(document.programmes.len(), 1);
+        let programme = &document.programmes[0];
+        assert_eq!(programme.titles[0].value, "Good");
+        assert_eq!(programme.sub_titles[0].value, "Part one");
+        assert_eq!(programme.descriptions[0].value, "Description");
+        assert_eq!(
+            programme.episode_numbers[0].system.as_deref(),
+            Some("onscreen")
+        );
+        assert!(programme.previously_shown);
+        assert!(programme.new);
+        assert_eq!(programme.credits.entries.len(), 1);
+        assert_eq!(programme.ratings[0].value, "PG");
+        assert!(
+            document
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DiagnosticCode::InvalidXmltvRecord)
+        );
+        assert!(
+            document
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DiagnosticCode::InvalidUrl)
+        );
+        assert!(
+            document
+                .diagnostics
+                .iter()
+                .any(|item| item.code == DiagnosticCode::UnknownXmlElement)
+        );
+    }
+
+    #[test]
+    fn malformed_xml_and_attributes_return_located_errors() {
+        assert!(matches!(
+            parse_xmltv(
+                Cursor::new("<tv><channel id=\"a & b\"/></tv>"),
+                ParseLimits::default()
+            ),
+            Err(ParseError::MalformedXmltv { .. })
+        ));
+        assert!(matches!(
+            parse_xmltv(Cursor::new("<tv><channel></tv>"), ParseLimits::default()),
+            Err(ParseError::MalformedXmltv { .. })
+        ));
+    }
+
+    #[test]
+    fn visitor_errors_propagate_and_unrecognized_top_level_elements_are_ignored() {
+        let error = parse_xmltv_visit(
+            Cursor::new("<tv><channel id=\"a\"/></tv>"),
+            ParseLimits::default(),
+            |_| {
+                Err(ParseError::MalformedXmltv {
+                    offset: 7,
+                    message: "visitor stopped".to_owned(),
+                })
+            },
+            |_| Ok(()),
+        )
+        .expect_err("visitor error");
+        assert!(matches!(
+            error,
+            ParseError::MalformedXmltv { offset: 7, .. }
+        ));
+
+        let document = parse_xmltv(
+            Cursor::new("<wrapper><ignored/></wrapper>"),
+            ParseLimits::default(),
+        )
+        .expect("top-level extension");
+        assert!(document.channels.is_empty());
+        assert!(document.programmes.is_empty());
+    }
+
+    #[test]
+    fn timestamp_parser_accepts_all_precisions_and_rejects_invalid_zones() {
+        assert_eq!(
+            parse_xmltv_timestamp("2026").unwrap().precision,
+            TimestampPrecision::Year
+        );
+        assert_eq!(
+            parse_xmltv_timestamp("202601").unwrap().precision,
+            TimestampPrecision::Month
+        );
+        assert_eq!(
+            parse_xmltv_timestamp("2026010112").unwrap().precision,
+            TimestampPrecision::Hour
+        );
+        assert_eq!(
+            parse_xmltv_timestamp("20260101120000 Z").unwrap().precision,
+            TimestampPrecision::Second
+        );
+        assert_eq!(
+            parse_xmltv_timestamp("20260101120000 GMT")
+                .unwrap()
+                .offset_seconds,
+            0
+        );
+        assert_eq!(
+            parse_xmltv_timestamp("20260101120000 +05:30")
+                .unwrap()
+                .offset_seconds,
+            19_800
+        );
+
+        for value in ["", "20x6", "20261", "20260101120000 UTC extra"] {
+            assert!(
+                parse_xmltv_timestamp(value).is_err(),
+                "{value:?} should fail"
+            );
+        }
+        for value in [
+            "20260101120000 +5",
+            "20260101120000 +2500",
+            "20260101120000 +0060",
+        ] {
+            assert!(matches!(
+                parse_xmltv_timestamp(value),
+                Err(XmltvTimestampError::InvalidTimezone(_))
+            ));
+        }
+        assert!(matches!(
+            parse_xmltv_timestamp("20260101120000 Mars/Olympus"),
+            Err(XmltvTimestampError::InvalidTimezone(_))
+        ));
     }
 
     proptest! {

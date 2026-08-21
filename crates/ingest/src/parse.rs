@@ -195,7 +195,13 @@ mod tests {
                 br#"{"epg_listings":[{"title":"TmV3cw==","description":"","start_timestamp":1700000000,"stop_timestamp":1700003600}]}"#.as_slice(),
             ),
         ];
-        for (kind, input) in cases {
+        let names = [
+            "Xtream auth",
+            "Xtream live categories",
+            "Xtream live streams",
+            "Xtream short EPG",
+        ];
+        for ((kind, input), name) in cases.into_iter().zip(names) {
             let parsed = parse_artifact(
                 &decoded(input),
                 IngestFormat::Xtream(kind),
@@ -203,6 +209,41 @@ mod tests {
             )
             .expect("Xtream payload");
             assert_eq!(parsed.usable_record_count(), 1);
+            assert_eq!(parsed.format_name(), name);
+            assert_eq!(parsed.stats().records_seen, 1);
+        }
+    }
+
+    #[test]
+    fn malformed_inputs_report_the_dispatch_format() {
+        let cases = [
+            (IngestFormat::M3u, b"#EXTM3U\n\xff\n".as_slice(), "M3U"),
+            (IngestFormat::Xmltv, b"<tv".as_slice(), "XMLTV"),
+            (
+                IngestFormat::Xtream(XtreamPayloadKind::Auth),
+                br"{}".as_slice(),
+                "Xtream auth",
+            ),
+            (
+                IngestFormat::Xtream(XtreamPayloadKind::LiveCategories),
+                br"{}".as_slice(),
+                "Xtream live categories",
+            ),
+            (
+                IngestFormat::Xtream(XtreamPayloadKind::LiveStreams),
+                br"{}".as_slice(),
+                "Xtream live streams",
+            ),
+            (
+                IngestFormat::Xtream(XtreamPayloadKind::ShortEpg),
+                br"{}".as_slice(),
+                "Xtream short EPG",
+            ),
+        ];
+        for (format, input, expected) in cases {
+            let error = parse_artifact(&decoded(input), format, ParseLimits::default())
+                .expect_err("malformed input");
+            assert!(matches!(error, IngestError::Parse { format, .. } if format == expected));
         }
     }
 

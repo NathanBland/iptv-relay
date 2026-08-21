@@ -83,3 +83,74 @@ impl IngestError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::IngestError;
+
+    #[test]
+    fn every_ingest_error_has_a_stable_redacted_summary() {
+        let errors = [
+            (IngestError::HttpRequest, "HTTP request failed"),
+            (
+                IngestError::HttpStatus(503),
+                "HTTP source returned an unsuccessful status",
+            ),
+            (
+                IngestError::DeclaredTooLarge { limit: 1 },
+                "source artifact exceeded configured limits",
+            ),
+            (
+                IngestError::DownloadTooLarge { limit: 2 },
+                "source artifact exceeded configured limits",
+            ),
+            (
+                IngestError::DecodedTooLarge { limit: 3 },
+                "source artifact exceeded configured limits",
+            ),
+            (
+                IngestError::ArtifactIo(std::io::Error::other("super-secret")),
+                "temporary artifact I/O failed",
+            ),
+            (
+                IngestError::StagingTooLarge { limit: 4 },
+                "prepared rows exceeded configured limits",
+            ),
+            (IngestError::InvalidArchive, "source archive was invalid"),
+            (IngestError::AmbiguousZip, "source archive was invalid"),
+            (
+                IngestError::Parse {
+                    format: "M3U",
+                    source: iptv_parsers::ParseError::MalformedM3u("super-secret".to_owned()),
+                },
+                "source artifact could not be parsed",
+            ),
+            (
+                IngestError::EmptySnapshot { format: "XMLTV" },
+                "source artifact contained no usable records",
+            ),
+            (
+                IngestError::EndpointProtection,
+                "source stream endpoint could not be protected",
+            ),
+            (
+                IngestError::Storage(sqlx::Error::RowNotFound),
+                "source snapshot transaction failed",
+            ),
+            (IngestError::Cancelled, "ingestion job was cancelled"),
+            (
+                IngestError::OwnershipLost,
+                "ingestion job ownership was lost",
+            ),
+            (
+                IngestError::InvalidRequest("super-secret"),
+                "ingestion request was invalid",
+            ),
+        ];
+
+        for (error, expected) in errors {
+            assert_eq!(error.persisted_summary(), expected);
+            assert!(!error.persisted_summary().contains("super-secret"));
+        }
+    }
+}

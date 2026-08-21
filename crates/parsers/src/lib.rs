@@ -8,9 +8,9 @@ mod xtream;
 
 pub use diagnostics::{Diagnostic, DiagnosticCode, ParseError, ParseLimits, ParseStats, Severity};
 pub use events::{
-    CompiledEventRules, EventCandidate, EventDateError, EventGuideError, EventRuleDocument,
-    GeneratedProgramme, GeneratedProgrammeKind, MatchedEvent, generate_event_guide,
-    parse_event_rules,
+    CompiledEventRules, EventCandidate, EventDateError, EventGuideError, EventGuideInput,
+    EventRuleDocument, GeneratedProgramme, GeneratedProgrammeKind, MatchedEvent,
+    generate_event_guide, generate_event_schedule, parse_event_rules,
 };
 pub use m3u::{M3uDirective, M3uEntry, M3uHeader, M3uPlaylist, parse_m3u, parse_m3u_visit};
 pub use xmltv::{
