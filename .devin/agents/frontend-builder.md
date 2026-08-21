@@ -85,3 +85,13 @@ Follow the instructions in AGENTS.md for all technical work:
 - Add new routes to `src/routes/` and regenerate the route tree.
 - Add Playwright tests to `apps/web/e2e/`.
 - Add Vitest tests to `apps/web/tests/`.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

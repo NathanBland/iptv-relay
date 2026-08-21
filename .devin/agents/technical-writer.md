@@ -581,3 +581,13 @@ When you update `IMPLEMENTATION_STATUS.md`:
 - Use the exact field names and path patterns from the source code.
 - Do not use gerund verbs in documentation.
 - Keep all documentation in ASD-STE100 Simplified Technical English.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

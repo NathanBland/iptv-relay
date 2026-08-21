@@ -65,3 +65,13 @@ Follow the instructions in AGENTS.md for all technical work:
 - Follow existing code style and conventions.
 - Use existing libraries; do not add new dependencies without checking the
   project first.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

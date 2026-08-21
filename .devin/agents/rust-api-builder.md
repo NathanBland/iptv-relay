@@ -86,3 +86,13 @@ Follow the instructions in AGENTS.md for all technical work:
 - Register all new OpenAPI paths and schemas.
 - Use sequential migration numbers (check `migrations/` for the next number).
 - Make all migrations idempotent with `IF NOT EXISTS` or `IF EXISTS`.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

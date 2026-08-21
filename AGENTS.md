@@ -41,3 +41,13 @@ Do not put credentials, secret URLs, or tokens in the status file.
 Do not add `Co-Authored-By` tags or `Generated with [Devin]` lines to commit messages.
 
 Do not claim authorship or co-authorship for commits that other tools or agents wrote.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

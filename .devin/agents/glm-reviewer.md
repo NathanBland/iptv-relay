@@ -58,3 +58,13 @@ Cite specific file paths and line numbers. Structure findings as:
 - **Recommendation**: the fix to apply
 
 If the code is correct and clean, report that explicitly.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

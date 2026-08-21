@@ -71,3 +71,13 @@ clear headings. Keep each finding concise and actionable. Identify:
 - **What is designed but not wired** — code that exists but is not called
 - **What is missing** — functionality that needs to be built
 - **What is broken** — code that exists but does not work correctly
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

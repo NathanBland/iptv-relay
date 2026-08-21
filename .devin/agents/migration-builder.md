@@ -85,3 +85,13 @@ Follow the instructions in AGENTS.md for all technical work:
 - Follow 3NF or higher.
 - Do not put credentials or secrets in migration files.
 - Test against the Docker PostgreSQL instance before reporting success.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

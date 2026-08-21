@@ -141,3 +141,13 @@ Follow the instructions in AGENTS.md:
 - Do not add new dependencies without checking the project first.
 - Measure before and after optimization when possible.
 - Prefer the simplest optimization that solves the bottleneck.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

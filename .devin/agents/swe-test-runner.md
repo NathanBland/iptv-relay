@@ -51,3 +51,13 @@ Use these commands to run the test suites:
 - Do not edit files unless explicitly asked.
 - Do not commit changes.
 - Report results accurately; do not infer success without evidence.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

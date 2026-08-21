@@ -39,3 +39,13 @@ This is a Rust workspace with:
 
 Use file paths and line numbers in your findings. Structure your report with
 clear headings. Keep each finding concise and actionable.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

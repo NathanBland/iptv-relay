@@ -116,3 +116,13 @@ Follow the instructions in AGENTS.md:
   during testing.
 - Report test failures accurately; do not infer success without evidence.
 - Run the full test suite after adding new tests to verify no regressions.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.

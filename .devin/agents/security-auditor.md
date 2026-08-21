@@ -95,3 +95,13 @@ Cite specific file paths and line numbers. Structure findings as:
 
 If no vulnerabilities are found, report that explicitly and suggest
 proactive hardening measures.
+
+## Rust safety
+
+Prefer safe Rust in all code.
+
+Treat `unsafe` as a last resort.
+
+Exhaust all safe alternatives before you use `unsafe`.
+
+Document the safety invariant when `unsafe` is necessary.
