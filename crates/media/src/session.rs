@@ -20,9 +20,10 @@ use tokio::{
 };
 
 use crate::{
-    AcquireError, HttpTsSessionSnapshot, MPEG_TS_PACKET_SIZE, MpegTsRing, MpegTsRingConfig,
-    PoolSnapshot, ProviderSlotBroker, RecoveryPolicy, RingCloseReason, RingRead, RingReadError,
-    SessionFailureKind, SessionState, SharedSessionRegistry, SlotLease,
+    AcquireError, BrokeredInputFormat, HttpTsSessionSnapshot, MPEG_TS_PACKET_SIZE, MpegTsRing,
+    MpegTsRingConfig, PoolSnapshot, ProcessAdapterKind, ProviderSlotBroker, RecoveryPolicy,
+    RingCloseReason, RingRead, RingReadError, SessionFailureKind, SessionState,
+    SharedSessionRegistry, SlotLease,
     psi::PatPmtTracker,
     recovery::{SessionDiagnostics, ViewerRegistration},
 };
@@ -30,6 +31,45 @@ use crate::{
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_VIEWER_BATCH_PACKETS: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const MAX_PRIMING_PACKETS: usize = 16_384;
+
+/// The input-adapter policy for one HTTP MPEG-TS source.
+///
+/// `Auto` selects native HTTP MPEG-TS input. It does not select an HLS adapter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InputAdapterPolicy {
+    #[default]
+    Auto,
+    NativeTs,
+    Ffmpeg,
+    Vlc,
+}
+
+/// The active adapter for a shared media session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionInputAdapter {
+    NativeTs,
+    Ffmpeg,
+    Vlc,
+}
+
+/// Redacted adapter diagnostics for one shared media session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionAdapterDiagnostics {
+    pub key: HttpTsSessionKey,
+    pub adapter: SessionInputAdapter,
+    pub process_id: Option<u32>,
+}
+
+impl InputAdapterPolicy {
+    #[must_use]
+    pub const fn selected_adapter(self) -> SessionInputAdapter {
+        match self {
+            Self::Auto | Self::NativeTs => SessionInputAdapter::NativeTs,
+            Self::Ffmpeg => SessionInputAdapter::Ffmpeg,
+            Self::Vlc => SessionInputAdapter::Vlc,
+        }
+    }
+}
 
 /// A provider account or explicit connection-sharing pool.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +120,7 @@ impl HttpTsSessionKey {
 /// One credential-bearing HTTP endpoint. Debug output is always redacted.
 #[derive(Clone, Eq, PartialEq)]
 pub struct HttpTsEndpoint {
+    provider_pool_id: Option<Arc<str>>,
     url: Arc<str>,
     headers: HeaderMap,
 }
@@ -88,6 +129,7 @@ impl fmt::Debug for HttpTsEndpoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HttpTsEndpoint")
+            .field("provider_pool_id", &self.provider_pool_id)
             .field("url", &"<redacted>")
             .field(
                 "header_names",
@@ -104,6 +146,16 @@ impl fmt::Debug for HttpTsEndpoint {
 impl HttpTsEndpoint {
     pub fn new(url: impl Into<Arc<str>>) -> Self {
         Self {
+            provider_pool_id: None,
+            url: url.into(),
+            headers: HeaderMap::new(),
+        }
+    }
+
+    /// Creates an endpoint that consumes capacity from a specific pool.
+    pub fn for_provider(provider_pool_id: impl Into<Arc<str>>, url: impl Into<Arc<str>>) -> Self {
+        Self {
+            provider_pool_id: Some(provider_pool_id.into()),
             url: url.into(),
             headers: HeaderMap::new(),
         }
@@ -113,6 +165,10 @@ impl HttpTsEndpoint {
     /// session diagnostic output.
     pub fn headers_mut(&mut self) -> &mut HeaderMap {
         &mut self.headers
+    }
+
+    fn effective_pool_id<'a>(&'a self, default: &'a Arc<str>) -> &'a Arc<str> {
+        self.provider_pool_id.as_ref().unwrap_or(default)
     }
 }
 
@@ -124,6 +180,8 @@ impl HttpTsEndpoint {
 pub struct HttpTsSourceSpec {
     key: HttpTsSessionKey,
     endpoints: Vec<HttpTsEndpoint>,
+    adapter_policy: InputAdapterPolicy,
+    process_input_format: BrokeredInputFormat,
     ring: MpegTsRingConfig,
     startup_timeout: Duration,
     viewer_batch_packets: NonZeroUsize,
@@ -137,6 +195,8 @@ impl fmt::Debug for HttpTsSourceSpec {
             .field("key", &self.key)
             .field("primary", &self.endpoints[0])
             .field("alternate_count", &self.endpoints.len().saturating_sub(1))
+            .field("adapter_policy", &self.adapter_policy)
+            .field("process_input_format", &self.process_input_format)
             .field("ring", &self.ring)
             .field("startup_timeout", &self.startup_timeout)
             .field("viewer_batch_packets", &self.viewer_batch_packets)
@@ -150,6 +210,8 @@ impl HttpTsSourceSpec {
         Self {
             key,
             endpoints: vec![HttpTsEndpoint::new(url)],
+            adapter_policy: InputAdapterPolicy::Auto,
+            process_input_format: BrokeredInputFormat::DirectMpegTs,
             ring,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             viewer_batch_packets: DEFAULT_VIEWER_BATCH_PACKETS,
@@ -159,6 +221,24 @@ impl HttpTsSourceSpec {
 
     pub fn key(&self) -> &HttpTsSessionKey {
         &self.key
+    }
+
+    pub fn adapter_policy(&self) -> InputAdapterPolicy {
+        self.adapter_policy
+    }
+
+    /// Select the adapter for this source generation.
+    ///
+    /// Change the generation before you change this value.
+    pub fn set_adapter_policy(&mut self, policy: InputAdapterPolicy) {
+        self.adapter_policy = policy;
+    }
+
+    /// Select the explicit format for a fixed process adapter.
+    ///
+    /// Change the generation before you change this value.
+    pub fn set_process_input_format(&mut self, input_format: BrokeredInputFormat) {
+        self.process_input_format = input_format;
     }
 
     /// Headers may contain credentials; debug output and errors never include
@@ -188,6 +268,8 @@ impl PartialEq for HttpTsSourceSpec {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
             && self.endpoints == other.endpoints
+            && self.adapter_policy == other.adapter_policy
+            && self.process_input_format == other.process_input_format
             && self.ring == other.ring
             && self.startup_timeout == other.startup_timeout
             && self.viewer_batch_packets == other.viewer_batch_packets
@@ -280,7 +362,7 @@ impl fmt::Debug for HttpTsSessionManager {
 
 struct ManagerInner {
     client: Client,
-    providers: DashMap<Arc<str>, ProviderSlotBroker>,
+    providers: Arc<DashMap<Arc<str>, ProviderSlotBroker>>,
     sessions: SharedSessionRegistry<HttpTsSessionKey, HttpTsSession, SessionStartError>,
     session_index: DashMap<HttpTsSessionKey, Weak<HttpTsSession>>,
 }
@@ -290,7 +372,7 @@ impl HttpTsSessionManager {
         Self {
             inner: Arc::new(ManagerInner {
                 client,
-                providers: DashMap::new(),
+                providers: Arc::new(DashMap::new()),
                 sessions: SharedSessionRegistry::new(),
                 session_index: DashMap::new(),
             }),
@@ -339,6 +421,28 @@ impl HttpTsSessionManager {
         snapshots
     }
 
+    /// List active adapter diagnostics without endpoint or credential data.
+    pub fn list_adapter_diagnostics(&self) -> Vec<SessionAdapterDiagnostics> {
+        self.inner
+            .session_index
+            .retain(|_, session| session.strong_count() > 0);
+        let mut diagnostics: Vec<_> = self
+            .inner
+            .session_index
+            .iter()
+            .filter_map(|session| session.value().upgrade())
+            .map(|session| session.adapter_diagnostics())
+            .collect();
+        diagnostics.sort_by(|left, right| {
+            left.key
+                .provider_pool_id
+                .cmp(&right.key.provider_pool_id)
+                .then_with(|| left.key.source_id.cmp(&right.key.source_id))
+                .then_with(|| left.key.generation.cmp(&right.key.generation))
+        });
+        diagnostics
+    }
+
     /// Opens an independent viewer cursor on a single-flight shared session.
     ///
     /// # Errors
@@ -346,22 +450,23 @@ impl HttpTsSessionManager {
     /// Returns an error when the provider is unknown/full, response headers do
     /// not arrive before the startup timeout, or the HTTP request/status fails.
     pub async fn open(&self, source: HttpTsSourceSpec) -> Result<ViewerHandle, SessionStartError> {
-        let broker = self
-            .inner
-            .providers
-            .get(&source.key.provider_pool_id)
-            .map(|broker| broker.clone())
-            .ok_or_else(|| SessionStartError::UnknownProvider {
-                pool_id: Arc::clone(&source.key.provider_pool_id),
-            })?;
+        for endpoint in &source.endpoints {
+            let pool_id = endpoint.effective_pool_id(&source.key.provider_pool_id);
+            if !self.inner.providers.contains_key(pool_id) {
+                return Err(SessionStartError::UnknownProvider {
+                    pool_id: Arc::clone(pool_id),
+                });
+            }
+        }
         let key = source.key.clone();
         let index_key = key.clone();
         let client = self.inner.client.clone();
+        let providers = Arc::clone(&self.inner.providers);
         let session = self
             .inner
             .sessions
             .get_or_try_init(key, || async move {
-                start_http_ts_session(client, broker, source).await
+                start_http_ts_session(client, providers, source).await
             })
             .await?;
         self.inner
@@ -382,13 +487,17 @@ pub enum SessionStartError {
     StartupTimeout,
     #[error("upstream HTTP request failed: {message}")]
     Http { message: Arc<str> },
+    #[error("the selected {adapter:?} adapter could not start")]
+    Process { adapter: SessionInputAdapter },
+    #[error("an HLS broker input requires FFmpeg or VLC")]
+    ProcessInputRequiresProcessAdapter,
 }
 
 struct HttpTsSession {
     key: HttpTsSessionKey,
     ring: MpegTsRing,
     lease_id: u64,
-    task: AbortHandle,
+    input: SessionInput,
     viewer_batch_packets: NonZeroUsize,
     diagnostics: Arc<SessionDiagnostics>,
 }
@@ -408,16 +517,52 @@ impl HttpTsSession {
     fn snapshot(&self) -> HttpTsSessionSnapshot {
         self.diagnostics.snapshot(self.ring.snapshot())
     }
+
+    fn adapter_diagnostics(&self) -> SessionAdapterDiagnostics {
+        SessionAdapterDiagnostics {
+            key: self.key.clone(),
+            adapter: self.input.adapter(),
+            process_id: self.input.process_id(),
+        }
+    }
 }
 
 impl Drop for HttpTsSession {
     fn drop(&mut self) {
-        // The task owns the lease behind its response body. Aborting it drops
-        // the HTTP adapter first and the lease second, so a replacement cannot
-        // briefly oversubscribe the provider while the socket is still live.
         self.diagnostics.set_state(SessionState::Stopping);
         self.ring.close(RingCloseReason::Shutdown);
-        self.task.abort();
+        self.input.request_shutdown();
+    }
+}
+
+enum SessionInput {
+    Native { task: AbortHandle },
+    Process(crate::LeasedBrokeredProcessInputSession),
+}
+
+impl SessionInput {
+    fn adapter(&self) -> SessionInputAdapter {
+        match self {
+            Self::Native { .. } => SessionInputAdapter::NativeTs,
+            Self::Process(session) => match session.adapter() {
+                ProcessAdapterKind::Ffmpeg => SessionInputAdapter::Ffmpeg,
+                ProcessAdapterKind::Vlc => SessionInputAdapter::Vlc,
+            },
+        }
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        match self {
+            Self::Native { .. } => None,
+            Self::Process(session) => session.process_id(),
+        }
+    }
+
+    fn request_shutdown(&mut self) {
+        match self {
+            Self::Native { task } => task.abort(),
+            Self::Process(session) => session.request_shutdown(),
+        }
     }
 }
 
@@ -427,19 +572,62 @@ struct PumpResources {
     // Rust drops struct fields in declaration order. The body—and therefore
     // response/socket adapter—is gone before provider accounting is released.
     body: Option<HttpBody>,
-    _lease: SlotLease,
+    lease: SlotLease,
+}
+
+struct PreparedHttpTsEndpoint {
+    provider_pool_id: Arc<str>,
+    url: Arc<str>,
+    headers: HeaderMap,
 }
 
 async fn start_http_ts_session(
     client: Client,
-    broker: ProviderSlotBroker,
+    providers: Arc<DashMap<Arc<str>, ProviderSlotBroker>>,
     source: HttpTsSourceSpec,
 ) -> Result<HttpTsSession, SessionStartError> {
     let diagnostics = SessionDiagnostics::new(source.key.clone());
     diagnostics.set_state(SessionState::Reserving);
+    let primary_pool_id = source.endpoints[0]
+        .effective_pool_id(&source.key.provider_pool_id)
+        .clone();
+    let broker = providers
+        .get(&primary_pool_id)
+        .map(|broker| broker.clone())
+        .ok_or_else(|| SessionStartError::UnknownProvider {
+            pool_id: Arc::clone(&primary_pool_id),
+        })?;
     let lease = broker.try_acquire(source.key.allocation_key())?;
     let lease_id = lease.lease_id();
     diagnostics.set_state(SessionState::Starting);
+
+    match source.adapter_policy.selected_adapter() {
+        SessionInputAdapter::NativeTs
+            if !matches!(
+                source.process_input_format,
+                BrokeredInputFormat::DirectMpegTs
+            ) =>
+        {
+            Err(SessionStartError::ProcessInputRequiresProcessAdapter)
+        }
+        SessionInputAdapter::NativeTs => {
+            start_native_http_ts_session(client, providers, source, lease, lease_id, diagnostics)
+                .await
+        }
+        SessionInputAdapter::Ffmpeg | SessionInputAdapter::Vlc => {
+            start_process_http_ts_session(client, source, lease, lease_id, diagnostics).await
+        }
+    }
+}
+
+async fn start_native_http_ts_session(
+    client: Client,
+    providers: Arc<DashMap<Arc<str>, ProviderSlotBroker>>,
+    source: HttpTsSourceSpec,
+    lease: SlotLease,
+    lease_id: u64,
+    diagnostics: Arc<SessionDiagnostics>,
+) -> Result<HttpTsSession, SessionStartError> {
     let primary = &source.endpoints[0];
     let response = tokio::time::timeout(
         source.startup_timeout,
@@ -455,9 +643,23 @@ async fn start_http_ts_session(
     .map_err(sanitize_reqwest_error)?;
 
     let ring = MpegTsRing::new(source.ring);
+    let endpoints = source
+        .endpoints
+        .into_iter()
+        .map(|endpoint| PreparedHttpTsEndpoint {
+            provider_pool_id: endpoint
+                .provider_pool_id
+                .unwrap_or_else(|| Arc::clone(&source.key.provider_pool_id)),
+            url: endpoint.url,
+            headers: endpoint.headers,
+        })
+        .collect();
     let pump_config = HttpPumpConfig {
         client,
-        endpoints: source.endpoints,
+        providers,
+        allocation_source_id: Arc::clone(&source.key.source_id),
+        allocation_generation: source.key.generation,
+        endpoints,
         diagnostics: Arc::clone(&diagnostics),
         recovery: source.recovery,
         startup_timeout: source.startup_timeout,
@@ -470,10 +672,93 @@ async fn start_http_ts_session(
         key: source.key,
         ring,
         lease_id,
-        task: abort_handle,
+        input: SessionInput::Native { task: abort_handle },
         viewer_batch_packets: source.viewer_batch_packets,
         diagnostics,
     })
+}
+
+async fn start_process_http_ts_session(
+    client: Client,
+    source: HttpTsSourceSpec,
+    lease: SlotLease,
+    lease_id: u64,
+    diagnostics: Arc<SessionDiagnostics>,
+) -> Result<HttpTsSession, SessionStartError> {
+    let adapter = source.adapter_policy.selected_adapter();
+    let primary = &source.endpoints[0];
+    let mut endpoint = crate::CredentialBrokerEndpoint::new(Arc::clone(&primary.url));
+    *endpoint.headers_mut() = primary.headers.clone();
+    let process_adapter = match adapter {
+        SessionInputAdapter::Ffmpeg => ProcessAdapterKind::Ffmpeg,
+        SessionInputAdapter::Vlc => ProcessAdapterKind::Vlc,
+        SessionInputAdapter::NativeTs => unreachable!("native adapter uses the HTTP session"),
+    };
+    let process = process_adapter
+        .start_brokered_leased_with_format(
+            client,
+            endpoint,
+            source.process_input_format,
+            source.ring,
+            lease,
+        )
+        .await
+        .map_err(|_| SessionStartError::Process { adapter })?;
+    diagnostics.set_state(SessionState::Priming);
+    let ring = process.ring();
+    monitor_process_input(ring.clone(), Arc::clone(&diagnostics));
+
+    Ok(HttpTsSession {
+        key: source.key,
+        ring,
+        lease_id,
+        input: SessionInput::Process(process),
+        viewer_batch_packets: source.viewer_batch_packets,
+        diagnostics,
+    })
+}
+
+fn monitor_process_input(ring: MpegTsRing, diagnostics: Arc<SessionDiagnostics>) {
+    tokio::spawn(async move {
+        let mut cursor = ring.subscribe_at_live_edge();
+        let mut previous_first_sequence = 0_u64;
+        loop {
+            match cursor.next(1).await {
+                Ok(RingRead::Packets { .. }) => {
+                    let snapshot = ring.snapshot();
+                    diagnostics.set_state(SessionState::Streaming);
+                    let overwritten = snapshot
+                        .first_sequence
+                        .saturating_sub(previous_first_sequence);
+                    diagnostics.record_write(overwritten);
+                    previous_first_sequence = snapshot.first_sequence;
+                }
+                Ok(RingRead::Lagged { .. } | RingRead::GenerationBoundary { .. }) => {}
+                Ok(RingRead::Closed {
+                    reason: RingCloseReason::Shutdown,
+                    ..
+                })
+                | Err(_) => return,
+                Ok(RingRead::Closed {
+                    reason: RingCloseReason::EndOfStream,
+                    ..
+                }) => {
+                    diagnostics.record_failure(SessionFailureKind::UpstreamEnded);
+                    diagnostics.set_state(SessionState::Failed);
+                    return;
+                }
+                Ok(RingRead::Closed {
+                    reason:
+                        RingCloseReason::UpstreamError(_) | RingCloseReason::RecoveryExpired { .. },
+                    ..
+                }) => {
+                    diagnostics.record_failure(SessionFailureKind::Http);
+                    diagnostics.set_state(SessionState::Failed);
+                    return;
+                }
+            }
+        }
+    });
 }
 
 fn sanitize_reqwest_error(error: reqwest::Error) -> SessionStartError {
@@ -490,6 +775,9 @@ async fn pump_http_ts(
 ) {
     let HttpPumpConfig {
         client,
+        providers,
+        allocation_source_id,
+        allocation_generation,
         endpoints,
         diagnostics,
         recovery,
@@ -497,7 +785,7 @@ async fn pump_http_ts(
     } = config;
     let mut resources = PumpResources {
         body: Some(Box::pin(response.bytes_stream())),
-        _lease: lease,
+        lease,
     };
     let mut packetizer = MpegTsPacketizer::new();
     diagnostics.set_state(SessionState::Priming);
@@ -538,13 +826,19 @@ async fn pump_http_ts(
         diagnostics.record_failure(active_failure);
         resources.body.take();
         let Some(recovered) = recover_session(
-            &client,
-            &endpoints,
+            RecoveryContext {
+                client: &client,
+                providers: &providers,
+                allocation_source_id: &allocation_source_id,
+                allocation_generation,
+                endpoints: &endpoints,
+                ring: &ring,
+                diagnostics: &diagnostics,
+                recovery,
+                startup_timeout,
+            },
             current_endpoint,
-            &ring,
-            &diagnostics,
-            recovery,
-            startup_timeout,
+            resources.lease.pool_id(),
         )
         .await
         else {
@@ -558,6 +852,9 @@ async fn pump_http_ts(
 
         current_endpoint = recovered.endpoint_index;
         packetizer = recovered.packetizer;
+        if let Some(lease) = recovered.lease {
+            resources.lease = lease;
+        }
         resources.body = Some(recovered.body);
         active_failure = stream_until_failure(
             resources.body.as_mut().expect("recovered body exists"),
@@ -571,7 +868,10 @@ async fn pump_http_ts(
 
 struct HttpPumpConfig {
     client: Client,
-    endpoints: Vec<HttpTsEndpoint>,
+    providers: Arc<DashMap<Arc<str>, ProviderSlotBroker>>,
+    allocation_source_id: Arc<str>,
+    allocation_generation: u64,
+    endpoints: Vec<PreparedHttpTsEndpoint>,
     diagnostics: Arc<SessionDiagnostics>,
     recovery: RecoveryPolicy,
     startup_timeout: Duration,
@@ -581,17 +881,59 @@ struct RecoveredStream {
     endpoint_index: usize,
     body: HttpBody,
     packetizer: MpegTsPacketizer,
+    lease: Option<SlotLease>,
+}
+
+struct RecoveryContext<'a> {
+    client: &'a Client,
+    providers: &'a DashMap<Arc<str>, ProviderSlotBroker>,
+    allocation_source_id: &'a Arc<str>,
+    allocation_generation: u64,
+    endpoints: &'a [PreparedHttpTsEndpoint],
+    ring: &'a MpegTsRing,
+    diagnostics: &'a Arc<SessionDiagnostics>,
+    recovery: RecoveryPolicy,
+    startup_timeout: Duration,
+}
+
+fn acquire_recovery_lease(
+    providers: &DashMap<Arc<str>, ProviderSlotBroker>,
+    allocation_source_id: &Arc<str>,
+    allocation_generation: u64,
+    endpoint: &PreparedHttpTsEndpoint,
+    current_pool_id: &str,
+) -> Result<Option<SlotLease>, ()> {
+    if endpoint.provider_pool_id.as_ref() == current_pool_id {
+        return Ok(None);
+    }
+    let broker = providers
+        .get(&endpoint.provider_pool_id)
+        .map(|broker| broker.clone())
+        .ok_or(())?;
+    let allocation_key: Arc<str> = format!(
+        "{}\u{1f}{}\u{1f}{}",
+        endpoint.provider_pool_id, allocation_source_id, allocation_generation
+    )
+    .into();
+    broker.try_acquire(allocation_key).map(Some).map_err(|_| ())
 }
 
 async fn recover_session(
-    client: &Client,
-    endpoints: &[HttpTsEndpoint],
+    context: RecoveryContext<'_>,
     previous_endpoint: usize,
-    ring: &MpegTsRing,
-    diagnostics: &Arc<SessionDiagnostics>,
-    recovery: RecoveryPolicy,
-    startup_timeout: Duration,
+    current_pool_id: &str,
 ) -> Option<RecoveredStream> {
+    let RecoveryContext {
+        client,
+        providers,
+        allocation_source_id,
+        allocation_generation,
+        endpoints,
+        ring,
+        diagnostics,
+        recovery,
+        startup_timeout,
+    } = context;
     if recovery.max_window().is_zero() {
         return None;
     }
@@ -618,12 +960,25 @@ async fn recover_session(
         });
         diagnostics.record_reconnect(is_failover);
 
+        let endpoint = &endpoints[endpoint_index];
+        let Ok(candidate_lease) = acquire_recovery_lease(
+            providers,
+            allocation_source_id,
+            allocation_generation,
+            endpoint,
+            current_pool_id,
+        ) else {
+            attempt = attempt.saturating_add(1);
+            sleep_until_retry(deadline, recovery.retry_delay()).await;
+            continue;
+        };
+
         let request_deadline = deadline.min(Instant::now() + startup_timeout);
         let response = tokio::time::timeout_at(
             request_deadline,
             client
-                .get(endpoints[endpoint_index].url.as_ref())
-                .headers(endpoints[endpoint_index].headers.clone())
+                .get(endpoint.url.as_ref())
+                .headers(endpoint.headers.clone())
                 .send(),
         )
         .await;
@@ -668,6 +1023,7 @@ async fn recover_session(
             endpoint_index,
             body,
             packetizer,
+            lease: candidate_lease,
         });
     }
 
@@ -878,6 +1234,10 @@ impl ViewerHandle {
 
     pub fn lease_id(&self) -> u64 {
         self.session.lease_id
+    }
+
+    pub fn input_adapter(&self) -> SessionInputAdapter {
+        self.session.input.adapter()
     }
 
     pub fn ring_snapshot(&self) -> crate::RingSnapshot {
@@ -1123,6 +1483,409 @@ mod tests {
         assert!(!debug.contains("hidden"));
     }
 
+    #[test]
+    fn adapter_policy_selects_typed_direct_input_without_hls() {
+        assert_eq!(
+            InputAdapterPolicy::Auto.selected_adapter(),
+            SessionInputAdapter::NativeTs
+        );
+        assert_eq!(
+            InputAdapterPolicy::NativeTs.selected_adapter(),
+            SessionInputAdapter::NativeTs
+        );
+        assert_eq!(
+            InputAdapterPolicy::Ffmpeg.selected_adapter(),
+            SessionInputAdapter::Ffmpeg
+        );
+        assert_eq!(
+            InputAdapterPolicy::Vlc.selected_adapter(),
+            SessionInputAdapter::Vlc
+        );
+
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "source", 1),
+            "http://provider.test/live.ts",
+            MpegTsRingConfig::new(8, 0).unwrap(),
+        );
+        assert_eq!(source.adapter_policy(), InputAdapterPolicy::Auto);
+        source.set_adapter_policy(InputAdapterPolicy::Vlc);
+        assert_eq!(source.adapter_policy(), InputAdapterPolicy::Vlc);
+        assert!(format!("{source:?}").contains("adapter_policy"));
+    }
+
+    #[cfg(unix)]
+    fn fixed_adapter_fixture() -> Vec<u8> {
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=32x32:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:sample_rate=48000",
+                "-t",
+                "1",
+                "-c:v",
+                "mpeg2video",
+                "-c:a",
+                "mp2",
+                "-f",
+                "mpegts",
+                "pipe:1",
+            ])
+            .output()
+            .expect("the fixed FFmpeg test fixture must start");
+        assert!(output.status.success(), "the fixed fixture must be valid");
+        output.stdout
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    async fn fixed_adapter_shares_one_process_and_stops(
+        policy: InputAdapterPolicy,
+        expected_adapter: SessionInputAdapter,
+        upstream_is_live: bool,
+    ) {
+        use std::{convert::Infallible, sync::Arc};
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::State,
+            http::{HeaderMap, HeaderValue, header},
+            response::Response,
+            routing::get,
+        };
+        use tokio::{net::TcpListener, time::timeout};
+
+        #[derive(Clone)]
+        struct UpstreamState {
+            requests: Arc<AtomicUsize>,
+            disconnects: Arc<AtomicUsize>,
+            fixture: Arc<Vec<u8>>,
+            live: bool,
+        }
+
+        struct DisconnectGuard(Arc<AtomicUsize>);
+
+        impl Drop for DisconnectGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        async fn upstream(State(state): State<UpstreamState>, headers: HeaderMap) -> Response {
+            assert_eq!(
+                headers.get(header::AUTHORIZATION),
+                Some(&reqwest::header::HeaderValue::from_static(
+                    "Bearer provider-secret"
+                ))
+            );
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            let stream = async_stream::stream! {
+                let _guard = DisconnectGuard(Arc::clone(&state.disconnects));
+                loop {
+                    yield Ok::<_, Infallible>(Bytes::copy_from_slice(&state.fixture));
+                    if !state.live {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            };
+            let mut response = Response::new(Body::from_stream(stream));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp2t"));
+            response
+        }
+
+        let state = UpstreamState {
+            requests: Arc::new(AtomicUsize::new(0)),
+            disconnects: Arc::new(AtomicUsize::new(0)),
+            fixture: Arc::new(fixed_adapter_fixture()),
+            live: upstream_is_live,
+        };
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/live.ts", get(upstream))
+                    .with_state(server_state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "channel", 1),
+            format!("http://{address}/live.ts?username=provider-user&password=provider-password"),
+            MpegTsRingConfig::new(8, 0).unwrap(),
+        );
+        source.set_adapter_policy(policy);
+        source.headers_mut().insert(
+            header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer provider-secret"),
+        );
+        let first = manager.open(source.clone()).await.unwrap();
+        let second = manager.open(source).await.unwrap();
+
+        assert_eq!(first.lease_id(), second.lease_id());
+        assert_eq!(first.input_adapter(), expected_adapter);
+        assert_eq!(second.input_adapter(), expected_adapter);
+        let diagnostics = manager.list_adapter_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].adapter, expected_adapter);
+        assert!(diagnostics[0].process_id.is_some());
+        let diagnostic_debug = format!("{diagnostics:?}");
+        for secret in ["provider-user", "provider-password", "provider-secret"] {
+            assert!(!diagnostic_debug.contains(secret));
+        }
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let ring = first.ring_snapshot();
+                if ring.first_sequence > 0
+                    && (!upstream_is_live
+                        || (ring.closed.is_none()
+                            && first.session_snapshot().state == SessionState::Streaming))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the fixed adapter must wrap its bounded ring without exit; requests={}, diagnostics={:?}, ring={:?}",
+                state.requests.load(Ordering::SeqCst),
+                manager.list_adapter_diagnostics(),
+                first.ring_snapshot(),
+            )
+        });
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        if upstream_is_live {
+            assert_eq!(
+                manager
+                    .provider_snapshot("provider")
+                    .unwrap()
+                    .active_sessions,
+                1
+            );
+        }
+
+        drop(first);
+        if upstream_is_live {
+            assert_eq!(
+                manager
+                    .provider_snapshot("provider")
+                    .unwrap()
+                    .active_sessions,
+                1
+            );
+        }
+        drop(second);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state.disconnects.load(Ordering::SeqCst) == 1
+                    && manager
+                        .provider_snapshot("provider")
+                        .unwrap()
+                        .active_sessions
+                        == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the final viewer must stop the fixed adapter within two seconds");
+
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ffmpeg_policy_shares_one_process_wraps_and_stops() {
+        fixed_adapter_shares_one_process_and_stops(
+            InputAdapterPolicy::Ffmpeg,
+            SessionInputAdapter::Ffmpeg,
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vlc_policy_shares_one_process_and_remuxes() {
+        fixed_adapter_shares_one_process_and_stops(
+            InputAdapterPolicy::Vlc,
+            SessionInputAdapter::Vlc,
+            false,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn explicit_hls_ffmpeg_policy_shares_one_process_and_nested_resources() {
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::{Path, State},
+            http::{HeaderMap, HeaderValue, header},
+            response::Response,
+            routing::get,
+        };
+        use tokio::time::timeout;
+
+        #[derive(Clone)]
+        struct UpstreamState {
+            requests: Arc<Mutex<HashMap<String, usize>>>,
+            fixture: Arc<Vec<u8>>,
+        }
+
+        async fn upstream(
+            State(state): State<UpstreamState>,
+            Path(path): Path<String>,
+            headers: HeaderMap,
+        ) -> Response {
+            assert_eq!(
+                headers.get(header::AUTHORIZATION),
+                Some(&HeaderValue::from_static("Bearer provider-secret"))
+            );
+            *state
+                .requests
+                .lock()
+                .unwrap()
+                .entry(path.clone())
+                .or_default() += 1;
+            let body = match path.as_str() {
+                "master.m3u8" => "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1\nnested/child.m3u8\n".as_bytes().to_vec(),
+                "nested/child.m3u8" => "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1,Segment\nsegment.ts\n#EXT-X-ENDLIST\n".as_bytes().to_vec(),
+                "nested/segment.ts" => state.fixture.as_ref().clone(),
+                _ => Vec::new(),
+            };
+            let mut response = Response::new(Body::from(body));
+            if std::path::Path::new(&path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("m3u8"))
+            {
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/vnd.apple.mpegurl"),
+                );
+            }
+            response
+        }
+
+        let state = UpstreamState {
+            requests: Arc::new(Mutex::new(HashMap::new())),
+            fixture: Arc::new(fixed_adapter_fixture()),
+        };
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/{*path}", get(upstream))
+                    .with_state(server_state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "hls-channel", 1),
+            format!(
+                "http://{address}/master.m3u8?username=provider-user&password=provider-password"
+            ),
+            MpegTsRingConfig::new(8, 0).unwrap(),
+        );
+        source.set_adapter_policy(InputAdapterPolicy::Ffmpeg);
+        source
+            .set_process_input_format(BrokeredInputFormat::Hls(crate::HlsBrokerConfig::default()));
+        source.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer provider-secret"),
+        );
+        let source_debug = format!("{source:?}");
+        let first = manager.open(source.clone()).await.unwrap();
+        let second = manager.open(source).await.unwrap();
+        assert_eq!(first.lease_id(), second.lease_id());
+        assert_eq!(first.input_adapter(), SessionInputAdapter::Ffmpeg);
+        assert_eq!(manager.list_adapter_diagnostics().len(), 1);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if first.ring_snapshot().next_sequence > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "FFmpeg must read the explicit loopback HLS manifest; requests={:?}, ring={:?}",
+                state.requests.lock().unwrap(),
+                first.ring_snapshot(),
+            )
+        });
+        let diagnostics = format!("{:?} {source_debug}", manager.list_adapter_diagnostics());
+        for secret in ["provider-user", "provider-password", "provider-secret"] {
+            assert!(!diagnostics.contains(secret));
+        }
+        {
+            let requests = state.requests.lock().unwrap();
+            assert_eq!(requests.get("master.m3u8"), Some(&1));
+            assert_eq!(requests.get("nested/child.m3u8"), Some(&1));
+            assert_eq!(requests.get("nested/segment.ts"), Some(&1));
+        }
+        drop(first);
+        drop(second);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .provider_snapshot("provider")
+                    .unwrap()
+                    .active_sessions
+                    == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("final HLS viewer cleanup must release the process slot");
+        server.abort();
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn manager_value_api_and_private_pump_edges_are_covered() {
@@ -1266,13 +2029,19 @@ mod tests {
 
         assert!(
             recover_session(
-                &Client::new(),
-                &[],
+                RecoveryContext {
+                    client: &Client::new(),
+                    providers: &DashMap::new(),
+                    allocation_source_id: &Arc::from("source"),
+                    allocation_generation: 1,
+                    endpoints: &[],
+                    ring: &ring,
+                    diagnostics: &diagnostics,
+                    recovery: RecoveryPolicy::disabled(),
+                    startup_timeout: Duration::from_millis(10),
+                },
                 0,
-                &ring,
-                &diagnostics,
-                RecoveryPolicy::disabled(),
-                Duration::from_millis(10),
+                "provider",
             )
             .await
             .is_none()
@@ -1293,7 +2062,7 @@ mod tests {
             key: HttpTsSessionKey::new("provider", "local", 1),
             ring: ring.clone(),
             lease_id: 7,
-            task: abort_handle,
+            input: SessionInput::Native { task: abort_handle },
             viewer_batch_packets: NonZeroUsize::new(2).unwrap(),
             diagnostics: Arc::clone(&diagnostics),
         });
@@ -1740,6 +2509,7 @@ mod tests {
 
         let manager = HttpTsSessionManager::new(Client::new());
         manager.configure_provider(ProviderSpec::new("provider", 2));
+        manager.configure_provider(ProviderSpec::new("alternate-provider", 1));
         let recovery = RecoveryPolicy::new(
             Duration::from_millis(500),
             Duration::from_millis(5),
@@ -1752,9 +2522,10 @@ mod tests {
             format!("http://{address}/primary?token=primary-secret"),
             MpegTsRingConfig::new(32, 32).unwrap(),
         );
-        flaky.add_alternate(HttpTsEndpoint::new(format!(
-            "http://{address}/alternate?token=alternate-secret"
-        )));
+        flaky.add_alternate(HttpTsEndpoint::for_provider(
+            "alternate-provider",
+            format!("http://{address}/alternate?token=alternate-secret"),
+        ));
         flaky.set_recovery_policy(recovery);
         let sibling = HttpTsSourceSpec::new(
             HttpTsSessionKey::new("provider", "sibling", 1),
@@ -1840,8 +2611,11 @@ mod tests {
         assert_eq!(requests.get("sibling"), Some(&1));
         drop(requests);
         let pool = manager.provider_snapshot("provider").unwrap();
-        assert_eq!(pool.active_sessions, 2);
+        assert_eq!(pool.active_sessions, 1);
         assert_eq!(pool.high_watermark, 2);
+        let alternate_pool = manager.provider_snapshot("alternate-provider").unwrap();
+        assert_eq!(alternate_pool.active_sessions, 1);
+        assert_eq!(alternate_pool.high_watermark, 1);
 
         drop(flaky_first);
         drop(flaky_second);

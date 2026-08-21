@@ -21,6 +21,7 @@ use tokio::{
 };
 
 use crate::{
+    CredentialBroker, CredentialBrokerEndpoint, CredentialBrokerError, HlsBrokerConfig,
     MpegTsPacketizer, MpegTsRing, MpegTsRingConfig, RingCloseReason, RingCursor, RingSnapshot,
 };
 
@@ -96,6 +97,11 @@ impl InputSource {
     fn command_argument(&self) -> OsString {
         self.broker_url.as_str().into()
     }
+
+    #[cfg(test)]
+    pub(crate) fn broker_url(&self) -> &reqwest::Url {
+        &self.broker_url
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,12 +110,119 @@ pub enum ProcessAdapterKind {
     Vlc,
 }
 
+/// The explicit media format that a fixed process reads from its broker.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BrokeredInputFormat {
+    #[default]
+    DirectMpegTs,
+    Hls(HlsBrokerConfig),
+}
+
 impl ProcessAdapterKind {
     pub fn executable(self) -> &'static OsStr {
         match self {
             Self::Ffmpeg => OsStr::new("ffmpeg"),
             Self::Vlc => OsStr::new("vlc"),
         }
+    }
+
+    /// Start this adapter through a loopback credential broker.
+    ///
+    /// The child receives only the broker URL. The broker keeps provider URLs
+    /// and header values out of child arguments and debug output.
+    ///
+    /// This method supports one direct media response. It does not support HLS
+    /// manifests or HLS segment requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error if the broker or fixed process cannot start.
+    pub async fn start_brokered(
+        self,
+        client: reqwest::Client,
+        endpoint: CredentialBrokerEndpoint,
+        ring_config: MpegTsRingConfig,
+    ) -> Result<BrokeredProcessInputSession, BrokeredProcessStartError> {
+        self.start_brokered_with_format(
+            client,
+            endpoint,
+            BrokeredInputFormat::DirectMpegTs,
+            ring_config,
+        )
+        .await
+    }
+
+    /// Start this adapter with an explicit broker input format.
+    ///
+    /// This method does not infer HLS from an endpoint URL or credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error if the broker or fixed process cannot start.
+    pub async fn start_brokered_with_format(
+        self,
+        client: reqwest::Client,
+        endpoint: CredentialBrokerEndpoint,
+        input_format: BrokeredInputFormat,
+        ring_config: MpegTsRingConfig,
+    ) -> Result<BrokeredProcessInputSession, BrokeredProcessStartError> {
+        start_brokered(
+            client,
+            endpoint,
+            input_format,
+            ring_config,
+            |input, ring_config| match self {
+                Self::Ffmpeg => FfmpegInputAdapter::new().start(input, ring_config),
+                Self::Vlc => VlcInputAdapter::new().start(input, ring_config),
+            },
+        )
+        .await
+    }
+
+    /// Start this adapter and retain a provider slot through cleanup.
+    ///
+    /// The returned session releases `lease` only after the child process and
+    /// loopback credential broker stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error if the broker or fixed process cannot start.
+    pub async fn start_brokered_leased(
+        self,
+        client: reqwest::Client,
+        endpoint: CredentialBrokerEndpoint,
+        ring_config: MpegTsRingConfig,
+        lease: crate::SlotLease,
+    ) -> Result<LeasedBrokeredProcessInputSession, BrokeredProcessStartError> {
+        self.start_brokered_leased_with_format(
+            client,
+            endpoint,
+            BrokeredInputFormat::DirectMpegTs,
+            ring_config,
+            lease,
+        )
+        .await
+    }
+
+    /// Start this adapter with a lease and explicit broker input format.
+    ///
+    /// The returned session retains `lease` until the child and broker stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error if the broker or fixed process cannot start.
+    pub async fn start_brokered_leased_with_format(
+        self,
+        client: reqwest::Client,
+        endpoint: CredentialBrokerEndpoint,
+        input_format: BrokeredInputFormat,
+        ring_config: MpegTsRingConfig,
+        lease: crate::SlotLease,
+    ) -> Result<LeasedBrokeredProcessInputSession, BrokeredProcessStartError> {
+        Ok(self
+            .start_brokered_with_format(client, endpoint, input_format, ring_config)
+            .await?
+            .into_leased(lease))
     }
 }
 
@@ -252,7 +365,7 @@ impl VlcInputAdapter {
                 "--quiet".into(),
                 input.command_argument(),
                 "--sout".into(),
-                "#standard{access=file,mux=ts,dst=-}".into(),
+                "#standard{access=fd,mux=ts,dst=1}".into(),
                 "vlc://quit".into(),
             ],
         }
@@ -282,6 +395,15 @@ pub enum ProcessAdapterError {
     },
     #[error("the fixed {adapter} process did not expose its configured stdout pipe")]
     MissingStdout { adapter: ProcessAdapterKind },
+}
+
+/// A broker or fixed process could not start.
+#[derive(Debug, Error)]
+pub enum BrokeredProcessStartError {
+    #[error("could not start the loopback credential broker")]
+    Broker(#[from] CredentialBrokerError),
+    #[error("could not start the fixed process input")]
+    Process(#[from] ProcessAdapterError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -319,6 +441,206 @@ pub struct ProcessInputSession {
     ring: MpegTsRing,
     shutdown: Option<oneshot::Sender<()>>,
     completion: watch::Receiver<Option<ProcessExit>>,
+}
+
+/// A process session that owns its loopback credential broker.
+///
+/// Drop this session to request process and broker shutdown.
+pub struct BrokeredProcessInputSession {
+    process: ProcessInputSession,
+    broker: Option<CredentialBroker>,
+}
+
+/// A brokered process session that owns a provider slot through cleanup.
+///
+/// The cleanup task owns the [`SlotLease`]. It drops the lease only after it
+/// reaps the child process and stops the credential broker.
+pub struct LeasedBrokeredProcessInputSession {
+    adapter: ProcessAdapterKind,
+    process_id: Option<u32>,
+    ring: MpegTsRing,
+    shutdown: Option<oneshot::Sender<()>>,
+    completion: watch::Receiver<Option<Result<ProcessExit, CredentialBrokerError>>>,
+}
+
+impl fmt::Debug for BrokeredProcessInputSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrokeredProcessInputSession")
+            .field("process", &self.process)
+            .field("broker_active", &self.broker.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for BrokeredProcessInputSession {
+    fn drop(&mut self) {
+        self.request_shutdown();
+    }
+}
+
+impl BrokeredProcessInputSession {
+    pub fn adapter(&self) -> ProcessAdapterKind {
+        self.process.adapter()
+    }
+
+    pub fn process_id(&self) -> Option<u32> {
+        self.process.process_id()
+    }
+
+    pub fn subscribe(&self) -> RingCursor {
+        self.process.subscribe()
+    }
+
+    pub fn snapshot(&self) -> RingSnapshot {
+        self.process.snapshot()
+    }
+
+    /// Transfer this session and a provider slot to a cleanup task.
+    ///
+    /// Use the returned handle for a process-backed shared media session. The
+    /// cleanup task retains the slot until the child and broker both stop.
+    #[must_use]
+    pub fn into_leased(self, lease: crate::SlotLease) -> LeasedBrokeredProcessInputSession {
+        LeasedBrokeredProcessInputSession::new(self, lease)
+    }
+
+    /// Idempotently request process and broker shutdown.
+    pub fn request_shutdown(&mut self) {
+        self.process.request_shutdown();
+        if let Some(broker) = &mut self.broker {
+            broker.request_shutdown();
+        }
+    }
+
+    /// Wait for process completion and broker cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the broker task stops unexpectedly.
+    pub async fn wait(&mut self) -> Result<ProcessExit, CredentialBrokerError> {
+        let exit = self.process.wait().await;
+        self.shutdown_broker().await?;
+        Ok(exit)
+    }
+
+    /// Request shutdown and wait for process and broker cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the broker task stops unexpectedly.
+    pub async fn shutdown(mut self) -> Result<ProcessExit, CredentialBrokerError> {
+        self.request_shutdown();
+        self.wait().await
+    }
+
+    async fn shutdown_broker(&mut self) -> Result<(), CredentialBrokerError> {
+        let Some(broker) = self.broker.take() else {
+            return Ok(());
+        };
+        broker.shutdown().await
+    }
+}
+
+impl fmt::Debug for LeasedBrokeredProcessInputSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeasedBrokeredProcessInputSession")
+            .field("adapter", &self.adapter)
+            .field("process_id", &self.process_id)
+            .field("ring", &self.ring.snapshot())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LeasedBrokeredProcessInputSession {
+    fn drop(&mut self) {
+        self.request_shutdown();
+    }
+}
+
+impl LeasedBrokeredProcessInputSession {
+    fn new(session: BrokeredProcessInputSession, lease: crate::SlotLease) -> Self {
+        let adapter = session.adapter();
+        let process_id = session.process_id();
+        let ring = session.process.ring.clone();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let (completion_tx, completion) = watch::channel(None);
+
+        tokio::spawn(async move {
+            let mut session = session;
+            let result = tokio::select! {
+                _ = &mut shutdown_rx => {
+                    session.request_shutdown();
+                    session.wait().await
+                },
+                result = session.wait() => result,
+            };
+            let _ = completion_tx.send(Some(result));
+            drop(lease);
+        });
+
+        Self {
+            adapter,
+            process_id,
+            ring,
+            shutdown: Some(shutdown_tx),
+            completion,
+        }
+    }
+
+    pub fn adapter(&self) -> ProcessAdapterKind {
+        self.adapter
+    }
+
+    pub fn process_id(&self) -> Option<u32> {
+        self.process_id
+    }
+
+    pub fn subscribe(&self) -> RingCursor {
+        self.ring.subscribe()
+    }
+
+    pub fn snapshot(&self) -> RingSnapshot {
+        self.ring.snapshot()
+    }
+
+    pub(crate) fn ring(&self) -> MpegTsRing {
+        self.ring.clone()
+    }
+
+    /// Idempotently request process and broker shutdown.
+    pub fn request_shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+
+    /// Wait until the child process and credential broker stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credential broker task stops unexpectedly.
+    pub async fn wait(&mut self) -> Result<ProcessExit, CredentialBrokerError> {
+        loop {
+            if let Some(result) = self.completion.borrow_and_update().clone() {
+                return result;
+            }
+            if self.completion.changed().await.is_err() {
+                return Err(CredentialBrokerError::TaskStopped);
+            }
+        }
+    }
+
+    /// Request shutdown and wait until the child and broker stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the credential broker task stops unexpectedly.
+    pub async fn shutdown(mut self) -> Result<ProcessExit, CredentialBrokerError> {
+        self.request_shutdown();
+        self.wait().await
+    }
 }
 
 impl fmt::Debug for ProcessInputSession {
@@ -382,6 +704,29 @@ impl ProcessInputSession {
         self.request_shutdown();
         self.wait().await
     }
+}
+
+async fn start_brokered<F>(
+    client: reqwest::Client,
+    endpoint: CredentialBrokerEndpoint,
+    input_format: BrokeredInputFormat,
+    ring_config: MpegTsRingConfig,
+    start_process: F,
+) -> Result<BrokeredProcessInputSession, BrokeredProcessStartError>
+where
+    F: FnOnce(&InputSource, MpegTsRingConfig) -> Result<ProcessInputSession, ProcessAdapterError>,
+{
+    let broker = match input_format {
+        BrokeredInputFormat::DirectMpegTs => CredentialBroker::start(client, endpoint).await?,
+        BrokeredInputFormat::Hls(config) => {
+            CredentialBroker::start_hls(client, endpoint, config).await?
+        }
+    };
+    let process = start_process(broker.input_source(), ring_config)?;
+    Ok(BrokeredProcessInputSession {
+        process,
+        broker: Some(broker),
+    })
 }
 
 fn spawn_command(
@@ -587,9 +932,22 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
+    use axum::{
+        Router,
+        body::Body,
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode, header},
+        response::Response,
+        routing::get,
+    };
+    use bytes::Bytes;
     use tokio::time::timeout;
     use uuid::Uuid;
 
@@ -625,6 +983,24 @@ mod tests {
             ids.into_iter().flat_map(packet).collect(),
         ]
         .concat()
+    }
+
+    async fn read_packets_to_end(cursor: &mut RingCursor) -> Vec<u8> {
+        let mut packets = Vec::new();
+        loop {
+            match timeout(Duration::from_secs(2), cursor.next(8))
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                RingRead::Packets { bytes, .. } => packets.extend_from_slice(&bytes),
+                RingRead::Closed {
+                    reason: RingCloseReason::EndOfStream,
+                    ..
+                } => return packets,
+                event => panic!("unexpected ring event: {event:?}"),
+            }
+        }
     }
 
     fn temp_fixture(contents: &[u8]) -> PathBuf {
@@ -711,7 +1087,7 @@ mod tests {
                 "--quiet",
                 "http://[::1]:8080/play/1?token=x",
                 "--sout",
-                "#standard{access=file,mux=ts,dst=-}",
+                "#standard{access=fd,mux=ts,dst=1}",
                 "vlc://quit",
             ]
         );
@@ -802,6 +1178,266 @@ mod tests {
             .await
             .expect("shutdown must kill and reap promptly");
         assert!(matches!(exit, ProcessExit::Cancelled { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn brokered_process_receives_only_a_loopback_url_and_streams_direct_media() {
+        #[derive(Clone)]
+        struct UpstreamState {
+            requests: Arc<AtomicUsize>,
+            expected: Vec<u8>,
+        }
+
+        async fn upstream(State(state): State<UpstreamState>, headers: HeaderMap) -> Response {
+            let authorized = headers
+                .get(header::AUTHORIZATION)
+                .is_some_and(|value| value == "Bearer provider-secret");
+            if !authorized {
+                let mut response = Response::new(Body::empty());
+                *response.status_mut() = StatusCode::UNAUTHORIZED;
+                return response;
+            }
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            Response::new(Body::from(state.expected))
+        }
+
+        let expected = packets(0..5);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_requests = Arc::clone(&requests);
+        let upstream_expected = expected.clone();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                upstream_listener,
+                Router::new()
+                    .route("/provider/live", get(upstream))
+                    .with_state(UpstreamState {
+                        requests: upstream_requests,
+                        expected: upstream_expected,
+                    }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut endpoint = CredentialBrokerEndpoint::new(format!(
+            "http://{upstream_address}/provider/live?username=provider-user&password=provider-password"
+        ));
+        endpoint.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer provider-secret"),
+        );
+        let arguments = Arc::new(Mutex::new(Vec::new()));
+        let captured_arguments = Arc::clone(&arguments);
+        let mut session = start_brokered(
+            reqwest::Client::new(),
+            endpoint,
+            BrokeredInputFormat::DirectMpegTs,
+            MpegTsRingConfig::new(8, 8).unwrap(),
+            move |input, ring_config| {
+                let input_argument = input.command_argument();
+                captured_arguments
+                    .lock()
+                    .unwrap()
+                    .push(input_argument.clone());
+                spawn_command(
+                    AuditedProcessCommand::test_only(
+                        ProcessAdapterKind::Ffmpeg,
+                        OsStr::new("curl"),
+                        vec!["--fail".into(), "--silent".into(), input_argument],
+                    ),
+                    ring_config,
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+        {
+            let command_arguments = arguments.lock().unwrap();
+            assert_eq!(command_arguments.len(), 1);
+            let command_input = command_arguments[0].to_string_lossy();
+            assert!(command_input.starts_with("http://127.0.0.1:"));
+            for credential in ["provider-user", "provider-password", "provider-secret"] {
+                assert!(!command_input.contains(credential));
+            }
+        }
+
+        let mut cursor = session.subscribe();
+        let actual = read_packets_to_end(&mut cursor).await;
+
+        assert_eq!(actual, expected);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            session.wait().await.unwrap(),
+            ProcessExit::Completed {
+                success: true,
+                code: Some(0)
+            }
+        );
+        let debug = format!("{session:?}");
+        for credential in ["provider-user", "provider-password", "provider-secret"] {
+            assert!(!debug.contains(credential));
+        }
+        upstream_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hls_brokered_process_receives_the_loopback_manifest_url() {
+        let endpoint = CredentialBrokerEndpoint::new(
+            "http://provider.invalid/live/master.m3u8?username=provider-user&password=provider-password",
+        );
+        let arguments = Arc::new(Mutex::new(Vec::new()));
+        let captured_arguments = Arc::clone(&arguments);
+        let session = start_brokered(
+            reqwest::Client::new(),
+            endpoint,
+            BrokeredInputFormat::Hls(HlsBrokerConfig::default()),
+            MpegTsRingConfig::new(8, 8).unwrap(),
+            move |input, ring_config| {
+                let input_argument = input.command_argument();
+                captured_arguments
+                    .lock()
+                    .unwrap()
+                    .push(input_argument.clone());
+                spawn_command(
+                    AuditedProcessCommand::test_only(
+                        ProcessAdapterKind::Ffmpeg,
+                        OsStr::new("/bin/sleep"),
+                        vec!["30".into()],
+                    ),
+                    ring_config,
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+        {
+            let command_arguments = arguments.lock().unwrap();
+            assert_eq!(command_arguments.len(), 1);
+            let command_input = command_arguments[0].to_string_lossy();
+            assert!(command_input.starts_with("http://127.0.0.1:"));
+            assert!(command_input.contains("/hls/"));
+            assert!(command_input.ends_with("/manifest.m3u8"));
+            for credential in ["provider-user", "provider-password"] {
+                assert!(!command_input.contains(credential));
+            }
+        }
+
+        let debug = format!("{session:?}");
+        for credential in ["provider-user", "provider-password"] {
+            assert!(!debug.contains(credential));
+        }
+        assert!(matches!(
+            timeout(Duration::from_secs(2), session.shutdown()).await,
+            Ok(Ok(ProcessExit::Cancelled { .. }))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn leased_brokered_shutdown_retains_slot_until_child_and_broker_stop() {
+        use std::convert::Infallible;
+
+        #[derive(Clone)]
+        struct UpstreamState {
+            requests: Arc<AtomicUsize>,
+        }
+
+        async fn upstream(State(state): State<UpstreamState>) -> Body {
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            let stream = async_stream::stream! {
+                loop {
+                    yield Ok::<_, Infallible>(Bytes::from_static(b"media"));
+                    tokio::time::sleep(Duration::from_mins(1)).await;
+                }
+            };
+            Body::from_stream(stream)
+        }
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let upstream_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream_requests = Arc::clone(&requests);
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                upstream_listener,
+                Router::new()
+                    .route("/provider/live", get(upstream))
+                    .with_state(UpstreamState {
+                        requests: upstream_requests,
+                    }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let endpoint =
+            CredentialBrokerEndpoint::new(format!("http://{upstream_address}/provider/live"));
+        let session = start_brokered(
+            reqwest::Client::new(),
+            endpoint,
+            BrokeredInputFormat::DirectMpegTs,
+            MpegTsRingConfig::new(8, 8).unwrap(),
+            |_input, ring_config| {
+                spawn_command(
+                    AuditedProcessCommand::test_only(
+                        ProcessAdapterKind::Ffmpeg,
+                        OsStr::new("/bin/sleep"),
+                        vec!["30".into()],
+                    ),
+                    ring_config,
+                )
+            },
+        )
+        .await
+        .unwrap();
+        let broker_url = session
+            .broker
+            .as_ref()
+            .unwrap()
+            .input_source()
+            .broker_url()
+            .as_str()
+            .to_owned();
+        let response = reqwest::Client::new().get(broker_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let slots = crate::ProviderSlotBroker::new("provider", 1);
+        let lease = slots.try_acquire("channel").unwrap();
+        let mut session = session.into_leased(lease);
+        session.request_shutdown();
+
+        assert!(
+            timeout(Duration::from_millis(100), session.wait())
+                .await
+                .is_err(),
+            "the active broker request must keep cleanup pending"
+        );
+        assert_eq!(slots.snapshot().active_sessions, 1);
+        assert!(matches!(
+            slots.try_acquire("replacement"),
+            Err(crate::AcquireError::AtCapacity { .. })
+        ));
+
+        drop(response);
+        let exit = timeout(Duration::from_secs(3), session.wait())
+            .await
+            .expect("cleanup must finish after the broker stops")
+            .unwrap();
+        assert!(matches!(exit, ProcessExit::Cancelled { .. }));
+        assert_eq!(slots.snapshot().active_sessions, 0);
+        assert!(slots.try_acquire("replacement").is_ok());
+        upstream_task.abort();
     }
 
     #[cfg(unix)]

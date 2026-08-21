@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 async-stream.workspace = true
+axum.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
@@ -14,13 +15,13 @@ iptv-domain = { path = "../domain", version = "0.1.0" }
 parking_lot.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
 proptest.workspace = true
 
 [lints]

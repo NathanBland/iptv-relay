@@ -5,6 +5,7 @@
 //! HTTP and fixed `FFmpeg`/VLC adapters provide the corresponding input edges.
 
 pub mod broker;
+pub mod credential_broker;
 pub mod process;
 mod psi;
 pub mod recovery;
@@ -13,9 +14,15 @@ pub mod ring;
 pub mod session;
 
 pub use broker::{AcquireError, PoolSnapshot, ProviderSlotBroker, SlotLease};
+pub use credential_broker::{
+    CredentialBroker, CredentialBrokerEndpoint, CredentialBrokerError, HlsBrokerConfig,
+    HlsBrokerConfigError,
+};
 pub use process::{
-    AuditedProcessCommand, FfmpegInputAdapter, InputSource, InputSourceError, ProcessAdapterError,
-    ProcessAdapterKind, ProcessExit, ProcessFailureStage, ProcessInputSession, VlcInputAdapter,
+    AuditedProcessCommand, BrokeredInputFormat, BrokeredProcessInputSession,
+    BrokeredProcessStartError, FfmpegInputAdapter, InputSource, InputSourceError,
+    LeasedBrokeredProcessInputSession, ProcessAdapterError, ProcessAdapterKind, ProcessExit,
+    ProcessFailureStage, ProcessInputSession, VlcInputAdapter,
 };
 pub use recovery::{
     HttpTsSessionSnapshot, MAX_RECOVERY_WINDOW, RecoveryConfigError, RecoveryPolicy,
@@ -28,7 +35,7 @@ pub use ring::{
     WriteOutcome,
 };
 pub use session::{
-    HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSourceSpec, MpegTsPacketizer,
-    PacketizerError, ProviderSpec, SessionStartError, ViewerByteStream, ViewerHandle,
-    ViewerStreamError,
+    HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSourceSpec, InputAdapterPolicy,
+    MpegTsPacketizer, PacketizerError, ProviderSpec, SessionAdapterDiagnostics,
+    SessionInputAdapter, SessionStartError, ViewerByteStream, ViewerHandle, ViewerStreamError,
 };
