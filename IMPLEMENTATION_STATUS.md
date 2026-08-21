@@ -2292,3 +2292,47 @@ The Clippy check passed for the persistence crate with warnings denied.
 After both Rust test suites completed, zero leftover schemas remained in the database.
 
 Three leftover schemas from previous test runs were removed manually.
+
+## Provider budget sidebar wired to real data
+
+Last verification: 2026-08-21.
+
+The sidebar provider budget widget used hardcoded values.
+
+The widget displayed `3 / 3` with a full progress bar and the text "Six viewers share three upstream streams."
+
+The header displayed "System healthy · Last inventory sync 3m ago."
+
+The status indicator showed a green dot with "All services operational."
+
+None of these values came from the backend.
+
+### Changes
+
+The `AppShell` component now fetches the system overview through the same TanStack Query used by the overview page.
+
+The `ProviderBudget` component receives the overview data as a prop.
+
+The widget displays `providerConnections / providerLimit` from the API response.
+
+The progress bar width reflects the real percentage.
+
+The description text shows the real `activeSessions` count.
+
+The header shows the real channel count and healthy stream count.
+
+The status indicator reflects the query state: "All services operational" when the query succeeds, "Service unavailable" when it fails, and "Connecting…" while it loads.
+
+### Verified results
+
+The web test suite passed all 73 tests.
+
+The TypeScript type check passed.
+
+The web lint check passed.
+
+The live API returned `providerConnections: 0` and `providerLimit: 0` with no active streams.
+
+The sidebar showed `0 / 0` with an empty progress bar and "0 downstream sessions share upstream connections."
+
+The header showed "Loading…" during initial render and then real data after hydration.

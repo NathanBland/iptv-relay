@@ -16,10 +16,16 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Combobox } from '@/components/ui/combobox'
 import { FieldMessage, Input, Select } from '@/components/ui/input'
 import { IptvApiError, MockIptvApiClient } from '@/lib/api/client'
+import { renderWithQuery } from './test-utils'
+
+vi.mock('@/lib/api/client', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api/client')>('@/lib/api/client')
+  return { ...actual, apiClient: new actual.MockIptvApiClient() }
+})
 
 describe('owned management components', () => {
   it('renders the accessible shell and both navigation layouts', () => {
-    render(<AppShell><h1>Current page</h1></AppShell>)
+    renderWithQuery(<AppShell><h1>Current page</h1></AppShell>)
     expect(screen.getByRole('link', { name: 'Skip to content' })).toHaveAttribute('href', '#main-content')
     expect(screen.getAllByRole('navigation', { name: 'Primary navigation' })).toHaveLength(2)
     expect(screen.getAllByRole('link', { name: 'Jellyfin setup' })).toHaveLength(2)

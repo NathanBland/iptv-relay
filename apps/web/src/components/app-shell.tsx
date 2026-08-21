@@ -19,7 +19,10 @@ import {
 } from 'lucide-react'
 import { Link } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { LogoutButton } from '@/components/logout-button'
+import { apiQueries } from '@/lib/api/queries'
+import { apiClient } from '@/lib/api/client'
 import { cn } from '@/lib/utils'
 
 const navigation = [
@@ -68,7 +71,32 @@ function Navigation({ compact = false }: { compact?: boolean }) {
   )
 }
 
+function ProviderBudget({ overview }: { overview?: { providerConnections: number; providerLimit: number; activeSessions: number } }) {
+  const connections = overview?.providerConnections ?? 0
+  const limit = overview?.providerLimit ?? 0
+  const sessions = overview?.activeSessions ?? 0
+  const percent = limit > 0 ? Math.min(100, Math.round((connections / limit) * 100)) : 0
+  const label = sessions === 1
+    ? 'One downstream session shares upstream connections.'
+    : `${sessions} downstream sessions share upstream connections.`
+
+  return (
+    <div className="rounded-xl border border-white/8 bg-white/[0.025] p-4">
+      <div className="flex items-center justify-between text-xs text-slate-400">
+        <span>Provider budget</span>
+        <span className="font-mono text-mint-400">{connections} / {limit}</span>
+      </div>
+      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/8">
+        <div className="h-full rounded-full bg-ocean-400 transition-all" style={{ width: `${percent}%` }} />
+      </div>
+      <p className="mt-2 text-xs leading-5 text-slate-500">{label}</p>
+    </div>
+  )
+}
+
 export function AppShell({ children }: { children: ReactNode }) {
+  const query = useQuery({ ...apiQueries(apiClient).overview })
+  const overview = query.data
   return (
     <div className="min-h-screen lg:grid lg:grid-cols-[15rem_1fr]">
       <a
@@ -90,16 +118,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
         <Navigation />
         <div className="mt-auto p-4">
-          <div className="rounded-xl border border-white/8 bg-white/[0.025] p-4">
-            <div className="flex items-center justify-between text-xs text-slate-400">
-              <span>Provider budget</span>
-              <span className="font-mono text-mint-400">3 / 3</span>
-            </div>
-            <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/8">
-              <div className="h-full w-full rounded-full bg-ocean-400" />
-            </div>
-            <p className="mt-2 text-xs leading-5 text-slate-500">Six viewers share three upstream streams.</p>
-          </div>
+          <ProviderBudget overview={overview} />
         </div>
       </aside>
 
@@ -111,11 +130,13 @@ export function AppShell({ children }: { children: ReactNode }) {
             </span>
             <span className="text-sm font-bold text-white">Relay Control</span>
           </div>
-          <p className="hidden text-sm text-slate-400 lg:block">System healthy · Last inventory sync 3m ago</p>
+          <p className="hidden text-sm text-slate-400 lg:block">
+            {overview ? `${overview.channels.toLocaleString()} channels · ${overview.healthyStreams.toLocaleString()} healthy streams` : 'Loading…'}
+          </p>
           <div className="flex items-center gap-2">
             <div className="hidden items-center gap-2 text-xs text-slate-400 sm:flex">
-              <span aria-hidden="true" className="size-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,.65)]" />
-              <span>All services operational</span>
+              <span aria-hidden="true" className={cn('size-2 rounded-full', query.isSuccess ? 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,.65)]' : 'bg-slate-500')} />
+              <span>{query.isSuccess ? 'All services operational' : query.isError ? 'Service unavailable' : 'Connecting…'}</span>
             </div>
             <LogoutButton />
           </div>
