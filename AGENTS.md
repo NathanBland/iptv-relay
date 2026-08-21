@@ -35,3 +35,9 @@ Update `IMPLEMENTATION_STATUS.md` after each verified test or confirmed failure.
 Do not list an item as working without test evidence.
 
 Do not put credentials, secret URLs, or tokens in the status file.
+
+## Git commits
+
+Do not add `Co-Authored-By` tags or `Generated with [Devin]` lines to commit messages.
+
+Do not claim authorship or co-authorship for commits that other tools or agents wrote.
