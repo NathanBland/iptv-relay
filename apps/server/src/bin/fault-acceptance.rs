@@ -39,6 +39,7 @@ impl Reader {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let provider = std::env::var("FAKE_PROVIDER_URL")
         .unwrap_or_else(|_| "http://fake-provider:8090".to_owned())
@@ -70,7 +71,14 @@ async fn main() -> Result<()> {
         .or_else(|| provider.strip_prefix("https://"))
         .unwrap_or(&provider);
     reset_toxiproxy(&client, &toxiproxy).await?;
-    create_proxy(&client, &toxiproxy, "media-fault", proxy_port, provider_host_port).await?;
+    create_proxy(
+        &client,
+        &toxiproxy,
+        "media-fault",
+        proxy_port,
+        provider_host_port,
+    )
+    .await?;
 
     let proxy_url = format!("http://toxiproxy:{proxy_port}");
     client
@@ -228,10 +236,7 @@ async fn wait_for_toxiproxy(client: &reqwest::Client, toxiproxy: &str) -> Result
         {
             return Ok(());
         }
-        ensure!(
-            Instant::now() < deadline,
-            "toxiproxy did not become ready"
-        );
+        ensure!(Instant::now() < deadline, "toxiproxy did not become ready");
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
@@ -415,11 +420,13 @@ fn assert_live_metrics(metrics: &ProviderMetrics) -> Result<()> {
     ensure!(metrics.active_streams == CHANNELS);
     ensure!(metrics.high_water == CHANNELS);
     ensure!(metrics.max_connections >= CHANNELS);
-    ensure!(metrics
-        .stream_opens
-        .iter()
-        .take(CHANNELS)
-        .all(|opens| *opens >= 1));
+    ensure!(
+        metrics
+            .stream_opens
+            .iter()
+            .take(CHANNELS)
+            .all(|opens| *opens >= 1)
+    );
     ensure!(metrics.rejected_connections == 0);
     Ok(())
 }

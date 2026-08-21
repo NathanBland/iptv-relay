@@ -63,9 +63,7 @@ async fn main() -> Result<()> {
         "the live stream delivered insufficient data: {total_bytes} bytes"
     );
 
-    println!(
-        "live acceptance passed: {packet_count} packets, {total_bytes} bytes, {seconds}s"
-    );
+    println!("live acceptance passed: {packet_count} packets, {total_bytes} bytes, {seconds}s");
     Ok(())
 }
 

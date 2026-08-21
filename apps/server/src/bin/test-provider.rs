@@ -189,6 +189,7 @@ async fn stream(State(state): State<AppState>, Path(channel_path): Path<String>)
     };
     let video_source = format!("color=c={color}:size=640x360:rate=30");
     let audio_source = format!("sine=frequency={frequency}:sample_rate=48000");
+    let service_id = channel.to_string();
     let Ok(mut child) = Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -217,6 +218,8 @@ async fn stream(State(state): State<AppState>, Path(channel_path): Path<String>)
             "mp2",
             "-b:a",
             "128k",
+            "-mpegts_service_id",
+            &service_id,
             "-mpegts_flags",
             "+resend_headers",
             "-f",

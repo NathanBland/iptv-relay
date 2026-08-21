@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, process::Stdio, time::Duration};
+use std::{env, future::Future, net::SocketAddr, pin::Pin, process::Stdio, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use iptv_api::{AppConfig, AppState, RuntimeVersions, hash_admin_password};
@@ -7,7 +7,8 @@ use iptv_ingest::{
     IngestResult, Ingestor, JobControl, PgSnapshotStore, ProtectedEndpoint, SnapshotOwner,
 };
 use iptv_persistence::{
-    CatalogRepository, Database, JobRecord, JobRepository, MasterKey, SourceKind, SourceRepository,
+    CatalogRepository, Database, JobRecord, JobRepository, MasterKey, NewJob, SourceKind,
+    SourceRepository,
 };
 use reqwest::Url;
 use tokio::{net::TcpListener, process::Command, signal, time::sleep};
@@ -67,7 +68,6 @@ async fn database() -> Result<Database> {
     Ok(database)
 }
 
-#[derive(Debug)]
 struct ServerEnvironment {
     bind: SocketAddr,
     public_base_url: String,
@@ -76,6 +76,21 @@ struct ServerEnvironment {
     admin_password_hash: String,
     master_key: MasterKey,
     tuner_count: u16,
+}
+
+impl std::fmt::Debug for ServerEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerEnvironment")
+            .field("bind", &self.bind)
+            .field("public_base_url", &self.public_base_url)
+            .field("output_token", &"<redacted>")
+            .field("admin_bootstrap_token", &"<redacted>")
+            .field("admin_password_hash", &"<redacted>")
+            .field("master_key", &self.master_key)
+            .field("tuner_count", &self.tuner_count)
+            .finish()
+    }
 }
 
 impl ServerEnvironment {
@@ -108,7 +123,8 @@ where
         Ok(hash) if !hash.trim().is_empty() => hash,
         _ => {
             warn!("IPTV_ADMIN_PASSWORD_HASH is unset; hashing IPTV_ADMIN_PASSWORD at startup");
-            hash_admin_password(&required_env_from(&mut lookup, "IPTV_ADMIN_PASSWORD")?)
+            let password = required_password_from(&mut lookup)?;
+            hash_admin_password(&password)
                 .map_err(anyhow::Error::msg)
                 .context("hash administrator password")?
         }
@@ -118,8 +134,8 @@ where
         bind,
         public_base_url: lookup("IPTV_PUBLIC_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:8080".to_owned()),
-        output_token: required_env_from(&mut lookup, "IPTV_OUTPUT_TOKEN")?,
-        admin_bootstrap_token: required_env_from(&mut lookup, "IPTV_ADMIN_BOOTSTRAP_TOKEN")?,
+        output_token: required_token_from(&mut lookup, "IPTV_OUTPUT_TOKEN")?,
+        admin_bootstrap_token: required_token_from(&mut lookup, "IPTV_ADMIN_BOOTSTRAP_TOKEN")?,
         admin_password_hash,
         master_key: MasterKey::from_base64(&required_env_from(&mut lookup, "IPTV_MASTER_KEY")?)
             .map_err(anyhow::Error::msg)
@@ -127,8 +143,47 @@ where
         tuner_count: lookup("IPTV_TUNER_COUNT")
             .ok()
             .and_then(|value| value.parse().ok())
+            .filter(|count| *count > 0)
             .unwrap_or(1),
     })
+}
+
+fn required_password_from<F>(lookup: &mut F) -> Result<String>
+where
+    F: FnMut(&str) -> std::result::Result<String, env::VarError>,
+{
+    let password = required_env_from(lookup, "IPTV_ADMIN_PASSWORD")?;
+    if password.len() < 12 || password.trim() != password {
+        bail!("IPTV_ADMIN_PASSWORD must contain at least 12 characters without outer spaces");
+    }
+    if is_placeholder_secret(&password) {
+        bail!("IPTV_ADMIN_PASSWORD cannot use a development or placeholder value");
+    }
+    Ok(password)
+}
+
+fn required_token_from<F>(lookup: &mut F, name: &str) -> Result<String>
+where
+    F: FnMut(&str) -> std::result::Result<String, env::VarError>,
+{
+    let token = required_env_from(lookup, name)?;
+    let valid_character = |character: char| {
+        character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '+' | '/' | '=')
+    };
+    if token.len() < 43 || !token.chars().all(valid_character) {
+        bail!("{name} must contain a 256-bit token in hexadecimal or base64 form");
+    }
+    if is_placeholder_secret(&token) {
+        bail!("{name} cannot use a development or placeholder value");
+    }
+    Ok(token)
+}
+
+fn is_placeholder_secret(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    ["change-me", "replace-with", "development", "placeholder"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
 }
 
 async fn serve() -> Result<()> {
@@ -136,7 +191,16 @@ async fn serve() -> Result<()> {
     let environment = server_environment()?;
     let bind = environment.bind;
     let config = environment.into_config(runtime_versions().await);
-    let app = iptv_api::router(AppState::new(Some(database), config));
+    let state = AppState::new(Some(database), config);
+    state
+        .initialize_auth()
+        .await
+        .context("initialize bootstrap authorization state")?;
+    state
+        .initialize_output_profile()
+        .await
+        .context("initialize output profile")?;
+    let app = iptv_api::router(state);
     let listener = TcpListener::bind(bind)
         .await
         .context("bind HTTP listener")?;
@@ -152,7 +216,56 @@ fn worker_id_from<F>(mut lookup: F) -> String
 where
     F: FnMut(&str) -> std::result::Result<String, env::VarError>,
 {
-    lookup("IPTV_WORKER_ID").unwrap_or_else(|_| "worker-1".to_owned())
+    lookup("IPTV_WORKER_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+        .or_else(|| lookup("HOSTNAME").ok().filter(|host| !host.is_empty()))
+        .unwrap_or_else(|| "worker-1".to_owned())
+}
+
+/// Periodically checks for sources due for refresh and enqueues refresh jobs.
+///
+/// Runs every 60 seconds. Sources with `refresh_interval_seconds > 0` that
+/// have not been refreshed within their interval get a new `refresh-source`
+/// job enqueued.
+async fn refresh_scheduler(sources: &SourceRepository, jobs: &JobRepository) {
+    let interval = Duration::from_mins(1);
+    info!("source refresh scheduler started");
+    loop {
+        tokio::select! {
+            () = shutdown_signal() => {
+                info!("source refresh scheduler stopping");
+                return;
+            }
+            () = tokio::time::sleep(interval) => {}
+        }
+        match sources.list_due_sources().await {
+            Ok(due) => {
+                if due.is_empty() {
+                    continue;
+                }
+                info!(
+                    due_count = due.len(),
+                    "enqueuing scheduled source refreshes"
+                );
+                for source in due {
+                    let job = NewJob {
+                        kind: "refresh-source".to_owned(),
+                        priority: 0,
+                        payload: serde_json::json!({ "sourceId": source.id.to_string() }),
+                        max_attempts: 3,
+                        available_at: chrono::Utc::now(),
+                    };
+                    if let Err(error) = jobs.enqueue(&job).await {
+                        warn!(source_id = %source.id, error = %error, "failed to enqueue scheduled refresh");
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "scheduler failed to list due sources");
+            }
+        }
+    }
 }
 
 async fn worker() -> Result<()> {
@@ -166,11 +279,40 @@ async fn worker() -> Result<()> {
     let catalog = CatalogRepository::new(database.pool().clone());
     let worker_id = worker_id_from(|name| env::var(name));
     info!(%worker_id, "job worker started");
+
+    // Spawn the scheduler that enqueues refresh jobs for due sources.
+    let scheduler_sources = sources.clone();
+    let scheduler_jobs = repository.clone();
+    let scheduler_handle = tokio::spawn(async move {
+        refresh_scheduler(&scheduler_sources, &scheduler_jobs).await;
+    });
+
+    // Spawn the reaper that resets jobs whose heartbeat is older than the
+    // lease timeout. A worker that crashed or lost its lease leaves a job
+    // stuck in `running`; the reaper returns it to `queued`.
+    let reaper_repository = repository.clone();
+    let reaper_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await; // skip the first immediate tick
+        loop {
+            interval.tick().await;
+            match reaper_repository.reap_stale_jobs(300).await {
+                Ok(count) if count > 0 => {
+                    info!(reaped = count, "stale job reaper reset orphaned jobs");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(%error, "stale job reaper failed");
+                }
+            }
+        }
+    });
+
     loop {
         tokio::select! {
             () = shutdown_signal() => {
-                info!(%worker_id, "job worker stopping");
-                return Ok(());
+                info!(%worker_id, "worker shutdown requested, finishing current job");
+                break;
             }
             result = repository.claim(&worker_id) => {
                 match result {
@@ -188,7 +330,7 @@ async fn worker() -> Result<()> {
                             sleep(Duration::from_secs(2)).await;
                         }
                     }
-                    Ok(None) => sleep(Duration::from_millis(500)).await,
+                    Ok(None) => sleep(Duration::from_millis(200)).await,
                     Err(error) => {
                         error!(%error, "job claim failed");
                         sleep(Duration::from_secs(2)).await;
@@ -197,6 +339,11 @@ async fn worker() -> Result<()> {
             }
         }
     }
+
+    scheduler_handle.abort();
+    reaper_handle.abort();
+    info!(%worker_id, "worker stopped");
+    Ok(())
 }
 
 async fn process_job(
@@ -215,22 +362,69 @@ async fn process_job(
     if job.kind != "refresh-source" {
         warn!(job_id = %job.id, kind = %job.kind, "unsupported job kind");
         jobs.fail(
-            &job,
+            job.id,
             worker_id,
+            job.attempts,
+            job.max_attempts,
             "job handler is not registered",
-            chrono::Utc::now() + chrono::Duration::seconds(30),
         )
         .await?;
         return Ok(());
     }
 
-    match run_source_refresh(
+    // Spawn a heartbeat task that keeps the job lease fresh during long
+    // downloads. The ingest pipeline reports progress through checkpoints,
+    // but a slow download can leave the heartbeat stale. This task writes an
+    // empty progress payload every 15 seconds so the reaper does not reset
+    // the job while it is still active.
+    let heartbeat_repository = jobs.clone();
+    let heartbeat_job_id = job.id;
+    let heartbeat_worker_id = worker_id.to_owned();
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.tick().await; // skip the first immediate tick
+        loop {
+            interval.tick().await;
+            if heartbeat_repository
+                .heartbeat(
+                    heartbeat_job_id,
+                    &heartbeat_worker_id,
+                    &serde_json::json!({}),
+                )
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let refresh_result = run_source_refresh(
         jobs, sources, snapshots, catalog, master_key, worker_id, &job,
     )
-    .await
-    {
+    .await;
+    heartbeat_handle.abort();
+
+    match refresh_result {
         Ok(result) => {
+            let completed_progress = serde_json::json!({
+                "stage": "completed",
+                "percent": 100,
+                "bytesDownloaded": result.downloaded_bytes,
+                "recordsProcessed": result.records,
+                "message": "Source refresh completed",
+            });
+            if let Err(error) = jobs.heartbeat(job.id, worker_id, &completed_progress).await {
+                warn!(job_id = %job.id, error = %error, "failed to report completed progress");
+            }
             jobs.succeed(job.id, worker_id).await?;
+            if let Some(source_id) = source_id_from_payload(&job.payload)
+                && let Err(error) = sources
+                    .mark_source_refreshed(source_id, chrono::Utc::now())
+                    .await
+            {
+                warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
+            }
             info!(
                 job_id = %job.id,
                 snapshot_id = %result.snapshot_id,
@@ -250,13 +444,8 @@ async fn process_job(
             }
             let summary = error.persisted_summary();
             warn!(job_id = %job.id, error = summary, "source refresh failed");
-            jobs.fail(
-                &job,
-                worker_id,
-                summary,
-                chrono::Utc::now() + chrono::Duration::seconds(30),
-            )
-            .await?;
+            jobs.fail(job.id, worker_id, job.attempts, job.max_attempts, summary)
+                .await?;
         }
     }
     Ok(())
@@ -298,25 +487,76 @@ async fn run_source_refresh(
         .run(&request)
         .await
         .map_err(RefreshError::Ingest)?;
-    // Best-effort catalog reconciliation. A snapshot is already active, so a
-    // reconciliation failure leaves the previous catalog in place and is logged.
-    match source.kind {
-        SourceKind::M3u => {
-            if let Err(error) = catalog.reconcile_provider_account(source.id).await {
-                warn!(job_id = %job.id, source_id = %source.id, error = %error, "canonical channel reconciliation failed");
-            }
-            if let Err(error) = catalog.reconcile_epg_mappings().await {
-                warn!(job_id = %job.id, error = %error, "epg mapping reconciliation failed");
-            }
-        }
-        SourceKind::Xmltv => {
-            if let Err(error) = catalog.reconcile_epg_mappings().await {
-                warn!(job_id = %job.id, error = %error, "epg mapping reconciliation failed");
-            }
-        }
-        SourceKind::Xtream | SourceKind::NetworkTuner => {}
+    // Report the reconcile stage before catalog reconciliation starts. This
+    // heartbeat is best-effort; a failure does not stop the refresh.
+    let reconcile_progress = serde_json::json!({
+        "stage": "reconciling",
+        "percent": 85,
+        "bytesDownloaded": result.downloaded_bytes,
+        "recordsProcessed": result.records,
+        "message": "Reconciling channels",
+    });
+    if let Err(error) = jobs.heartbeat(job.id, worker_id, &reconcile_progress).await {
+        warn!(job_id = %job.id, error = %error, "failed to report reconcile progress");
+    }
+    // A source snapshot is active before this work starts. A hook failure
+    // therefore leaves the previous catalog output intact and is logged.
+    if let Err(error) = run_post_refresh_catalog(source.kind, source.id, catalog).await {
+        warn!(job_id = %job.id, source_id = %source.id, error = %error, "catalog post-refresh work failed");
     }
     Ok(result)
+}
+
+type CatalogFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), iptv_persistence::PersistenceError>> + Send + 'a>>;
+
+trait PostRefreshCatalog {
+    fn reconcile_provider_account(&self, source_id: Uuid) -> CatalogFuture<'_>;
+    fn reconcile_epg_mappings(&self) -> CatalogFuture<'_>;
+    fn scan_all_event_channels(&self) -> CatalogFuture<'_>;
+}
+
+impl PostRefreshCatalog for CatalogRepository {
+    fn reconcile_provider_account(&self, source_id: Uuid) -> CatalogFuture<'_> {
+        Box::pin(async move {
+            CatalogRepository::reconcile_provider_account(self, source_id)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn reconcile_epg_mappings(&self) -> CatalogFuture<'_> {
+        Box::pin(async move {
+            CatalogRepository::reconcile_epg_mappings(self)
+                .await
+                .map(|_| ())
+        })
+    }
+
+    fn scan_all_event_channels(&self) -> CatalogFuture<'_> {
+        Box::pin(async move {
+            CatalogRepository::scan_all_event_channels(self)
+                .await
+                .map(|_| ())
+        })
+    }
+}
+
+async fn run_post_refresh_catalog<C: PostRefreshCatalog>(
+    source_kind: SourceKind,
+    source_id: Uuid,
+    catalog: &C,
+) -> Result<(), iptv_persistence::PersistenceError> {
+    match source_kind {
+        SourceKind::M3u => {
+            catalog.reconcile_provider_account(source_id).await?;
+            catalog.reconcile_epg_mappings().await?;
+            catalog.scan_all_event_channels().await?;
+        }
+        SourceKind::Xmltv => catalog.reconcile_epg_mappings().await?,
+        SourceKind::Xtream | SourceKind::NetworkTuner => {}
+    }
+    Ok(())
 }
 
 fn source_id_from_payload(payload: &serde_json::Value) -> Option<Uuid> {
@@ -375,13 +615,42 @@ impl JobControl for WorkerJobControl {
         {
             return Err(IngestError::Cancelled);
         }
-        let progress = serde_json::to_value(progress)
-            .map_err(|_| IngestError::InvalidRequest("job progress could not be serialized"))?;
+        let progress = refresh_progress_json(
+            &progress.phase,
+            progress.downloaded_bytes,
+            progress.records_seen,
+        );
         self.repository
             .heartbeat(self.job_id, &self.worker_id, &progress)
             .await
             .map_err(|_| IngestError::OwnershipLost)
     }
+}
+
+/// Maps an ingest phase to the stage-based progress JSON reported through
+/// `JobRepository::heartbeat`. The stage names align with the public
+/// `GET /api/v1/sources/{source_id}/sync-status` contract.
+fn refresh_progress_json(
+    phase: &str,
+    downloaded_bytes: u64,
+    records_seen: u64,
+) -> serde_json::Value {
+    let (stage, percent, message): (&'static str, u8, &'static str) = match phase {
+        "downloading" => ("downloading", 5, "Downloading source data"),
+        "downloaded" => ("downloading", 15, "Downloaded source data"),
+        "decoded" => ("parsing", 30, "Decoded source artifact"),
+        "parsed" => ("parsing", 45, "Parsed source records"),
+        "staging" => ("parsing", 55, "Staged source records"),
+        "activated" => ("activating", 70, "Activated snapshot"),
+        _ => ("downloading", 0, "Refreshing source"),
+    };
+    serde_json::json!({
+        "stage": stage,
+        "percent": percent,
+        "bytesDownloaded": downloaded_bytes,
+        "recordsProcessed": records_seen,
+        "message": message,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -480,9 +749,78 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use axum::{Router, routing::get};
+    use std::{collections::HashMap, sync::Mutex};
 
-    const MASTER_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    const OUTPUT_TOKEN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const BOOTSTRAP_TOKEN: &str =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+
+    #[derive(Default)]
+    struct TestPostRefreshCatalog {
+        calls: Mutex<Vec<&'static str>>,
+        fail_at: Option<&'static str>,
+    }
+
+    impl TestPostRefreshCatalog {
+        fn call(&self, name: &'static str) -> Result<(), iptv_persistence::PersistenceError> {
+            self.calls.lock().unwrap().push(name);
+            if self.fail_at == Some(name) {
+                return Err(iptv_persistence::PersistenceError::InvalidSource(
+                    "test hook failure".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl PostRefreshCatalog for TestPostRefreshCatalog {
+        fn reconcile_provider_account(&self, _: Uuid) -> CatalogFuture<'_> {
+            Box::pin(async move { self.call("provider") })
+        }
+
+        fn reconcile_epg_mappings(&self) -> CatalogFuture<'_> {
+            Box::pin(async move { self.call("epg") })
+        }
+
+        fn scan_all_event_channels(&self) -> CatalogFuture<'_> {
+            Box::pin(async move { self.call("events") })
+        }
+    }
+
+    #[tokio::test]
+    async fn m3u_post_refresh_scans_events_after_reconciliation() {
+        let catalog = TestPostRefreshCatalog::default();
+        run_post_refresh_catalog(SourceKind::M3u, Uuid::now_v7(), &catalog)
+            .await
+            .expect("post-refresh work");
+        assert_eq!(catalog.calls(), ["provider", "epg", "events"]);
+    }
+
+    #[tokio::test]
+    async fn failed_or_non_m3u_post_refresh_never_scans_events() {
+        let failed = TestPostRefreshCatalog {
+            fail_at: Some("provider"),
+            ..TestPostRefreshCatalog::default()
+        };
+        assert!(
+            run_post_refresh_catalog(SourceKind::M3u, Uuid::now_v7(), &failed)
+                .await
+                .is_err()
+        );
+        assert_eq!(failed.calls(), ["provider"]);
+
+        let xmltv = TestPostRefreshCatalog::default();
+        run_post_refresh_catalog(SourceKind::Xmltv, Uuid::now_v7(), &xmltv)
+            .await
+            .expect("XMLTV post-refresh work");
+        assert_eq!(xmltv.calls(), ["epg"]);
+    }
 
     fn lookup(
         entries: &[(&str, &str)],
@@ -497,8 +835,8 @@ mod tests {
     fn required_settings() -> [(&'static str, &'static str); 4] {
         [
             ("IPTV_ADMIN_PASSWORD_HASH", "already-hashed"),
-            ("IPTV_OUTPUT_TOKEN", "output-secret"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap-secret"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
             ("IPTV_MASTER_KEY", MASTER_KEY),
         ]
     }
@@ -534,12 +872,17 @@ mod tests {
     }
 
     #[test]
+    fn tracing_initialization_accepts_the_default_filter() {
+        init_tracing();
+    }
+
+    #[test]
     fn server_environment_uses_stable_defaults() {
         let environment = server_environment_from(lookup(&required_settings())).expect("settings");
         assert_eq!(environment.bind, "0.0.0.0:8081".parse().expect("address"));
         assert_eq!(environment.public_base_url, "http://localhost:8080");
-        assert_eq!(environment.output_token, "output-secret");
-        assert_eq!(environment.admin_bootstrap_token, "bootstrap-secret");
+        assert_eq!(environment.output_token, OUTPUT_TOKEN);
+        assert_eq!(environment.admin_bootstrap_token, BOOTSTRAP_TOKEN);
         assert_eq!(environment.admin_password_hash, "already-hashed");
         assert_eq!(environment.tuner_count, 1);
     }
@@ -550,8 +893,8 @@ mod tests {
             ("IPTV_BIND", "127.0.0.1:9000"),
             ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
             ("IPTV_PUBLIC_BASE_URL", "https://iptv.example.test/base"),
-            ("IPTV_OUTPUT_TOKEN", "output"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
             ("IPTV_MASTER_KEY", MASTER_KEY),
             ("IPTV_TUNER_COUNT", "7"),
         ]))
@@ -569,8 +912,8 @@ mod tests {
         for value in ["", "not-a-number", "65536", "-1"] {
             let environment = server_environment_from(lookup(&[
                 ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
-                ("IPTV_OUTPUT_TOKEN", "output"),
-                ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+                ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+                ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
                 ("IPTV_MASTER_KEY", MASTER_KEY),
                 ("IPTV_TUNER_COUNT", value),
             ]))
@@ -580,16 +923,16 @@ mod tests {
     }
 
     #[test]
-    fn zero_tuners_remains_accepted_for_backward_compatibility() {
+    fn zero_tuners_uses_the_supported_default() {
         let environment = server_environment_from(lookup(&[
             ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
-            ("IPTV_OUTPUT_TOKEN", "output"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
             ("IPTV_MASTER_KEY", MASTER_KEY),
             ("IPTV_TUNER_COUNT", "0"),
         ]))
-        .expect("zero was accepted by the original parser");
-        assert_eq!(environment.tuner_count, 0);
+        .expect("zero tuner count defaults");
+        assert_eq!(environment.tuner_count, 1);
     }
 
     #[test]
@@ -597,8 +940,8 @@ mod tests {
         for optional_hash in [None, Some("  ")] {
             let mut entries = vec![
                 ("IPTV_ADMIN_PASSWORD", "correct horse battery staple"),
-                ("IPTV_OUTPUT_TOKEN", "output"),
-                ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+                ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+                ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
                 ("IPTV_MASTER_KEY", MASTER_KEY),
             ];
             if let Some(hash) = optional_hash {
@@ -618,8 +961,8 @@ mod tests {
         let bind_error = server_environment_from(lookup(&[
             ("IPTV_BIND", "not-an-address"),
             ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
-            ("IPTV_OUTPUT_TOKEN", "output"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
             ("IPTV_MASTER_KEY", MASTER_KEY),
         ]))
         .expect_err("invalid bind");
@@ -644,8 +987,8 @@ mod tests {
         let invalid = "not-a-valid-master-key";
         let error = server_environment_from(lookup(&[
             ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
-            ("IPTV_OUTPUT_TOKEN", "output"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
             ("IPTV_MASTER_KEY", invalid),
         ]))
         .expect_err("invalid master key");
@@ -656,8 +999,8 @@ mod tests {
     #[test]
     fn missing_plaintext_password_is_reported_when_hash_is_unavailable() {
         let error = server_environment_from(lookup(&[
-            ("IPTV_OUTPUT_TOKEN", "output"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
         ]))
         .expect_err("missing password");
         assert!(error.to_string().contains("IPTV_ADMIN_PASSWORD"));
@@ -673,8 +1016,8 @@ mod tests {
         };
         let config = environment.into_config(versions);
         assert_eq!(config.public_base_url, "http://localhost:8080");
-        assert_eq!(config.output_token, "output-secret");
-        assert_eq!(config.admin_bootstrap_token, "bootstrap-secret");
+        assert_eq!(config.output_token, OUTPUT_TOKEN);
+        assert_eq!(config.admin_bootstrap_token, BOOTSTRAP_TOKEN);
         assert_eq!(config.admin_password_hash, "already-hashed");
         assert_eq!(config.tuner_count, 1);
         assert_eq!(config.runtime_versions.gateway, "gateway-version");
@@ -686,11 +1029,26 @@ mod tests {
     }
 
     #[test]
+    fn server_environment_debug_redacts_all_plaintext_secrets() {
+        let environment = server_environment_from(lookup(&required_settings())).expect("settings");
+        let debug = format!("{environment:?}");
+        assert!(debug.contains("0.0.0.0:8081"));
+        assert!(debug.contains("<redacted>"));
+        for secret in [OUTPUT_TOKEN, BOOTSTRAP_TOKEN, "already-hashed"] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[test]
     fn worker_id_uses_override_or_default() {
         assert_eq!(worker_id_from(lookup(&[])), "worker-1");
         assert_eq!(
             worker_id_from(lookup(&[("IPTV_WORKER_ID", "worker-blue")])),
             "worker-blue"
+        );
+        assert_eq!(
+            worker_id_from(lookup(&[("HOSTNAME", "compose-worker-3")])),
+            "compose-worker-3"
         );
     }
 
@@ -817,8 +1175,8 @@ mod tests {
         let environment = server_environment_from(lookup(&[
             ("IPTV_BIND", "[::1]:8081"),
             ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
-            ("IPTV_OUTPUT_TOKEN", "output"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
             ("IPTV_MASTER_KEY", MASTER_KEY),
         ]))
         .expect("IPv6 bind");
@@ -829,8 +1187,8 @@ mod tests {
     fn maximum_tuner_count_is_supported() {
         let environment = server_environment_from(lookup(&[
             ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
-            ("IPTV_OUTPUT_TOKEN", "output"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
             ("IPTV_MASTER_KEY", MASTER_KEY),
             ("IPTV_TUNER_COUNT", "65535"),
         ]))
@@ -842,8 +1200,8 @@ mod tests {
     fn configured_hash_is_preserved_byte_for_byte() {
         let environment = server_environment_from(lookup(&[
             ("IPTV_ADMIN_PASSWORD_HASH", "  precomputed hash  "),
-            ("IPTV_OUTPUT_TOKEN", "output"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
             ("IPTV_MASTER_KEY", MASTER_KEY),
         ]))
         .expect("precomputed hash");
@@ -855,8 +1213,8 @@ mod tests {
         let environment = server_environment_from(lookup(&[
             ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
             ("IPTV_PUBLIC_BASE_URL", ""),
-            ("IPTV_OUTPUT_TOKEN", "output"),
-            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "bootstrap"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
             ("IPTV_MASTER_KEY", MASTER_KEY),
         ]))
         .expect("blank public URL");
@@ -864,21 +1222,84 @@ mod tests {
     }
 
     #[test]
-    fn explicitly_blank_required_secrets_remain_accepted() {
-        let environment = server_environment_from(lookup(&[
-            ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
+    fn blank_short_and_placeholder_tokens_fail_closed() {
+        for (name, value) in [
             ("IPTV_OUTPUT_TOKEN", ""),
+            ("IPTV_OUTPUT_TOKEN", "short"),
+            (
+                "IPTV_OUTPUT_TOKEN",
+                "development-output-token-change-me-00000000000000000000000000000000",
+            ),
             ("IPTV_ADMIN_BOOTSTRAP_TOKEN", ""),
-            ("IPTV_MASTER_KEY", MASTER_KEY),
-        ]))
-        .expect("presence, rather than content, is required");
-        assert!(environment.output_token.is_empty());
-        assert!(environment.admin_bootstrap_token.is_empty());
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", "short"),
+            (
+                "IPTV_ADMIN_BOOTSTRAP_TOKEN",
+                "replace-with-bootstrap-token-00000000000000000000000000000000",
+            ),
+        ] {
+            let mut entries = required_settings().to_vec();
+            entries.retain(|(entry_name, _)| *entry_name != name);
+            entries.push((name, value));
+            let error = server_environment_from(lookup(&entries)).expect_err("invalid token");
+            assert!(error.to_string().contains(name));
+            if !value.is_empty() {
+                assert!(!error.to_string().contains(value));
+            }
+        }
     }
 
     #[test]
-    fn blank_worker_id_is_preserved() {
-        assert_eq!(worker_id_from(lookup(&[("IPTV_WORKER_ID", "")])), "");
+    fn tokens_reject_characters_outside_hexadecimal_and_base64() {
+        for (name, value) in [
+            (
+                "IPTV_OUTPUT_TOKEN",
+                "!1111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            (
+                "IPTV_ADMIN_BOOTSTRAP_TOKEN",
+                "?2222222222222222222222222222222222222222222222222222222222222222",
+            ),
+        ] {
+            let mut entries = required_settings().to_vec();
+            entries.retain(|(entry_name, _)| *entry_name != name);
+            entries.push((name, value));
+            let error = server_environment_from(lookup(&entries)).expect_err("invalid token");
+            assert!(error.to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn blank_short_and_placeholder_passwords_fail_closed() {
+        for password in [
+            "",
+            "short",
+            "development-admin-password-change-me",
+            " replace-this-password ",
+        ] {
+            let error = server_environment_from(lookup(&[
+                ("IPTV_ADMIN_PASSWORD", password),
+                ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+                ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
+                ("IPTV_MASTER_KEY", MASTER_KEY),
+            ]))
+            .expect_err("invalid password");
+            assert!(error.to_string().contains("IPTV_ADMIN_PASSWORD"));
+            if !password.is_empty() {
+                assert!(!error.to_string().contains(password));
+            }
+        }
+    }
+
+    #[test]
+    fn blank_worker_id_falls_back_to_hostname_then_default() {
+        assert_eq!(
+            worker_id_from(lookup(&[("IPTV_WORKER_ID", "")])),
+            "worker-1"
+        );
+        assert_eq!(
+            worker_id_from(lookup(&[("IPTV_WORKER_ID", ""), ("HOSTNAME", "pod-abc")])),
+            "pod-abc"
+        );
     }
 
     #[test]
@@ -904,8 +1325,8 @@ mod tests {
             queried.push(name.to_owned());
             match name {
                 "IPTV_ADMIN_PASSWORD_HASH" => Ok("hash".to_owned()),
-                "IPTV_OUTPUT_TOKEN" => Ok("output".to_owned()),
-                "IPTV_ADMIN_BOOTSTRAP_TOKEN" => Ok("bootstrap".to_owned()),
+                "IPTV_OUTPUT_TOKEN" => Ok(OUTPUT_TOKEN.to_owned()),
+                "IPTV_ADMIN_BOOTSTRAP_TOKEN" => Ok(BOOTSTRAP_TOKEN.to_owned()),
                 "IPTV_MASTER_KEY" => Ok(MASTER_KEY.to_owned()),
                 _ => Err(env::VarError::NotPresent),
             }
@@ -1067,6 +1488,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refresh_progress_maps_each_ingest_phase_to_the_public_stage_contract() {
+        for (phase, stage, percent, message) in [
+            ("downloading", "downloading", 5, "Downloading source data"),
+            ("downloaded", "downloading", 15, "Downloaded source data"),
+            ("decoded", "parsing", 30, "Decoded source artifact"),
+            ("parsed", "parsing", 45, "Parsed source records"),
+            ("staging", "parsing", 55, "Staged source records"),
+            ("activated", "activating", 70, "Activated snapshot"),
+            ("unknown", "downloading", 0, "Refreshing source"),
+        ] {
+            let progress = refresh_progress_json(phase, 123, 7);
+            assert_eq!(progress["stage"], stage);
+            assert_eq!(progress["percent"], percent);
+            assert_eq!(progress["bytesDownloaded"], 123);
+            assert_eq!(progress["recordsProcessed"], 7);
+            assert_eq!(progress["message"], message);
+        }
+    }
+
+    #[tokio::test]
+    async fn database_reports_missing_database_url_before_connecting() {
+        // The process test environment does not set this variable.
+        if env::var_os("DATABASE_URL").is_some() {
+            return;
+        }
+        let error = database().await.expect_err("missing database URL");
+        assert!(error.to_string().contains("DATABASE_URL"));
+    }
+
     async fn integration_database() -> Option<Database> {
         let url = std::env::var("IPTV_TEST_DATABASE_URL").ok()?;
         let database = Database::connect(&url, 4)
@@ -1074,6 +1525,34 @@ mod tests {
             .expect("connect to test database");
         database.migrate().await.expect("run migrations");
         Some(database)
+    }
+
+    async fn isolated_integration_database() -> Option<(Database, Database, String)> {
+        let database_url = std::env::var("IPTV_TEST_DATABASE_URL").ok()?;
+        let admin = Database::connect(&database_url, 2)
+            .await
+            .expect("connect to test database");
+        let schema = format!("iptv_gateway_test_{}", Uuid::now_v7().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(admin.pool())
+            .await
+            .expect("create isolated test schema");
+
+        let mut url = Url::parse(&database_url).expect("parse test database URL");
+        url.query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema},public"));
+        let database = Database::connect(url.as_str(), 4)
+            .await
+            .expect("connect to isolated test schema");
+        database.migrate().await.expect("run isolated migrations");
+        Some((admin, database, schema))
+    }
+
+    async fn drop_isolated_schema(admin: &Database, schema: &str) {
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(admin.pool())
+            .await
+            .expect("drop isolated test schema");
     }
 
     async fn force_running(pool: &sqlx::PgPool, job_id: Uuid, worker_id: &str) {
@@ -1304,6 +1783,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_job_leaves_a_cancelled_refresh_in_cancelled_state() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let jobs = JobRepository::new(pool.clone());
+        let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([1_u8; 32]));
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let worker_id = "test-worker-cancelled-refresh";
+        let mut new_job = iptv_persistence::NewJob::immediate(
+            "refresh-source",
+            serde_json::json!({"notSourceId": true}),
+        );
+        new_job.max_attempts = 1;
+        let job = jobs.enqueue(&new_job).await.expect("enqueue refresh job");
+        force_running(&pool, job.id, worker_id).await;
+        jobs.cancel(job.id).await.expect("cancel refresh job");
+        let record = fetch_job(&pool, job.id).await;
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            record,
+        )
+        .await
+        .expect("process cancelled refresh");
+        assert_eq!(job_status(&pool, job.id).await, "cancelled");
+        delete_job(&pool, job.id).await;
+    }
+
+    #[tokio::test]
     async fn process_job_fails_refresh_source_for_unsupported_xtream_source() {
         let Some(database) = integration_database().await else {
             eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
@@ -1354,6 +1870,246 @@ mod tests {
             .expect("error was persisted");
         assert!(error.contains("source type is not supported"));
         delete_source(&pool, source_id).await;
+    }
+
+    #[tokio::test]
+    async fn process_job_completes_a_local_m3u_refresh_and_reconciles_catalog() {
+        let Some((admin, database, schema)) = isolated_integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let suffix = Uuid::now_v7();
+        let event_group = format!("Worker events {suffix}");
+        let playlist = format!(
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"coverage-local-{suffix}\" group-title=\"{event_group}\",Event 7: Broncos vs Chiefs 2026-09-14 00:20 HD\nhttp://provider.invalid/live.ts\n"
+        );
+        let parsed = iptv_parsers::parse_m3u(
+            std::io::Cursor::new(&playlist),
+            iptv_parsers::ParseLimits::default(),
+        )
+        .expect("parse isolated M3U fixture");
+        assert_eq!(parsed.entries.len(), 1, "{:#?}", parsed.diagnostics);
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind source fixture");
+        let address = listener.local_addr().expect("source fixture address");
+        let source_app = Router::new().route(
+            "/playlist.m3u",
+            get(move || {
+                let playlist = playlist.clone();
+                async move { playlist }
+            }),
+        );
+        let source_server = tokio::spawn(async move {
+            axum::serve(listener, source_app)
+                .await
+                .expect("serve source fixture");
+        });
+
+        let pool = database.pool().clone();
+        let master_key = MasterKey::from_bytes([3_u8; 32]);
+        let jobs = JobRepository::new(pool.clone());
+        let sources = SourceRepository::new(pool.clone(), master_key.clone());
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let worker_id = "test-worker-m3u-success";
+        let event_template = catalog
+            .create_event_template(iptv_persistence::CreateEventTemplate {
+                name: format!("worker-events-{suffix}"),
+                display_name: "Worker sports".to_owned(),
+                match_regex: "Broncos".to_owned(),
+                channel_name_format: "{home} vs {away}".to_owned(),
+                group_name: event_group,
+                event_duration_hours: 3,
+                past_date_grace_hours: 1,
+                future_date_days: 1,
+            })
+            .await
+            .expect("create event template");
+        let created = sources
+            .create(
+                &iptv_persistence::NewSource {
+                    name: format!("M3U coverage test {suffix}"),
+                    kind: SourceKind::M3u,
+                    endpoint: format!("http://{address}/playlist.m3u"),
+                },
+                "coverage-test",
+            )
+            .await
+            .expect("create M3U source");
+        let source_id = created.source.id;
+        sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE id = $1")
+            .bind(created.refresh_job.id)
+            .execute(&pool)
+            .await
+            .expect("set max attempts");
+        force_running(&pool, created.refresh_job.id, worker_id).await;
+        let record = fetch_job(&pool, created.refresh_job.id).await;
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            record,
+        )
+        .await
+        .expect("process M3U refresh");
+        let status = job_status(&pool, created.refresh_job.id).await;
+        assert_eq!(
+            status,
+            "succeeded",
+            "M3U refresh failed: {:?}",
+            job_last_error(&pool, created.refresh_job.id).await
+        );
+        let snapshot_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM source_snapshots WHERE provider_account_id = $1 AND status = 'active'",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count active snapshots");
+        assert_eq!(snapshot_count, 1);
+        let event_channels = catalog
+            .list_event_channels(Some(event_template.id))
+            .await
+            .expect("list generated event channels");
+        assert_eq!(event_channels.len(), 1);
+        let channel_id = event_channels[0].channel_id.expect("event channel target");
+        let programmes = catalog
+            .list_programmes_for_channels(&[channel_id])
+            .await
+            .expect("list generated programmes");
+        assert_eq!(programmes.len(), 3);
+        assert!(
+            programmes
+                .iter()
+                .any(|programme| programme.title == "Broncos vs Chiefs")
+        );
+
+        catalog
+            .delete_event_template(event_template.id)
+            .await
+            .expect("delete event template");
+        delete_source(&pool, source_id).await;
+        source_server.abort();
+        drop(database);
+        drop_isolated_schema(&admin, &schema).await;
+    }
+
+    #[tokio::test]
+    async fn process_job_stops_ingest_when_a_refresh_is_cancelled() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let master_key = MasterKey::from_bytes([4_u8; 32]);
+        let jobs = JobRepository::new(pool.clone());
+        let sources = SourceRepository::new(pool.clone(), master_key.clone());
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let worker_id = "test-worker-cancelled-ingest";
+        let suffix = Uuid::now_v7();
+        let created = sources
+            .create(
+                &iptv_persistence::NewSource {
+                    name: format!("Cancelled M3U coverage test {suffix}"),
+                    kind: SourceKind::M3u,
+                    endpoint: "http://127.0.0.1:1/never.m3u".to_owned(),
+                },
+                "coverage-test",
+            )
+            .await
+            .expect("create M3U source");
+        force_running(&pool, created.refresh_job.id, worker_id).await;
+        jobs.cancel(created.refresh_job.id)
+            .await
+            .expect("cancel refresh job");
+        let record = fetch_job(&pool, created.refresh_job.id).await;
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            record,
+        )
+        .await
+        .expect("process cancelled ingest");
+        assert_eq!(job_status(&pool, created.refresh_job.id).await, "cancelled");
+        delete_source(&pool, created.source.id).await;
+    }
+
+    #[tokio::test]
+    async fn process_job_completes_a_local_xmltv_refresh_and_reconciles_epg() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind EPG fixture");
+        let address = listener.local_addr().expect("EPG fixture address");
+        let source_app = Router::new().route(
+            "/guide.xml",
+            get(|| async {
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><tv><channel id=\"coverage-epg\"><display-name>Coverage EPG</display-name></channel><programme start=\"20260820130000 +0000\" stop=\"20260820140000 +0000\" channel=\"coverage-epg\"><title>Coverage Programme</title></programme></tv>"
+            }),
+        );
+        let source_server = tokio::spawn(async move {
+            axum::serve(listener, source_app)
+                .await
+                .expect("serve EPG fixture");
+        });
+
+        let pool = database.pool().clone();
+        let master_key = MasterKey::from_bytes([5_u8; 32]);
+        let jobs = JobRepository::new(pool.clone());
+        let sources = SourceRepository::new(pool.clone(), master_key.clone());
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let worker_id = "test-worker-xmltv-success";
+        let suffix = Uuid::now_v7();
+        let created = sources
+            .create(
+                &iptv_persistence::NewSource {
+                    name: format!("XMLTV coverage test {suffix}"),
+                    kind: SourceKind::Xmltv,
+                    endpoint: format!("http://{address}/guide.xml"),
+                },
+                "coverage-test",
+            )
+            .await
+            .expect("create XMLTV source");
+        let source_id = created.source.id;
+        force_running(&pool, created.refresh_job.id, worker_id).await;
+        let record = fetch_job(&pool, created.refresh_job.id).await;
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            record,
+        )
+        .await
+        .expect("process XMLTV refresh");
+        assert_eq!(job_status(&pool, created.refresh_job.id).await, "succeeded");
+        let snapshot_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM source_snapshots WHERE epg_source_id = $1 AND status = 'active'",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count active EPG snapshots");
+        assert_eq!(snapshot_count, 1);
+
+        delete_source(&pool, source_id).await;
+        source_server.abort();
     }
 
     #[tokio::test]
