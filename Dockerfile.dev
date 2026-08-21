@@ -1,0 +1,48 @@
+FROM rust:1.97-bookworm AS chef
+RUN cargo install cargo-chef --locked && rm -rf /usr/local/cargo/registry/cache
+WORKDIR /build
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY apps/server/Cargo.toml apps/server/Cargo.toml
+COPY crates/api/Cargo.toml crates/api/Cargo.toml
+COPY crates/domain/Cargo.toml crates/domain/Cargo.toml
+COPY crates/ingest/Cargo.toml crates/ingest/Cargo.toml
+COPY crates/media/Cargo.toml crates/media/Cargo.toml
+COPY crates/parsers/Cargo.toml crates/parsers/Cargo.toml
+COPY crates/persistence/Cargo.toml crates/persistence/Cargo.toml
+COPY apps/server/src apps/server/src
+COPY crates/api/src crates/api/src
+COPY crates/domain/src crates/domain/src
+COPY crates/ingest/src crates/ingest/src
+COPY crates/media/src crates/media/src
+COPY crates/parsers/src crates/parsers/src
+COPY crates/persistence/src crates/persistence/src
+COPY migrations migrations
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+# Cook dependencies in release mode — this layer is cached until Cargo.toml/lock changes.
+# Limit parallelism to avoid OOM kills in Docker Desktop on macOS.
+RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 CARGO_PROFILE_RELEASE_DEBUG=0 cargo chef cook --release -j 2 --recipe-path recipe.json
+
+# Runtime stage: Rust toolchain + runtime deps + pre-cooked artifacts + watchexec.
+# Source code is mounted at runtime via docker-compose volumes.
+FROM rust:1.97-bookworm AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg vlc-bin vlc-plugin-base inotify-tools bash \
+    && rm -rf /var/lib/apt/lists/*
+# Install watchexec (pre-built .deb package, no compilation needed).
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "$ARCH" in arm64) ARCH=aarch64;; amd64) ARCH=x86_64;; esac && \
+    curl -sSL -o /tmp/watchexec.deb "https://github.com/watchexec/watchexec/releases/download/v2.3.0/watchexec-2.3.0-${ARCH}-unknown-linux-musl.deb" && \
+    dpkg -i /tmp/watchexec.deb && rm /tmp/watchexec.deb
+# Copy the cargo registry cache so cargo does not re-download dependencies.
+COPY --from=builder /usr/local/cargo/registry/cache /usr/local/cargo/registry/cache
+# Copy the pre-cooked target directory. The named volume in docker-compose
+# preserves incremental compilation artifacts across container restarts.
+COPY --from=builder /build/target /build/target
+WORKDIR /build
+ENV CARGO_TARGET_DIR=/build/target
+COPY scripts/dev-reload.sh /usr/local/bin/dev-reload.sh

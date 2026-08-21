@@ -9,7 +9,7 @@ services:
       web:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "${IPTV_GATEWAY_BIND:-127.0.0.1}:${IPTV_GATEWAY_PORT:-8080}:8080"
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
     restart: unless-stopped
@@ -30,18 +30,20 @@ services:
     restart: unless-stopped
 
   core:
+    image: iptv-gateway-core:local
     build:
       context: .
     command: ["serve"]
     environment:
-      DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:-iptv-development}@postgres:5432/iptv
+      DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/iptv
       IPTV_BIND: 0.0.0.0:8081
       IPTV_PUBLIC_BASE_URL: ${IPTV_PUBLIC_BASE_URL:-http://localhost:8080}
-      IPTV_OUTPUT_TOKEN: ${IPTV_OUTPUT_TOKEN:-development-output-token-change-me}
-      IPTV_ADMIN_BOOTSTRAP_TOKEN: ${IPTV_ADMIN_BOOTSTRAP_TOKEN:-development-bootstrap-token-change-me}
-      IPTV_ADMIN_PASSWORD: ${IPTV_ADMIN_PASSWORD:-development-admin-password-change-me}
+      IPTV_OUTPUT_TOKEN: ${IPTV_OUTPUT_TOKEN:?Set IPTV_OUTPUT_TOKEN}
+      IPTV_ADMIN_BOOTSTRAP_TOKEN: ${IPTV_ADMIN_BOOTSTRAP_TOKEN:?Set IPTV_ADMIN_BOOTSTRAP_TOKEN}
+      IPTV_ADMIN_PASSWORD: ${IPTV_ADMIN_PASSWORD:-}
       IPTV_ADMIN_PASSWORD_HASH: ${IPTV_ADMIN_PASSWORD_HASH:-}
-      IPTV_MASTER_KEY: ${IPTV_MASTER_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+      IPTV_MASTER_KEY: ${IPTV_MASTER_KEY:?Set IPTV_MASTER_KEY}
+      IPTV_TUNER_COUNT: ${IPTV_TUNER_COUNT:-1}
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres:
@@ -56,18 +58,26 @@ services:
     restart: unless-stopped
 
   worker:
-    build:
-      context: .
+    image: iptv-gateway-core:local
     command: ["worker"]
+    deploy:
+      replicas: ${IPTV_WORKER_COUNT:-4}
     environment:
-      DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:-iptv-development}@postgres:5432/iptv
-      IPTV_WORKER_ID: compose-worker-1
-      IPTV_MASTER_KEY: ${IPTV_MASTER_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+      DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/iptv
+      IPTV_MASTER_KEY: ${IPTV_MASTER_KEY:?Set IPTV_MASTER_KEY}
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres:
         condition: service_healthy
+    stop_grace_period: 60s
+    stop_signal: SIGTERM
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h postgres -U iptv -d iptv || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   postgres:
     image: postgres:17-alpine
@@ -76,7 +86,7 @@ services:
     environment:
       POSTGRES_DB: iptv
       POSTGRES_USER: iptv
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-iptv-development}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -87,8 +97,7 @@ services:
     restart: unless-stopped
 
   fake-provider:
-    build:
-      context: .
+    image: iptv-gateway-core:local
     entrypoint: ["test-provider"]
     profiles: ["test"]
     environment:
@@ -111,8 +120,7 @@ services:
       - "8666-8668"
 
   media-acceptance:
-    build:
-      context: .
+    image: iptv-gateway-core:local
     entrypoint: ["media-acceptance"]
     profiles: ["test"]
     environment:
@@ -124,8 +132,7 @@ services:
     restart: "no"
 
   fault-acceptance:
-    build:
-      context: .
+    image: iptv-gateway-core:local
     entrypoint: ["fault-acceptance"]
     profiles: ["test"]
     environment:
@@ -141,8 +148,7 @@ services:
     restart: "no"
 
   live-acceptance:
-    build:
-      context: .
+    image: iptv-gateway-core:local
     entrypoint: ["live-acceptance"]
     profiles: ["test"]
     environment:

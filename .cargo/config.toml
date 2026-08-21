@@ -1,0 +1,4 @@
+[test]
+# Run integration tests with one thread per CPU core.
+# The default already uses all cores, but this makes the intent explicit.
+threads = "num-cpus"

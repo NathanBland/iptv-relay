@@ -1,0 +1,52 @@
+# Development override: hot-reload Rust and web via volume mounts.
+# Usage: make compose-dev-up  (or: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up)
+#
+# The first build cooks dependencies into the Docker image (~2 min).
+# Source changes trigger incremental rebuilds in ~10-30 seconds.
+# The target/ directory persists in a named volume across restarts.
+# Docker Desktop on macOS does not propagate inotify events through bind
+# mounts, so the dev-reload.sh script polls file mtimes every second.
+services:
+  core:
+    image: iptv-gateway-core:dev
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    entrypoint: []
+    volumes:
+      - ./:/build:cached
+      - cargo-target:/build/target
+    command: ["/usr/local/bin/dev-reload.sh", "/build/crates /build/apps/server/src /build/migrations", "cargo", "run", "--release", "-j", "2", "--bin", "iptv-gateway", "--", "serve"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,iptv=debug}
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8081/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 300s
+
+  worker:
+    # Worker uses the production image in dev mode.
+    # Worker count is controlled by IPTV_WORKER_COUNT (default: 4).
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./apps/web:/app:cached
+      - web-node-modules:/app/node_modules
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+volumes:
+  cargo-target:
+  web-node-modules:

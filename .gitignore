@@ -13,3 +13,4 @@
 /data/
 *.profraw
 lcov.info
+/.pnpm-store/
