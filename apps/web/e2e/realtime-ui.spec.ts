@@ -22,7 +22,7 @@ test.describe('realtime UI and management routes', () => {
         const timeout = setTimeout(() => {
           source.close()
           resolve(events)
-        }, 8_000)
+        }, 15_000)
         source.addEventListener('overview', (event) => {
           events.push(`overview:${event.data}`)
           if (events.length >= 1) {

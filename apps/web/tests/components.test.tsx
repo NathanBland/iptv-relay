@@ -13,6 +13,7 @@ import { PageHeader } from '@/components/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Combobox } from '@/components/ui/combobox'
 import { FieldMessage, Input, Select } from '@/components/ui/input'
 import { IptvApiError, MockIptvApiClient } from '@/lib/api/client'
 
@@ -78,5 +79,47 @@ describe('owned management components', () => {
     render(<LogoutButton client={client} onLoggedOut={vi.fn()} />)
     await userEvent.click(screen.getByRole('button', { name: 'Sign out' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Session could not be cleared.')
+  })
+
+  it('filters combobox items by search query and selects on click', async () => {
+    const onChange = vi.fn()
+    const items = [
+      { value: 'sports', label: 'Sports' },
+      { value: 'news', label: 'News' },
+      { value: 'movies', label: 'Movies' },
+    ]
+    render(<Combobox items={items} value="" onChange={onChange} placeholder="All groups" />)
+    const trigger = screen.getByRole('button', { name: 'All groups' })
+    await userEvent.click(trigger)
+    expect(screen.getByRole('listbox')).toBeVisible()
+    expect(screen.getByRole('option', { name: /Sports/ })).toBeVisible()
+    expect(screen.getByRole('option', { name: /News/ })).toBeVisible()
+    expect(screen.getByRole('option', { name: /Movies/ })).toBeVisible()
+    const searchInput = screen.getByRole('combobox')
+    await userEvent.type(searchInput, 'new')
+    expect(screen.queryByRole('option', { name: /Sports/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /Movies/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /News/ })).toBeVisible()
+    await userEvent.click(screen.getByRole('option', { name: /News/ }).querySelector('button')!)
+    expect(onChange).toHaveBeenCalledWith('news')
+  })
+
+  it('shows empty text when no items match the search', async () => {
+    const onChange = vi.fn()
+    const items = [{ value: 'sports', label: 'Sports' }]
+    render(<Combobox items={items} value="" onChange={onChange} placeholder="All groups" />)
+    await userEvent.click(screen.getByRole('button', { name: 'All groups' }))
+    await userEvent.type(screen.getByRole('combobox'), 'xyz')
+    expect(screen.getByText('No items found.')).toBeVisible()
+  })
+
+  it('closes the popover on Escape', async () => {
+    const onChange = vi.fn()
+    const items = [{ value: 'a', label: 'Alpha' }]
+    render(<Combobox items={items} value="" onChange={onChange} placeholder="Pick" />)
+    await userEvent.click(screen.getByRole('button', { name: 'Pick' }))
+    expect(screen.getByRole('listbox')).toBeVisible()
+    await userEvent.keyboard('{Escape}')
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
   })
 })

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { MockIptvApiClient, apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
+import { partitionProgrammesAt } from '@/lib/programmes'
 import { cn, formatBitrate, formatRelativeTime } from '@/lib/utils'
 
 describe('typed API boundary', () => {
@@ -13,7 +14,7 @@ describe('typed API boundary', () => {
     expect(sources).toHaveLength(3)
     expect(channels.items.length).toBeGreaterThan(10)
     expect(programmes.items.length).toBeGreaterThan(10)
-    expect(events[0]?.programmeTitle).toContain('Broncos')
+    expect(events).toEqual([])
     expect(sessions).toHaveLength(3)
     expect(sessions.reduce((total, session) => total + session.viewerCount, 0)).toBe(6)
 
@@ -24,8 +25,8 @@ describe('typed API boundary', () => {
   it('validates and creates sources', async () => {
     const client = new MockIptvApiClient()
     await expect(client.createSource({ name: ' ', kind: 'M3U', endpoint: '' })).rejects.toThrow('required')
-    const source = await client.createSource({ name: '  Backup  ', kind: 'M3U', endpoint: ' https://backup.invalid/list.m3u ' })
-    expect(source).toMatchObject({ name: 'Backup', state: 'syncing', endpoint: 'https://backup.invalid/list.m3u' })
+    const source = await client.createSource({ name: '  Backup  ', kind: 'M3U', endpoint: ' https://backup.invalid/list.m3u ', timezone: 'America/Denver' })
+    expect(source).toMatchObject({ name: 'Backup', state: 'syncing', endpoint: 'https://backup.invalid/list.m3u', timezone: 'America/Denver' })
     expect(await client.getSources()).toHaveLength(4)
   })
 
@@ -57,6 +58,21 @@ describe('typed API boundary', () => {
 })
 
 describe('display utilities', () => {
+  it('selects current and upcoming programme instants at a fixed clock', () => {
+    const winterNow = Date.parse('2026-01-01T19:00:00Z')
+    const summerNow = Date.parse('2026-07-01T18:00:00Z')
+    const programmes = [
+      { id: 'utc', channel: 'UTC', title: 'UTC current', start: '2026-01-01T18:30:00Z', end: '2026-01-01T19:30:00Z', source: 'XMLTV', confidence: 100 },
+      { id: 'winter', channel: 'Denver', title: 'Winter local noon', start: '2026-01-01T19:00:00Z', end: '2026-01-01T20:00:00Z', source: 'XMLTV', confidence: 100 },
+      { id: 'summer', channel: 'Denver', title: 'Summer local noon', start: '2026-07-01T18:00:00Z', end: '2026-07-01T19:00:00Z', source: 'XMLTV', confidence: 100 },
+      { id: 'next', channel: 'Denver', title: 'Next', start: '2026-07-01T19:00:00Z', end: '2026-07-01T20:00:00Z', source: 'XMLTV', confidence: 100 },
+    ]
+    expect(partitionProgrammesAt(programmes, winterNow).current.map((item) => item.id)).toEqual(['utc', 'winter'])
+    const summer = partitionProgrammesAt(programmes, summerNow)
+    expect(summer.current.map((item) => item.id)).toEqual(['summer'])
+    expect(summer.upcoming.map((item) => item.id)).toEqual(['next'])
+  })
+
   it('merges classes and formats bitrate', () => {
     expect(cn('px-2', false, 'px-4')).toBe('px-4')
     expect(formatBitrate(800)).toBe('800 Kbps')

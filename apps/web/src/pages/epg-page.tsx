@@ -1,30 +1,41 @@
-import { useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { CalendarDays, Search } from 'lucide-react'
-import { useMemo, useRef, useState } from 'react'
+import { CalendarDays, ChevronLeft, ChevronRight, Search } from 'lucide-react'
+import { useRef, useState } from 'react'
 import { PageHeader } from '@/components/page-header'
 import { LoadingPage } from '@/components/loading-page'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
+import { useDebouncedValue } from '@/lib/hooks/use-debounced-value'
 import type { IptvApiClient } from '@/lib/api/types'
+
+const PAGE_SIZE = 100
 
 const timeFormatter = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Denver' })
 
 export function EpgPage({ client = apiClient }: { client?: IptvApiClient }) {
-  const query = useQuery({ ...apiQueries(client).programmes({ limit: 500 }) })
+  const [searchInput, setSearchInput] = useState('')
+  const [page, setPage] = useState(0)
+  const debouncedSearch = useDebouncedValue(searchInput, 300)
+  const programmeQuery = {
+    limit: PAGE_SIZE,
+    offset: page * PAGE_SIZE,
+    ...(debouncedSearch ? { search: debouncedSearch } : {}),
+  }
+  const query = useQuery({
+    ...apiQueries(client).programmes(programmeQuery),
+    placeholderData: keepPreviousData,
+  })
   const programmes = query.data?.items ?? []
   const total = query.data?.total ?? 0
-  const [filter, setFilter] = useState('')
-  const visibleProgrammes = useMemo(() => {
-    const term = filter.trim().toLowerCase()
-    return term ? programmes.filter((programme) => `${programme.channel} ${programme.title} ${programme.source}`.toLowerCase().includes(term)) : programmes
-  }, [filter, programmes])
+  const pageCount = Math.ceil(total / PAGE_SIZE)
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
-    count: visibleProgrammes.length,
+    count: programmes.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => 76,
     overscan: 5,
@@ -33,30 +44,32 @@ export function EpgPage({ client = apiClient }: { client?: IptvApiClient }) {
   const measuredItems = virtualizer.getVirtualItems()
   const virtualItems = measuredItems.length > 0
     ? measuredItems
-    : visibleProgrammes.slice(0, 11).map((programme, index) => ({ key: programme.id, index, size: 76, start: index * 76 }))
+    : programmes.slice(0, 11).map((programme, index) => ({ key: programme.id, index, size: 76, start: index * 76 }))
 
   if (!query.data) return <LoadingPage label="programme guide" />
 
   return (
     <>
-      <PageHeader eyebrow="Guide" title="EPG" description="Review mapped programme slots, XMLTV source confidence, and upcoming guide coverage in a virtualized schedule." />
+      <PageHeader eyebrow="Guide" title="EPG" description="Search mapped programme slots, XMLTV source confidence, and upcoming guide coverage. Server-side search queries the database." />
       <section className="grid gap-4 xl:grid-cols-[1fr_18rem]">
         <Card>
           <CardHeader className="items-center">
-            <label className="relative block w-full max-w-sm">
-              <span className="sr-only">Filter programme guide</span>
-              <Search aria-hidden="true" className="absolute left-3 top-3 size-4 text-slate-500" />
-              <Input className="pl-9" value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="Filter channel, title, or source" />
-            </label>
-            <Badge tone="success">{visibleProgrammes.length} slots</Badge>
+            <div className="flex w-full max-w-sm items-center gap-2">
+              <label className="relative block flex-1">
+                <span className="sr-only">Search programme guide</span>
+                <Search aria-hidden="true" className="absolute left-3 top-3 size-4 text-slate-500" />
+                <Input className="pl-9" value={searchInput} onChange={(event) => { setSearchInput(event.target.value); setPage(0) }} placeholder="Search channel or title" />
+              </label>
+            </div>
+            <Badge tone="success">{total.toLocaleString()} slots</Badge>
           </CardHeader>
           <CardContent className="p-0">
             <div ref={scrollRef} className="h-[28.5rem] overflow-auto" tabIndex={0} aria-label="Scrollable programme schedule">
-              {visibleProgrammes.length === 0
+              {programmes.length === 0
                 ? <p className="p-8 text-center text-sm text-slate-500">No programme data available.</p>
                 : <ol className="relative m-0 list-none p-0" style={{ height: `${virtualizer.getTotalSize()}px` }}>
                   {virtualItems.map((virtualItem) => {
-                    const programme = visibleProgrammes[virtualItem.index]
+                    const programme = programmes[virtualItem.index]
                     if (!programme) return null
                     return (
                       <li
@@ -73,6 +86,19 @@ export function EpgPage({ client = apiClient }: { client?: IptvApiClient }) {
                 </ol>
               }
             </div>
+            {pageCount > 1 ? (
+              <div className="flex items-center justify-between border-t border-white/8 p-3">
+                <p className="text-xs text-slate-500">Page {page + 1} of {pageCount.toLocaleString()}</p>
+                <div className="flex gap-2">
+                  <Button variant="ghost" size="sm" disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
+                    <ChevronLeft aria-hidden="true" className="size-4" /> Prev
+                  </Button>
+                  <Button variant="ghost" size="sm" disabled={page >= pageCount - 1} onClick={() => setPage((p) => p + 1)}>
+                    Next <ChevronRight aria-hidden="true" className="size-4" />
+                  </Button>
+                </div>
+              </div>
+            ) : null}
           </CardContent>
         </Card>
         <Card>

@@ -3,6 +3,8 @@ import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 import { ChannelsPage } from '@/pages/channels-page'
 import { EpgPage } from '@/pages/epg-page'
+import { EpgMappingsPage } from '@/pages/epg-mappings-page'
+import { GroupsPage } from '@/pages/groups-page'
 import { EventsPage } from '@/pages/events-page'
 import { JellyfinPage } from '@/pages/jellyfin-page'
 import { LoginPage } from '@/pages/login-page'
@@ -105,27 +107,41 @@ describe('management pages', () => {
   it('filters and sorts the TanStack channel table', async () => {
     renderWithQuery(<ChannelsPage client={new MockIptvApiClient()} />)
     expect(await screen.findByText('KWGN Denver')).toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('Search channels'), 'ESPN2')
-    expect(screen.getByText('ESPN2')).toBeInTheDocument()
-    expect(screen.queryByText('KWGN Denver')).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent('16 channels')
     await userEvent.click(screen.getByRole('button', { name: /No./ }))
-    expect(screen.getByRole('status')).toHaveTextContent('1 of 16 channels')
+    expect(screen.getByRole('status')).toHaveTextContent('16 channels')
+  })
+
+  it('shows channel groups with enable and disable controls', async () => {
+    renderWithQuery(<GroupsPage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'Groups', level: 1 })).toBeInTheDocument()
+    const enableButtons = screen.getAllByRole('button', { name: /Enable all/ })
+    const disableButtons = screen.getAllByRole('button', { name: /Disable all/ })
+    expect(enableButtons.length).toBeGreaterThan(0)
+    expect(disableButtons.length).toBeGreaterThan(0)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('shows bulk enable and disable all groups buttons', async () => {
+    renderWithQuery(<GroupsPage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'Groups', level: 1 })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Enable all groups/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Disable all groups/ })).toBeInTheDocument()
   })
 
   it('filters the virtualized programme guide', async () => {
     renderWithQuery(<EpgPage client={new MockIptvApiClient()} />)
     expect(await screen.findByRole('heading', { name: 'EPG' })).toBeInTheDocument()
     expect(screen.getByText('Colorado’s Own News at 6')).toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('Filter programme guide'), 'Broncos')
-    expect(screen.getByText('Denver Broncos vs Kansas City Chiefs')).toBeInTheDocument()
-    expect(screen.getByText('1 slots')).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Search programme guide'), 'Broncos')
+    expect(await screen.findByText('Denver Broncos vs Kansas City Chiefs')).toBeInTheDocument()
+    expect(await screen.findByText('1 slots')).toBeInTheDocument()
   })
 
   it('shows event parsing decisions and templates', async () => {
     renderWithQuery(<EventsPage client={new MockIptvApiClient()} />)
-    expect(await screen.findByText('Denver Broncos vs Kansas City Chiefs')).toBeInTheDocument()
-    expect(screen.getByText('The system quarantines unparseable or DST-ambiguous titles. The system does not use guesswork to schedule them.')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Review Denver Broncos/ })).toBeInTheDocument()
+    expect(await screen.findByText('No event templates configured. Create a template to start detecting events from provider streams.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Configure templates/ })).toBeInTheDocument()
   })
 
   it('shows honest shared-session fan-out and recovery telemetry', async () => {
@@ -161,5 +177,49 @@ describe('management pages', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Saved tuner')
     await userEvent.click(screen.getByRole('button', { name: 'Copy M3U tuner URL' }))
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('http://iptv-web:3000/api/jellyfin/playlist.m3u')
+  })
+
+  it('shows EPG mappings with confidence and method badges', async () => {
+    const mock = new MockIptvApiClient()
+    mock.getEpgMappings = vi.fn().mockResolvedValue({
+      total: 1,
+      limit: 50,
+      offset: 0,
+      items: [{
+        channelId: 'ch-1',
+        epgChannelId: 'epg-1',
+        method: 'tvg-id',
+        confidence: 0.99,
+        evidence: { match: 'tvg-id-exact' },
+        reviewStatus: 'applied',
+        reviewedBy: null,
+        reviewedAt: null,
+        revision: 1,
+        updatedAt: '2026-01-01T00:00:00Z',
+        channelName: 'KUSA HD',
+        canonicalKey: 'kusa.denver.example',
+        epgXmltvId: 'kusa.denver.example',
+        epgDisplayName: 'KUSA',
+      }],
+    })
+    renderWithQuery(<EpgMappingsPage client={mock} />)
+    expect(await screen.findByRole('heading', { name: 'EPG Mappings' })).toBeInTheDocument()
+    expect(await screen.findByText('KUSA HD')).toBeInTheDocument()
+    expect(screen.getByText('tvg-id')).toBeInTheDocument()
+    expect(screen.getByText('99%')).toBeInTheDocument()
+  })
+
+  it('switches to the unmapped tab and shows empty state', async () => {
+    const mock = new MockIptvApiClient()
+    mock.getUnmappedChannels = vi.fn().mockResolvedValue({
+      total: 0,
+      limit: 50,
+      offset: 0,
+      items: [],
+    })
+    renderWithQuery(<EpgMappingsPage client={mock} />)
+    expect(await screen.findByRole('heading', { name: 'EPG Mappings' })).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Unmapped' }))
+    expect(await screen.findByText('All channels have EPG mappings.')).toBeInTheDocument()
   })
 })

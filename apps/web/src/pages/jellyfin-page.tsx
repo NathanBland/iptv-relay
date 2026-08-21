@@ -8,14 +8,14 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { FieldMessage, Input, Select } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
 import type { IptvApiClient, JellyfinConfig } from '@/lib/api/types'
-
-const isAbsoluteUrl = (value: string) => /^https?:\/\/[^\s]+$/.test(value)
+import { jellyfinSchema } from '@/lib/validation'
 
 export function JellyfinPage({ client = apiClient }: { client?: IptvApiClient }) {
   const [notice, setNotice] = useState('')
   const mutation = useMutation({ mutationFn: (value: JellyfinConfig) => client.saveJellyfin(value), onSuccess: (result) => setNotice(result.message) })
   const form = useForm({
     defaultValues: { baseUrl: 'http://jellyfin:8096', tunerName: 'Relay Control', publicBaseUrl: 'http://iptv-web:3000', guideDays: 7 },
+    validators: { onSubmit: jellyfinSchema },
     onSubmit: async ({ value }) => { await mutation.mutateAsync(value) },
   })
   const endpoints = [
@@ -32,18 +32,18 @@ export function JellyfinPage({ client = apiClient }: { client?: IptvApiClient })
           <CardHeader><div><h2 className="font-semibold text-white">Connection settings</h2><p className="mt-1 text-xs text-slate-500">Saved through the typed server API boundary</p></div></CardHeader>
           <CardContent>
             <form className="space-y-4" onSubmit={(event) => { event.preventDefault(); event.stopPropagation(); void form.handleSubmit() }}>
-              <form.Field name="baseUrl" validators={{ onChange: ({ value }) => isAbsoluteUrl(value) ? undefined : 'Enter an absolute Jellyfin URL.' }}>
+              <form.Field name="baseUrl" validators={{ onChange: jellyfinSchema.shape.baseUrl }}>
                 {(field) => <label className="block text-xs font-medium text-slate-300">Jellyfin server URL<Input className="mt-1" value={field.state.value} onBlur={field.handleBlur} onChange={(event) => field.handleChange(event.target.value)} aria-invalid={field.state.meta.errors.length > 0} /><FieldMessage>{field.state.meta.errors[0]}</FieldMessage></label>}
               </form.Field>
               <div className="grid gap-4 sm:grid-cols-2">
-                <form.Field name="tunerName" validators={{ onChange: ({ value }) => value.trim() ? undefined : 'A tuner name is required.' }}>
+                <form.Field name="tunerName" validators={{ onChange: jellyfinSchema.shape.tunerName }}>
                   {(field) => <label className="block text-xs font-medium text-slate-300">Tuner name<Input className="mt-1" value={field.state.value} onBlur={field.handleBlur} onChange={(event) => field.handleChange(event.target.value)} aria-invalid={field.state.meta.errors.length > 0} /><FieldMessage>{field.state.meta.errors[0]}</FieldMessage></label>}
                 </form.Field>
                 <form.Field name="guideDays">
                   {(field) => <label className="block text-xs font-medium text-slate-300">Guide horizon<Select className="mt-1" value={field.state.value} onChange={(event) => field.handleChange(Number(event.target.value))}>{[3, 7, 14].map((days) => <option key={days} value={days}>{days} days</option>)}</Select></label>}
                 </form.Field>
               </div>
-              <form.Field name="publicBaseUrl" validators={{ onChange: ({ value }) => isAbsoluteUrl(value) ? undefined : 'Enter an absolute URL reachable by Jellyfin.' }}>
+              <form.Field name="publicBaseUrl" validators={{ onChange: jellyfinSchema.shape.publicBaseUrl }}>
                 {(field) => <label className="block text-xs font-medium text-slate-300">Relay URL visible to Jellyfin<Input className="mt-1" value={field.state.value} onBlur={field.handleBlur} onChange={(event) => field.handleChange(event.target.value)} aria-invalid={field.state.meta.errors.length > 0} /><FieldMessage>{field.state.meta.errors[0]}</FieldMessage></label>}
               </form.Field>
               <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting]}>

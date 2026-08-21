@@ -30,6 +30,16 @@ export const Select = forwardRef<HTMLSelectElement, SelectHTMLAttributes<HTMLSel
   )
 })
 
-export function FieldMessage({ children }: { children: string | undefined }) {
-  return children ? <p className="mt-1 text-xs text-red-300">{children}</p> : null
+function errorMessage(error: unknown): string | undefined {
+  if (typeof error === 'string') return error
+  if (Array.isArray(error)) return error.map(errorMessage).find((message) => message !== undefined)
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') {
+    return error.message
+  }
+  return undefined
+}
+
+export function FieldMessage({ children }: { children: unknown }) {
+  const message = errorMessage(children)
+  return message ? <p className="mt-1 text-xs text-red-300">{message}</p> : null
 }

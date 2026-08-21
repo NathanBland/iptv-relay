@@ -8,6 +8,7 @@ import { FieldMessage, Input } from '@/components/ui/input'
 import { apiClient, IptvApiError, mockInitialData, safeNextPath } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
 import type { AuthStatus, IptvApiClient, LoginInput } from '@/lib/api/types'
+import { loginSchema } from '@/lib/validation'
 
 function defaultAuthenticated(next: string) {
   if (typeof window !== 'undefined') window.location.assign(next)
@@ -45,6 +46,7 @@ export function LoginPage({
   })
   const form = useForm({
     defaultValues: { username: '', password: '' },
+    validators: { onSubmit: loginSchema },
     onSubmit: async ({ value }) => {
       setFormError('')
       await mutation.mutateAsync(value)
@@ -95,7 +97,7 @@ export function LoginPage({
               >
                 <form.Field
                   name="username"
-                  validators={{ onChange: ({ value }) => value.trim() ? undefined : 'Enter your username.' }}
+                  validators={{ onChange: loginSchema.shape.username }}
                 >
                   {(field) => (
                     <label className="block text-xs font-medium text-slate-300">
@@ -117,7 +119,7 @@ export function LoginPage({
                 </form.Field>
                 <form.Field
                   name="password"
-                  validators={{ onChange: ({ value }) => value ? undefined : 'Enter your password.' }}
+                  validators={{ onChange: loginSchema.shape.password }}
                 >
                   {(field) => (
                     <label className="block text-xs font-medium text-slate-300">

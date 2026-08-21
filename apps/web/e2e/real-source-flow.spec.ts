@@ -24,7 +24,6 @@ const adminUsername = process.env.IPTV_ADMIN_USERNAME ?? 'operator'
 const adminPassword = requiredEnvironment('IPTV_ADMIN_PASSWORD')
 const m3uUrl = requiredEnvironment('IPTV_TEST_M3U_URL')
 const xmltvUrl = requiredEnvironment('IPTV_TEST_XMLTV_URL')
-const baseUrl = process.env.IPTV_E2E_BASE_URL ?? process.env.IPTV_PUBLIC_BASE_URL ?? 'http://127.0.0.1:8080'
 const secrets = [adminPassword, m3uUrl, xmltvUrl]
 
 function requiredEnvironment(name: string) {
@@ -212,7 +211,7 @@ async function expectManagementPage(page: Page, path: string, heading: string) {
 }
 
 test('operator can add and activate real M3U and XMLTV sources', async ({ context, page }, testInfo) => {
-  test.skip(!['127.0.0.1', 'localhost'].includes(new URL(baseUrl).hostname) && process.env.IPTV_E2E_KEEP_SOURCES !== 'true', 'Remote runs must retain their sources explicitly.')
+  test.skip(process.env.IPTV_E2E_REAL_SOURCES !== 'true', 'Set IPTV_E2E_REAL_SOURCES=true to run this long real-source test.')
   const runId = `${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
   const requestedSources = [
     { endpoint: m3uUrl, kind: 'M3U' as const, name: `E2E M3U ${runId}` },

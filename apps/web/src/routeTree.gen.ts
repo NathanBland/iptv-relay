@@ -10,17 +10,30 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ChannelAliasesRouteImport } from './routes/channel-aliases'
 import { Route as ChannelsRouteImport } from './routes/channels'
 import { Route as EpgRouteImport } from './routes/epg'
+import { Route as EpgMappingsRouteImport } from './routes/epg-mappings'
 import { Route as EventsRouteImport } from './routes/events'
+import { Route as GroupsRouteImport } from './routes/groups'
 import { Route as JellyfinRouteImport } from './routes/jellyfin'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as RecordingsRouteImport } from './routes/recordings'
 import { Route as SessionsRouteImport } from './routes/sessions'
 import { Route as SourcesRouteImport } from './routes/sources'
+import { Route as StreamHealthRouteImport } from './routes/stream-health'
+import { Route as StreamProfilesRouteImport } from './routes/stream-profiles'
+import { Route as TvGuideRouteImport } from './routes/tv-guide'
+import { Route as UsersRouteImport } from './routes/users'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ChannelAliasesRoute = ChannelAliasesRouteImport.update({
+  id: '/channel-aliases',
+  path: '/channel-aliases',
   getParentRoute: () => rootRouteImport,
 } as any)
 const ChannelsRoute = ChannelsRouteImport.update({
@@ -33,9 +46,19 @@ const EpgRoute = EpgRouteImport.update({
   path: '/epg',
   getParentRoute: () => rootRouteImport,
 } as any)
+const EpgMappingsRoute = EpgMappingsRouteImport.update({
+  id: '/epg-mappings',
+  path: '/epg-mappings',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const EventsRoute = EventsRouteImport.update({
   id: '/events',
   path: '/events',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const GroupsRoute = GroupsRouteImport.update({
+  id: '/groups',
+  path: '/groups',
   getParentRoute: () => rootRouteImport,
 } as any)
 const JellyfinRoute = JellyfinRouteImport.update({
@@ -48,6 +71,11 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
+const RecordingsRoute = RecordingsRouteImport.update({
+  id: '/recordings',
+  path: '/recordings',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const SessionsRoute = SessionsRouteImport.update({
   id: '/sessions',
   path: '/sessions',
@@ -58,80 +86,156 @@ const SourcesRoute = SourcesRouteImport.update({
   path: '/sources',
   getParentRoute: () => rootRouteImport,
 } as any)
+const StreamHealthRoute = StreamHealthRouteImport.update({
+  id: '/stream-health',
+  path: '/stream-health',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const StreamProfilesRoute = StreamProfilesRouteImport.update({
+  id: '/stream-profiles',
+  path: '/stream-profiles',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const TvGuideRoute = TvGuideRouteImport.update({
+  id: '/tv-guide',
+  path: '/tv-guide',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const UsersRoute = UsersRouteImport.update({
+  id: '/users',
+  path: '/users',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/channel-aliases': typeof ChannelAliasesRoute
   '/channels': typeof ChannelsRoute
   '/epg': typeof EpgRoute
+  '/epg-mappings': typeof EpgMappingsRoute
   '/events': typeof EventsRoute
+  '/groups': typeof GroupsRoute
   '/jellyfin': typeof JellyfinRoute
   '/login': typeof LoginRoute
+  '/recordings': typeof RecordingsRoute
   '/sessions': typeof SessionsRoute
   '/sources': typeof SourcesRoute
+  '/stream-health': typeof StreamHealthRoute
+  '/stream-profiles': typeof StreamProfilesRoute
+  '/tv-guide': typeof TvGuideRoute
+  '/users': typeof UsersRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/channel-aliases': typeof ChannelAliasesRoute
   '/channels': typeof ChannelsRoute
   '/epg': typeof EpgRoute
+  '/epg-mappings': typeof EpgMappingsRoute
   '/events': typeof EventsRoute
+  '/groups': typeof GroupsRoute
   '/jellyfin': typeof JellyfinRoute
   '/login': typeof LoginRoute
+  '/recordings': typeof RecordingsRoute
   '/sessions': typeof SessionsRoute
   '/sources': typeof SourcesRoute
+  '/stream-health': typeof StreamHealthRoute
+  '/stream-profiles': typeof StreamProfilesRoute
+  '/tv-guide': typeof TvGuideRoute
+  '/users': typeof UsersRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/channel-aliases': typeof ChannelAliasesRoute
   '/channels': typeof ChannelsRoute
   '/epg': typeof EpgRoute
+  '/epg-mappings': typeof EpgMappingsRoute
   '/events': typeof EventsRoute
+  '/groups': typeof GroupsRoute
   '/jellyfin': typeof JellyfinRoute
   '/login': typeof LoginRoute
+  '/recordings': typeof RecordingsRoute
   '/sessions': typeof SessionsRoute
   '/sources': typeof SourcesRoute
+  '/stream-health': typeof StreamHealthRoute
+  '/stream-profiles': typeof StreamProfilesRoute
+  '/tv-guide': typeof TvGuideRoute
+  '/users': typeof UsersRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/channel-aliases'
     | '/channels'
     | '/epg'
+    | '/epg-mappings'
     | '/events'
+    | '/groups'
     | '/jellyfin'
     | '/login'
+    | '/recordings'
     | '/sessions'
     | '/sources'
+    | '/stream-health'
+    | '/stream-profiles'
+    | '/tv-guide'
+    | '/users'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/channel-aliases'
     | '/channels'
     | '/epg'
+    | '/epg-mappings'
     | '/events'
+    | '/groups'
     | '/jellyfin'
     | '/login'
+    | '/recordings'
     | '/sessions'
     | '/sources'
+    | '/stream-health'
+    | '/stream-profiles'
+    | '/tv-guide'
+    | '/users'
   id:
     | '__root__'
     | '/'
+    | '/channel-aliases'
     | '/channels'
     | '/epg'
+    | '/epg-mappings'
     | '/events'
+    | '/groups'
     | '/jellyfin'
     | '/login'
+    | '/recordings'
     | '/sessions'
     | '/sources'
+    | '/stream-health'
+    | '/stream-profiles'
+    | '/tv-guide'
+    | '/users'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  ChannelAliasesRoute: typeof ChannelAliasesRoute
   ChannelsRoute: typeof ChannelsRoute
   EpgRoute: typeof EpgRoute
+  EpgMappingsRoute: typeof EpgMappingsRoute
   EventsRoute: typeof EventsRoute
+  GroupsRoute: typeof GroupsRoute
   JellyfinRoute: typeof JellyfinRoute
   LoginRoute: typeof LoginRoute
+  RecordingsRoute: typeof RecordingsRoute
   SessionsRoute: typeof SessionsRoute
   SourcesRoute: typeof SourcesRoute
+  StreamHealthRoute: typeof StreamHealthRoute
+  StreamProfilesRoute: typeof StreamProfilesRoute
+  TvGuideRoute: typeof TvGuideRoute
+  UsersRoute: typeof UsersRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -141,6 +245,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/channel-aliases': {
+      id: '/channel-aliases'
+      path: '/channel-aliases'
+      fullPath: '/channel-aliases'
+      preLoaderRoute: typeof ChannelAliasesRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/channels': {
@@ -157,11 +268,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof EpgRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/epg-mappings': {
+      id: '/epg-mappings'
+      path: '/epg-mappings'
+      fullPath: '/epg-mappings'
+      preLoaderRoute: typeof EpgMappingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/events': {
       id: '/events'
       path: '/events'
       fullPath: '/events'
       preLoaderRoute: typeof EventsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/groups': {
+      id: '/groups'
+      path: '/groups'
+      fullPath: '/groups'
+      preLoaderRoute: typeof GroupsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/jellyfin': {
@@ -178,6 +303,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/recordings': {
+      id: '/recordings'
+      path: '/recordings'
+      fullPath: '/recordings'
+      preLoaderRoute: typeof RecordingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/sessions': {
       id: '/sessions'
       path: '/sessions'
@@ -192,18 +324,54 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof SourcesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/stream-health': {
+      id: '/stream-health'
+      path: '/stream-health'
+      fullPath: '/stream-health'
+      preLoaderRoute: typeof StreamHealthRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/stream-profiles': {
+      id: '/stream-profiles'
+      path: '/stream-profiles'
+      fullPath: '/stream-profiles'
+      preLoaderRoute: typeof StreamProfilesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/tv-guide': {
+      id: '/tv-guide'
+      path: '/tv-guide'
+      fullPath: '/tv-guide'
+      preLoaderRoute: typeof TvGuideRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/users': {
+      id: '/users'
+      path: '/users'
+      fullPath: '/users'
+      preLoaderRoute: typeof UsersRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  ChannelAliasesRoute: ChannelAliasesRoute,
   ChannelsRoute: ChannelsRoute,
   EpgRoute: EpgRoute,
+  EpgMappingsRoute: EpgMappingsRoute,
   EventsRoute: EventsRoute,
+  GroupsRoute: GroupsRoute,
   JellyfinRoute: JellyfinRoute,
   LoginRoute: LoginRoute,
+  RecordingsRoute: RecordingsRoute,
   SessionsRoute: SessionsRoute,
   SourcesRoute: SourcesRoute,
+  StreamHealthRoute: StreamHealthRoute,
+  StreamProfilesRoute: StreamProfilesRoute,
+  TvGuideRoute: TvGuideRoute,
+  UsersRoute: UsersRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

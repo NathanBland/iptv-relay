@@ -1,6 +1,5 @@
 import {
   mockChannels,
-  mockEvents,
   mockOverview,
   mockProgrammes,
   mockSessions,
@@ -9,22 +8,56 @@ import {
 import type {
   Channel,
   ChannelPage,
+  ChannelPreview,
   ChannelQuery,
   AuthStatus,
-  DynamicEvent,
+  CreateEventTemplateInput,
+  CreateLineupTemplateInput,
+  EventChannel,
+  EventTemplate,
+  Group,
   IptvApiClient,
   JellyfinConfig,
+  LineupTemplate,
   Overview,
   LoginInput,
   Page,
   Programme,
   ProgrammePage,
   ProgrammeQuery,
+  EpgMapping,
+  EpgMappingPage,
+  EpgReconcileResult,
+  EpgChannelSearchResult,
+  ReviewCandidate,
+  UnmappedChannel,
+  UnmappedChannelPage,
   SaveResult,
   Session,
   Source,
   SourceInput,
+  SourceSyncStatus,
+  SourceUpdateInput,
   ProblemDetails,
+  StreamHealthItem,
+  StreamHealthPage,
+  StreamHealthStats,
+  BestStream,
+  User,
+  CreateUserInput,
+  UpdateUserInput,
+  ChannelAlias,
+  ChannelAliasPage,
+  CreateChannelAliasInput,
+  ResolveAliasResult,
+  RecordingRule,
+  CreateRecordingRuleInput,
+  Recording,
+  RecordingPage,
+  CreateRecordingInput,
+  RecordingStats,
+  StreamProfile,
+  CreateStreamProfileInput,
 } from './types'
 
 type Fetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
@@ -41,8 +74,22 @@ const API_PATHS = {
   channels: '/api/v1/channels',
   programmes: '/api/v1/programmes',
   events: '/api/v1/events',
+  eventTemplates: '/api/v1/event-templates',
+  eventChannels: '/api/v1/event-channels',
+  lineupTemplates: '/api/v1/lineup-templates',
   sessions: '/api/v1/sessions',
   jellyfin: '/api/v1/jellyfin',
+  groups: '/api/v1/groups',
+  streamsHealth: '/api/v1/streams/health',
+  streamsHealthStats: '/api/v1/streams/health/stats',
+  streamsHealthCheck: '/api/v1/streams/health/check',
+  streamsRank: '/api/v1/streams/rank',
+  users: '/api/v1/users',
+  channelAliases: '/api/v1/channel-aliases',
+  recordings: '/api/v1/recordings',
+  recordingRules: '/api/v1/recordings/rules',
+  recordingStats: '/api/v1/recordings/stats',
+  streamProfiles: '/api/v1/stream-profiles',
 } as const
 
 const MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
@@ -272,18 +319,396 @@ export class FetchIptvApiClient implements IptvApiClient {
     })
   }
 
+  async deleteSource(id: string): Promise<void> {
+    await this.deleteResource(`${API_PATHS.sources}/${encodeURIComponent(id)}`, 'Source')
+  }
+
+  async setSourceRefreshInterval(id: string, refreshIntervalSeconds: number): Promise<void> {
+    const csrfToken = this.readCsrfToken()
+    if (!csrfToken) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:missing-csrf-token',
+        title: 'CSRF token unavailable',
+        status: 400,
+        detail: 'Sign in before you change source settings.',
+      })
+    }
+    const headers = new Headers()
+    headers.set('Content-Type', 'application/json')
+    headers.set('Accept', 'application/json, application/problem+json')
+    headers.set('X-CSRF-Token', csrfToken)
+    let response: Response
+    try {
+      response = await this.fetcher(
+        `${API_PATHS.sources}/${encodeURIComponent(id)}/refresh-interval`,
+        {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify({ refreshIntervalSeconds }),
+          credentials: 'same-origin',
+        },
+      )
+    } catch {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:network',
+        title: 'Unable to reach the IPTV API',
+        status: 0,
+        detail: 'The same-origin API request failed before a response was received.',
+      })
+    }
+    if (!response.ok) {
+      throw await problemFromResponse(response)
+    }
+  }
+
+  async triggerSourceSync(id: string): Promise<{ jobId: string; message: string }> {
+    const csrfToken = this.readCsrfToken()
+    if (!csrfToken) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:missing-csrf-token',
+        title: 'CSRF token unavailable',
+        status: 400,
+        detail: 'Sign in before you sync a source.',
+      })
+    }
+    const headers = new Headers()
+    headers.set('Accept', 'application/json, application/problem+json')
+    headers.set('X-CSRF-Token', csrfToken)
+    let response: Response
+    try {
+      response = await this.fetcher(
+        `${API_PATHS.sources}/${encodeURIComponent(id)}/sync`,
+        {
+          method: 'POST',
+          headers,
+          credentials: 'same-origin',
+        },
+      )
+    } catch {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:network',
+        title: 'Unable to reach the IPTV API',
+        status: 0,
+        detail: 'The same-origin API request failed before a response was received.',
+      })
+    }
+    if (!response.ok) {
+      throw await problemFromResponse(response)
+    }
+    return await response.json() as { jobId: string; message: string }
+  }
+
+  async cancelSourceSync(id: string): Promise<{ ok: boolean; message: string }> {
+    const csrfToken = this.readCsrfToken()
+    if (!csrfToken) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:missing-csrf-token',
+        title: 'CSRF token unavailable',
+        status: 400,
+        detail: 'Sign in before you cancel a sync.',
+      })
+    }
+    const headers = new Headers()
+    headers.set('Accept', 'application/json, application/problem+json')
+    headers.set('X-CSRF-Token', csrfToken)
+    let response: Response
+    try {
+      response = await this.fetcher(
+        `${API_PATHS.sources}/${encodeURIComponent(id)}/sync/cancel`,
+        {
+          method: 'POST',
+          headers,
+          credentials: 'same-origin',
+        },
+      )
+    } catch {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:network',
+        title: 'Unable to reach the IPTV API',
+        status: 0,
+        detail: 'The same-origin API request failed before a response was received.',
+      })
+    }
+    if (!response.ok) {
+      throw await problemFromResponse(response)
+    }
+    return await response.json() as { ok: boolean; message: string }
+  }
+
+  async getSourceSyncStatus(sourceId: string): Promise<SourceSyncStatus> {
+    return this.request(`${API_PATHS.sources}/${encodeURIComponent(sourceId)}/sync-status`, (value) => asObject<SourceSyncStatus>(value, 'Source sync status response'))
+  }
+
+  async updateSource(id: string, input: SourceUpdateInput): Promise<void> {
+    const csrfToken = this.readCsrfToken()
+    if (!csrfToken) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:missing-csrf-token',
+        title: 'CSRF token unavailable',
+        status: 400,
+        detail: 'Sign in before you change source settings.',
+      })
+    }
+    const headers = new Headers()
+    headers.set('Content-Type', 'application/json')
+    headers.set('Accept', 'application/json, application/problem+json')
+    headers.set('X-CSRF-Token', csrfToken)
+    let response: Response
+    try {
+      response = await this.fetcher(
+        `${API_PATHS.sources}/${encodeURIComponent(id)}`,
+        {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify(input),
+          credentials: 'same-origin',
+        },
+      )
+    } catch {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:network',
+        title: 'Unable to reach the IPTV API',
+        status: 0,
+        detail: 'The same-origin API request failed before a response was received.',
+      })
+    }
+    if (!response.ok) {
+      throw await problemFromResponse(response)
+    }
+  }
+
+  private async deleteResource(path: string, _resource: string): Promise<void> {
+    const csrfToken = this.readCsrfToken()
+    if (!csrfToken) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:missing-csrf-token',
+        title: 'CSRF token unavailable',
+        status: 403,
+        detail: 'Refresh the page before retrying this request.',
+      })
+    }
+    const headers = new Headers()
+    headers.set('Accept', 'application/json, application/problem+json')
+    headers.set('X-CSRF-Token', csrfToken)
+    let response: Response
+    try {
+      response = await this.fetcher(path, {
+        method: 'DELETE',
+        headers,
+        credentials: 'same-origin',
+      })
+    } catch {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:network',
+        title: 'Unable to reach the IPTV API',
+        status: 0,
+        detail: 'The same-origin API request failed before a response was received.',
+      })
+    }
+    if (!response.ok) {
+      if (response.status === 401 && !path.startsWith('/api/v1/auth/') && !this.redirectingToLogin) {
+        this.redirectingToLogin = true
+        this.onUnauthorized(path)
+      }
+      throw await problemFromResponse(response)
+    }
+  }
+
+  async getGroups(): Promise<Group[]> {
+    return this.request(API_PATHS.groups, (value) => asObjectArray<Group>(value, 'Groups response'))
+  }
+
   async getChannels(query?: ChannelQuery): Promise<ChannelPage> {
-    const qs = buildQueryString({ search: query?.search, group: query?.group, limit: query?.limit, offset: query?.offset })
+    const qs = buildQueryString({ search: query?.search, group: query?.group, enabled: query?.enabled, limit: query?.limit, offset: query?.offset })
     return this.request(`${API_PATHS.channels}${qs}`, (value) => asPage<Channel>(value, 'Channels response'))
   }
 
+  async getChannelPreview(channelId: string): Promise<ChannelPreview> {
+    return this.request(`${API_PATHS.channels}/${encodeURIComponent(channelId)}/preview`, (value) => asObject<ChannelPreview>(value, 'Channel preview response'))
+  }
+
+  async setChannelEnabled(channelId: string, enabled: boolean): Promise<SaveResult> {
+    return this.request(`${API_PATHS.channels}/${encodeURIComponent(channelId)}/enabled`, (value) => asObject<SaveResult>(value, 'Channel enabled response'), {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async setGroupEnabled(groupName: string, enabled: boolean): Promise<SaveResult> {
+    return this.request(`${API_PATHS.groups}/${encodeURIComponent(groupName)}/enabled`, (value) => asObject<SaveResult>(value, 'Group enabled response'), {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async setAllGroupsEnabled(enabled: boolean): Promise<SaveResult> {
+    return this.request(`${API_PATHS.groups}/enabled`, (value) => asObject<SaveResult>(value, 'Bulk group enabled response'), {
+      method: 'PATCH',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
   async getProgrammes(query?: ProgrammeQuery): Promise<ProgrammePage> {
-    const qs = buildQueryString({ channelId: query?.channelId, limit: query?.limit, offset: query?.offset })
+    const qs = buildQueryString({ channelId: query?.channelId, search: query?.search, limit: query?.limit, offset: query?.offset })
     return this.request(`${API_PATHS.programmes}${qs}`, (value) => asPage<Programme>(value, 'Programmes response'))
   }
 
-  async getEvents(): Promise<DynamicEvent[]> {
-    return this.request(API_PATHS.events, (value) => asObjectArray<DynamicEvent>(value, 'Events response'))
+  async reconcileEpg(): Promise<EpgReconcileResult> {
+    return this.request('/api/v1/epg/reconcile', (value) => asObject<EpgReconcileResult>(value, 'EPG reconcile response'), {
+      method: 'POST',
+    })
+  }
+
+  async getEpgMappings(reviewStatus?: string, limit?: number, offset?: number): Promise<EpgMappingPage> {
+    const qs = buildQueryString({ reviewStatus, limit, offset })
+    return this.request(`/api/v1/epg/mappings${qs}`, (value) => asPage<EpgMapping>(value, 'EPG mappings response'))
+  }
+
+  async getUnmappedChannels(search?: string, limit?: number, offset?: number): Promise<UnmappedChannelPage> {
+    const qs = buildQueryString({ search, limit, offset })
+    return this.request(`/api/v1/epg/unmapped${qs}`, (value) => asPage<UnmappedChannel>(value, 'Unmapped channels response'))
+  }
+
+  async getReviewCandidates(channelId: string): Promise<ReviewCandidate[]> {
+    return this.request(`/api/v1/epg/review/${encodeURIComponent(channelId)}/candidates`, (value) => asObjectArray<ReviewCandidate>(value, 'Review candidates response'))
+  }
+
+  async searchEpgChannels(query: string, limit?: number): Promise<EpgChannelSearchResult[]> {
+    const qs = buildQueryString({ q: query, limit })
+    return this.request(`/api/v1/epg/channels/search${qs}`, (value) => asObjectArray<EpgChannelSearchResult>(value, 'EPG channel search response'))
+  }
+
+  async setChannelEpgMapping(channelId: string, epgChannelId: string): Promise<void> {
+    const csrfToken = this.readCsrfToken()
+    if (!csrfToken) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:missing-csrf-token',
+        title: 'CSRF token unavailable',
+        status: 400,
+        detail: 'Sign in before you change EPG mappings.',
+      })
+    }
+    const headers = new Headers()
+    headers.set('Content-Type', 'application/json')
+    headers.set('Accept', 'application/json, application/problem+json')
+    headers.set('X-CSRF-Token', csrfToken)
+    let response: Response
+    try {
+      response = await this.fetcher(
+        `/api/v1/channels/${encodeURIComponent(channelId)}/epg-mapping`,
+        {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify({ epgChannelId }),
+          credentials: 'same-origin',
+        },
+      )
+    } catch {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:network',
+        title: 'Unable to reach the IPTV API',
+        status: 0,
+        detail: 'The same-origin API request failed before a response was received.',
+      })
+    }
+    if (!response.ok) {
+      throw await problemFromResponse(response)
+    }
+  }
+
+  async removeChannelEpgMapping(channelId: string): Promise<void> {
+    await this.deleteResource(`/api/v1/channels/${encodeURIComponent(channelId)}/epg-mapping`, 'EPG mapping')
+  }
+
+  async resolveReview(channelId: string, accept: boolean, epgChannelId?: string): Promise<void> {
+    const csrfToken = this.readCsrfToken()
+    if (!csrfToken) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:missing-csrf-token',
+        title: 'CSRF token unavailable',
+        status: 400,
+        detail: 'Sign in before you resolve reviews.',
+      })
+    }
+    const headers = new Headers()
+    headers.set('Content-Type', 'application/json')
+    headers.set('Accept', 'application/json, application/problem+json')
+    headers.set('X-CSRF-Token', csrfToken)
+    let response: Response
+    try {
+      response = await this.fetcher(
+        `/api/v1/epg/review/${encodeURIComponent(channelId)}/resolve`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ accept, epgChannelId }),
+          credentials: 'same-origin',
+        },
+      )
+    } catch {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:network',
+        title: 'Unable to reach the IPTV API',
+        status: 0,
+        detail: 'The same-origin API request failed before a response was received.',
+      })
+    }
+    if (!response.ok) {
+      throw await problemFromResponse(response)
+    }
+  }
+
+  async getEvents(): Promise<EventChannel[]> {
+    return this.request(API_PATHS.events, (value) => asObjectArray<EventChannel>(value, 'Events response'))
+  }
+
+  async getEventTemplates(): Promise<EventTemplate[]> {
+    return this.request(API_PATHS.eventTemplates, (value) => asObjectArray<EventTemplate>(value, 'Event templates response'))
+  }
+
+  async createEventTemplate(input: CreateEventTemplateInput): Promise<EventTemplate> {
+    return this.request(API_PATHS.eventTemplates, (value) => asObject<EventTemplate>(value, 'Event template response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async deleteEventTemplate(id: string): Promise<void> {
+    await this.deleteResource(`${API_PATHS.eventTemplates}/${encodeURIComponent(id)}`, 'Event template')
+  }
+
+  async getEventChannels(templateId?: string): Promise<EventChannel[]> {
+    const qs = buildQueryString({ templateId })
+    return this.request(`${API_PATHS.eventChannels}${qs}`, (value) => asObjectArray<EventChannel>(value, 'Event channels response'))
+  }
+
+  async scanEventTemplate(id: string): Promise<SaveResult> {
+    return this.request(`${API_PATHS.eventTemplates}/${encodeURIComponent(id)}/scan`, (value) => asObject<SaveResult>(value, 'Scan response'), {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
+  }
+
+  async getLineupTemplates(): Promise<LineupTemplate[]> {
+    return this.request(API_PATHS.lineupTemplates, (value) => asObjectArray<LineupTemplate>(value, 'Lineup templates response'))
+  }
+
+  async createLineupTemplate(input: CreateLineupTemplateInput): Promise<LineupTemplate> {
+    return this.request(API_PATHS.lineupTemplates, (value) => asObject<LineupTemplate>(value, 'Lineup template response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async deleteLineupTemplate(id: string): Promise<void> {
+    await this.deleteResource(`${API_PATHS.lineupTemplates}/${encodeURIComponent(id)}`, 'Lineup template')
+  }
+
+  async applyLineupTemplate(id: string): Promise<SaveResult> {
+    return this.request(`${API_PATHS.lineupTemplates}/${encodeURIComponent(id)}/apply`, (value) => asObject<SaveResult>(value, 'Apply lineup response'), {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })
   }
 
   async getSessions(): Promise<Session[]> {
@@ -296,10 +721,155 @@ export class FetchIptvApiClient implements IptvApiClient {
       body: JSON.stringify(config),
     })
   }
+
+  async getStreamHealth(status?: string, group?: string, limit?: number, offset?: number): Promise<StreamHealthPage> {
+    const params = new URLSearchParams()
+    if (status) params.set('status', status)
+    if (group) params.set('group', group)
+    if (limit !== undefined) params.set('limit', String(limit))
+    if (offset !== undefined) params.set('offset', String(offset))
+    const qs = params.toString() ? `?${params}` : ''
+    return this.request(`${API_PATHS.streamsHealth}${qs}`, (value) => asPage<StreamHealthItem>(value, 'Stream health response'))
+  }
+
+  async getStreamHealthStats(): Promise<StreamHealthStats> {
+    return this.request(API_PATHS.streamsHealthStats, (value) => asObject<StreamHealthStats>(value, 'Stream health stats response'))
+  }
+
+  async triggerHealthCheck(limit?: number): Promise<{ queued: number }> {
+    const body = limit !== undefined ? JSON.stringify({ limit }) : '{}'
+    return this.request(API_PATHS.streamsHealthCheck, (value) => asObject<{ queued: number }>(value, 'Health check trigger response'), {
+      method: 'POST',
+      body,
+    })
+  }
+
+  async rankAllStreams(): Promise<{ ranked: number }> {
+    return this.request(API_PATHS.streamsRank, (value) => asObject<{ ranked: number }>(value, 'Stream rank response'), {
+      method: 'POST',
+    })
+  }
+
+  async getBestStream(channelId: string): Promise<BestStream> {
+    return this.request(`${API_PATHS.channels}/${encodeURIComponent(channelId)}/best-stream`, (value) => asObject<BestStream>(value, 'Best stream response'))
+  }
+
+  async getUsers(): Promise<User[]> {
+    return this.request(API_PATHS.users, (value) => asObjectArray<User>(value, 'Users response'))
+  }
+
+  async createUser(input: CreateUserInput): Promise<User> {
+    return this.request(API_PATHS.users, (value) => asObject<User>(value, 'Create user response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async updateUser(id: string, input: UpdateUserInput): Promise<User> {
+    return this.request(`${API_PATHS.users}/${encodeURIComponent(id)}`, (value) => asObject<User>(value, 'Update user response'), {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    await this.deleteResource(`${API_PATHS.users}/${encodeURIComponent(id)}`, 'User')
+  }
+
+  async getChannelAliases(country?: string, limit?: number, offset?: number): Promise<ChannelAliasPage> {
+    const params = new URLSearchParams()
+    if (country) params.set('country', country)
+    if (limit !== undefined) params.set('limit', String(limit))
+    if (offset !== undefined) params.set('offset', String(offset))
+    const qs = params.toString() ? `?${params}` : ''
+    return this.request(`${API_PATHS.channelAliases}${qs}`, (value) => asPage<ChannelAlias>(value, 'Channel aliases response'))
+  }
+
+  async createChannelAlias(input: CreateChannelAliasInput): Promise<ChannelAlias> {
+    return this.request(API_PATHS.channelAliases, (value) => asObject<ChannelAlias>(value, 'Create alias response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async deleteChannelAlias(id: string): Promise<void> {
+    await this.deleteResource(`${API_PATHS.channelAliases}/${encodeURIComponent(id)}`, 'Channel alias')
+  }
+
+  async resolveChannelAlias(name: string): Promise<ResolveAliasResult> {
+    const qs = `?name=${encodeURIComponent(name)}`
+    return this.request(`${API_PATHS.channelAliases}/resolve${qs}`, (value) => asObject<ResolveAliasResult>(value, 'Resolve alias response'))
+  }
+
+  async getRecordingRules(): Promise<RecordingRule[]> {
+    return this.request(API_PATHS.recordingRules, (value) => asObjectArray<RecordingRule>(value, 'Recording rules response'))
+  }
+
+  async createRecordingRule(input: CreateRecordingRuleInput): Promise<RecordingRule> {
+    return this.request(API_PATHS.recordingRules, (value) => asObject<RecordingRule>(value, 'Create recording rule response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async deleteRecordingRule(id: string): Promise<void> {
+    await this.deleteResource(`${API_PATHS.recordingRules}/${encodeURIComponent(id)}`, 'Recording rule')
+  }
+
+  async getRecordings(status?: string, limit?: number, offset?: number): Promise<RecordingPage> {
+    const params = new URLSearchParams()
+    if (status) params.set('status', status)
+    if (limit !== undefined) params.set('limit', String(limit))
+    if (offset !== undefined) params.set('offset', String(offset))
+    const qs = params.toString() ? `?${params}` : ''
+    return this.request(`${API_PATHS.recordings}${qs}`, (value) => asPage<Recording>(value, 'Recordings response'))
+  }
+
+  async createRecording(input: CreateRecordingInput): Promise<Recording> {
+    return this.request(API_PATHS.recordings, (value) => asObject<Recording>(value, 'Create recording response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async deleteRecording(id: string): Promise<void> {
+    await this.deleteResource(`${API_PATHS.recordings}/${encodeURIComponent(id)}`, 'Recording')
+  }
+
+  async getRecordingStats(): Promise<RecordingStats> {
+    return this.request(API_PATHS.recordingStats, (value) => asObject<RecordingStats>(value, 'Recording stats response'))
+  }
+
+  async getStreamProfiles(): Promise<StreamProfile[]> {
+    return this.request(API_PATHS.streamProfiles, (value) => asObjectArray<StreamProfile>(value, 'Stream profiles response'))
+  }
+
+  async createStreamProfile(input: CreateStreamProfileInput): Promise<StreamProfile> {
+    return this.request(API_PATHS.streamProfiles, (value) => asObject<StreamProfile>(value, 'Create stream profile response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async deleteStreamProfile(id: string): Promise<void> {
+    await this.deleteResource(`${API_PATHS.streamProfiles}/${encodeURIComponent(id)}`, 'Stream profile')
+  }
+
+  async assignStreamProfile(channelId: string, profileId: string): Promise<void> {
+    return this.request(`${API_PATHS.channels}/${encodeURIComponent(channelId)}/stream-profile`, () => undefined, {
+      method: 'POST',
+      body: JSON.stringify({ stream_profile_id: profileId }),
+    })
+  }
+
+  async removeStreamProfile(channelId: string): Promise<void> {
+    await this.deleteResource(`${API_PATHS.channels}/${encodeURIComponent(channelId)}/stream-profile`, 'Stream profile assignment')
+  }
 }
 
 export class MockIptvApiClient implements IptvApiClient {
   private readonly sources: Source[] = mockSources.map((source) => ({ ...source }))
+  private readonly syncJobs = new Map<string, SourceSyncStatus>()
   private authenticated = false
 
   async getAuthStatus(): Promise<AuthStatus> {
@@ -340,9 +910,109 @@ export class MockIptvApiClient implements IptvApiClient {
       state: 'syncing',
       channels: 0,
       lastSync: '2026-08-19T18:00:00Z',
+      refreshIntervalSeconds: 0,
+      lastRefreshedAt: null,
+      maxConnections: 1,
+      timezone: input.timezone?.trim() || 'UTC',
+      enabled: true,
     }
     this.sources.push(source)
     return { ...source }
+  }
+
+  async deleteSource(id: string): Promise<void> {
+    const index = this.sources.findIndex((source) => source.id === id)
+    if (index >= 0) this.sources.splice(index, 1)
+  }
+
+  async setSourceRefreshInterval(id: string, refreshIntervalSeconds: number): Promise<void> {
+    const source = this.sources.find((source) => source.id === id)
+    if (source) {
+      source.refreshIntervalSeconds = refreshIntervalSeconds
+    }
+  }
+
+  async triggerSourceSync(id: string): Promise<{ jobId: string; message: string }> {
+    const now = new Date().toISOString()
+    const jobId = `mock-${id}`
+    this.syncJobs.set(id, {
+      jobId,
+      status: 'running',
+      stage: 'downloading',
+      percent: 0,
+      message: 'Download source data',
+      bytesDownloaded: 0,
+      recordsProcessed: 0,
+      startedAt: now,
+      updatedAt: now,
+    })
+    return { jobId, message: 'Source sync started.' }
+  }
+
+  async getSourceSyncStatus(sourceId: string): Promise<SourceSyncStatus> {
+    const job = this.syncJobs.get(sourceId)
+    if (!job) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:not-found',
+        title: 'Sync status not found',
+        status: 404,
+        detail: 'No sync is currently running for this source.',
+      })
+    }
+    const nextPercent = Math.min(100, job.percent + 25)
+    const stage: SourceSyncStatus['stage'] = nextPercent === 100 ? 'completed' : nextPercent < 25 ? 'downloading' : nextPercent < 50 ? 'parsing' : nextPercent < 75 ? 'activating' : 'reconciling'
+    const status: SourceSyncStatus['status'] = nextPercent === 100 ? 'succeeded' : 'running'
+    const message = nextPercent === 100 ? 'Source sync complete' : nextPercent < 25 ? 'Download source data' : nextPercent < 50 ? 'Parse source data' : nextPercent < 75 ? 'Activate source data' : 'Reconcile source data'
+    const recordsProcessed = (job.recordsProcessed ?? 0) + (nextPercent === 100 ? 0 : 12_000)
+    const bytesDownloaded = (job.bytesDownloaded ?? 0) + (nextPercent === 100 ? 0 : 500_000)
+    const updated: SourceSyncStatus = {
+      ...job,
+      percent: nextPercent,
+      stage,
+      status,
+      message,
+      recordsProcessed,
+      bytesDownloaded,
+      updatedAt: new Date().toISOString(),
+    }
+    this.syncJobs.set(sourceId, updated)
+    return { ...updated }
+  }
+
+  async cancelSourceSync(id: string): Promise<{ ok: boolean; message: string }> {
+    const job = this.syncJobs.get(id)
+    if (!job) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:not-found',
+        title: 'Sync not found',
+        status: 404,
+        detail: 'No active sync is running for this source.',
+      })
+    }
+    this.syncJobs.delete(id)
+    return { ok: true, message: 'Sync cancelled.' }
+  }
+
+  async updateSource(id: string, input: SourceUpdateInput): Promise<void> {
+    const source = this.sources.find((source) => source.id === id)
+    if (source) {
+      if (input.maxConnections !== undefined) source.maxConnections = input.maxConnections
+      if (input.timezone !== undefined) source.timezone = input.timezone
+      if (input.enabled !== undefined) source.enabled = input.enabled
+    }
+  }
+
+  async getGroups(): Promise<Group[]> {
+    const groups = new Map<string, { channelCount: number; enabledCount: number }>()
+    for (const channel of mockChannels) {
+      const entry = groups.get(channel.group) ?? { channelCount: 0, enabledCount: 0 }
+      entry.channelCount += 1
+      if (channel.enabled) entry.enabledCount += 1
+      groups.set(channel.group, entry)
+    }
+    return Array.from(groups.entries())
+      .map(([name, { channelCount, enabledCount }]) => ({ name, channelCount, enabledCount }))
+      .sort((a, b) => b.channelCount - a.channelCount)
   }
 
   async getChannels(query?: ChannelQuery): Promise<ChannelPage> {
@@ -356,9 +1026,28 @@ export class MockIptvApiClient implements IptvApiClient {
     if (query?.group) {
       items = items.filter((channel) => channel.group === query.group)
     }
+    if (query?.enabled !== undefined) {
+      items = items.filter((channel) => channel.enabled === query.enabled)
+    }
     const total = items.length
     items = items.slice(offset, offset + limit)
     return { total, limit, offset, items }
+  }
+
+  async getChannelPreview(channelId: string): Promise<ChannelPreview> {
+    return { streamUrl: `/api/v1/channels/${encodeURIComponent(channelId)}/stream`, contentType: 'video/mp2t' }
+  }
+
+  async setChannelEnabled(_channelId: string, _enabled: boolean): Promise<SaveResult> {
+    return { ok: true, message: 'Channel updated.' }
+  }
+
+  async setGroupEnabled(_groupName: string, _enabled: boolean): Promise<SaveResult> {
+    return { ok: true, message: 'Group updated.' }
+  }
+
+  async setAllGroupsEnabled(_enabled: boolean): Promise<SaveResult> {
+    return { ok: true, message: 'All groups updated.' }
   }
 
   async getProgrammes(query?: ProgrammeQuery): Promise<ProgrammePage> {
@@ -368,13 +1057,93 @@ export class MockIptvApiClient implements IptvApiClient {
     if (query?.channelId) {
       items = items.filter((programme) => programme.id.startsWith(query.channelId!))
     }
+    if (query?.search) {
+      const term = query.search.toLowerCase()
+      items = items.filter((programme) => `${programme.channel} ${programme.title}`.toLowerCase().includes(term))
+    }
     const total = items.length
     items = items.slice(offset, offset + limit)
     return { total, limit, offset, items }
   }
 
-  async getEvents(): Promise<DynamicEvent[]> {
-    return mockEvents.map((event) => ({ ...event }))
+  async reconcileEpg(): Promise<EpgReconcileResult> {
+    return { mappingsApplied: 0, mappingsRemoved: 0, reviewQueued: 0 }
+  }
+
+  async getEpgMappings(reviewStatus?: string, limit?: number, offset?: number): Promise<EpgMappingPage> {
+    return { total: 0, limit: limit ?? 100, offset: offset ?? 0, items: [] }
+  }
+
+  async getUnmappedChannels(search?: string, limit?: number, offset?: number): Promise<UnmappedChannelPage> {
+    return { total: 0, limit: limit ?? 100, offset: offset ?? 0, items: [] }
+  }
+
+  async getReviewCandidates(_channelId: string): Promise<ReviewCandidate[]> {
+    return []
+  }
+
+  async searchEpgChannels(_query: string, _limit?: number): Promise<EpgChannelSearchResult[]> {
+    return []
+  }
+
+  async setChannelEpgMapping(_channelId: string, _epgChannelId: string): Promise<void> {}
+
+  async removeChannelEpgMapping(_channelId: string): Promise<void> {}
+
+  async resolveReview(_channelId: string, _accept: boolean, _epgChannelId?: string): Promise<void> {}
+
+  async getEvents(): Promise<EventChannel[]> {
+    return []
+  }
+
+  async getEventTemplates(): Promise<EventTemplate[]> {
+    return []
+  }
+
+  async createEventTemplate(input: CreateEventTemplateInput): Promise<EventTemplate> {
+    return {
+      id: `event-template-${Date.now()}`,
+      name: input.name,
+      displayName: input.displayName,
+      matchRegex: input.matchRegex,
+      channelNameFormat: input.channelNameFormat,
+      groupName: input.groupName,
+      eventDurationHours: input.eventDurationHours ?? 3,
+      pastDateGraceHours: input.pastDateGraceHours ?? 6,
+      futureDateDays: input.futureDateDays ?? 7,
+      enabled: true,
+    }
+  }
+
+  async deleteEventTemplate(_id: string): Promise<void> {}
+
+  async getEventChannels(_templateId?: string): Promise<EventChannel[]> {
+    return []
+  }
+
+  async scanEventTemplate(_id: string): Promise<SaveResult> {
+    return { ok: true, message: 'Scan complete.' }
+  }
+
+  async getLineupTemplates(): Promise<LineupTemplate[]> {
+    return []
+  }
+
+  async createLineupTemplate(input: CreateLineupTemplateInput): Promise<LineupTemplate> {
+    return {
+      id: `lineup-template-${Date.now()}`,
+      name: input.name,
+      packageName: input.packageName,
+      country: input.country,
+      description: input.description ?? null,
+      enabled: true,
+    }
+  }
+
+  async deleteLineupTemplate(_id: string): Promise<void> {}
+
+  async applyLineupTemplate(_id: string): Promise<SaveResult> {
+    return { ok: true, message: 'Lineup applied.' }
   }
 
   async getSessions(): Promise<Session[]> {
@@ -389,6 +1158,106 @@ export class MockIptvApiClient implements IptvApiClient {
       return { ok: false, message: 'Both Jellyfin and public URLs must be valid absolute URLs.' }
     }
     return { ok: true, message: `Saved tuner “${config.tunerName}” with ${config.guideDays} guide days.` }
+  }
+
+  async getStreamHealth(): Promise<StreamHealthPage> {
+    return { total: 0, items: [] }
+  }
+
+  async getStreamHealthStats(): Promise<StreamHealthStats> {
+    return { alive: 0, dead: 0, unknown: 0, checking: 0 }
+  }
+
+  async triggerHealthCheck(): Promise<{ queued: number }> {
+    return { queued: 0 }
+  }
+
+  async rankAllStreams(): Promise<{ ranked: number }> {
+    return { ranked: 0 }
+  }
+
+  async getBestStream(): Promise<BestStream> {
+    throw new Error('Not implemented in mock client')
+  }
+
+  async getUsers(): Promise<User[]> {
+    return []
+  }
+
+  async createUser(): Promise<User> {
+    throw new Error('Not implemented in mock client')
+  }
+
+  async updateUser(): Promise<User> {
+    throw new Error('Not implemented in mock client')
+  }
+
+  async deleteUser(): Promise<void> {
+    return
+  }
+
+  async getChannelAliases(): Promise<ChannelAliasPage> {
+    return { total: 0, items: [] }
+  }
+
+  async createChannelAlias(): Promise<ChannelAlias> {
+    throw new Error('Not implemented in mock client')
+  }
+
+  async deleteChannelAlias(): Promise<void> {
+    return
+  }
+
+  async resolveChannelAlias(name: string): Promise<ResolveAliasResult> {
+    return { canonicalName: null, input: name }
+  }
+
+  async getRecordingRules(): Promise<RecordingRule[]> {
+    return []
+  }
+
+  async createRecordingRule(): Promise<RecordingRule> {
+    throw new Error('Not implemented in mock client')
+  }
+
+  async deleteRecordingRule(): Promise<void> {
+    return
+  }
+
+  async getRecordings(): Promise<RecordingPage> {
+    return { total: 0, items: [] }
+  }
+
+  async createRecording(): Promise<Recording> {
+    throw new Error('Not implemented in mock client')
+  }
+
+  async deleteRecording(): Promise<void> {
+    return
+  }
+
+  async getRecordingStats(): Promise<RecordingStats> {
+    return { scheduled: 0, recording: 0, completed: 0, failed: 0, totalBytes: 0 }
+  }
+
+  async getStreamProfiles(): Promise<StreamProfile[]> {
+    return []
+  }
+
+  async createStreamProfile(): Promise<StreamProfile> {
+    throw new Error('Not implemented in mock client')
+  }
+
+  async deleteStreamProfile(): Promise<void> {
+    return
+  }
+
+  async assignStreamProfile(): Promise<void> {
+    return
+  }
+
+  async removeStreamProfile(): Promise<void> {
+    return
   }
 }
 

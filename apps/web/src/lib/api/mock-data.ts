@@ -1,6 +1,6 @@
 import type {
   Channel,
-  DynamicEvent,
+  EventChannel,
   Overview,
   Programme,
   Session,
@@ -25,6 +25,11 @@ export const mockSources: Source[] = [
     channels: 682,
     lastSync: '2026-08-19T17:57:00Z',
     endpoint: 'https://provider.invalid/player_api.php',
+    refreshIntervalSeconds: 3600,
+    lastRefreshedAt: '2026-08-19T17:57:00Z',
+    maxConnections: 4,
+    timezone: 'UTC',
+    enabled: true,
   },
   {
     id: 'source-local',
@@ -34,6 +39,11 @@ export const mockSources: Source[] = [
     channels: 54,
     lastSync: '2026-08-19T17:49:00Z',
     endpoint: 'http://tuner.local/discover.json',
+    refreshIntervalSeconds: 0,
+    lastRefreshedAt: null,
+    maxConnections: 1,
+    timezone: 'America/Denver',
+    enabled: true,
   },
   {
     id: 'source-guide',
@@ -43,6 +53,11 @@ export const mockSources: Source[] = [
     channels: 731,
     lastSync: '2026-08-19T16:45:00Z',
     endpoint: 'https://guide.invalid/xmltv.xml.gz',
+    refreshIntervalSeconds: 7200,
+    lastRefreshedAt: '2026-08-19T16:45:00Z',
+    maxConnections: 1,
+    timezone: 'UTC',
+    enabled: true,
   },
 ]
 
@@ -76,6 +91,7 @@ export const mockChannels: Channel[] = channelSeeds.map(
     primaryCodec,
     bitrateKbps,
     state,
+    enabled: true,
   }),
 )
 
@@ -136,38 +152,7 @@ export const mockProgrammes: Programme[] = [
   })),
 ]
 
-export const mockEvents: DynamicEvent[] = [
-  {
-    id: 'event-1',
-    group: 'NFL',
-    rawTitle: 'NFL 08/19 1:00 PM Broncos vs Chiefs',
-    programmeTitle: 'Denver Broncos vs Kansas City Chiefs',
-    channelSlot: 'NFL Event 01',
-    start: '2026-08-19T19:00:00Z',
-    state: 'scheduled',
-    template: '{league} {date} {time} {away} vs {home}',
-  },
-  {
-    id: 'event-2',
-    group: 'MLB',
-    rawTitle: 'COL @ LAD | 2026-08-19 19:10 MT',
-    programmeTitle: 'Colorado Rockies at Los Angeles Dodgers',
-    channelSlot: 'MLB Event 03',
-    start: '2026-08-20T01:10:00Z',
-    state: 'live',
-    template: '{away} @ {home} | {date} {time} {zone}',
-  },
-  {
-    id: 'event-3',
-    group: 'Football',
-    rawTitle: 'United vs City 20/08 19:45',
-    programmeTitle: 'United vs City',
-    channelSlot: 'Football Event 02',
-    start: '2026-08-20T18:45:00Z',
-    state: 'ambiguous',
-    template: '{home} vs {away} {date} {time}',
-  },
-]
+export const mockEvents: EventChannel[] = []
 
 export const mockSessions: Session[] = [
   {

@@ -4,10 +4,18 @@ import {
   CalendarRange,
   Cable,
   CircleGauge,
+  HeartPulse,
+  LayoutGrid,
+  Tag,
+  Users,
+  Video,
   Library,
   RadioTower,
+  Settings,
   Settings2,
   Tv,
+  Tv2,
+  Workflow,
 } from 'lucide-react'
 import { Link } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
@@ -18,9 +26,17 @@ const navigation = [
   { to: '/', label: 'Overview', icon: CircleGauge, exact: true },
   { to: '/sources', label: 'Sources', icon: RadioTower },
   { to: '/channels', label: 'Channels', icon: Tv },
+  { to: '/groups', label: 'Groups', icon: LayoutGrid },
+  { to: '/tv-guide', label: 'TV Guide', icon: Tv2 },
   { to: '/epg', label: 'EPG', icon: CalendarRange },
+  { to: '/epg-mappings', label: 'EPG mappings', icon: Workflow },
   { to: '/events', label: 'Events', icon: CalendarClock },
   { to: '/sessions', label: 'Sessions', icon: Activity },
+  { to: '/stream-health', label: 'Stream health', icon: HeartPulse },
+  { to: '/users', label: 'Users', icon: Users },
+  { to: '/channel-aliases', label: 'Channel aliases', icon: Tag },
+  { to: '/recordings', label: 'Recordings', icon: Video },
+  { to: '/stream-profiles', label: 'Stream profiles', icon: Settings },
   { to: '/jellyfin', label: 'Jellyfin setup', icon: Settings2 },
 ] as const
 

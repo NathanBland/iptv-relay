@@ -18,8 +18,8 @@ export default defineConfig({
   outputDir: './test-results',
   timeout: 20 * 60 * 1_000,
   expect: { timeout: 20_000 },
-  fullyParallel: false,
-  workers: 1,
+  fullyParallel: true,
+  workers: process.env.CI ? 1 : 3,
   retries: 0,
   forbidOnly: Boolean(process.env.CI),
   reporter: [
