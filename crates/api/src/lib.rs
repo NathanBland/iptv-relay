@@ -592,7 +592,7 @@ impl ProblemDetails {
 #[derive(Debug, OpenApi)]
 #[openapi(
     paths(auth_status, login, logout, system_info, settings_schema, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, list_sessions, session_events, catalog_events, save_jellyfin, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
-    components(schemas(LoginRequest, LogoutRequest, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, EventChannelResponse, SessionResponse, JellyfinConfigRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
+    components(schemas(LoginRequest, LogoutRequest, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, EventChannelResponse, SessionResponse, JellyfinConfigRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -5398,11 +5398,17 @@ async fn resolve_channel_alias(
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct RegionSettingsResponse {
+struct RegionSettingsDto {
     timezone: String,
     enabled_prefixes: Vec<String>,
     suggested_prefixes: Vec<String>,
     auto_detected: bool,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RegionSettingsResponse {
+    settings: RegionSettingsDto,
     prefixes: Vec<RegionPrefixResponse>,
 }
 
@@ -5472,10 +5478,12 @@ async fn get_region_settings(State(state): State<AppState>, headers: HeaderMap) 
         })
         .collect();
     Json(RegionSettingsResponse {
-        timezone: settings.timezone,
-        enabled_prefixes: settings.enabled_prefixes,
-        suggested_prefixes: suggested.iter().map(|s| (*s).to_owned()).collect(),
-        auto_detected: settings.auto_detected,
+        settings: RegionSettingsDto {
+            timezone: settings.timezone,
+            enabled_prefixes: settings.enabled_prefixes,
+            suggested_prefixes: suggested.iter().map(|s| (*s).to_owned()).collect(),
+            auto_detected: settings.auto_detected,
+        },
         prefixes: prefix_responses,
     })
     .into_response()
@@ -5487,7 +5495,7 @@ async fn get_region_settings(State(state): State<AppState>, headers: HeaderMap) 
     tag = "configuration",
     request_body = UpdateRegionSettingsRequest,
     responses(
-        (status = 200, body = RegionSettingsResponse, description = "Updated region settings"),
+        (status = 200, body = RegionSettingsDto, description = "Updated region settings"),
         (status = 401, body = ProblemDetails),
         (status = 403, body = ProblemDetails),
         (status = 503, body = ProblemDetails)
@@ -5519,12 +5527,11 @@ async fn update_region_settings(
     {
         Ok(settings) => {
             let suggested = iptv_domain::suggested_prefixes_for_timezone(&settings.timezone);
-            Json(RegionSettingsResponse {
+            Json(RegionSettingsDto {
                 timezone: settings.timezone,
                 enabled_prefixes: settings.enabled_prefixes,
                 suggested_prefixes: suggested.iter().map(|s| (*s).to_owned()).collect(),
                 auto_detected: settings.auto_detected,
-                prefixes: Vec::new(),
             })
             .into_response()
         }
