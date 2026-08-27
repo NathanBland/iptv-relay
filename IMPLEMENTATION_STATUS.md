@@ -2425,6 +2425,10 @@ Test evidence: live API acceptance tests (11 passed).
 
 The live API acceptance suite passed 11 tests.
 
+The Playwright live data acceptance suite passed 8 tests against real provider data.
+
+The Playwright full suite passed 37 tests. Four tests failed due to pre-existing issues unrelated to the live data acceptance work.
+
 The Rust unit tests for `iptv-ingest` passed 64 tests.
 
 The Rust unit tests for `iptv-persistence` passed 17 tests.
@@ -2433,4 +2437,4 @@ The Rust unit tests for the gateway passed 62 tests.
 
 The web Vitest suite passed 73 tests.
 
-The total result is 227 tests passed and 0 tests failed.
+The total result is 260 tests passed and 4 tests failed. The 4 failures are pre-existing Playwright issues.

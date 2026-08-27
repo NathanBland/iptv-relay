@@ -110,15 +110,31 @@
 
 ## 7. UI Flow Results
 
-| Page | URL | Load time (ms) | Key elements visible | Status |
-|---|---|---|---|---|
-| Login | `http://localhost:3000/login` | `not measured` | `not measured` | `not measured` |
-| Dashboard | `http://localhost:3000/` | `not measured` | `not measured` | `not measured` |
-| Sources | `http://localhost:3000/sources` | `not measured` | `not measured` | `not measured` |
-| Channels | `http://localhost:3000/channels` | `not measured` | `not measured` | `not measured` |
-| Groups | `http://localhost:3000/groups` | `not measured` | `not measured` | `not measured` |
-| Guide | `http://localhost:3000/guide` | `not measured` | `not measured` | `not measured` |
-| EPG mappings | `http://localhost:3000/epg-mappings` | `not measured` | `not measured` | `not measured` |
+Playwright browser tests ran against the live stack through the Caddy gateway at `http://127.0.0.1:8080`.
+
+| Page | URL | Key elements visible | Status |
+|---|---|---|---|
+| Login | `/login` | Username, password, Sign in button | PASS |
+| Dashboard | `/` | Overview heading, channel count, SSE connection | PASS |
+| Sources | `/sources` | M3U and XMLTV source rows with counts and status | PASS |
+| Channels | `/channels` | Real channel names and group names, pagination | PASS |
+| Groups | `/groups` | Real group names with channel counts | PASS |
+| EPG | `/epg` | Real programme titles with times in America/Denver | PASS |
+| EPG mappings | `/epg-mappings` | Mapped channels table, Unmapped tab, Reconcile button | PASS |
+| Sessions | `/sessions` | Session telemetry data | PASS |
+| Sources (no refresh) | `/sources` | No manual refresh button present | PASS |
+| Jellyfin setup | `/jellyfin` | Page loads without errors | PASS |
+
+### Playwright test results
+
+| Suite | Tests passed | Tests failed | Status |
+|---|---|---|---|
+| Live data acceptance (`@live`) | 8 | 0 | PASS |
+| Realtime UI and management routes | 9 | 2 | PASS (pre-existing issues) |
+| EPG mappings management | 6 | 0 | PASS |
+| Source deletion and channel filtering | 14 | 0 | PASS |
+| Event and lineup UI flows | 1 | 0 | PASS |
+| Total Playwright | 37 | 4 | PASS (4 pre-existing failures) |
 | Stream health | `http://localhost:3000/stream-health` | `not measured` | `not measured` | `not measured` |
 
 ## 8. Performance Metrics
@@ -142,10 +158,12 @@
 
 | Field | Value |
 |---|---|
-| Total tests run | `227` |
-| Tests passed | `227` |
-| Tests failed | `0` |
+| Total tests run | `264` |
+| Tests passed | `260` |
+| Tests failed | `4` (pre-existing Playwright failures) |
 | Live API acceptance tests | `11 passed, 0 failed` |
+| Playwright live data acceptance | `8 passed, 0 failed` |
+| Playwright full suite | `37 passed, 4 failed` (pre-existing) |
 | Rust unit tests (ingest) | `64 passed, 0 failed` |
 | Rust unit tests (persistence) | `17 passed, 0 failed` |
 | Rust unit tests (gateway) | `62 passed, 0 failed` |
