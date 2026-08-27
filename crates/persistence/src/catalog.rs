@@ -129,7 +129,10 @@ impl CatalogRepository {
     /// 2. Normalized name match that strips quality, resolution, and
     ///    country-prefix tokens from both channel and EPG display names
     ///    (confidence 0.90).
-    /// 3. Ambiguous name matches populate `review_candidates` for operator
+    /// 3. Channel alias match: when a channel name and an EPG display name
+    ///    resolve to the same canonical name via the `channel_aliases` table,
+    ///    a mapping is created with confidence 0.85.
+    /// 4. Ambiguous name matches populate `review_candidates` for operator
     ///    review rather than auto-applying the first result.
     ///
     /// Manual mappings (`review_status = 'manual'`) are preserved and never
@@ -252,7 +255,76 @@ impl CatalogRepository {
         .try_into()
         .unwrap_or(i64::MAX);
 
-        // Pass 3: ambiguous name matches — store all candidates for review.
+        // Pass 3: channel alias match for channels without a mapping.
+        // When a channel name and an EPG display name resolve to the same
+        // canonical name via the channel_aliases table, create a mapping.
+        // This catches cases like "ESPN HD" (channel) -> "ESPN" (EPG)
+        // where normalized name matching fails due to quality tokens.
+        let alias_applied: i64 = sqlx::query(
+            r"
+            WITH latest_active_xmltv AS (
+                SELECT id AS snapshot_id
+                FROM source_snapshots
+                WHERE kind = 'xmltv' AND status = 'active'
+                ORDER BY activated_at DESC NULLS LAST
+                LIMIT 1
+            ),
+            epg_names AS (
+                SELECT ec.id AS epg_channel_id,
+                       normalize_channel_name(ec.display_names->0->>'value') AS norm
+                FROM epg_channels ec
+                JOIN latest_active_xmltv lax ON lax.snapshot_id = ec.source_snapshot_id
+                WHERE normalize_channel_name(ec.display_names->0->>'value') <> ''
+            ),
+            unique_epg_names AS (
+                SELECT norm,
+                       (array_agg(epg_channel_id ORDER BY epg_channel_id))[1] AS epg_channel_id
+                FROM epg_names
+                GROUP BY norm
+                HAVING count(*) = 1
+            ),
+            alias_matchable AS (
+                SELECT c.id AS channel_id,
+                       normalize_channel_name(c.name) AS channel_norm,
+                       ca.canonical_name AS canonical
+                FROM channels c
+                JOIN channel_aliases ca
+                  ON normalize_channel_name(ca.alias) = normalize_channel_name(c.name)
+                WHERE c.managed_by = 'automatic'
+                  AND c.canonical_key IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM channel_epg_mappings cem WHERE cem.channel_id = c.id
+                  )
+                  AND normalize_channel_name(c.name) <> ''
+            )
+            INSERT INTO channel_epg_mappings
+                (channel_id, epg_channel_id, method, confidence, evidence,
+                 review_status, revision)
+            SELECT am.channel_id, uen.epg_channel_id, 'alias', 0.85,
+                   jsonb_build_object('match', 'channel-alias',
+                                      'channel_name', am.channel_norm,
+                                      'canonical_name', am.canonical,
+                                      'epg_name', uen.norm), 'applied', 1
+            FROM alias_matchable am
+            JOIN unique_epg_names uen ON uen.norm = normalize_channel_name(am.canonical)
+            ON CONFLICT (channel_id) DO UPDATE SET
+                epg_channel_id = EXCLUDED.epg_channel_id,
+                method = EXCLUDED.method,
+                confidence = EXCLUDED.confidence,
+                evidence = EXCLUDED.evidence,
+                review_status = EXCLUDED.review_status,
+                revision = channel_epg_mappings.revision + 1,
+                updated_at = now()
+            WHERE channel_epg_mappings.review_status <> 'manual'
+            ",
+        )
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+        .try_into()
+        .unwrap_or(i64::MAX);
+
+        // Pass 4: ambiguous name matches — store all candidates for review.
         // Channels whose normalized name matches multiple EPG channels get
         // review_candidate rows. If the channel has no mapping yet, create a
         // mapping with review_status = 'review' pointing at the top candidate.
@@ -331,8 +403,8 @@ impl CatalogRepository {
         .await?;
 
         // Remove automatic mappings that no longer have a matching EPG
-        // channel by either tvg-id or normalized name. Manual mappings
-        // are preserved.
+        // channel by tvg-id, normalized name, or channel alias. Manual
+        // mappings are preserved.
         let removed: i64 = sqlx::query(
             r"
             DELETE FROM channel_epg_mappings cem
@@ -349,6 +421,13 @@ impl CatalogRepository {
                 WHERE lower(ec.xmltv_id) = lower(c.canonical_key)
                    OR normalize_channel_name(ec.display_names->0->>'value')
                     = normalize_channel_name(c.name)
+                   OR EXISTS (
+                      SELECT 1
+                      FROM channel_aliases ca
+                      WHERE normalize_channel_name(ca.alias) = normalize_channel_name(c.name)
+                        AND normalize_channel_name(ca.canonical_name)
+                          = normalize_channel_name(ec.display_names->0->>'value')
+                   )
               )
             ",
         )
@@ -359,7 +438,7 @@ impl CatalogRepository {
         .unwrap_or(i64::MAX);
         transaction.commit().await?;
         Ok(EpgMappingStats {
-            mappings_applied: tvg_applied + name_applied,
+            mappings_applied: tvg_applied + name_applied + alias_applied,
             mappings_removed: removed,
             review_queued,
         })

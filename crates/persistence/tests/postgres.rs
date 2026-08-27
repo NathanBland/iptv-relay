@@ -477,6 +477,220 @@ async fn reconcile_merges_streams_by_tvg_id_and_maps_epg() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn reconcile_epg_mappings_by_channel_alias() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+
+    // Create a provider account with a channel named "ESPN HD" that has no
+    // tvg-id. The normalized name "espn hd" will not match the EPG channel
+    // "ESPN" (normalized "espn") because "HD" is a meaningful token.
+    let mut transaction = pool.begin().await.unwrap();
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("Alias-match account {suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, channel_number, url_template, attributes, directives, supported) VALUES ($1, $2, $3, $4, $5, NULL, $6, 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind("espn-hd")
+    .bind("ESPN HD")
+    .bind("200")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+
+    catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+
+    // Create an EPG source with a channel named "ESPN".
+    let epg_source_id = uuid::Uuid::now_v7();
+    let epg_snapshot_id = uuid::Uuid::now_v7();
+    let epg_channel_id = uuid::Uuid::now_v7();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO epg_sources (id, name, url_template, enabled) VALUES ($1, $2, 'https://guide.test/g.xml', true)")
+        .bind(epg_source_id)
+        .bind(format!("Alias-match guide {suffix}"))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO source_snapshots (id, epg_source_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'xmltv', 'active', $3, 1, 1)")
+        .bind(epg_snapshot_id)
+        .bind(epg_source_id)
+        .bind(epg_snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO epg_channels (id, source_snapshot_id, epg_source_id, xmltv_id, display_names) VALUES ($1, $2, $3, 'espn.us', $4)")
+        .bind(epg_channel_id)
+        .bind(epg_snapshot_id)
+        .bind(epg_source_id)
+        .bind(json!([{"value": "ESPN"}]))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO programmes (id, source_snapshot_id, epg_channel_id, starts_at, stops_at, original_start, original_stop, title) VALUES ($1, $2, $3, $4, $5, $6, $7, 'SportsCenter')")
+        .bind(uuid::Uuid::now_v7())
+        .bind(epg_snapshot_id)
+        .bind(epg_channel_id)
+        .bind(Utc::now())
+        .bind(Utc::now() + Duration::hours(1))
+        .bind("start")
+        .bind("stop")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    // First reconcile without alias — should NOT match.
+    let _stats_before = catalog.reconcile_epg_mappings().await.unwrap();
+    let page_before = catalog
+        .list_channels(iptv_persistence::ChannelQuery {
+            limit: Some(100),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let channel_before = page_before
+        .items
+        .iter()
+        .find(|row| row.name == "ESPN HD")
+        .expect("channel exists");
+    assert!(
+        !channel_before.epg_mapped,
+        "channel should not be mapped before alias is created"
+    );
+
+    // Create a channel alias: "ESPN HD" -> "ESPN".
+    catalog
+        .create_channel_alias(&iptv_persistence::CreateChannelAliasInput {
+            canonical_name: "ESPN".to_owned(),
+            alias: "ESPN HD".to_owned(),
+            country: None,
+            category: None,
+        })
+        .await
+        .unwrap();
+
+    // Reconcile again — alias should now bridge the gap.
+    let stats_after = catalog.reconcile_epg_mappings().await.unwrap();
+    assert!(
+        stats_after.mappings_applied >= 1,
+        "expected at least one alias-based mapping, got {}",
+        stats_after.mappings_applied
+    );
+
+    // Verify the channel is mapped and programmes are accessible.
+    let page_after = catalog
+        .list_channels(iptv_persistence::ChannelQuery {
+            limit: Some(100),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mapped = page_after
+        .items
+        .iter()
+        .find(|row| row.name == "ESPN HD")
+        .expect("channel exists after alias reconciliation");
+    assert!(mapped.epg_mapped, "channel should be EPG-mapped by alias");
+
+    let programmes = catalog
+        .list_programmes(iptv_persistence::ProgrammeQuery {
+            channel_id: Some(mapped.id),
+            limit: Some(100),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(programmes.total, 1);
+    assert_eq!(programmes.items[0].title, "SportsCenter");
+
+    // Verify the mapping method is 'alias'.
+    let mappings = catalog
+        .list_epg_mappings(None, 100, 0)
+        .await
+        .unwrap();
+    let alias_mapping = mappings
+        .items
+        .iter()
+        .find(|m| m.channel_name == "ESPN HD");
+    assert!(
+        alias_mapping.is_some(),
+        "mapping should exist for ESPN HD"
+    );
+    assert_eq!(
+        alias_mapping.unwrap().method, "alias",
+        "mapping method should be 'alias'"
+    );
+
+    // Cleanup.
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM channel_streams USING channels WHERE channel_streams.channel_id = channels.id AND channels.provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM channel_epg_mappings USING channels WHERE channel_epg_mappings.channel_id = channels.id AND channels.provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM channels WHERE provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM epg_sources WHERE id = $1")
+        .bind(epg_source_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM channel_aliases WHERE canonical_name = 'ESPN'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn reconcile_epg_mappings_by_normalized_name() {
     let Some(database_url) = database_url() else {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");

@@ -191,6 +191,16 @@ function confidenceTone(confidence: number): 'success' | 'warning' | 'danger' {
   return 'danger'
 }
 
+function methodTone(method: string): 'info' | 'neutral' {
+  if (method === 'alias') return 'info'
+  return 'neutral'
+}
+
+function methodLabel(method: string): string {
+  if (method === 'alias') return 'Alias'
+  return method
+}
+
 function MappingRow({
   mapping,
   showReviewActions,
@@ -232,7 +242,7 @@ function MappingRow({
           </div>
         ) : <span className="text-slate-500">—</span>}
       </TableCell>
-      <TableCell><Badge tone="neutral">{mapping.method}</Badge></TableCell>
+      <TableCell><Badge tone={methodTone(mapping.method)}>{methodLabel(mapping.method)}</Badge></TableCell>
       <TableCell>
         <Badge tone={confidenceTone(mapping.confidence)}>
           {(mapping.confidence * 100).toFixed(0)}%

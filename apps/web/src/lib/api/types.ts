@@ -112,7 +112,7 @@ export interface Programme {
 export interface EpgMapping {
   channelId: string
   epgChannelId: string
-  method: string
+  method: 'tvg-id' | 'exact-name' | 'alias' | string
   confidence: number
   evidence: Record<string, unknown>
   reviewStatus: 'applied' | 'review' | 'rejected' | 'manual'
