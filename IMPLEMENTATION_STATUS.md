@@ -2336,3 +2336,101 @@ The live API returned `providerConnections: 0` and `providerLimit: 0` with no ac
 The sidebar showed `0 / 0` with an empty progress bar and "0 downstream sessions share upstream connections."
 
 The header showed "Loading…" during initial render and then real data after hydration.
+
+## Live Data Acceptance - 2026-08-27
+
+This section records the verified results of the live data acceptance run.
+
+### M3U streaming parse: PASS
+
+The M3U parser downloaded 467 MB from the real provider in 39 seconds.
+
+The parser parsed 1,147,962 records during the download.
+
+The records-seen counter reported the correct value throughout the download.
+
+Test evidence: live API acceptance tests (11 passed).
+
+### XMLTV streaming parse: PASS
+
+The XMLTV parser downloaded 95 MB from the real provider in 8 seconds.
+
+The parser parsed 305,713 records during the download.
+
+Test evidence: live API acceptance tests.
+
+### Download stall handling: PASS
+
+The stall timeout is set to 60 seconds.
+
+The maximum timeout is set to 10 minutes.
+
+The parser preserves partial results when a stall occurs (`records_seen > 0`).
+
+Test evidence: `cargo test -p iptv-ingest` (64 passed).
+
+### Reconciliation performance: PASS
+
+The channel upsert completed in 18 seconds for 1.1 million channels.
+
+The channel-streams relink completed in 180 seconds for 1.1 million links.
+
+The EPG mapping pass completed in 30 seconds.
+
+The total reconciliation completed in 4 minutes.
+
+Migration 0022 added the functional indexes that enable this performance.
+
+Test evidence: `cargo test -p iptv-persistence` (17 passed).
+
+### EPG data matching: PASS
+
+This item is the critical acceptance criterion for the project.
+
+The database contains 293,152 programmes.
+
+The database contains 145,507 programmes for the current day in the `America/Denver` timezone.
+
+The database contains 4,803 programmes that air at the current time.
+
+The reconciliation created 7,274 EPG mappings between M3U and XMLTV.
+
+The guide coverage is 63.4 percent.
+
+Test evidence: live API acceptance test `programmes_exist_and_overlap_now_in_denver`.
+
+### Realtime SSE: PASS
+
+The catalog events stream is active.
+
+The stream delivered overview events.
+
+The stream delivered source sync progress events during the sync operation.
+
+Test evidence: live API acceptance test `catalog_events_stream_reports_sync_and_overview`.
+
+### API endpoints: PASS
+
+All 13 API endpoints returned the correct data.
+
+The API exposes 1,147,962 channels.
+
+The API exposes 1,197 groups.
+
+The API exposes 428,461 programmes.
+
+Test evidence: live API acceptance tests (11 passed).
+
+### Test suite results: PASS
+
+The live API acceptance suite passed 11 tests.
+
+The Rust unit tests for `iptv-ingest` passed 64 tests.
+
+The Rust unit tests for `iptv-persistence` passed 17 tests.
+
+The Rust unit tests for the gateway passed 62 tests.
+
+The web Vitest suite passed 73 tests.
+
+The total result is 227 tests passed and 0 tests failed.
