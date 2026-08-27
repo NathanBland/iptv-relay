@@ -1,12 +1,16 @@
 import { expect, test } from '@playwright/test'
 
 const adminUsername = process.env.IPTV_ADMIN_USERNAME ?? 'operator'
-const adminPassword = process.env.IPTV_ADMIN_PASSWORD ?? ''
+const adminPassword = process.env.IPTV_ADMIN_PASSWORD ?? 'admin1234567'
 
 test.describe.serial('EPG mappings management', () => {
   test.beforeEach(async ({ page, context }) => {
     await context.request.get('/health/ready')
     await page.goto('/login')
+    await expect.poll(async () => {
+      const cookies = await context.cookies()
+      return cookies.some((c) => c.name === 'iptv_csrf')
+    }, { timeout: 15_000, message: 'CSRF cookie was not set.' }).toBe(true)
     await page.getByLabel('Username').fill(adminUsername)
     await page.getByLabel('Password').fill(adminPassword)
     await page.getByRole('button', { name: 'Sign in' }).click()
