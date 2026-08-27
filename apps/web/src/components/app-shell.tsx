@@ -71,7 +71,7 @@ function Navigation({ compact = false }: { compact?: boolean }) {
   )
 }
 
-function ProviderBudget({ overview }: { overview?: { providerConnections: number; providerLimit: number; activeSessions: number } }) {
+function ProviderBudget({ overview }: { overview: { providerConnections: number; providerLimit: number; activeSessions: number } | undefined }) {
   const connections = overview?.providerConnections ?? 0
   const limit = overview?.providerLimit ?? 0
   const sessions = overview?.activeSessions ?? 0

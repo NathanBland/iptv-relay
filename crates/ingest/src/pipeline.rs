@@ -26,7 +26,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::{debug, info};
 use url::Url;
 use uuid::Uuid;
@@ -56,12 +56,16 @@ impl ChannelReader {
 impl Read for ChannelReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.pos >= self.current.len() {
-            match self.receiver.blocking_recv() {
-                Some(chunk) => {
-                    self.current = chunk;
-                    self.pos = 0;
-                }
-                None => return Ok(0),
+            if let Some(chunk) = self.receiver.blocking_recv() {
+                debug!(
+                    chunk_len = chunk.len(),
+                    "ChannelReader: received chunk from download loop"
+                );
+                self.current = chunk;
+                self.pos = 0;
+            } else {
+                debug!("ChannelReader: channel closed (EOF)");
+                return Ok(0);
             }
         }
         let available = &self.current[self.pos..];
@@ -245,7 +249,7 @@ where
         info!("streaming: download and parse will overlap");
 
         // Set up the parser channel and task.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(256);
         let reader = ChannelReader::new(rx);
 
         let format = request.format;
@@ -273,7 +277,8 @@ where
         // chunks to the parser channel. The parser runs concurrently in
         // spawn_blocking, pulling from the channel as chunks arrive.
         let file = tempfile::tempfile()?;
-        let mut file = tokio::fs::File::from_std(file);
+        let file = tokio::fs::File::from_std(file);
+        let mut file = BufWriter::with_capacity(512 * 1024, file);
         let mut hasher = Sha256::new();
         let mut byte_count = 0_u64;
         let mut last_checkpoint = std::time::Instant::now();
@@ -308,8 +313,8 @@ where
                     })?,
                     Ok(None) => break, // EOF
                     Err(_) => {
-                        debug!(byte_count, stall_timeout = ?stall_timeout, "streaming: stalled");
-                        return Err(IngestError::HttpRequest);
+                        debug!(byte_count, stall_timeout = ?stall_timeout, "streaming: stalled, attempting partial activation");
+                        break;
                     }
                 }
             };
@@ -336,8 +341,8 @@ where
                 break;
             }
 
-            // Periodic progress checkpoint (every 5 seconds).
-            if last_checkpoint.elapsed() >= Duration::from_secs(5) {
+            // Periodic progress checkpoint (every 2 seconds).
+            if last_checkpoint.elapsed() >= Duration::from_secs(2) {
                 last_checkpoint = std::time::Instant::now();
                 let records = records_counter.load(Ordering::Relaxed);
                 if let Err(error) = self.checkpoint("downloading", byte_count, 0, records, 0).await {
@@ -361,6 +366,14 @@ where
         let (mut snapshot, records_seen) = parse_task
             .await
             .map_err(|_| IngestError::ArtifactIo(std::io::Error::other("parse task panicked")))??;
+
+        if records_seen == 0 {
+            debug!(
+                byte_count,
+                "streaming: parser produced no records, cannot activate partial snapshot"
+            );
+            return Err(IngestError::HttpRequest);
+        }
 
         info!(
             downloaded_bytes = byte_count,
@@ -627,16 +640,15 @@ fn streaming_parse<P: EndpointProtector>(
             let mut callback_error = None;
             let mut stable_keys = HashMap::new();
             let summary = parse_m3u_visit(BufReader::new(reader), limits, |entry| {
-                match stage_m3u_entry(&mut snapshot, entry, protector, &mut stable_keys) {
-                    Ok(()) => {
-                        records_counter.fetch_add(1, Ordering::Relaxed);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        callback_error = Some(error);
-                        Err(ParseError::Io(std::io::Error::other("M3U staging visitor failed")))
-                    }
+                if let Err(error) = stage_m3u_entry(&mut snapshot, entry, protector, &mut stable_keys) {
+                    callback_error = Some(error);
+                    return Err(ParseError::Io(std::io::Error::other("M3U staging visitor failed")));
                 }
+                let count = records_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                if count.is_multiple_of(1000) {
+                    debug!(records_staged = count, "streaming_parse: M3U staging progress");
+                }
+                Ok(())
             });
             let summary = match summary {
                 Ok(summary) => summary,

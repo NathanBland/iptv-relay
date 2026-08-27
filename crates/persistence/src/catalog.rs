@@ -85,13 +85,39 @@ impl CatalogRepository {
         &self,
         account_id: Uuid,
     ) -> Result<ReconcileStats, PersistenceError> {
-        let mut transaction = self.pool.begin().await?;
-        let channel_stats = upsert_canonical_channels(&mut transaction, account_id).await?;
-        let link_count = relink_channel_streams(&mut transaction, account_id).await?;
-        transaction.commit().await?;
+        let channel_stats = {
+            let mut transaction = self.pool.begin().await?;
+            sqlx::query("SET LOCAL statement_timeout = '120s'")
+                .execute(&mut *transaction)
+                .await?;
+            let stats = upsert_canonical_channels(&mut transaction, account_id).await?;
+            transaction.commit().await?;
+            stats
+        };
+
+        let link_count = {
+            let mut transaction = self.pool.begin().await?;
+            sqlx::query("SET LOCAL statement_timeout = '300s'")
+                .execute(&mut *transaction)
+                .await?;
+            let count = relink_channel_streams(&mut transaction, account_id).await?;
+            transaction.commit().await?;
+            count
+        };
+
+        let orphans_removed = {
+            let mut transaction = self.pool.begin().await?;
+            sqlx::query("SET LOCAL statement_timeout = '300s'")
+                .execute(&mut *transaction)
+                .await?;
+            let count = remove_orphaned_channels(&mut transaction, account_id).await?;
+            transaction.commit().await?;
+            count
+        };
+
         Ok(ReconcileStats {
             channels: channel_stats.channels,
-            orphaned_channels_removed: channel_stats.orphans_removed,
+            orphaned_channels_removed: orphans_removed,
             stream_links: link_count,
         })
     }
@@ -2455,7 +2481,6 @@ pub struct LineupApplyStats {
 #[derive(Debug, FromRow)]
 struct ReconcileCountRow {
     channels: i64,
-    orphans_removed: i64,
 }
 
 #[derive(Debug, FromRow)]
@@ -2511,12 +2536,7 @@ async fn upsert_canonical_channels(
         channel_rows AS (
             SELECT
                 COALESCE(
-                    (
-                        SELECT c.id
-                        FROM channels c
-                        WHERE c.provider_account_id = $1
-                          AND c.canonical_key = all_groups.canonical_key
-                    ),
+                    c.id,
                     regexp_replace(
                         md5('iptv-channel:v1:' || $1::text || ':' || all_groups.canonical_key),
                         '^(.{8})(.{4})(.{4})(.{4})(.{12})$',
@@ -2530,13 +2550,16 @@ async fn upsert_canonical_channels(
                 CASE
                     WHEN all_groups.preferred_number IS NOT NULL
                          AND NOT EXISTS (
-                             SELECT 1 FROM channels c
-                             WHERE c.channel_number = all_groups.preferred_number
+                             SELECT 1 FROM channels c2
+                             WHERE c2.channel_number = all_groups.preferred_number
                          )
                     THEN all_groups.preferred_number
                     ELSE nextval('canonical_channel_number_seq')::text
                 END AS channel_number
             FROM all_groups
+            LEFT JOIN channels c
+              ON c.provider_account_id = $1
+             AND c.canonical_key = all_groups.canonical_key
         )
         INSERT INTO channels
             (id, channel_number, name, group_name, logo_url, enabled,
@@ -2551,6 +2574,9 @@ async fn upsert_canonical_channels(
             enabled = true,
             updated_at = now(),
             revision = channels.revision + 1
+        WHERE (channels.name, channels.group_name, channels.logo_url, channels.enabled)
+              IS DISTINCT FROM
+              (EXCLUDED.name, EXCLUDED.group_name, EXCLUDED.logo_url, EXCLUDED.enabled)
         ",
     )
     .bind(account_id)
@@ -2560,6 +2586,15 @@ async fn upsert_canonical_channels(
     .try_into()
     .unwrap_or(i64::MAX);
 
+    Ok(ReconcileCountRow {
+        channels: inserted,
+    })
+}
+
+async fn remove_orphaned_channels(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+) -> Result<i64, PersistenceError> {
     let orphans_removed: i64 = sqlx::query(
         r"
         DELETE FROM channels c
@@ -2584,29 +2619,13 @@ async fn upsert_canonical_channels(
     .try_into()
     .unwrap_or(i64::MAX);
 
-    Ok(ReconcileCountRow {
-        channels: inserted,
-        orphans_removed,
-    })
+    Ok(orphans_removed)
 }
 
 async fn relink_channel_streams(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
 ) -> Result<i64, PersistenceError> {
-    sqlx::query(
-        r"
-        DELETE FROM channel_streams cs
-        USING channels c
-        WHERE cs.channel_id = c.id
-          AND c.provider_account_id = $1
-          AND c.managed_by = 'automatic'
-        ",
-    )
-    .bind(account_id)
-    .execute(&mut **transaction)
-    .await?;
-
     let result = sqlx::query(
         r"
         INSERT INTO channel_streams (channel_id, provider_stream_id, priority, evidence)
@@ -2619,18 +2638,50 @@ async fn relink_channel_streams(
         JOIN source_snapshots ss ON ss.id = ps.snapshot_id
         JOIN channels c
           ON c.provider_account_id = $1
+         AND c.managed_by = 'automatic'
          AND c.canonical_key = COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key)
         WHERE ss.provider_account_id = $1
           AND ss.status = 'active'
           AND ss.kind = 'm3u'
           AND ps.supported
-        ON CONFLICT (channel_id, provider_stream_id) DO NOTHING
+        ON CONFLICT (channel_id, provider_stream_id) DO UPDATE SET
+            priority = EXCLUDED.priority
+        WHERE channel_streams.priority != EXCLUDED.priority
         ",
     )
     .bind(account_id)
     .execute(&mut **transaction)
     .await?;
-    Ok(result.rows_affected().try_into().unwrap_or(i64::MAX))
+
+    let deleted: i64 = sqlx::query(
+        r"
+        DELETE FROM channel_streams cs
+        USING channels c
+        WHERE cs.channel_id = c.id
+          AND c.provider_account_id = $1
+          AND c.managed_by = 'automatic'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM provider_streams ps
+              JOIN source_snapshots ss ON ss.id = ps.snapshot_id
+              WHERE ss.provider_account_id = $1
+                AND ss.status = 'active'
+                AND ss.kind = 'm3u'
+                AND ps.supported
+                AND ps.id = cs.provider_stream_id
+                AND c.canonical_key = COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key)
+          )
+        ",
+    )
+    .bind(account_id)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected()
+    .try_into()
+    .unwrap_or(i64::MAX);
+
+    let upserted: i64 = result.rows_affected().try_into().unwrap_or(i64::MAX);
+    Ok(upserted + deleted)
 }
 
 /// A row of stream health data returned by the health check listing query.

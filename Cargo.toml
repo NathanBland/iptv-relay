@@ -1,3 +1,11 @@
+[package]
+name = "iptv-live-acceptance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
 [workspace]
 members = [
   "apps/server",
@@ -68,3 +76,15 @@ must_use_candidate = "allow"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[dev-dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+futures-util.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

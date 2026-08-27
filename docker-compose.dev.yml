@@ -30,8 +30,27 @@ services:
       start_period: 300s
 
   worker:
-    # Worker uses the production image in dev mode.
+    # Workers use the dev image with volume-mounted source for fast rebuilds.
     # Worker count is controlled by IPTV_WORKER_COUNT (default: 4).
+    image: iptv-gateway-core:dev
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    entrypoint: []
+    volumes:
+      - ./:/build:cached
+      - cargo-target:/build/target
+    command: ["/usr/local/bin/dev-reload.sh", "/build/crates /build/apps/server/src /build/migrations", "cargo", "run", "--release", "-j", "2", "--bin", "iptv-gateway", "--", "worker"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,iptv=debug}
+      CARGO_PROFILE_RELEASE_LTO: "off"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h postgres -U iptv -d iptv || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   web:
     build:
