@@ -4099,6 +4099,182 @@ impl CatalogRepository {
         }
         Ok(())
     }
+    // -- Region settings --
+
+    /// Reads the current region settings row. Creates a default row if none exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn get_region_settings(&self) -> Result<RegionSettingsRow, PersistenceError> {
+        let row: Option<RegionSettingsRow> = sqlx::query_as(
+            r"
+            SELECT id, timezone, enabled_prefixes, auto_detected, created_at, updated_at
+            FROM region_settings
+            ORDER BY updated_at DESC
+            LIMIT 1
+            ",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = row {
+            return Ok(row);
+        }
+        // Insert a default row if the table is empty.
+        let row: RegionSettingsRow = sqlx::query_as(
+            r#"
+            INSERT INTO region_settings (timezone, enabled_prefixes, auto_detected)
+            VALUES ('America/Denver', '{"US","USA","CAN","EN","LA","GLOBAL","MULTI","SPT"}', true)
+            ON CONFLICT DO NOTHING
+            RETURNING id, timezone, enabled_prefixes, auto_detected, created_at, updated_at
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Updates the region settings row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the update fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn update_region_settings(
+        &self,
+        timezone: &str,
+        enabled_prefixes: &[String],
+    ) -> Result<RegionSettingsRow, PersistenceError> {
+        let row: RegionSettingsRow = sqlx::query_as(
+            r"
+            UPDATE region_settings SET
+                timezone = $2,
+                enabled_prefixes = $3,
+                auto_detected = false,
+                updated_at = now()
+            WHERE id = (
+                SELECT id FROM region_settings ORDER BY updated_at DESC LIMIT 1
+            )
+            RETURNING id, timezone, enabled_prefixes, auto_detected, created_at, updated_at
+            ",
+        )
+        .bind(timezone)
+        .bind(enabled_prefixes)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Lists all region prefixes found in channel group names with counts.
+    ///
+    /// Returns one row per distinct prefix (e.g., "US", "UK", "AF") with the
+    /// number of groups and total channels that share that prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn list_region_prefixes(&self) -> Result<Vec<RegionPrefixRow>, PersistenceError> {
+        let rows: Vec<RegionPrefixRow> = sqlx::query_as(
+            r"
+            WITH prefixed AS (
+                SELECT
+                    substring(group_name FROM '^([A-Z]{2,7}):') AS prefix,
+                    count(DISTINCT group_name) AS group_count,
+                    count(*) AS channel_count
+                FROM channels
+                WHERE group_name IS NOT NULL
+                  AND group_name ~ '^[A-Z]{2,7}:'
+                GROUP BY prefix
+            )
+            SELECT prefix, group_count, channel_count
+            FROM prefixed
+            WHERE prefix IS NOT NULL
+            ORDER BY channel_count DESC
+            ",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Enables channels whose group name starts with one of the given prefixes
+    /// and disables all other channels that have a prefixed group name.
+    ///
+    /// Channels without a prefixed group name are left unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the update fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn apply_region_filter(
+        &self,
+        enabled_prefixes: &[String],
+    ) -> Result<RegionFilterStats, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+
+        // Disable channels with prefixed groups that do not match.
+        let disabled: i64 = sqlx::query(
+            r"
+            UPDATE channels SET enabled = false, updated_at = now()
+            WHERE group_name ~ '^[A-Z]{2,7}:'
+              AND enabled = true
+              AND substring(group_name FROM '^([A-Z]{2,7}):') <> ALL($1::text[])
+            ",
+        )
+        .bind(enabled_prefixes)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+        .try_into()
+        .unwrap_or(i64::MAX);
+
+        // Enable channels with prefixed groups that do match.
+        let enabled: i64 = sqlx::query(
+            r"
+            UPDATE channels SET enabled = true, updated_at = now()
+            WHERE group_name ~ '^[A-Z]{2,7}:'
+              AND enabled = false
+              AND substring(group_name FROM '^([A-Z]{2,7}):') = ANY($1::text[])
+            ",
+        )
+        .bind(enabled_prefixes)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+        .try_into()
+        .unwrap_or(i64::MAX);
+
+        transaction.commit().await?;
+        Ok(RegionFilterStats { enabled, disabled })
+    }
+}
+
+/// Region settings row stored in the `region_settings` table.
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RegionSettingsRow {
+    pub id: Uuid,
+    pub timezone: String,
+    pub enabled_prefixes: Vec<String>,
+    pub auto_detected: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A region prefix with group and channel counts.
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct RegionPrefixRow {
+    pub prefix: String,
+    pub group_count: i64,
+    pub channel_count: i64,
+}
+
+/// Statistics from applying a region filter.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RegionFilterStats {
+    pub enabled: i64,
+    pub disabled: i64,
 }
 
 #[cfg(test)]

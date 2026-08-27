@@ -591,8 +591,8 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, system_info, settings_schema, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, list_sessions, session_events, catalog_events, save_jellyfin, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile),
-    components(schemas(LoginRequest, LogoutRequest, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, EventChannelResponse, SessionResponse, JellyfinConfigRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest)),
+    paths(auth_status, login, logout, system_info, settings_schema, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, list_sessions, session_events, catalog_events, save_jellyfin, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    components(schemas(LoginRequest, LogoutRequest, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, EventChannelResponse, SessionResponse, JellyfinConfigRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -806,6 +806,12 @@ fn configuration_control_routes() -> Router<AppState> {
             "/api/v1/channels/{channel_id}/stream-profile",
             axum::routing::post(assign_stream_profile).delete(remove_stream_profile),
         )
+        .route("/api/v1/region-settings", get(get_region_settings))
+        .route(
+            "/api/v1/region-settings",
+            axum::routing::put(update_region_settings),
+        )
+        .route("/api/v1/region-settings/apply", axum::routing::post(apply_region_filter))
 }
 
 fn output_routes() -> Router<AppState> {
@@ -5386,6 +5392,187 @@ async fn resolve_channel_alias(
             input: name.clone(),
         })
         .into_response(),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RegionSettingsResponse {
+    timezone: String,
+    enabled_prefixes: Vec<String>,
+    suggested_prefixes: Vec<String>,
+    auto_detected: bool,
+    prefixes: Vec<RegionPrefixResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RegionPrefixResponse {
+    prefix: String,
+    group_count: i64,
+    channel_count: i64,
+    suggested: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct UpdateRegionSettingsRequest {
+    timezone: String,
+    enabled_prefixes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ApplyRegionFilterRequest {
+    enabled_prefixes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RegionFilterResponse {
+    enabled: i64,
+    disabled: i64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/region-settings",
+    tag = "configuration",
+    responses(
+        (status = 200, body = RegionSettingsResponse, description = "Current region settings and available prefixes"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn get_region_settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    let settings = match catalog.get_region_settings().await {
+        Ok(s) => s,
+        Err(error) => return persistence_error_response(error),
+    };
+    let prefixes = match catalog.list_region_prefixes().await {
+        Ok(p) => p,
+        Err(error) => return persistence_error_response(error),
+    };
+    let suggested = iptv_domain::suggested_prefixes_for_timezone(&settings.timezone);
+    let suggested_set: std::collections::HashSet<&str> = suggested.iter().copied().collect();
+    let prefix_responses = prefixes
+        .iter()
+        .map(|p| RegionPrefixResponse {
+            prefix: p.prefix.clone(),
+            group_count: p.group_count,
+            channel_count: p.channel_count,
+            suggested: suggested_set.contains(p.prefix.as_str()),
+        })
+        .collect();
+    Json(RegionSettingsResponse {
+        timezone: settings.timezone,
+        enabled_prefixes: settings.enabled_prefixes,
+        suggested_prefixes: suggested.iter().map(|s| (*s).to_owned()).collect(),
+        auto_detected: settings.auto_detected,
+        prefixes: prefix_responses,
+    })
+    .into_response()
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/region-settings",
+    tag = "configuration",
+    request_body = UpdateRegionSettingsRequest,
+    responses(
+        (status = 200, body = RegionSettingsResponse, description = "Updated region settings"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn update_region_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Result<Json<UpdateRegionSettingsRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_mutation(&state, &headers) {
+        return response;
+    }
+    let Ok(Json(request)) = request else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-region-settings",
+            "Invalid region settings request",
+            "send a JSON request with timezone and enabledPrefixes",
+        )
+        .response();
+    };
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    match catalog
+        .update_region_settings(&request.timezone, &request.enabled_prefixes)
+        .await
+    {
+        Ok(settings) => {
+            let suggested = iptv_domain::suggested_prefixes_for_timezone(&settings.timezone);
+            Json(RegionSettingsResponse {
+                timezone: settings.timezone,
+                enabled_prefixes: settings.enabled_prefixes,
+                suggested_prefixes: suggested.iter().map(|s| (*s).to_owned()).collect(),
+                auto_detected: settings.auto_detected,
+                prefixes: Vec::new(),
+            })
+            .into_response()
+        }
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/region-settings/apply",
+    tag = "configuration",
+    request_body = ApplyRegionFilterRequest,
+    responses(
+        (status = 200, body = RegionFilterResponse, description = "Region filter applied"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn apply_region_filter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Result<Json<ApplyRegionFilterRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_mutation(&state, &headers) {
+        return response;
+    }
+    let Ok(Json(request)) = request else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-region-filter",
+            "Invalid region filter request",
+            "send a JSON request with enabledPrefixes",
+        )
+        .response();
+    };
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    match catalog.apply_region_filter(&request.enabled_prefixes).await {
+        Ok(result) => {
+            // Invalidate cached queries so the UI reflects the changes.
+            Json(RegionFilterResponse {
+                enabled: result.enabled,
+                disabled: result.disabled,
+            })
+            .into_response()
+        }
         Err(error) => persistence_error_response(error),
     }
 }

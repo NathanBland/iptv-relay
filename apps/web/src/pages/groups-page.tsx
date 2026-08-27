@@ -3,6 +3,7 @@ import { LayoutGrid, Loader2, Power, PowerOff } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { LoadingPage } from '@/components/loading-page'
 import { PageHeader } from '@/components/page-header'
+import { RegionFilter } from '@/components/region-filter'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -157,6 +158,7 @@ export function GroupsPage({ client = apiClient }: { client?: IptvApiClient }) {
         title="Groups"
         description="Enable or disable entire channel groups. Disabled groups do not appear in M3U or XMLTV output."
       />
+      <RegionFilter client={client} />
       <section className="space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <label className="relative block max-w-sm flex-1">

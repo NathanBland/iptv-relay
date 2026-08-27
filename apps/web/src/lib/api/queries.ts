@@ -14,6 +14,7 @@ export function apiQueries(client: IptvApiClient = apiClient) {
       enabled: !!sourceId,
     }),
     groups: queryOptions({ queryKey: ['groups'], queryFn: () => client.getGroups() }),
+    regionSettings: queryOptions({ queryKey: ['region-settings'], queryFn: () => client.getRegionSettings() }),
     channels: (query?: ChannelQuery) => queryOptions({ queryKey: ['channels', query ?? null], queryFn: () => client.getChannels(query) }),
     programmes: (query?: ProgrammeQuery) => queryOptions({ queryKey: ['programmes', query ?? null], queryFn: () => client.getProgrammes(query) }),
     events: queryOptions({ queryKey: ['events'], queryFn: () => client.getEvents() }),

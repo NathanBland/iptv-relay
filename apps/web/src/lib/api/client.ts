@@ -2,6 +2,8 @@ import {
   mockChannels,
   mockOverview,
   mockProgrammes,
+  mockRegionPrefixes,
+  mockRegionSettings,
   mockSessions,
   mockSources,
 } from './mock-data'
@@ -56,6 +58,9 @@ import type {
   RecordingPage,
   CreateRecordingInput,
   RecordingStats,
+  RegionPrefixInfo,
+  RegionSettings,
+  RegionSettingsResponse,
   StreamProfile,
   CreateStreamProfileInput,
 } from './types'
@@ -80,6 +85,7 @@ const API_PATHS = {
   sessions: '/api/v1/sessions',
   jellyfin: '/api/v1/jellyfin',
   groups: '/api/v1/groups',
+  regionSettings: '/api/v1/region-settings',
   streamsHealth: '/api/v1/streams/health',
   streamsHealthStats: '/api/v1/streams/health/stats',
   streamsHealthCheck: '/api/v1/streams/health/check',
@@ -516,6 +522,24 @@ export class FetchIptvApiClient implements IptvApiClient {
 
   async getGroups(): Promise<Group[]> {
     return this.request(API_PATHS.groups, (value) => asObjectArray<Group>(value, 'Groups response'))
+  }
+
+  async getRegionSettings(): Promise<RegionSettingsResponse> {
+    return this.request(API_PATHS.regionSettings, (value) => asObject<RegionSettingsResponse>(value, 'Region settings response'))
+  }
+
+  async updateRegionSettings(input: { timezone: string; enabledPrefixes: string[] }): Promise<RegionSettings> {
+    return this.request(API_PATHS.regionSettings, (value) => asObject<RegionSettings>(value, 'Region settings update response'), {
+      method: 'PUT',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async applyRegionFilter(input: { enabledPrefixes: string[] }): Promise<{ enabled: number; disabled: number }> {
+    return this.request(`${API_PATHS.regionSettings}/apply`, (value) => asObject<{ enabled: number; disabled: number }>(value, 'Region filter apply response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
   }
 
   async getChannels(query?: ChannelQuery): Promise<ChannelPage> {
@@ -1013,6 +1037,34 @@ export class MockIptvApiClient implements IptvApiClient {
     return Array.from(groups.entries())
       .map(([name, { channelCount, enabledCount }]) => ({ name, channelCount, enabledCount }))
       .sort((a, b) => b.channelCount - a.channelCount)
+  }
+
+  async getRegionSettings(): Promise<RegionSettingsResponse> {
+    return {
+      settings: { ...mockRegionSettings },
+      prefixes: mockRegionPrefixes.map((prefix) => ({ ...prefix })),
+    }
+  }
+
+  async updateRegionSettings(input: { timezone: string; enabledPrefixes: string[] }): Promise<RegionSettings> {
+    return { ...mockRegionSettings, ...input, autoDetected: false }
+  }
+
+  async applyRegionFilter(input: { enabledPrefixes: string[] }): Promise<{ enabled: number; disabled: number }> {
+    const enabledSet = new Set(input.enabledPrefixes)
+    let enabled = 0
+    let disabled = 0
+    for (const channel of mockChannels) {
+      const prefix = channel.name.split(' ')[0] ?? ''
+      if (enabledSet.has(prefix) || enabledSet.has(channel.group)) {
+        channel.enabled = true
+        enabled += 1
+      } else {
+        channel.enabled = false
+        disabled += 1
+      }
+    }
+    return { enabled, disabled }
   }
 
   async getChannels(query?: ChannelQuery): Promise<ChannelPage> {

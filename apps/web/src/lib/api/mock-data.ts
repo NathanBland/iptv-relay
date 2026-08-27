@@ -3,6 +3,8 @@ import type {
   EventChannel,
   Overview,
   Programme,
+  RegionPrefixInfo,
+  RegionSettings,
   Session,
   Source,
 } from './types'
@@ -218,4 +220,22 @@ export const mockSessions: Session[] = [
     providerHighWatermark: 3,
     providerAvailableSlots: 0,
   },
+]
+
+export const mockRegionSettings: RegionSettings = {
+  timezone: 'America/New_York',
+  enabledPrefixes: ['US', 'USA', 'EN'],
+  suggestedPrefixes: ['US', 'USA', 'EN'],
+  autoDetected: true,
+}
+
+export const mockRegionPrefixes: RegionPrefixInfo[] = [
+  { prefix: 'US', groupCount: 8, channelCount: 120, suggested: true },
+  { prefix: 'USA', groupCount: 4, channelCount: 56, suggested: true },
+  { prefix: 'EN', groupCount: 3, channelCount: 42, suggested: true },
+  { prefix: 'UK', groupCount: 2, channelCount: 34, suggested: false },
+  { prefix: 'FR', groupCount: 2, channelCount: 28, suggested: false },
+  { prefix: 'DE', groupCount: 2, channelCount: 24, suggested: false },
+  { prefix: 'AF', groupCount: 1, channelCount: 12, suggested: false },
+  { prefix: 'ARA', groupCount: 1, channelCount: 16, suggested: false },
 ]

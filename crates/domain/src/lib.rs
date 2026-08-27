@@ -10,6 +10,7 @@ mod epg;
 mod events;
 mod ids;
 mod reconcile;
+mod regions;
 
 pub use catalog::{
     Channel, ChannelGroup, ChannelNumber, ChannelNumberError, Provider, ProviderError, Source,
@@ -32,3 +33,4 @@ pub use reconcile::{
     MappingCandidate, MappingContext, MappingDecision, MappingMethod, StationEvidence,
     apply_non_destructive, reconcile_epg,
 };
+pub use regions::{suggested_prefixes_for_timezone, REGION_PREFIXES};

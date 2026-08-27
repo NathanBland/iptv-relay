@@ -491,6 +491,25 @@ export interface ProblemDetails {
   instance?: string
 }
 
+export interface RegionSettings {
+  timezone: string
+  enabledPrefixes: string[]
+  suggestedPrefixes: string[]
+  autoDetected: boolean
+}
+
+export interface RegionPrefixInfo {
+  prefix: string
+  groupCount: number
+  channelCount: number
+  suggested: boolean
+}
+
+export interface RegionSettingsResponse {
+  settings: RegionSettings
+  prefixes: RegionPrefixInfo[]
+}
+
 export interface IptvApiClient {
   getAuthStatus(): Promise<AuthStatus>
   login(input: LoginInput): Promise<AuthStatus>
@@ -505,6 +524,9 @@ export interface IptvApiClient {
   getSourceSyncStatus(sourceId: string): Promise<SourceSyncStatus>
   updateSource(id: string, input: SourceUpdateInput): Promise<void>
   getGroups(): Promise<Group[]>
+  getRegionSettings(): Promise<RegionSettingsResponse>
+  updateRegionSettings(input: { timezone: string; enabledPrefixes: string[] }): Promise<RegionSettings>
+  applyRegionFilter(input: { enabledPrefixes: string[] }): Promise<{ enabled: number; disabled: number }>
   getChannels(query?: ChannelQuery): Promise<ChannelPage>
   getChannelPreview(channelId: string): Promise<ChannelPreview>
   setChannelEnabled(channelId: string, enabled: boolean): Promise<SaveResult>
