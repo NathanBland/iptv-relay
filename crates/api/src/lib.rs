@@ -3329,6 +3329,50 @@ struct CatalogEvent {
     timestamp: DateTime<Utc>,
 }
 
+/// Deduplicate refresh-source jobs by source ID for SSE emission.
+///
+/// Priority: running > queued > succeeded/failed > cancelled.
+/// Terminal jobs are only included for 60 seconds after their last
+/// update so the UI can clear stale progress bars.
+fn dedup_sync_progress(jobs: &[JobRecord]) -> Vec<(&str, &JobRecord)> {
+    let now = Utc::now();
+    let priority = |status: &str| -> u8 {
+        match status {
+            "running" => 4,
+            "queued" => 3,
+            "succeeded" | "failed" => 2,
+            "cancelled" => 1,
+            _ => 0,
+        }
+    };
+    let mut seen: std::collections::HashMap<&str, &JobRecord> = std::collections::HashMap::new();
+    for job in jobs.iter().filter(|job| {
+        if job.kind != "refresh-source" {
+            return false;
+        }
+        match job.status.as_str() {
+            "queued" | "running" => true,
+            "succeeded" | "failed" | "cancelled" => {
+                (now - job.updated_at).num_seconds() < 60
+            }
+            _ => false,
+        }
+    }) {
+        let source_id = job
+            .payload
+            .get("sourceId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let existing = seen.get(source_id);
+        if existing.is_none()
+            || priority(job.status.as_str()) > priority(existing.unwrap().status.as_str())
+        {
+            seen.insert(source_id, job);
+        }
+    }
+    seen.into_iter().collect()
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/catalog-events",
@@ -3352,30 +3396,7 @@ async fn catalog_events(State(state): State<AppState>, headers: HeaderMap) -> Re
             if let Some(jobs) = &job_repository
                 && let Ok(recent) = jobs.list_recent(200).await
             {
-                // Deduplicate by source ID, preferring running over queued
-                // so the UI sees the most progressed job for each source.
-                let mut seen: std::collections::HashMap<&str, &JobRecord> =
-                    std::collections::HashMap::new();
-                for job in recent.iter().filter(|job| {
-                    job.kind == "refresh-source"
-                        && (job.status == "queued"
-                            || job.status == "running"
-                            || job.status == "cancelled")
-                }) {
-                    let source_id = job
-                        .payload
-                        .get("sourceId")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let existing = seen.get(source_id);
-                    if existing.is_none()
-                        || (existing.is_some_and(|e| e.status == "queued")
-                            && job.status == "running")
-                    {
-                        seen.insert(source_id, job);
-                    }
-                }
-                for (source_id, job) in &seen {
+                for (source_id, job) in dedup_sync_progress(&recent) {
                     let status = SourceSyncStatusResponse::from_job(job);
                     let payload = serde_json::json!({
                         "sourceId": source_id,

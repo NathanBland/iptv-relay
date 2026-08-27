@@ -46,6 +46,35 @@ export function useCatalogEvents() {
       catalogSource.addEventListener('source-sync-progress', (event) => {
         const parsed = parseSyncProgress(event.data)
         if (!parsed) return
+
+        // For terminal statuses (succeeded, failed, cancelled), write the
+        // final state and then invalidate the sources query so the UI
+        // updates to show the final channel count and health state.
+        // After a short delay, remove the sync status from the cache so
+        // stale progress bars do not persist.
+        if (parsed.status === 'succeeded' || parsed.status === 'failed' || parsed.status === 'cancelled') {
+          queryClient.setQueryData<SourceSyncStatus>(
+            ['source-sync-status', parsed.sourceId],
+            {
+              jobId: parsed.jobId,
+              status: parsed.status as SourceSyncStatus['status'],
+              stage: parsed.stage as SourceSyncStatus['stage'],
+              percent: parsed.percent,
+              message: parsed.message,
+              bytesDownloaded: parsed.bytesDownloaded,
+              recordsProcessed: parsed.recordsProcessed,
+              updatedAt: parsed.updatedAt,
+            },
+          )
+          void queryClient.invalidateQueries({ queryKey: ['sources'] })
+          void queryClient.invalidateQueries({ queryKey: ['overview'] })
+          setTimeout(() => {
+            queryClient.removeQueries({ queryKey: ['source-sync-status', parsed.sourceId] })
+          }, 3000)
+          return
+        }
+
+        // For active statuses (running, queued), write progress directly.
         queryClient.setQueryData<SourceSyncStatus>(
           ['source-sync-status', parsed.sourceId],
           {

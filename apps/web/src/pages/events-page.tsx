@@ -1,14 +1,15 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Braces, CalendarClock, Radio, ScanLine } from 'lucide-react'
+import { Braces, CalendarClock, Radio, ScanLine, Trash2, X } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
 import { LoadingPage } from '@/components/loading-page'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
-import type { EventChannel, EventTemplate, IptvApiClient } from '@/lib/api/types'
+import type { CreateEventTemplateInput, EventChannel, EventTemplate, IptvApiClient } from '@/lib/api/types'
 
 const channelTones: Record<EventChannel['state'], 'success' | 'info' | 'warning' | 'neutral'> = {
   live: 'success',
@@ -31,11 +32,21 @@ function TemplateCard({
   channels,
   onScan,
   scanning,
+  onDelete,
+  confirmDelete,
+  deletePending,
+  onConfirmDelete,
+  onCancelDelete,
 }: {
   template: EventTemplate
   channels: EventChannel[]
   onScan: () => void
   scanning: boolean
+  onDelete: () => void
+  confirmDelete: boolean
+  deletePending: boolean
+  onConfirmDelete: () => void
+  onCancelDelete: () => void
 }) {
   return (
     <Card>
@@ -51,10 +62,24 @@ function TemplateCard({
             {template.groupName} · {template.eventDurationHours}h duration
           </p>
         </div>
-        <Button variant="secondary" size="sm" onClick={onScan} disabled={scanning}>
-          <ScanLine aria-hidden="true" className="size-4" />
-          {scanning ? 'Scanning' : 'Scan'}
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button variant="secondary" size="sm" onClick={onScan} disabled={scanning}>
+            <ScanLine aria-hidden="true" className="size-4" />
+            {scanning ? 'Scanning' : 'Scan'}
+          </Button>
+          {confirmDelete ? (
+            <span className="inline-flex items-center gap-1">
+              <Button variant="ghost" size="sm" className="text-red-300 hover:text-red-200" disabled={deletePending} onClick={onConfirmDelete}>
+                {deletePending ? 'Wait…' : 'Yes'}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={onCancelDelete}>No</Button>
+            </span>
+          ) : (
+            <Button variant="ghost" size="sm" className="text-slate-400 hover:text-red-300" aria-label={`Delete ${template.displayName}`} onClick={onDelete}>
+              <Trash2 aria-hidden="true" className="size-4" />
+            </Button>
+          )}
+        </div>
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid gap-3 sm:grid-cols-2">
@@ -120,6 +145,8 @@ function TemplateCard({
 export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
   const queryClient = useQueryClient()
   const [scanningId, setScanningId] = useState<string | null>(null)
+  const [showTemplateForm, setShowTemplateForm] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
 
   const templatesQuery = useQuery({ ...apiQueries(client).eventTemplates })
   const channelsQuery = useQuery({ ...apiQueries(client).eventChannels() })
@@ -131,6 +158,23 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['event-channels'] })
       void queryClient.invalidateQueries({ queryKey: ['events'] })
+    },
+  })
+
+  const createMutation = useMutation({
+    mutationFn: (input: CreateEventTemplateInput) => client.createEventTemplate(input),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['event-templates'] })
+      setShowTemplateForm(false)
+    },
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => client.deleteEventTemplate(id),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['event-templates'] })
+      void queryClient.invalidateQueries({ queryKey: ['event-channels'] })
+      setConfirmDelete(null)
     },
   })
 
@@ -148,11 +192,19 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
         title="Events"
         description="The system parses provider titles into stable event channels and EPG programme slots with per-group templates."
         actions={
-          <Button variant="secondary">
+          <Button variant="secondary" onClick={() => setShowTemplateForm(true)}>
             <Braces aria-hidden="true" className="size-4" /> Configure templates
           </Button>
         }
       />
+      {showTemplateForm ? (
+        <EventTemplateForm
+          pending={createMutation.isPending}
+          error={createMutation.error instanceof Error ? createMutation.error.message : null}
+          onSubmit={(input) => createMutation.mutate(input)}
+          onCancel={() => setShowTemplateForm(false)}
+        />
+      ) : null}
       <section className="space-y-4">
         {templates.length === 0 ? (
           <Card>
@@ -168,10 +220,78 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
               channels={channels.filter((channel) => channel.templateId === template.id)}
               onScan={() => scanMutation.mutate(template.id)}
               scanning={scanningId === template.id || scanMutation.isPending}
+              onDelete={() => setConfirmDelete(template.id)}
+              confirmDelete={confirmDelete === template.id}
+              deletePending={deleteMutation.isPending}
+              onConfirmDelete={() => deleteMutation.mutate(template.id)}
+              onCancelDelete={() => setConfirmDelete(null)}
             />
           ))
         )}
       </section>
     </>
+  )
+}
+
+function EventTemplateForm({
+  pending,
+  error,
+  onSubmit,
+  onCancel,
+}: {
+  pending: boolean
+  error: string | null
+  onSubmit: (input: CreateEventTemplateInput) => void
+  onCancel: () => void
+}) {
+  const [name, setName] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [matchRegex, setMatchRegex] = useState('')
+  const [channelNameFormat, setChannelNameFormat] = useState('{event}')
+  const [groupName, setGroupName] = useState('Sports')
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    onSubmit({ name, displayName, matchRegex, channelNameFormat, groupName })
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <h2 className="font-semibold text-white">New event template</h2>
+          <Button variant="ghost" size="sm" onClick={onCancel}><X aria-hidden="true" className="size-4" /></Button>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <label className="block text-xs font-medium text-slate-300">
+            Name
+            <Input className="mt-1" value={name} onChange={(e) => setName(e.target.value)} placeholder="nba" required />
+          </label>
+          <label className="block text-xs font-medium text-slate-300">
+            Display name
+            <Input className="mt-1" value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="NBA Games" required />
+          </label>
+          <label className="block text-xs font-medium text-slate-300">
+            Match regex
+            <Input className="mt-1 font-mono text-xs" value={matchRegex} onChange={(e) => setMatchRegex(e.target.value)} placeholder="NBA.*vs.*" required />
+          </label>
+          <label className="block text-xs font-medium text-slate-300">
+            Channel name format
+            <Input className="mt-1 font-mono text-xs" value={channelNameFormat} onChange={(e) => setChannelNameFormat(e.target.value)} placeholder="{event}" required />
+          </label>
+          <label className="block text-xs font-medium text-slate-300">
+            Group name
+            <Input className="mt-1" value={groupName} onChange={(e) => setGroupName(e.target.value)} placeholder="Sports" required />
+          </label>
+          {error ? <p role="alert" className="text-sm text-red-300">{error}</p> : null}
+          <div className="flex justify-end gap-2">
+            <Button variant="ghost" size="sm" onClick={onCancel}>Cancel</Button>
+            <Button type="submit" size="sm" disabled={pending}>{pending ? 'Saving…' : 'Create template'}</Button>
+          </div>
+        </form>
+      </CardContent>
+    </Card>
   )
 }
