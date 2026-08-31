@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Braces, CalendarClock, Radio, ScanLine, Trash2, X } from 'lucide-react'
+import { Braces, CalendarClock, Radio, ScanLine, Sparkles, Trash2, X } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
 import { LoadingPage } from '@/components/loading-page'
 import { Badge } from '@/components/ui/badge'
@@ -9,7 +9,7 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
-import type { CreateEventTemplateInput, EventChannel, EventTemplate, IptvApiClient } from '@/lib/api/types'
+import type { CreateEventTemplateInput, EventChannel, EventTemplate, EventTemplateSuggestion, IptvApiClient } from '@/lib/api/types'
 
 const channelTones: Record<EventChannel['state'], 'success' | 'info' | 'warning' | 'neutral'> = {
   live: 'success',
@@ -142,11 +142,82 @@ function TemplateCard({
   )
 }
 
+function SuggestionCard({
+  suggestion,
+  pending,
+  onCreate,
+}: {
+  suggestion: EventTemplateSuggestion
+  pending: boolean
+  onCreate: () => void
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="font-semibold text-white">{suggestion.displayName}</h2>
+            <Badge tone="info">{suggestion.streamCount} streams</Badge>
+          </div>
+          <p className="mt-1 text-xs text-slate-500">
+            {suggestion.groupName} · {suggestion.eventDurationHours}h duration
+          </p>
+        </div>
+        <Button variant="secondary" size="sm" disabled={pending} onClick={onCreate}>
+          {pending ? 'Creating…' : 'Create template'}
+        </Button>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <p className="mb-1 text-xs font-medium text-slate-300">Match pattern</p>
+            <code className="block break-all rounded-lg bg-ink-950 p-3 text-xs leading-5 text-mint-400">
+              {suggestion.matchRegex}
+            </code>
+          </div>
+          <div>
+            <p className="mb-1 text-xs font-medium text-slate-300">Channel name format</p>
+            <code className="block break-all rounded-lg bg-ink-950 p-3 text-xs leading-5 text-cyan-300">
+              {suggestion.channelNameFormat}
+            </code>
+          </div>
+        </div>
+        <div className="grid gap-2 text-xs text-slate-400 sm:grid-cols-2">
+          <span>Group: {suggestion.groupName}</span>
+          <span>Duration: {suggestion.eventDurationHours}h</span>
+          <span>Past grace: {suggestion.pastDateGraceHours}h</span>
+          <span>Future window: {suggestion.futureDateDays}d</span>
+        </div>
+        <div>
+          <p className="mb-1 text-xs font-medium text-slate-300">Sample streams</p>
+          {suggestion.sampleStreams.length === 0 ? (
+            <p className="text-xs text-slate-500">No sample streams.</p>
+          ) : (
+            <ul className="space-y-2">
+              {suggestion.sampleStreams.slice(0, 5).map((stream, index) => (
+                <li
+                  key={index}
+                  className="rounded-lg border border-white/8 bg-white/3 px-4 py-3 text-xs text-slate-300"
+                >
+                  {stream}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
 export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
   const queryClient = useQueryClient()
   const [scanningId, setScanningId] = useState<string | null>(null)
   const [showTemplateForm, setShowTemplateForm] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [showSuggestions, setShowSuggestions] = useState(false)
+  const [suggestions, setSuggestions] = useState<EventTemplateSuggestion[] | null>(null)
+  const [creatingName, setCreatingName] = useState<string | null>(null)
 
   const templatesQuery = useQuery({ ...apiQueries(client).eventTemplates })
   const channelsQuery = useQuery({ ...apiQueries(client).eventChannels() })
@@ -178,6 +249,38 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
     },
   })
 
+  const suggestMutation = useMutation({
+    mutationFn: () => client.suggestEventTemplates(),
+    onSuccess: (data) => {
+      setSuggestions(data)
+    },
+    onError: () => {
+      setSuggestions(null)
+    },
+  })
+
+  const handleCreateSuggestion = (suggestion: EventTemplateSuggestion) => {
+    setCreatingName(suggestion.name)
+    const input: CreateEventTemplateInput = {
+      name: suggestion.name,
+      displayName: suggestion.displayName,
+      matchRegex: suggestion.matchRegex,
+      channelNameFormat: suggestion.channelNameFormat,
+      groupName: suggestion.groupName,
+      eventDurationHours: suggestion.eventDurationHours,
+      pastDateGraceHours: suggestion.pastDateGraceHours,
+      futureDateDays: suggestion.futureDateDays,
+    }
+    createMutation.mutate(input, {
+      onSuccess: () => {
+        setSuggestions((prev) => prev?.filter((s) => s.name !== suggestion.name) ?? null)
+      },
+      onSettled: () => {
+        setCreatingName(null)
+      },
+    })
+  }
+
   if (!templatesQuery.data || !channelsQuery.data) {
     return <LoadingPage label="event templates" />
   }
@@ -192,9 +295,22 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
         title="Events"
         description="The system parses provider titles into stable event channels and EPG programme slots with per-group templates."
         actions={
-          <Button variant="secondary" onClick={() => setShowTemplateForm(true)}>
-            <Braces aria-hidden="true" className="size-4" /> Configure templates
-          </Button>
+          <>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setShowSuggestions(true)
+                suggestMutation.mutate()
+              }}
+              disabled={suggestMutation.isPending}
+            >
+              <Sparkles aria-hidden="true" className="size-4" />
+              {suggestMutation.isPending ? 'Analyzing…' : 'Analyze streams'}
+            </Button>
+            <Button variant="secondary" onClick={() => setShowTemplateForm(true)}>
+              <Braces aria-hidden="true" className="size-4" /> Configure templates
+            </Button>
+          </>
         }
       />
       {showTemplateForm ? (
@@ -204,6 +320,40 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
           onSubmit={(input) => createMutation.mutate(input)}
           onCancel={() => setShowTemplateForm(false)}
         />
+      ) : null}
+      {showSuggestions ? (
+        <section className="mb-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold text-white">Suggested templates</h2>
+            <Button variant="ghost" size="sm" onClick={() => setShowSuggestions(false)}>
+              Close
+            </Button>
+          </div>
+          {suggestMutation.isPending ? (
+            <Card>
+              <CardContent className="py-8 text-center text-sm text-slate-500">
+                <span role="status">Analyzing streams…</span>
+              </CardContent>
+            </Card>
+          ) : suggestMutation.isError ? (
+            <p role="alert" className="text-sm text-red-300">
+              {suggestMutation.error instanceof Error ? suggestMutation.error.message : 'Stream analysis failed.'}
+            </p>
+          ) : !suggestions || suggestions.length === 0 ? (
+            <p className="text-sm text-slate-500">No template suggestions found.</p>
+          ) : (
+            <div className="space-y-4">
+              {suggestions.map((suggestion) => (
+                <SuggestionCard
+                  key={suggestion.name}
+                  suggestion={suggestion}
+                  pending={creatingName === suggestion.name}
+                  onCreate={() => handleCreateSuggestion(suggestion)}
+                />
+              ))}
+            </div>
+          )}
+        </section>
       ) : null}
       <section className="space-y-4">
         {templates.length === 0 ? (

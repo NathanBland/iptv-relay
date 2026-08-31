@@ -377,6 +377,19 @@ export interface EventTemplate {
   enabled: boolean
 }
 
+export interface EventTemplateSuggestion {
+  name: string
+  displayName: string
+  matchRegex: string
+  channelNameFormat: string
+  groupName: string
+  eventDurationHours: number
+  pastDateGraceHours: number
+  futureDateDays: number
+  sampleStreams: string[]
+  streamCount: number
+}
+
 export interface EventChannel {
   id: string
   templateId: string
@@ -547,6 +560,7 @@ export interface IptvApiClient {
   deleteEventTemplate(id: string): Promise<void>
   getEventChannels(templateId?: string): Promise<EventChannel[]>
   scanEventTemplate(id: string): Promise<SaveResult>
+  suggestEventTemplates(): Promise<EventTemplateSuggestion[]>
   getLineupTemplates(): Promise<LineupTemplate[]>
   createLineupTemplate(input: CreateLineupTemplateInput): Promise<LineupTemplate>
   deleteLineupTemplate(id: string): Promise<void>

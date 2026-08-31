@@ -27,7 +27,7 @@ pub use catalog::{
     EventTemplateQuery, EventTemplateRow, LineupApplyStats, LineupCategoryRow, LineupChannelRow,
     LineupTemplateRow, OutputProfileRow, OutputProfileTokenHash, ProgrammePage, ProgrammeQuery,
     ProgrammeRow, ReconcileStats, RecordingRow, RecordingRuleRow, RecordingStats,
-    RegionFilterStats, RegionPrefixRow, RegionSettingsRow, ReviewCandidateRow, StreamHealthPage,
+    EventTemplateSuggestion, RegionFilterStats, RegionPrefixRow, RegionSettingsRow, ReviewCandidateRow, StreamHealthPage,
     StreamHealthRow, StreamHealthStats, StreamHealthUpdate, StreamProfileRow, SystemCounts,
     UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput, UserRow,
 };

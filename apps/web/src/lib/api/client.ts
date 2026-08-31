@@ -17,6 +17,7 @@ import type {
   CreateLineupTemplateInput,
   EventChannel,
   EventTemplate,
+  EventTemplateSuggestion,
   Group,
   IptvApiClient,
   JellyfinConfig,
@@ -713,6 +714,10 @@ export class FetchIptvApiClient implements IptvApiClient {
     })
   }
 
+  async suggestEventTemplates(): Promise<EventTemplateSuggestion[]> {
+    return this.request(`${API_PATHS.eventTemplates}/suggestions`, (value) => asObjectArray<EventTemplateSuggestion>(value, 'Event template suggestions'))
+  }
+
   async getLineupTemplates(): Promise<LineupTemplate[]> {
     return this.request(API_PATHS.lineupTemplates, (value) => asObjectArray<LineupTemplate>(value, 'Lineup templates response'))
   }
@@ -1175,6 +1180,10 @@ export class MockIptvApiClient implements IptvApiClient {
 
   async scanEventTemplate(_id: string): Promise<SaveResult> {
     return { ok: true, message: 'Scan complete.' }
+  }
+
+  async suggestEventTemplates(): Promise<EventTemplateSuggestion[]> {
+    return []
   }
 
   async getLineupTemplates(): Promise<LineupTemplate[]> {

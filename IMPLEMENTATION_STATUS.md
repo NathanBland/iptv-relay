@@ -31,6 +31,24 @@ This file records verified results. It does not contain credentials or secret UR
 
 ## Working
 
+### Event template suggestions
+
+The `EventTemplateSuggestion` type and `suggestEventTemplates` API client method are in the frontend.
+
+The `FetchIptvApiClient` calls `GET /api/v1/event-templates/suggestions`.
+
+The `MockIptvApiClient` returns an empty array.
+
+The events page has an "Analyze streams" button that loads suggestions.
+
+The suggestion panel shows loading, error, and result states.
+
+Each suggestion card displays match regex, channel name format, group, duration, grace, future window, and sample streams.
+
+Each card has a "Create template" button that creates the template and removes the suggestion from the panel.
+
+`npx tsc --noEmit` and `CI=true pnpm test` pass.
+
 ### Compose startup
 
 The default Compose stack builds and starts.

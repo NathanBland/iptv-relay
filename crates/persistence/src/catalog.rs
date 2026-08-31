@@ -2569,6 +2569,81 @@ struct EventStreamMatch {
     slot: i32,
 }
 
+#[derive(Debug, FromRow)]
+struct EventSuggestionStream {
+    name: String,
+    group_name: Option<String>,
+}
+
+/// A suggested event template configuration derived from provider stream data.
+#[derive(Clone, Debug, Serialize)]
+pub struct EventTemplateSuggestion {
+    pub name: String,
+    pub display_name: String,
+    pub match_regex: String,
+    pub channel_name_format: String,
+    pub group_name: String,
+    pub event_duration_hours: i32,
+    pub past_date_grace_hours: i32,
+    pub future_date_days: i32,
+    pub sample_streams: Vec<String>,
+    pub stream_count: u64,
+}
+
+/// Detects a grouping key from a stream name and optional group name.
+///
+/// Looks for known league prefixes (NBA, NHL, NFL, MLB, MLS, EPL, UFC, etc.)
+/// in the stream name. Falls back to the provider group name, or "Sports"
+/// if no league prefix is found.
+const EVENT_LEAGUES: &[&str] = &[
+    "NBA", "NHL", "NFL", "MLB", "MLS", "EPL", "UFC", "BOXING", "F1",
+    "NASCAR", "PGA", "ATP", "WTA", "UCL", "UEL", "SERIE A", "LA LIGA",
+    "BUNDESLIGA", "LIGUE 1", "CHAMPIONS", "EUROPA", "WORLD CUP",
+    "COLLEGE", "NCAA", "CFL", "AFL", "RUGBY", "CRICKET", "IPL",
+];
+
+fn detect_event_group_key(stream_name: &str, group_name: Option<&str>) -> String {
+    let upper = stream_name.to_uppercase();
+    for league in EVENT_LEAGUES {
+        if upper.contains(league) {
+            return (*league).to_owned();
+        }
+    }
+    // Fall back to the provider group name if it looks like a sports group.
+    if let Some(group) = group_name {
+        let group_upper = group.to_uppercase();
+        if group_upper.contains("SPORT")
+            || group_upper.contains("LIVE")
+            || group_upper.contains("EVENT")
+            || group_upper.contains("PPV")
+        {
+            return group.to_owned();
+        }
+    }
+    "Sports".to_owned()
+}
+
+/// Builds a suggested template configuration from a group key and sample streams.
+fn build_suggestion_config(
+    group_key: &str,
+    samples: &[String],
+) -> (String, String, String, String) {
+    let name = group_key
+        .to_lowercase()
+        .replace([' ', '/'], "-")
+        .replace("--", "-");
+    let display_name = group_key.to_owned();
+    // Build a regex that matches the league prefix plus vs/@ pattern.
+    let match_regex = if group_key == "Sports" {
+        r"(?i).*\b(?:vs\.?|versus|@|at)\b.*".to_owned()
+    } else {
+        format!(r"(?i)\b{group_key}\b.*\b(?:vs\.?|versus|@|at)\b.*")
+    };
+    let group_name = "Sports".to_owned();
+    let _ = samples;
+    (name, display_name, match_regex, group_name)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn upsert_canonical_channels(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -4099,6 +4174,67 @@ impl CatalogRepository {
         }
         Ok(())
     }
+    // -- Event template suggestions --
+
+    /// Scans provider streams for event-like patterns and returns grouped
+    /// suggestions for event template creation.
+    ///
+    /// Detects sports patterns (team vs team, team @ team) with dates, and
+    /// groups them by detected league prefix (NBA, NHL, NFL, MLB, etc.) or
+    /// by the group name when no league prefix is found.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn suggest_event_templates(&self) -> Result<Vec<EventTemplateSuggestion>, PersistenceError> {
+        // Find provider streams that look like sports events: they contain
+        // "vs", "vs.", "versus", "@", or "at" between two words, plus a
+        // date-like pattern.
+        let streams: Vec<EventSuggestionStream> = sqlx::query_as(
+            r"
+            SELECT ps.name, ps.group_name
+            FROM provider_streams ps
+            JOIN source_snapshots ss ON ss.id = ps.snapshot_id
+            WHERE ss.status = 'active'
+              AND ps.supported
+              AND ps.name ~ '(?i)(?:vs\.?|versus|@|\bat\b)'
+              AND ps.name ~ '(?i)(?:20[0-9]{2}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/20[0-9]{2})'
+            ORDER BY ps.name
+            ",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // Group streams by detected league/sport prefix.
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for stream in &streams {
+            let key = detect_event_group_key(&stream.name, stream.group_name.as_deref());
+            groups.entry(key).or_default().push(stream.name.clone());
+        }
+
+        let mut suggestions = Vec::with_capacity(groups.len());
+        for (group_key, samples) in &groups {
+            let (name, display_name, match_regex, group_name) =
+                build_suggestion_config(group_key, samples);
+            suggestions.push(EventTemplateSuggestion {
+                name,
+                display_name,
+                match_regex,
+                channel_name_format: "{event}".to_owned(),
+                group_name,
+                event_duration_hours: 3,
+                past_date_grace_hours: 6,
+                future_date_days: 7,
+                sample_streams: samples.iter().take(10).cloned().collect(),
+                stream_count: u64::try_from(samples.len()).unwrap_or(u64::MAX),
+            });
+        }
+        // Sort by stream count descending.
+        suggestions.sort_by_key(|b| std::cmp::Reverse(b.stream_count));
+        Ok(suggestions)
+    }
+
     // -- Region settings --
 
     /// Reads the current region settings row. Creates a default row if none exists.
