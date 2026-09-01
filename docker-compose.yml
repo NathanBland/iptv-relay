@@ -103,7 +103,7 @@ services:
     environment:
       FAKE_PROVIDER_BIND: 0.0.0.0:8090
       FAKE_PROVIDER_BASE_URL: http://fake-provider:8090
-      FAKE_PROVIDER_MAX_CONNECTIONS: "3"
+      FAKE_PROVIDER_MAX_CONNECTIONS: ${LIVE_ACCEPTANCE_PROVIDER_CAP:-3}
     expose:
       - "8090"
     healthcheck:
@@ -154,6 +154,31 @@ services:
     environment:
       IPTV_TEST_M3U_URL: ${IPTV_TEST_M3U_URL}
       LIVE_ACCEPTANCE_SECONDS: ${LIVE_ACCEPTANCE_SECONDS:-30}
+    restart: "no"
+
+  live-acceptance-gateway:
+    image: iptv-gateway-core:local
+    entrypoint: ["live-acceptance"]
+    profiles: ["test"]
+    environment:
+      IPTV_GATEWAY_URL: http://gateway:8080
+      IPTV_OUTPUT_TOKEN: ${IPTV_OUTPUT_TOKEN}
+      IPTV_ADMIN_BOOTSTRAP_TOKEN: ${IPTV_ADMIN_BOOTSTRAP_TOKEN}
+      IPTV_TEST_PROVIDER_URL: http://fake-provider:8090
+      LIVE_ACCEPTANCE_SECONDS: ${LIVE_ACCEPTANCE_SECONDS:-120}
+      LIVE_ACCEPTANCE_CHANNELS: ${LIVE_ACCEPTANCE_CHANNELS:-3}
+      LIVE_ACCEPTANCE_PROVIDER_CAP: ${LIVE_ACCEPTANCE_PROVIDER_CAP:-3}
+      LIVE_ACCEPTANCE_SOAK: ${LIVE_ACCEPTANCE_SOAK:-0}
+      LIVE_ACCEPTANCE_SOAK_SECONDS: ${LIVE_ACCEPTANCE_SOAK_SECONDS:-1800}
+    depends_on:
+      gateway:
+        condition: service_started
+      core:
+        condition: service_healthy
+      fake-provider:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
     restart: "no"
 
 volumes:

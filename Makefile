@@ -111,6 +111,12 @@ live-acceptance:
 	docker-compose --env-file .env.test build core
 	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from live-acceptance live-acceptance
 
+live-acceptance-gateway:
+	docker-compose --env-file .env.test build core
+	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from live-acceptance-gateway live-acceptance-gateway
+	docker-compose --env-file .env.test --profile test stop fake-provider
+	docker-compose --env-file .env.test --profile test rm -f live-acceptance-gateway
+
 dev:
 	docker-compose up -d postgres web
 	docker run -d --name iptv-gateway-caddy --network iptv-gateway_default -p 8080:8080 \
