@@ -22,6 +22,7 @@ export function apiQueries(client: IptvApiClient = apiClient) {
     eventChannels: (templateId?: string) => queryOptions({ queryKey: ['event-channels', templateId ?? null], queryFn: () => client.getEventChannels(templateId) }),
     lineupTemplates: queryOptions({ queryKey: ['lineup-templates'], queryFn: () => client.getLineupTemplates() }),
     sessions: queryOptions({ queryKey: ['sessions'], queryFn: () => client.getSessions() }),
+    jellyfinSetup: queryOptions({ queryKey: ['jellyfin-setup'], queryFn: () => client.getJellyfinSetup() }),
     streamHealthStats: () => queryOptions({ queryKey: ['stream-health-stats'], queryFn: () => client.getStreamHealthStats() }),
     streamHealth: (status?: string, group?: string, limit?: number) => queryOptions({ queryKey: ['stream-health', status ?? null, group ?? null, limit ?? null], queryFn: () => client.getStreamHealth(status, group, limit) }),
     users: queryOptions({ queryKey: ['users'], queryFn: () => client.getUsers() }),

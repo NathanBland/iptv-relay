@@ -1421,12 +1421,49 @@ async fn output_profiles_resolve_rotate_and_select_channels() {
         Err(PersistenceError::InvalidOutputProfileTunerCount)
     ));
 
-    let second_hash = OutputProfileTokenHash::from_sha256([2_u8; 32]);
-    let second_profile = catalog
-        .ensure_environment_output_profile(second_hash.clone(), 6)
+    // Re-initialize startup with the same environment hash. The tuner count
+    // updates to 6 but the persisted current token hash stays as `first_hash`.
+    // `ensure_environment_output_profile` must not rotate or replace the token.
+    let reinitialized_profile = catalog
+        .ensure_environment_output_profile(first_hash.clone(), 6)
         .await
         .unwrap();
-    assert_eq!(second_profile.tuner_count, 6);
+    assert_eq!(reinitialized_profile.tuner_count, 6);
+    assert_eq!(
+        catalog
+            .environment_output_profile_token_hash()
+            .await
+            .unwrap()
+            .as_ref()
+            .map(OutputProfileTokenHash::as_bytes),
+        Some(first_hash.as_bytes())
+    );
+    assert_eq!(
+        catalog
+            .resolve_enabled_output_profile(&first_hash)
+            .await
+            .unwrap()
+            .map(|profile| profile.id),
+        Some(ENVIRONMENT_OUTPUT_PROFILE_ID)
+    );
+
+    // Rotate the token through the dedicated rotation path. The prior hash
+    // stays valid through the overlap window.
+    let second_hash = OutputProfileTokenHash::from_sha256([2_u8; 32]);
+    let rotated_profile = catalog
+        .rotate_environment_output_profile_token(second_hash.clone(), 300)
+        .await
+        .unwrap();
+    assert_eq!(rotated_profile.id, ENVIRONMENT_OUTPUT_PROFILE_ID);
+    assert_eq!(
+        catalog
+            .environment_output_profile_token_hash()
+            .await
+            .unwrap()
+            .as_ref()
+            .map(OutputProfileTokenHash::as_bytes),
+        Some(second_hash.as_bytes())
+    );
     assert!(
         catalog
             .resolve_enabled_output_profile(&first_hash)
@@ -1434,9 +1471,45 @@ async fn output_profiles_resolve_rotate_and_select_channels() {
             .unwrap()
             .is_some()
     );
-    assert!(
+    assert_eq!(
         catalog
             .resolve_enabled_output_profile(&second_hash)
+            .await
+            .unwrap()
+            .map(|profile| profile.id),
+        Some(ENVIRONMENT_OUTPUT_PROFILE_ID)
+    );
+
+    // Simulate a restart that re-seeds the environment hash. The persisted
+    // current hash must remain the rotated hash. The environment hash must not
+    // become the current hash. The rotated current hash stays active.
+    let startup_profile = catalog
+        .ensure_environment_output_profile(first_hash.clone(), 6)
+        .await
+        .unwrap();
+    assert_eq!(startup_profile.tuner_count, 6);
+    assert_eq!(
+        catalog
+            .environment_output_profile_token_hash()
+            .await
+            .unwrap()
+            .as_ref()
+            .map(OutputProfileTokenHash::as_bytes),
+        Some(second_hash.as_bytes())
+    );
+    assert_eq!(
+        catalog
+            .resolve_enabled_output_profile(&second_hash)
+            .await
+            .unwrap()
+            .map(|profile| profile.id),
+        Some(ENVIRONMENT_OUTPUT_PROFILE_ID)
+    );
+    // The environment hash still resolves only because it is the prior hash
+    // within the overlap window, not because it became current.
+    assert!(
+        catalog
+            .resolve_enabled_output_profile(&first_hash)
             .await
             .unwrap()
             .is_some()
@@ -1457,6 +1530,14 @@ async fn output_profiles_resolve_rotate_and_select_channels() {
             .await
             .unwrap()
             .is_none()
+    );
+    assert_eq!(
+        catalog
+            .resolve_enabled_output_profile(&second_hash)
+            .await
+            .unwrap()
+            .map(|profile| profile.id),
+        Some(ENVIRONMENT_OUTPUT_PROFILE_ID)
     );
 
     let all_channels = catalog

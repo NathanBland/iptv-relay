@@ -164,19 +164,42 @@ describe('management pages', () => {
     expect(ringPercent({ ...session, capacityPackets: 10, retainedPackets: 20 })).toBe(100)
   })
 
-  it('validates and saves Jellyfin setup and copies an endpoint', async () => {
+  it('shows published Jellyfin setup URLs and copies an endpoint', async () => {
     renderWithQuery(<JellyfinPage client={new MockIptvApiClient()} />)
-    const publicUrl = screen.getByLabelText('Relay URL visible to Jellyfin')
-    await userEvent.clear(publicUrl)
-    await userEvent.type(publicUrl, 'invalid')
-    await userEvent.tab()
-    expect(screen.getByText('Enter an absolute URL reachable by Jellyfin.')).toBeInTheDocument()
-    await userEvent.clear(publicUrl)
-    await userEvent.type(publicUrl, 'http://relay:3000')
-    await userEvent.click(screen.getByRole('button', { name: 'Save Jellyfin setup' }))
-    expect(await screen.findByRole('status')).toHaveTextContent('Saved tuner')
+    const playlist = await screen.findByTestId('endpoint-M3U tuner URL')
+    expect(playlist).toHaveTextContent('/out/mock-token/playlist.m3u')
+    expect(screen.getByTestId('endpoint-XMLTV guide URL')).toHaveTextContent('/out/mock-token/xmltv.xml')
+    expect(screen.getByTestId('endpoint-HDHomeRun device URL')).toHaveTextContent('/out/mock-token/hdhr/device.xml')
     await userEvent.click(screen.getByRole('button', { name: 'Copy M3U tuner URL' }))
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('http://iptv-web:3000/api/jellyfin/playlist.m3u')
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith('http://iptv-web:3000/out/mock-token/playlist.m3u')
+  })
+
+  it('rotates the publish token and shows new URLs once', async () => {
+    renderWithQuery(<JellyfinPage client={new MockIptvApiClient()} />)
+    await screen.findByTestId('endpoint-M3U tuner URL')
+    expect(screen.getByTestId('endpoint-M3U tuner URL')).toHaveTextContent('/out/mock-token/playlist.m3u')
+    await userEvent.click(screen.getByRole('button', { name: 'Rotate publish token' }))
+    expect(await screen.findByText('New token published. Copy the URLs below now; they show once.')).toBeInTheDocument()
+    expect(screen.getByTestId('endpoint-M3U tuner URL')).toHaveTextContent('/out/rotated-token/playlist.m3u')
+    expect(screen.getByTestId('endpoint-XMLTV guide URL')).toHaveTextContent('/out/rotated-token/xmltv.xml')
+  })
+
+  it('shows a regeneration-required message when the setup status is not available', async () => {
+    const mock = new MockIptvApiClient()
+    mock.getJellyfinSetup = vi.fn().mockResolvedValue({ status: 'regeneration-required', guideDaysMax: 30 })
+    renderWithQuery(<JellyfinPage client={mock} />)
+    expect(await screen.findByTestId('regeneration-required')).toHaveTextContent('A token rotation occurred. Rotate the publish token to display new URLs.')
+    expect(screen.queryByTestId('endpoint-M3U tuner URL')).not.toBeInTheDocument()
+  })
+
+  it('removes token-bearing Jellyfin setup data from the query cache on unmount', async () => {
+    const { queryClient, unmount } = renderWithQuery(<JellyfinPage client={new MockIptvApiClient()} />)
+    await screen.findByTestId('endpoint-M3U tuner URL')
+    expect(queryClient.getQueryData(['jellyfin-setup'])).toBeDefined()
+    unmount()
+    // The unmount cleanup removes the token-bearing setup data from the
+    // TanStack Query cache so the URLs do not persist after navigation.
+    expect(queryClient.getQueryData(['jellyfin-setup'])).toBeUndefined()
   })
 
   it('shows EPG mappings with confidence and method badges', async () => {

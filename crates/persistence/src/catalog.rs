@@ -20,7 +20,6 @@ use crate::PersistenceError;
 
 const DEFAULT_PAGE_SIZE: i64 = 100;
 const MAX_PAGE_SIZE: i64 = 500;
-const ENVIRONMENT_TOKEN_OVERLAP_SECONDS: i64 = 300;
 
 /// The fixed identity for the environment output profile.
 pub const ENVIRONMENT_OUTPUT_PROFILE_ID: Uuid = Uuid::from_u128(1);
@@ -40,7 +39,7 @@ impl OutputProfileTokenHash {
         Self(bytes)
     }
 
-    fn as_bytes(&self) -> &[u8; 32] {
+    pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
@@ -940,10 +939,13 @@ impl CatalogRepository {
         Ok(rows)
     }
 
-    /// Creates or updates the fixed environment output profile.
+    /// Creates or seeds the fixed environment output profile.
     ///
-    /// A changed token hash keeps the prior hash valid for five minutes. The
-    /// returned profile and all persisted diagnostics exclude token hashes.
+    /// On first creation the environment token hash is seeded. On subsequent
+    /// calls the persisted current token hash is retained so a rotated token
+    /// stays active across restarts. Only non-token fields (`name`,
+    /// `tuner_count`) update on conflict. The returned profile and all
+    /// persisted diagnostics exclude token hashes.
     ///
     /// # Errors
     ///
@@ -967,28 +969,15 @@ impl CatalogRepository {
             VALUES ($1, $2, $3, $4, true)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
-                token_hash = EXCLUDED.token_hash,
-                previous_token_hash = CASE
-                    WHEN output_profiles.token_hash <> EXCLUDED.token_hash
-                    THEN output_profiles.token_hash
-                    ELSE output_profiles.previous_token_hash
-                END,
-                previous_token_expires_at = CASE
-                    WHEN output_profiles.token_hash <> EXCLUDED.token_hash
-                    THEN now() + ($5::bigint * interval '1 second')
-                    ELSE output_profiles.previous_token_expires_at
-                END,
                 tuner_count = EXCLUDED.tuner_count,
                 updated_at = CASE
-                    WHEN output_profiles.token_hash <> EXCLUDED.token_hash
-                      OR output_profiles.tuner_count <> EXCLUDED.tuner_count
+                    WHEN output_profiles.tuner_count <> EXCLUDED.tuner_count
                       OR output_profiles.name <> EXCLUDED.name
                     THEN now()
                     ELSE output_profiles.updated_at
                 END,
                 revision = CASE
-                    WHEN output_profiles.token_hash <> EXCLUDED.token_hash
-                      OR output_profiles.tuner_count <> EXCLUDED.tuner_count
+                    WHEN output_profiles.tuner_count <> EXCLUDED.tuner_count
                       OR output_profiles.name <> EXCLUDED.name
                     THEN output_profiles.revision + 1
                     ELSE output_profiles.revision
@@ -1000,10 +989,37 @@ impl CatalogRepository {
         .bind(ENVIRONMENT_OUTPUT_PROFILE_NAME)
         .bind(token_hash.as_bytes().as_slice())
         .bind(tuner_count)
-        .bind(ENVIRONMENT_TOKEN_OVERLAP_SECONDS)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    /// Returns the persisted current token hash for the environment profile.
+    ///
+    /// Returns `None` when the environment profile does not exist. The returned
+    /// hash is never serialized in API responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn environment_output_profile_token_hash(
+        &self,
+    ) -> Result<Option<OutputProfileTokenHash>, PersistenceError> {
+        let row = sqlx::query_as::<_, (Option<Vec<u8>>,)>(
+            r"
+            SELECT token_hash FROM output_profiles WHERE id = $1
+            ",
+        )
+        .bind(ENVIRONMENT_OUTPUT_PROFILE_ID)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(hash,)| hash).and_then(|bytes| {
+            bytes
+                .try_into()
+                .map(OutputProfileTokenHash::from_sha256)
+                .ok()
+        }))
     }
 
     /// Resolves an enabled output profile by a current or valid prior hash.
@@ -1033,6 +1049,41 @@ impl CatalogRepository {
         )
         .bind(token_hash.as_bytes().as_slice())
         .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Rotates the environment output profile token hash.
+    ///
+    /// The previous token hash stays valid through the supplied overlap window
+    /// in seconds. Only the hash is stored; the caller receives the plaintext
+    /// token once and must not persist it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn rotate_environment_output_profile_token(
+        &self,
+        new_token_hash: OutputProfileTokenHash,
+        overlap_seconds: i64,
+    ) -> Result<OutputProfileRow, PersistenceError> {
+        let row = sqlx::query_as::<_, OutputProfileRow>(
+            r"
+            UPDATE output_profiles SET
+                previous_token_hash = token_hash,
+                previous_token_expires_at = now() + ($2::bigint * interval '1 second'),
+                token_hash = $1,
+                updated_at = now(),
+                revision = revision + 1
+            WHERE id = $3
+            RETURNING id, name, tuner_count, include_all_channels, enabled, revision
+            ",
+        )
+        .bind(new_token_hash.as_bytes().as_slice())
+        .bind(overlap_seconds)
+        .bind(ENVIRONMENT_OUTPUT_PROFILE_ID)
+        .fetch_one(&self.pool)
         .await?;
         Ok(row)
     }

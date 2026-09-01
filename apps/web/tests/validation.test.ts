@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { jellyfinSchema, loginSchema, sourceSchema, sourceUpdateSchema } from '@/lib/validation'
+import { loginSchema, sourceSchema, sourceUpdateSchema } from '@/lib/validation'
 
 describe('management form schemas', () => {
   it('accepts the login values used by the authentication API', () => {
@@ -37,20 +37,5 @@ describe('management form schemas', () => {
   it('requires safe provider settings when a source is edited', () => {
     expect(sourceUpdateSchema.safeParse({ maxConnections: 3, timezone: 'America/Denver', enabled: true }).success).toBe(true)
     expect(sourceUpdateSchema.safeParse({ maxConnections: 0, timezone: ' ', enabled: true }).success).toBe(false)
-  })
-
-  it('accepts Jellyfin settings and rejects non-HTTP relay URLs', () => {
-    expect(jellyfinSchema.safeParse({
-      baseUrl: 'http://jellyfin:8096',
-      tunerName: 'Relay Control',
-      publicBaseUrl: 'https://iptv.example',
-      guideDays: 7,
-    }).success).toBe(true)
-    expect(jellyfinSchema.safeParse({
-      baseUrl: 'http://jellyfin:8096',
-      tunerName: 'Relay Control',
-      publicBaseUrl: 'ftp://iptv.example',
-      guideDays: 7,
-    }).success).toBe(false)
   })
 })

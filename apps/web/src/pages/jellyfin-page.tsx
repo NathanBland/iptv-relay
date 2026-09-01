@@ -1,61 +1,74 @@
-import { useForm } from '@tanstack/react-form'
-import { useMutation } from '@tanstack/react-query'
-import { CheckCircle2, Clipboard, ExternalLink } from 'lucide-react'
-import { useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { CheckCircle2, Clipboard, ExternalLink, RefreshCw } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import { PageHeader } from '@/components/page-header'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
-import { FieldMessage, Input, Select } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
-import type { IptvApiClient, JellyfinConfig } from '@/lib/api/types'
-import { jellyfinSchema } from '@/lib/validation'
+import { apiQueries } from '@/lib/api/queries'
+import type { IptvApiClient, JellyfinSetup } from '@/lib/api/types'
+
+const EMPTY_SETUP: JellyfinSetup = {
+  status: 'regeneration-required',
+  guideDaysMax: 30,
+}
 
 export function JellyfinPage({ client = apiClient }: { client?: IptvApiClient }) {
-  const [notice, setNotice] = useState('')
-  const mutation = useMutation({ mutationFn: (value: JellyfinConfig) => client.saveJellyfin(value), onSuccess: (result) => setNotice(result.message) })
-  const form = useForm({
-    defaultValues: { baseUrl: 'http://jellyfin:8096', tunerName: 'Relay Control', publicBaseUrl: 'http://iptv-web:3000', guideDays: 7 },
-    validators: { onSubmit: jellyfinSchema },
-    onSubmit: async ({ value }) => { await mutation.mutateAsync(value) },
+  const [copied, setCopied] = useState('')
+  const [rotated, setRotated] = useState<JellyfinSetup | null>(null)
+  const queryClient = useQueryClient()
+  const query = useQuery({ ...apiQueries(client).jellyfinSetup })
+  const rotation = useMutation({
+    mutationFn: () => client.rotateJellyfinToken(),
+    onSuccess: (result) => setRotated(result),
   })
+  const setup: JellyfinSetup = rotated ?? query.data ?? EMPTY_SETUP
+  const available = setup.status === 'available'
+
+  // Remove the token-bearing setup data from the query cache when the page
+  // unmounts so the URLs do not persist after navigation.
+  useEffect(() => {
+    return () => {
+      queryClient.removeQueries({ queryKey: ['jellyfin-setup'] })
+    }
+  }, [queryClient])
+
+  // Clear the one-time rotation result from local state on unmount.
+  useEffect(() => {
+    return () => setRotated(null)
+  }, [])
+
   const endpoints = [
-    { label: 'M3U tuner URL', value: 'http://iptv-web:3000/api/jellyfin/playlist.m3u' },
-    { label: 'XMLTV guide URL', value: 'http://iptv-web:3000/api/jellyfin/guide.xml' },
+    { label: 'M3U tuner URL', value: setup.playlistUrl },
+    { label: 'XMLTV guide URL', value: setup.xmltvUrl },
+    { label: 'HDHomeRun device URL', value: setup.hdhrDeviceUrl },
   ]
+
+  async function copyEndpoint(label: string, value: string | undefined) {
+    if (!value) return
+    await navigator.clipboard?.writeText(value)
+    setCopied(label)
+  }
 
   return (
     <>
       <PageHeader eyebrow="Integration" title="Jellyfin setup" description="Publish the managed lineup as an M3U tuner and XMLTV guide, then connect both endpoints in Jellyfin Live TV." actions={<a className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/12 bg-white/6 px-3 text-sm font-semibold text-slate-100 hover:bg-white/10" href="https://jellyfin.org/docs/general/server/live-tv/setup-guide/" target="_blank" rel="noreferrer">Jellyfin docs <ExternalLink aria-hidden="true" className="size-4" /></a>} />
-      {notice ? <p role="status" className="mb-4 rounded-lg border border-ocean-400/20 bg-ocean-400/8 p-3 text-sm text-mint-400">{notice}</p> : null}
       <section className="grid gap-4 xl:grid-cols-[1.1fr_.9fr]">
         <Card>
-          <CardHeader><div><h2 className="font-semibold text-white">Connection settings</h2><p className="mt-1 text-xs text-slate-500">Saved through the typed server API boundary</p></div></CardHeader>
-          <CardContent>
-            <form className="space-y-4" onSubmit={(event) => { event.preventDefault(); event.stopPropagation(); void form.handleSubmit() }}>
-              <form.Field name="baseUrl" validators={{ onChange: jellyfinSchema.shape.baseUrl }}>
-                {(field) => <label className="block text-xs font-medium text-slate-300">Jellyfin server URL<Input className="mt-1" value={field.state.value} onBlur={field.handleBlur} onChange={(event) => field.handleChange(event.target.value)} aria-invalid={field.state.meta.errors.length > 0} /><FieldMessage>{field.state.meta.errors[0]}</FieldMessage></label>}
-              </form.Field>
-              <div className="grid gap-4 sm:grid-cols-2">
-                <form.Field name="tunerName" validators={{ onChange: jellyfinSchema.shape.tunerName }}>
-                  {(field) => <label className="block text-xs font-medium text-slate-300">Tuner name<Input className="mt-1" value={field.state.value} onBlur={field.handleBlur} onChange={(event) => field.handleChange(event.target.value)} aria-invalid={field.state.meta.errors.length > 0} /><FieldMessage>{field.state.meta.errors[0]}</FieldMessage></label>}
-                </form.Field>
-                <form.Field name="guideDays">
-                  {(field) => <label className="block text-xs font-medium text-slate-300">Guide horizon<Select className="mt-1" value={field.state.value} onChange={(event) => field.handleChange(Number(event.target.value))}>{[3, 7, 14].map((days) => <option key={days} value={days}>{days} days</option>)}</Select></label>}
-                </form.Field>
-              </div>
-              <form.Field name="publicBaseUrl" validators={{ onChange: jellyfinSchema.shape.publicBaseUrl }}>
-                {(field) => <label className="block text-xs font-medium text-slate-300">Relay URL visible to Jellyfin<Input className="mt-1" value={field.state.value} onBlur={field.handleBlur} onChange={(event) => field.handleChange(event.target.value)} aria-invalid={field.state.meta.errors.length > 0} /><FieldMessage>{field.state.meta.errors[0]}</FieldMessage></label>}
-              </form.Field>
-              <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting]}>
-                {([canSubmit, isSubmitting]) => <Button type="submit" disabled={!canSubmit || isSubmitting}>{isSubmitting ? 'Wait…' : 'Save Jellyfin setup'}</Button>}
-              </form.Subscribe>
-            </form>
+          <CardHeader><div><h2 className="font-semibold text-white">Connection settings</h2><p className="mt-1 text-xs text-slate-500">The output profile supplies the token and tuner count.</p></div></CardHeader>
+          <CardContent className="space-y-3">
+            <p className="text-sm text-slate-400">The published URLs below come from the relay output profile. Copy each URL into the matching Jellyfin Live TV field. The guide horizon accepts up to {setup.guideDaysMax} days.</p>
+            <div className="flex items-center gap-3">
+              <Button type="button" variant="secondary" onClick={() => rotation.mutate()} disabled={rotation.isPending} aria-label="Rotate publish token">{rotation.isPending ? 'Wait…' : 'Rotate publish token'}<RefreshCw aria-hidden="true" className="size-4" /></Button>
+              {rotation.isError ? <p role="status" className="text-xs text-rose-400">Token rotation failed.</p> : null}
+              {rotated ? <p role="status" className="text-xs text-mint-400">New token published. Copy the URLs below now; they show once.</p> : null}
+            </div>
           </CardContent>
         </Card>
         <div className="space-y-4">
           <Card>
             <CardHeader><h2 className="font-semibold text-white">Published endpoints</h2></CardHeader>
-            <CardContent className="space-y-3">{endpoints.map((endpoint) => <div key={endpoint.label}><p className="mb-1 text-xs font-medium text-slate-400">{endpoint.label}</p><div className="flex items-center gap-2 rounded-lg bg-ink-950 p-2"><code className="min-w-0 flex-1 truncate text-xs text-cyan-300">{endpoint.value}</code><Button size="icon" variant="ghost" aria-label={`Copy ${endpoint.label}`} onClick={() => void navigator.clipboard?.writeText(endpoint.value)}><Clipboard aria-hidden="true" className="size-4" /></Button></div></div>)}</CardContent>
+            <CardContent className="space-y-3">{query.isLoading ? <p role="status" className="text-sm text-slate-500">Wait while the published endpoints load.</p> : query.isError && !rotated ? <p role="status" className="text-sm text-rose-400">The published endpoints could not load.</p> : !available ? <p role="status" className="text-sm text-amber-400" data-testid="regeneration-required">A token rotation occurred. Rotate the publish token to display new URLs.</p> : endpoints.map((endpoint) => <div key={endpoint.label}><p className="mb-1 text-xs font-medium text-slate-400">{endpoint.label}</p><div className="flex items-center gap-2 rounded-lg bg-ink-950 p-2"><code className="min-w-0 flex-1 truncate text-xs text-cyan-300" data-testid={`endpoint-${endpoint.label}`}>{endpoint.value}</code><Button size="icon" variant="ghost" aria-label={`Copy ${endpoint.label}`} onClick={() => void copyEndpoint(endpoint.label, endpoint.value)}><Clipboard aria-hidden="true" className="size-4" /></Button></div>{copied === endpoint.label ? <p className="mt-1 text-xs text-mint-400">Copied.</p> : null}</div>)}</CardContent>
           </Card>
           <Card><CardContent><h2 className="font-semibold text-white">Jellyfin checklist</h2><ol className="mt-4 space-y-3 text-sm text-slate-400">{['Add the M3U URL as an M3U Tuner.', 'Add the XMLTV URL as a TV guide data provider.', 'Map guide data and refresh the Jellyfin guide.'].map((step, index) => <li key={step} className="flex gap-3"><CheckCircle2 aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-ocean-400" /><span><strong className="text-slate-200">{index + 1}.</strong> {step}</span></li>)}</ol></CardContent></Card>
         </div>

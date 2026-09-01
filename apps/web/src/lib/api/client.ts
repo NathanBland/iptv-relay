@@ -20,7 +20,7 @@ import type {
   EventTemplateSuggestion,
   Group,
   IptvApiClient,
-  JellyfinConfig,
+  JellyfinSetup,
   LineupTemplate,
   Overview,
   LoginInput,
@@ -35,6 +35,7 @@ import type {
   ReviewCandidate,
   UnmappedChannel,
   UnmappedChannelPage,
+  RotateJellyfinTokenInput,
   SaveResult,
   Session,
   Source,
@@ -84,7 +85,7 @@ const API_PATHS = {
   eventChannels: '/api/v1/event-channels',
   lineupTemplates: '/api/v1/lineup-templates',
   sessions: '/api/v1/sessions',
-  jellyfin: '/api/v1/jellyfin',
+  jellyfinSetup: '/api/v1/jellyfin/setup',
   groups: '/api/v1/groups',
   regionSettings: '/api/v1/region-settings',
   streamsHealth: '/api/v1/streams/health',
@@ -192,6 +193,24 @@ function asPage<T>(value: unknown, resource: string): Page<T> {
   const offset = typeof value.offset === 'number' ? value.offset : 0
   const items = asObjectArray<T>(value.items, `${resource} items`)
   return { total, limit, offset, items }
+}
+
+function decodeJellyfinSetup(value: unknown): JellyfinSetup {
+  const record = asObject<JellyfinSetup>(value, 'Jellyfin setup response')
+  if (typeof record.status !== 'string' || (record.status !== 'available' && record.status !== 'regeneration-required')) {
+    throw invalidResponse('Jellyfin setup response must include a valid status.')
+  }
+  if (typeof record.guideDaysMax !== 'number') {
+    throw invalidResponse('Jellyfin setup response must include guideDaysMax.')
+  }
+  const optionalUrl = (key: string): string | undefined => (typeof record[key as keyof JellyfinSetup] === 'string' ? record[key as keyof JellyfinSetup] as string : undefined)
+  return {
+    status: record.status,
+    playlistUrl: optionalUrl('playlistUrl'),
+    xmltvUrl: optionalUrl('xmltvUrl'),
+    hdhrDeviceUrl: optionalUrl('hdhrDeviceUrl'),
+    guideDaysMax: record.guideDaysMax,
+  }
 }
 
 function buildQueryString(params: Record<string, unknown>): string {
@@ -744,10 +763,15 @@ export class FetchIptvApiClient implements IptvApiClient {
     return this.request(API_PATHS.sessions, (value) => asObjectArray<Session>(value, 'Sessions response'))
   }
 
-  async saveJellyfin(config: JellyfinConfig): Promise<SaveResult> {
-    return this.request(API_PATHS.jellyfin, (value) => asObject<SaveResult>(value, 'Jellyfin response'), {
-      method: 'PUT',
-      body: JSON.stringify(config),
+  async getJellyfinSetup(): Promise<JellyfinSetup> {
+    return this.request(API_PATHS.jellyfinSetup, (value) => decodeJellyfinSetup(value))
+  }
+
+  async rotateJellyfinToken(input?: RotateJellyfinTokenInput): Promise<JellyfinSetup> {
+    const body = input?.overlapSeconds !== undefined ? JSON.stringify({ overlapSeconds: input.overlapSeconds }) : '{}'
+    return this.request(`${API_PATHS.jellyfinSetup}/rotate`, (value) => decodeJellyfinSetup(value), {
+      method: 'POST',
+      body,
     })
   }
 
@@ -1211,14 +1235,24 @@ export class MockIptvApiClient implements IptvApiClient {
     return mockSessions.map((session) => ({ ...session }))
   }
 
-  async saveJellyfin(config: JellyfinConfig): Promise<SaveResult> {
-    try {
-      new URL(config.baseUrl)
-      new URL(config.publicBaseUrl)
-    } catch {
-      return { ok: false, message: 'Both Jellyfin and public URLs must be valid absolute URLs.' }
+  async getJellyfinSetup(): Promise<JellyfinSetup> {
+    return {
+      status: 'available',
+      playlistUrl: 'http://iptv-web:3000/out/mock-token/playlist.m3u',
+      xmltvUrl: 'http://iptv-web:3000/out/mock-token/xmltv.xml',
+      hdhrDeviceUrl: 'http://iptv-web:3000/out/mock-token/hdhr/device.xml',
+      guideDaysMax: 30,
     }
-    return { ok: true, message: `Saved tuner “${config.tunerName}” with ${config.guideDays} guide days.` }
+  }
+
+  async rotateJellyfinToken(_input?: RotateJellyfinTokenInput): Promise<JellyfinSetup> {
+    return {
+      status: 'available',
+      playlistUrl: 'http://iptv-web:3000/out/rotated-token/playlist.m3u',
+      xmltvUrl: 'http://iptv-web:3000/out/rotated-token/xmltv.xml',
+      hdhrDeviceUrl: 'http://iptv-web:3000/out/rotated-token/hdhr/device.xml',
+      guideDaysMax: 30,
+    }
   }
 
   async getStreamHealth(): Promise<StreamHealthPage> {

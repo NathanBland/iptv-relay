@@ -30,14 +30,6 @@ export const sourceUpdateSchema = z.object({
   enabled: z.boolean(),
 })
 
-export const jellyfinSchema = z.object({
-  baseUrl: z.string().refine(isAbsoluteHttpUrl, 'Enter an absolute Jellyfin URL.'),
-  tunerName: nonBlank('A tuner name is required.'),
-  publicBaseUrl: z.string().refine(isAbsoluteHttpUrl, 'Enter an absolute URL reachable by Jellyfin.'),
-  guideDays: z.number().int('Use a whole number.').min(1, 'Choose at least one guide day.').max(31, 'Choose no more than 31 guide days.'),
-})
-
 export type LoginFormValues = z.input<typeof loginSchema>
 export type SourceFormValues = z.input<typeof sourceSchema>
 export type SourceUpdateFormValues = z.input<typeof sourceUpdateSchema>
-export type JellyfinFormValues = z.input<typeof jellyfinSchema>

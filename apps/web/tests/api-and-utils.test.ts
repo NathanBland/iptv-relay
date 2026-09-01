@@ -43,10 +43,26 @@ describe('typed API boundary', () => {
     expect(await client.getAuthStatus()).toEqual({ authenticated: false })
   })
 
-  it('validates Jellyfin URLs', async () => {
+  it('returns published Jellyfin setup URLs from the mock boundary', async () => {
     const client = new MockIptvApiClient()
-    await expect(client.saveJellyfin({ baseUrl: 'not a url', publicBaseUrl: 'http://relay', tunerName: 'Relay', guideDays: 7 })).resolves.toEqual(expect.objectContaining({ ok: false }))
-    await expect(client.saveJellyfin({ baseUrl: 'http://jellyfin:8096', publicBaseUrl: 'http://relay:3000', tunerName: 'Relay', guideDays: 14 })).resolves.toEqual(expect.objectContaining({ ok: true, message: expect.stringContaining('14') }))
+    const setup = await client.getJellyfinSetup()
+    expect(setup.status).toBe('available')
+    expect(setup.playlistUrl).toContain('/out/')
+    expect(setup.playlistUrl).toContain('/playlist.m3u')
+    expect(setup.xmltvUrl).toContain('/out/')
+    expect(setup.xmltvUrl).toContain('/xmltv.xml')
+    expect(setup.hdhrDeviceUrl).toContain('/out/')
+    expect(setup.hdhrDeviceUrl).toContain('/hdhr/device.xml')
+    expect(setup.guideDaysMax).toBe(30)
+  })
+
+  it('rotates the Jellyfin publish token and returns new URLs once', async () => {
+    const client = new MockIptvApiClient()
+    const rotated = await client.rotateJellyfinToken({ overlapSeconds: 120 })
+    expect(rotated.status).toBe('available')
+    expect(rotated.playlistUrl).toContain('/out/rotated-token/playlist.m3u')
+    expect(rotated.xmltvUrl).toContain('/out/rotated-token/xmltv.xml')
+    expect(rotated.hdhrDeviceUrl).toContain('/out/rotated-token/hdhr/device.xml')
   })
 
   it('builds query definitions for default and injected clients', () => {

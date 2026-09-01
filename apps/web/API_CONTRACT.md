@@ -302,26 +302,69 @@ provider, source, channel, URL, or credential-bearing labels. Exported gauges in
 capacity/usage/high-water/availability, shared sessions, viewers, aggregate ring occupancy, and
 lag/wrap/overwrite/reconnect/failover/failure counters.
 
-## PUT `/api/v1/jellyfin`
+## GET `/api/v1/jellyfin/setup`
 
-Request:
+Requires authentication. Returns the current Jellyfin setup state. The output token stays embedded in
+each URL path and is never exposed as a separate field. The response sets `Cache-Control: no-store`
+because the URLs may contain the token.
 
-```json
-{
-  "baseUrl": "http://jellyfin:8096",
-  "tunerName": "Relay Control",
-  "publicBaseUrl": "http://iptv-web:3000",
-  "guideDays": 7
-}
-```
-
-Response:
+When the environment token is active and its plaintext is available at startup:
 
 ```json
 {
-  "ok": true,
-  "message": "Saved tuner “Relay Control” with 7 guide days."
+  "status": "available",
+  "playlistUrl": "https://relay.example/out/output-token/playlist.m3u",
+  "xmltvUrl": "https://relay.example/out/output-token/xmltv.xml",
+  "hdhrDeviceUrl": "https://relay.example/out/output-token/hdhr/device.xml",
+  "guideDaysMax": 30
 }
 ```
+
+After a rotation the plaintext token is no longer retained, so later GET responses omit the URLs:
+
+```json
+{
+  "status": "regeneration-required",
+  "guideDaysMax": 30
+}
+```
+
+`playlistUrl`, `xmltvUrl`, and `hdhrDeviceUrl` are absolute URLs built from the configured public
+base URL and the active output token. `guideDaysMax` is the backend maximum guide horizon in days.
+The web client removes the `['jellyfin-setup']` query cache entry on unmount so token-bearing URLs
+do not persist after navigation.
+
+## POST `/api/v1/jellyfin/setup/rotate`
+
+Requires authentication and CSRF. Generates a cryptographically random output token server-side,
+stores only its SHA-256 hash, and keeps the previous hash valid through an overlap window. The
+plaintext token is returned once as complete published URLs and is never stored in the database.
+
+Request (all fields optional):
+
+```json
+{
+  "overlapSeconds": 300
+}
+```
+
+`overlapSeconds` is the window in seconds during which the previous token remains valid. It defaults
+to 300 and accepts 0 through 86400.
+
+Response (`Cache-Control: no-store`):
+
+```json
+{
+  "status": "available",
+  "playlistUrl": "https://relay.example/out/new-token/playlist.m3u",
+  "xmltvUrl": "https://relay.example/out/new-token/xmltv.xml",
+  "hdhrDeviceUrl": "https://relay.example/out/new-token/hdhr/device.xml",
+  "guideDaysMax": 30
+}
+```
+
+After this response, `GET /api/v1/jellyfin/setup` returns `regeneration-required` because the
+plaintext token is not retained. The previous token stays valid through the overlap window so
+existing Jellyfin tuners keep working during the transition.
 
 The browser sends cookies with `credentials: same-origin`; no backend URL is accepted from client configuration. Set `VITE_USE_MOCK_API=true` only for an explicit fixture-backed development demo.

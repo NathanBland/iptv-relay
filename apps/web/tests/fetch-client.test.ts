@@ -132,7 +132,8 @@ describe('FetchIptvApiClient', () => {
       if (path === '/api/v1/sessions') return jsonResponse(mockSessions)
       if (path === '/api/v1/sources' && init?.method === 'POST') return jsonResponse(mockSources[0], 201)
       if (path === '/api/v1/sources') return jsonResponse(mockSources)
-      if (path === '/api/v1/jellyfin' && init?.method === 'PUT') return jsonResponse({ ok: true, message: 'Saved.' })
+      if (path === '/api/v1/jellyfin/setup') return jsonResponse({ status: 'available', playlistUrl: 'http://relay:3000/out/token/playlist.m3u', xmltvUrl: 'http://relay:3000/out/token/xmltv.xml', hdhrDeviceUrl: 'http://relay:3000/out/token/hdhr/device.xml', guideDaysMax: 30 })
+      if (path === '/api/v1/jellyfin/setup/rotate' && init?.method === 'POST') return jsonResponse({ status: 'available', playlistUrl: 'http://relay:3000/out/new-token/playlist.m3u', xmltvUrl: 'http://relay:3000/out/new-token/xmltv.xml', hdhrDeviceUrl: 'http://relay:3000/out/new-token/hdhr/device.xml', guideDaysMax: 30 })
       return jsonResponse({ title: 'Not found' }, 404)
     })
     const client = new FetchIptvApiClient(fetcher, { readCsrfToken: () => 'csrf-test-token' })
@@ -149,7 +150,7 @@ describe('FetchIptvApiClient', () => {
       client.getEvents(),
       client.getSessions(),
       client.createSource({ name: 'Prime IPTV', kind: 'Xtream', endpoint: 'https://provider.invalid/player_api.php' }),
-      client.saveJellyfin({ baseUrl: 'http://jellyfin:8096', tunerName: 'Relay', publicBaseUrl: 'http://relay:3000', guideDays: 7 }),
+      client.getJellyfinSetup(),
     ])
 
     expect(overview.channels).toBe(486)
@@ -160,7 +161,14 @@ describe('FetchIptvApiClient', () => {
     expect(sessions).toHaveLength(3)
     expect(sessions[2]).toMatchObject({ state: 'recovering', viewerCount: 2, lastFailure: 'http' })
     expect(created?.id).toBe('source-prime')
-    expect(jellyfin).toEqual({ ok: true, message: 'Saved.' })
+    expect(jellyfin).toEqual({ status: 'available', playlistUrl: 'http://relay:3000/out/token/playlist.m3u', xmltvUrl: 'http://relay:3000/out/token/xmltv.xml', hdhrDeviceUrl: 'http://relay:3000/out/token/hdhr/device.xml', guideDaysMax: 30 })
+
+    const rotated = await client.rotateJellyfinToken({ overlapSeconds: 60 })
+    expect(rotated.status).toBe('available')
+    expect(rotated.playlistUrl).toBe('http://relay:3000/out/new-token/playlist.m3u')
+    const rotationCommand = fetcher.mock.calls.find(([path, init]) => path === '/api/v1/jellyfin/setup/rotate' && init?.method === 'POST')
+    expect(rotationCommand?.[1]).toEqual(expect.objectContaining({ credentials: 'same-origin', body: expect.stringContaining('overlapSeconds') }))
+    expect(new Headers(rotationCommand?.[1]?.headers).get('x-csrf-token')).toBe('csrf-test-token')
 
     const sourceCommand = fetcher.mock.calls.find(([path, init]) => path === '/api/v1/sources' && init?.method === 'POST')
     expect(sourceCommand?.[1]).toEqual(expect.objectContaining({ credentials: 'same-origin', body: expect.stringContaining('Prime IPTV') }))

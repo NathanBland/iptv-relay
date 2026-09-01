@@ -469,11 +469,18 @@ export interface Session {
   providerAvailableSlots: number
 }
 
-export interface JellyfinConfig {
-  baseUrl: string
-  tunerName: string
-  publicBaseUrl: string
-  guideDays: number
+export type JellyfinSetupStatus = 'available' | 'regeneration-required'
+
+export interface JellyfinSetup {
+  status: JellyfinSetupStatus
+  playlistUrl?: string | undefined
+  xmltvUrl?: string | undefined
+  hdhrDeviceUrl?: string | undefined
+  guideDaysMax: number
+}
+
+export interface RotateJellyfinTokenInput {
+  overlapSeconds?: number
 }
 
 export interface SaveResult {
@@ -566,7 +573,8 @@ export interface IptvApiClient {
   deleteLineupTemplate(id: string): Promise<void>
   applyLineupTemplate(id: string): Promise<SaveResult>
   getSessions(): Promise<Session[]>
-  saveJellyfin(config: JellyfinConfig): Promise<SaveResult>
+  getJellyfinSetup(): Promise<JellyfinSetup>
+  rotateJellyfinToken(input?: RotateJellyfinTokenInput): Promise<JellyfinSetup>
   getStreamHealth(status?: string, group?: string, limit?: number, offset?: number): Promise<StreamHealthPage>
   getStreamHealthStats(): Promise<StreamHealthStats>
   triggerHealthCheck(limit?: number): Promise<{ queued: number }>

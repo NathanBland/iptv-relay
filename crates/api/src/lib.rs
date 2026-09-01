@@ -21,8 +21,9 @@ use axum::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use iptv_domain::{SettingDefinition, setting_catalog};
 use iptv_media::{
@@ -79,12 +80,13 @@ pub struct RuntimeVersions {
     pub vlc: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AppState {
     database: Option<Database>,
     catalog: Arc<RwLock<CatalogSnapshot>>,
     public_base_url: Arc<str>,
     output_token_hash: [u8; 32],
+    environment_output_token: Arc<str>,
     auth: AuthManager,
     tuner_count: u16,
     runtime_versions: RuntimeVersions,
@@ -93,8 +95,31 @@ pub struct AppState {
     source_repository: Option<SourceRepository>,
     job_repository: Option<JobRepository>,
     catalog_repository: Option<CatalogRepository>,
-    jellyfin: Arc<RwLock<Option<JellyfinConfigRequest>>>,
+    jellyfin_setup: Arc<RwLock<JellyfinSetup>>,
     master_key: MasterKey,
+}
+
+impl fmt::Debug for AppState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppState")
+            .field("database", &self.database)
+            .field("catalog", &self.catalog)
+            .field("public_base_url", &self.public_base_url)
+            .field("output_token_hash", &"<redacted>")
+            .field("environment_output_token", &"<redacted>")
+            .field("auth", &self.auth)
+            .field("tuner_count", &self.tuner_count)
+            .field("runtime_versions", &self.runtime_versions)
+            .field("started_at", &self.started_at)
+            .field("media", &self.media)
+            .field("source_repository", &self.source_repository)
+            .field("job_repository", &self.job_repository)
+            .field("catalog_repository", &self.catalog_repository)
+            .field("jellyfin_setup", &self.jellyfin_setup)
+            .field("master_key", &self.master_key)
+            .finish()
+    }
 }
 
 impl AppState {
@@ -114,6 +139,7 @@ impl AppState {
             catalog: Arc::new(RwLock::new(CatalogSnapshot::default())),
             public_base_url: config.public_base_url.trim_end_matches('/').into(),
             output_token_hash: token_hash(&config.output_token),
+            environment_output_token: Arc::from(config.output_token.as_str()),
             auth: AuthManager::new(
                 config.admin_password_hash,
                 &config.admin_bootstrap_token,
@@ -126,7 +152,10 @@ impl AppState {
             source_repository,
             job_repository,
             catalog_repository,
-            jellyfin: Arc::new(RwLock::new(None)),
+            jellyfin_setup: Arc::new(RwLock::new(JellyfinSetup::available(
+                &config.public_base_url,
+                &config.output_token,
+            ))),
             master_key: config.master_key,
         }
     }
@@ -136,6 +165,13 @@ impl AppState {
     }
 
     /// Create or update the database output profile from environment configuration.
+    ///
+    /// On first creation the environment token hash is seeded. On subsequent
+    /// calls the persisted current token hash is retained so a rotated token
+    /// stays active across restarts. When the persisted current hash differs
+    /// from the environment hash, the Jellyfin setup state becomes
+    /// `regeneration-required` because the environment plaintext no longer
+    /// matches the active token.
     ///
     /// # Errors
     ///
@@ -150,6 +186,17 @@ impl AppState {
                 i32::from(self.tuner_count),
             )
             .await?;
+        // Compare the environment token hash with the persisted current hash.
+        // When they differ, a rotation occurred and the environment plaintext
+        // is no longer the active token.
+        let persisted_hash = catalog.environment_output_profile_token_hash().await?;
+        let setup = match persisted_hash {
+            Some(hash) if hash.as_bytes() == &self.output_token_hash => {
+                JellyfinSetup::available(&self.public_base_url, &self.environment_output_token)
+            }
+            _ => JellyfinSetup::regeneration_required(),
+        };
+        *self.jellyfin_setup.write().await = setup;
         Ok(())
     }
 
@@ -515,14 +562,60 @@ struct SessionResponse {
     provider_available_slots: usize,
 }
 
-#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct JellyfinConfigRequest {
-    base_url: String,
-    tuner_name: String,
-    public_base_url: String,
-    guide_days: u16,
+pub struct JellyfinSetup {
+    /// `available` when the published URLs are present. `regeneration-required`
+    /// when a rotation occurred and the plaintext token is no longer retained.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playlist_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xmltv_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hdhr_device_url: Option<String>,
+    pub guide_days_max: u16,
 }
+
+impl JellyfinSetup {
+    /// Build the published Jellyfin setup URLs from the public base URL and the
+    /// output token. The token stays embedded in the path and is never exposed
+    /// as a separate field.
+    pub fn available(public_base_url: &str, output_token: &str) -> Self {
+        let base = public_base_url.trim_end_matches('/');
+        Self {
+            status: JELLYFIN_SETUP_AVAILABLE.into(),
+            playlist_url: Some(format!("{base}/out/{output_token}/playlist.m3u")),
+            xmltv_url: Some(format!("{base}/out/{output_token}/xmltv.xml")),
+            hdhr_device_url: Some(format!("{base}/out/{output_token}/hdhr/device.xml")),
+            guide_days_max: GUIDE_DAYS_MAX,
+        }
+    }
+
+    /// Build the response that states regeneration is required because a
+    /// rotation occurred and the plaintext token is no longer retained.
+    pub fn regeneration_required() -> Self {
+        Self {
+            status: JELLYFIN_SETUP_REGENERATION_REQUIRED.into(),
+            playlist_url: None,
+            xmltv_url: None,
+            hdhr_device_url: None,
+            guide_days_max: GUIDE_DAYS_MAX,
+        }
+    }
+}
+
+/// Maximum number of guide days that the backend accepts.
+pub const GUIDE_DAYS_MAX: u16 = 30;
+
+/// Setup status value when published URLs are present.
+pub const JELLYFIN_SETUP_AVAILABLE: &str = "available";
+
+/// Setup status value when a rotation occurred and regeneration is required.
+pub const JELLYFIN_SETUP_REGENERATION_REQUIRED: &str = "regeneration-required";
+
+/// Default overlap window in seconds for token rotation.
+pub const TOKEN_ROTATION_OVERLAP_SECONDS: i64 = 300;
 
 #[derive(Debug, Serialize, ToSchema)]
 struct SaveResult {
@@ -591,8 +684,8 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, system_info, settings_schema, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, save_jellyfin, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
-    components(schemas(LoginRequest, LogoutRequest, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinConfigRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
+    paths(auth_status, login, logout, system_info, settings_schema, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    components(schemas(LoginRequest, LogoutRequest, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -725,7 +818,8 @@ fn operations_control_routes() -> Router<AppState> {
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/session-events", get(session_events))
         .route("/api/v1/catalog-events", get(catalog_events))
-        .route("/api/v1/jellyfin", axum::routing::put(save_jellyfin))
+        .route("/api/v1/jellyfin/setup", get(jellyfin_setup))
+        .route("/api/v1/jellyfin/setup/rotate", post(rotate_jellyfin_token))
         .route(
             "/api/v1/lineup-templates",
             get(list_lineup_templates).post(create_lineup_template),
@@ -3593,44 +3687,113 @@ const fn session_failure_name(failure: SessionFailureKind) -> &'static str {
 }
 
 #[utoipa::path(
-    put,
-    path = "/api/v1/jellyfin",
+    get,
+    path = "/api/v1/jellyfin/setup",
     tag = "configuration",
-    request_body = JellyfinConfigRequest,
-    responses((status = 200, body = SaveResult), (status = 422, body = ProblemDetails))
+    responses((status = 200, body = JellyfinSetup), (status = 401, body = ProblemDetails))
 )]
-async fn save_jellyfin(
+async fn jellyfin_setup(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    let setup = state.jellyfin_setup.read().await.clone();
+    let mut response = Json(setup).into_response();
+    // The response may embed the output token in each URL path. Prevent
+    // intermediary and browser caching so token-bearing URLs do not persist.
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RotateJellyfinTokenRequest {
+    #[serde(default = "default_rotation_overlap_seconds")]
+    overlap_seconds: i64,
+}
+
+fn default_rotation_overlap_seconds() -> i64 {
+    TOKEN_ROTATION_OVERLAP_SECONDS
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/jellyfin/setup/rotate",
+    tag = "configuration",
+    request_body = RotateJellyfinTokenRequest,
+    responses(
+        (status = 200, body = JellyfinSetup),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn rotate_jellyfin_token(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<JellyfinConfigRequest>,
+    request: Result<Json<RotateJellyfinTokenRequest>, JsonRejection>,
 ) -> Response {
     if let Some(response) = require_admin_mutation(&state, &headers) {
         return response;
     }
-    let valid_url = |value: &str| {
-        url::Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+    let Ok(Json(request)) = request else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-rotation-request",
+            "Invalid rotation request",
+            "send a JSON request that matches the documented rotation schema",
+        )
+        .response();
     };
-    if request.tuner_name.trim().is_empty()
-        || request.tuner_name.len() > 160
-        || !(1..=30).contains(&request.guide_days)
-        || !valid_url(&request.base_url)
-        || !valid_url(&request.public_base_url)
-    {
+    if !(0..=86_400).contains(&request.overlap_seconds) {
         return ProblemDetails::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid-jellyfin-configuration",
-            "Invalid Jellyfin configuration",
-            "provide HTTP(S) URLs, a tuner name, and 1-30 guide days",
+            "invalid-overlap-window",
+            "Invalid overlap window",
+            "provide an overlap window between 0 and 86400 seconds",
         )
         .response();
     }
-    let message = format!(
-        "Saved tuner “{}” with {} guide days.",
-        request.tuner_name.trim(),
-        request.guide_days
-    );
-    *state.jellyfin.write().await = Some(request);
-    Json(SaveResult { ok: true, message }).into_response()
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    // Generate a cryptographically random token. The plaintext is returned once
+    // and is never stored in the database; only its SHA-256 hash is persisted.
+    let Ok(plaintext_token) = generate_output_token() else {
+        return ProblemDetails::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "token-generation-failed",
+            "Token generation failed",
+            "the cryptographic random source could not produce a token",
+        )
+        .response();
+    };
+    let new_hash = OutputProfileTokenHash::from_sha256(token_hash(&plaintext_token));
+    match catalog
+        .rotate_environment_output_profile_token(new_hash, request.overlap_seconds)
+        .await
+    {
+        Ok(_) => {
+            let setup = JellyfinSetup::available(&state.public_base_url, &plaintext_token);
+            // Mark future GET responses as regeneration-required because the
+            // plaintext token is not retained after this response.
+            *state.jellyfin_setup.write().await = JellyfinSetup::regeneration_required();
+            let mut response = Json(setup).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+/// Generate a cryptographically random output token encoded as URL-safe base64.
+fn generate_output_token() -> Result<String, getrandom::Error> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random)?;
+    Ok(URL_SAFE_NO_PAD.encode(random))
 }
 
 // Lineup template response and request types.
@@ -7004,11 +7167,38 @@ mod tests {
             serde_json::from_str(&response_text(discover).await).unwrap();
         assert_eq!(discover["TunerCount"], 3);
 
-        let rotated_token = "rotated-output-secret";
+        // Update only the tuner count through the startup path. The persisted
+        // current token hash stays as the environment hash so `output-secret`
+        // keeps resolving. `ensure_environment_output_profile` must not rotate.
         catalog
             .ensure_environment_output_profile(
-                OutputProfileTokenHash::from_sha256(token_hash(rotated_token)),
+                OutputProfileTokenHash::from_sha256(token_hash("output-secret")),
                 5,
+            )
+            .await
+            .unwrap();
+        let tuned = app
+            .clone()
+            .oneshot(
+                Request::get("/out/output-secret/hdhr/discover.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tuned.status(), StatusCode::OK);
+        let tuned_body: serde_json::Value =
+            serde_json::from_str(&response_text(tuned).await).unwrap();
+        assert_eq!(tuned_body["TunerCount"], 5);
+
+        // Rotate through the dedicated rotation path. The prior hash stays
+        // valid through the overlap window so both tokens resolve. The tuner
+        // count is unchanged by rotation.
+        let rotated_token = "rotated-output-secret";
+        catalog
+            .rotate_environment_output_profile_token(
+                OutputProfileTokenHash::from_sha256(token_hash(rotated_token)),
+                300,
             )
             .await
             .unwrap();
@@ -7039,6 +7229,178 @@ mod tests {
         assert_eq!(invalid_token.status(), StatusCode::NOT_FOUND);
 
         drop(app);
+        drop(catalog);
+        drop(pool);
+        drop(database);
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(admin.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn jellyfin_setup_becomes_regeneration_required_after_rotation_restart() {
+        let Ok(database_url) = std::env::var("IPTV_TEST_DATABASE_URL") else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL API integration test");
+            return;
+        };
+        let admin = Database::connect(&database_url, 2).await.unwrap();
+        let schema = format!("iptv_api_test_{}", Uuid::now_v7().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(admin.pool())
+            .await
+            .unwrap();
+        let mut isolated_url = url::Url::parse(&database_url).unwrap();
+        isolated_url
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema},public"));
+        let database = Database::connect(isolated_url.as_str(), 4).await.unwrap();
+        database.migrate().await.unwrap();
+        let pool = database.pool().clone();
+        let catalog = CatalogRepository::new(pool.clone());
+
+        // Initial startup seeds the environment hash and exposes the
+        // environment plaintext token in the published URLs.
+        let state = state_with_database(Some(database.clone()));
+        state.initialize_output_profile().await.unwrap();
+        let app = router(state.clone());
+        let setup = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/jellyfin/setup")
+                    .header(header::AUTHORIZATION, "Bearer admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        assert_eq!(setup.headers()[header::CACHE_CONTROL], "no-store");
+        let setup_body: serde_json::Value =
+            serde_json::from_str(&response_text(setup).await).unwrap();
+        assert_eq!(setup_body["status"], "available");
+        assert_eq!(
+            setup_body["playlistUrl"],
+            "http://gateway.test/out/output-secret/playlist.m3u"
+        );
+
+        // Rotate the token through the dedicated rotation path. The plaintext
+        // is returned once and is never retained by the server.
+        let rotated_token = "rotated-output-secret";
+        let rotated_hash = OutputProfileTokenHash::from_sha256(token_hash(rotated_token));
+        catalog
+            .rotate_environment_output_profile_token(rotated_hash.clone(), 300)
+            .await
+            .unwrap();
+        // The persisted current hash is now the rotated hash, not the
+        // environment hash.
+        assert_eq!(
+            catalog
+                .environment_output_profile_token_hash()
+                .await
+                .unwrap()
+                .as_ref()
+                .map(OutputProfileTokenHash::as_bytes),
+            Some(rotated_hash.as_bytes())
+        );
+
+        // Simulate a restart. The environment hash re-seeds through the
+        // startup path but must not replace the rotated current hash. The
+        // setup status becomes regeneration-required because the environment
+        // plaintext no longer matches the active token.
+        let restarted_state = state_with_database(Some(database.clone()));
+        restarted_state.initialize_output_profile().await.unwrap();
+        assert_eq!(
+            catalog
+                .environment_output_profile_token_hash()
+                .await
+                .unwrap()
+                .as_ref()
+                .map(OutputProfileTokenHash::as_bytes),
+            Some(rotated_hash.as_bytes()),
+            "environment hash must not become current after restart"
+        );
+        let restarted_app = router(restarted_state.clone());
+        let restarted_setup = restarted_app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/jellyfin/setup")
+                    .header(header::AUTHORIZATION, "Bearer admin-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(restarted_setup.status(), StatusCode::OK);
+        assert_eq!(restarted_setup.headers()[header::CACHE_CONTROL], "no-store");
+        let restarted_body: serde_json::Value =
+            serde_json::from_str(&response_text(restarted_setup).await).unwrap();
+        assert_eq!(restarted_body["status"], "regeneration-required");
+        assert!(restarted_body.get("playlistUrl").is_none());
+        assert!(restarted_body.get("xmltvUrl").is_none());
+        assert!(restarted_body.get("hdhrDeviceUrl").is_none());
+        assert_eq!(restarted_body["guideDaysMax"], 30);
+
+        // The rotated token still serves output routes. The environment token
+        // resolves only as the prior hash within the overlap window.
+        let rotated_response = restarted_app
+            .clone()
+            .oneshot(
+                Request::get("/out/rotated-output-secret/hdhr/discover.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotated_response.status(), StatusCode::OK);
+        let environment_response = restarted_app
+            .clone()
+            .oneshot(
+                Request::get("/out/output-secret/hdhr/discover.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(environment_response.status(), StatusCode::OK);
+
+        // After the overlap window expires, the environment token stops
+        // resolving while the rotated token stays active.
+        sqlx::query(
+            "UPDATE output_profiles
+             SET previous_token_expires_at = now() - interval '1 second'
+             WHERE id = $1",
+        )
+        .bind(iptv_persistence::ENVIRONMENT_OUTPUT_PROFILE_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let expired_environment = restarted_app
+            .clone()
+            .oneshot(
+                Request::get("/out/output-secret/hdhr/discover.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired_environment.status(), StatusCode::NOT_FOUND);
+        let still_active_rotated = restarted_app
+            .clone()
+            .oneshot(
+                Request::get("/out/rotated-output-secret/hdhr/discover.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(still_active_rotated.status(), StatusCode::OK);
+
+        drop(restarted_app);
+        drop(restarted_state);
+        drop(app);
+        drop(state);
         drop(catalog);
         drop(pool);
         drop(database);
@@ -7771,35 +8133,98 @@ mod tests {
             "application/problem+json"
         );
 
-        let invalid = app
+        let unauthorized_setup = app
             .clone()
             .oneshot(
-                Request::put("/api/v1/jellyfin")
-                    .header(header::AUTHORIZATION, "Bearer admin-secret")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"baseUrl":"invalid","tunerName":"","publicBaseUrl":"http://gateway.test","guideDays":0}"#))
+                Request::get("/api/v1/jellyfin/setup")
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(unauthorized_setup.status(), StatusCode::UNAUTHORIZED);
 
-        let saved = app
+        let setup = app
+            .clone()
             .oneshot(
-                Request::put("/api/v1/jellyfin")
+                Request::get("/api/v1/jellyfin/setup")
                     .header(header::AUTHORIZATION, "Bearer admin-secret")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"baseUrl":"http://jellyfin:8096","tunerName":"Relay","publicBaseUrl":"http://gateway.test","guideDays":7}"#))
+                    .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(saved.status(), StatusCode::OK);
-        assert!(response_text(saved).await.contains("7 guide days"));
+        assert_eq!(setup.status(), StatusCode::OK);
+        assert_eq!(setup.headers()[header::CACHE_CONTROL], "no-store");
+        let setup_body: serde_json::Value =
+            serde_json::from_str(&response_text(setup).await).unwrap();
+        assert_eq!(setup_body["status"], "available");
         assert_eq!(
-            app_state.jellyfin.read().await.as_ref().unwrap().guide_days,
-            7
+            setup_body["playlistUrl"],
+            "http://gateway.test/out/output-secret/playlist.m3u"
         );
+        assert_eq!(
+            setup_body["xmltvUrl"],
+            "http://gateway.test/out/output-secret/xmltv.xml"
+        );
+        assert_eq!(
+            setup_body["hdhrDeviceUrl"],
+            "http://gateway.test/out/output-secret/hdhr/device.xml"
+        );
+        assert_eq!(setup_body["guideDaysMax"], 30);
+        // The raw token is never exposed as a separate field.
+        assert!(setup_body.get("token").is_none());
+        assert!(setup_body.get("outputToken").is_none());
+
+        // Rotation requires admin mutation authorization.
+        let unauthenticated_rotate = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/jellyfin/setup/rotate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated_rotate.status(), StatusCode::UNAUTHORIZED);
+
+        // Without a database the rotation endpoint reports persistence
+        // unavailable instead of generating a token.
+        let rotate_unavailable = app
+            .oneshot(
+                Request::post("/api/v1/jellyfin/setup/rotate")
+                    .header(header::AUTHORIZATION, "Bearer admin-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotate_unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn jellyfin_setup_regeneration_required_omits_urls() {
+        let setup = JellyfinSetup::regeneration_required();
+        assert_eq!(setup.status, JELLYFIN_SETUP_REGENERATION_REQUIRED);
+        assert!(setup.playlist_url.is_none());
+        assert!(setup.xmltv_url.is_none());
+        assert!(setup.hdhr_device_url.is_none());
+        assert_eq!(setup.guide_days_max, GUIDE_DAYS_MAX);
+    }
+
+    #[test]
+    fn generate_output_token_produces_url_safe_base64() {
+        let token = generate_output_token().expect("random source is available");
+        assert!(token.len() >= 43);
+        // URL-safe base64 without padding contains only these characters.
+        for byte in token.bytes() {
+            assert!(
+                byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_',
+                "unexpected byte {byte} in token"
+            );
+        }
     }
 
     #[test]
@@ -8663,7 +9088,8 @@ mod tests {
         assert_schema::<EventChannelResponse>();
         assert_schema::<EventChannelQuery>();
         assert_schema::<SessionResponse>();
-        assert_schema::<JellyfinConfigRequest>();
+        assert_schema::<JellyfinSetup>();
+        assert_schema::<RotateJellyfinTokenRequest>();
         assert_schema::<SaveResult>();
         assert_schema::<LoginRequest>();
         assert_schema::<LogoutRequest>();
@@ -9150,10 +9576,6 @@ mod tests {
             "eventDurationHours": 3, "pastDateGraceHours": 4, "futureDateDays": 2
         }));
         assert_deserializes::<EventChannelQuery>(serde_json::json!({"templateId": id}));
-        assert_deserializes::<JellyfinConfigRequest>(serde_json::json!({
-            "baseUrl": "http://jellyfin.test", "tunerName": "Relay",
-            "publicBaseUrl": "https://gateway.test", "guideDays": 7
-        }));
         assert_deserializes::<LoginRequest>(serde_json::json!({
             "username": "operator", "password": "password"
         }));
