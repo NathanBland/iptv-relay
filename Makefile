@@ -1,5 +1,7 @@
 .PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-coverage-script postgres-test coverage coverage-rust coverage-web coverage-changed fuzz-smoke ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance dev
 
+DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
+
 IPTV_TEST_DATABASE_URL ?= postgres://iptv:iptv-development@127.0.0.1:54329/iptv
 COVERAGE_CHANGED_THRESHOLD ?= 95
 COVERAGE_BASE_REF ?=
@@ -75,6 +77,7 @@ build:
 compose-config:
 	docker-compose --env-file .env.example config --quiet
 	docker-compose --env-file .env.test --profile test config --quiet
+	$(DEV_COMPOSE) --env-file .env.example config --quiet
 
 compose-up:
 	docker-compose up --build
@@ -82,19 +85,17 @@ compose-up:
 compose-down:
 	docker-compose down
 
-# Hot-reload dev environment: cargo-watch for Rust, Vite for web.
-# First build cooks dependencies (~2min). Source changes rebuild in seconds.
 compose-dev-build:
-	docker-compose -f docker-compose.yml -f docker-compose.dev.yml build
+	$(DEV_COMPOSE) build core web
 
 compose-dev-up:
-	docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+	$(DEV_COMPOSE) up --no-build
 
 compose-dev-down:
-	docker-compose -f docker-compose.yml -f docker-compose.dev.yml down
+	$(DEV_COMPOSE) down
 
 compose-dev-logs:
-	docker-compose -f docker-compose.yml -f docker-compose.dev.yml logs -f core worker web
+	$(DEV_COMPOSE) logs -f core worker web
 
 media-acceptance:
 	docker-compose --env-file .env.test build core

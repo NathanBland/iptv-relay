@@ -1,6 +1,6 @@
 # IPTV Gateway Implementation Status
 
-Last update: 2026-08-21 (session 3)
+Last update: 2026-09-01 (complete Rust coverage)
 
 ## Ingest store coverage
 
@@ -2456,3 +2456,529 @@ The Rust unit tests for the gateway passed 62 tests.
 The web Vitest suite passed 73 tests.
 
 The total result is 260 tests passed and 4 tests failed. The 4 failures are pre-existing Playwright issues.
+
+## Development Compose Audit - 2026-08-31
+
+### Production image build: PASS
+
+The active production image build used `--no-cache`.
+
+The build finished successfully in approximately five minutes.
+
+The Docker runtime provides two CPUs and approximately 2 GB of memory.
+
+Test evidence: process inspection, Docker image timestamps, and Docker image tags.
+
+### Development startup memory use: FAILED
+
+The prior dev start ran the core and worker Rust builds at the same time.
+
+Both Rust builds used one shared target volume.
+
+The web container exited after an out-of-memory kill.
+
+The core and worker containers later received termination signals.
+
+Docker did not report those two exits as out-of-memory kills.
+
+Test evidence: Docker container state and Compose container labels.
+
+### Revised development image build: FAILED
+
+The revised Compose configuration passed validation.
+
+The dev image build failed at the Cargo registry copy step.
+
+The image deletes `/usr/local/cargo/registry/cache` before this copy step.
+
+Test evidence: `make compose-config` passed, and `make compose-dev-build` failed.
+
+### Corrected development image build: PASS
+
+The dev image copies the complete Cargo registry data.
+
+The core dev image built successfully in 19 seconds with cached layers.
+
+The web dev image built successfully in seven seconds with cached layers.
+
+Test evidence: `make compose-dev-build` passed.
+
+### Revised development stack start: FAILED
+
+PostgreSQL became healthy.
+
+Only the core service started a Cargo process.
+
+The core build failed because the command did not select the server package.
+
+The web and worker services correctly waited for core health.
+
+Test evidence: Compose service state, process output, and core logs.
+
+### Development worker health check: FAILED
+
+The core, web, gateway, and PostgreSQL services started successfully.
+
+The gateway live and ready routes returned successful responses.
+
+The worker process started successfully.
+
+The worker health check failed because the dev image does not contain `pg_isready`.
+
+Test evidence: Compose service state and Docker health-check output.
+
+### Development Compose startup: PASS
+
+The dev stack uses one fixed Compose project and one Cargo target volume.
+
+The core is the only service that compiles Rust.
+
+The worker restarts the shared server binary without a second Cargo process.
+
+The web and worker services wait for core health.
+
+The worker health check verifies the active worker process.
+
+The first empty-volume Rust build completed in 94 seconds.
+
+The complete warm stack reached healthy state in 18 seconds.
+
+The gateway live and ready routes returned successful responses.
+
+Test evidence: Compose validation, image builds, process lists, health checks, and a timed warm start.
+
+### Development hot reload: FAILED
+
+A source change started one Rust build.
+
+The incremental build completed in 27 seconds.
+
+The core restarted from the new binary.
+
+The worker detected the new binary but waited for its 60-second graceful shutdown.
+
+The worker did not restart within the expected incremental reload window.
+
+Test evidence: Compose process lists, executable inode data, and service logs.
+
+### Development hot reload shutdown fix: PASS
+
+A source change started one Rust build.
+
+The incremental release build completed in 27 seconds.
+
+The core restarted from the new binary.
+
+The worker stopped its old child process within two seconds.
+
+The worker started PID 423 from the new executable.
+
+The worker restored its direct health marker.
+
+Test evidence: Compose process lists, executable inode data, health marker state, and service logs.
+
+### Development stack stability: PASS
+
+All five dev services remained active for 17 hours.
+
+The core, worker, web, and PostgreSQL services report healthy state.
+
+Test evidence: current Compose service state on 2026-09-01.
+
+### Incremental Xtream edit build: FAILED
+
+The dev watcher compiled an incomplete request constructor during the Xtream edit.
+
+The compiler reported a missing `xtream_category_names` field.
+
+The prior core process remained active and healthy.
+
+Test evidence: dev core compile log.
+
+### Incremental Xtream edit build retry: PASS
+
+The next dev build completed in 27 seconds.
+
+The core and worker restarted from the new binary.
+
+Test evidence: dev core and worker logs.
+
+## Timezone Reverification - 2026-08-31
+
+### XMLTV timezone parser: PASS
+
+All 17 focused XMLTV tests passed.
+
+The tests cover explicit offsets, implicit source timezones, and UTC normalization.
+
+The tests cover ambiguous and nonexistent Denver times.
+
+Test evidence: `cargo test -p iptv-parsers xmltv`.
+
+### Web timezone test command: FAILED
+
+The pnpm command stopped before it ran the requested web test.
+
+The repository requires pnpm 11.19.0, but the host command used pnpm 11.22.0.
+
+No web test result came from this command.
+
+### Web current-programme selection: PASS
+
+The focused web utility suite passed all eight tests.
+
+The suite includes current, upcoming, winter, and summer programme instants.
+
+Test evidence: direct Vitest execution for `tests/api-and-utils.test.ts`.
+
+## Implementation Audit - 2026-08-31
+
+### Xtream source refresh: FAILED
+
+The worker rejects each Xtream source refresh as unsupported.
+
+A server test confirms this rejection.
+
+This behavior does not satisfy the v1 Xtream ingestion requirement.
+
+### Live media acceptance: FAILED
+
+The live acceptance program opens one provider stream for 30 seconds.
+
+The program does not open the stream through the gateway.
+
+The program does not run the required three-channel scenario.
+
+The program does not run the required six-viewer scenario.
+
+## Xtream persistence - 2026-09-01
+
+### Rust format check: FAILED
+
+`cargo fmt --check` did not pass.
+
+The command reports concurrent format changes outside the persistence task.
+
+The command also reports format changes in the new persistence test code.
+
+Test evidence: `cargo fmt --check`.
+
+### Xtream reconciliation: PASS
+
+The PostgreSQL test creates a canonical channel from an active Xtream snapshot.
+
+The test retains the canonical channel after Xtream snapshot replacement.
+
+The test removes the prior stream link and creates the new stream link.
+
+Test evidence: `cargo test -p iptv-persistence --test postgres reconcile_xtream_snapshots_retain_channels_and_replace_stream_links -- --exact`.
+
+### Xtream reconciliation independent retry: FAILED
+
+The focused test reached the isolated PostgreSQL service.
+
+The second snapshot caused a duplicate channel-priority constraint error.
+
+The old stream link blocked the replacement link at priority zero.
+
+The earlier pass did not prove the database path.
+
+Test evidence: focused PostgreSQL test with the isolated coverage database.
+
+### Scheduled Xtream source kind: PASS
+
+The PostgreSQL test returns `SourceKind::Xtream` for a due Xtream provider source.
+
+Test evidence: `cargo test -p iptv-persistence --test postgres list_due_sources_preserves_xtream_provider_kind -- --exact`.
+
+### Persistence Clippy: FAILED
+
+Strict Clippy rejects the Xtream reconciliation integration test for 110 lines.
+
+Test evidence: `cargo clippy -p iptv-persistence --all-targets -- -D warnings`.
+
+### Persistence Clippy retry: PASS
+
+Strict Clippy passes for all `iptv-persistence` targets.
+
+Test evidence: `cargo clippy -p iptv-persistence --all-targets -- -D warnings`.
+
+## Xtream ingestion - 2026-09-01
+
+### Xtream endpoint preparation: PASS
+
+The ingest package passed 83 tests.
+
+One environment-only test was ignored.
+
+The tests cover concrete per-stream URL protection and category-name mapping.
+
+The tests cover credential redaction for requests, errors, templates, and stored metadata.
+
+Test evidence: `cargo test -p iptv-ingest`.
+
+### Rust format retry: PASS
+
+The complete Rust workspace has no format differences.
+
+Test evidence: `cargo fmt --all --check`.
+
+### Xtream refresh target: PASS
+
+The worker maps an Xtream source to a provider-owned live-stream snapshot.
+
+The focused server test passed.
+
+Test evidence: `cargo test -p iptv-gateway tests::refresh_targets_match_source_ownership -- --exact`.
+
+### Xtream ingest Clippy: PASS
+
+Strict Clippy passes for all `iptv-ingest` targets.
+
+Test evidence: `cargo clippy -p iptv-ingest --all-targets -- -D warnings`.
+
+### Xtream ingest coverage first run: FAILED
+
+All 70 unit tests passed.
+
+The 13 PostgreSQL tests could not open the local sandbox port.
+
+The test process reported `Operation not permitted` for each database connection.
+
+The command did not produce a valid coverage result.
+
+Test evidence: focused `cargo llvm-cov` output.
+
+### Isolated coverage database: PASS
+
+A separate PostgreSQL 17 test service reached healthy state on port 54330.
+
+The service uses the test configuration and a separate Compose project.
+
+Test evidence: Compose startup and health state.
+
+### Xtream ingest package coverage: FAILED
+
+All 83 executable tests passed.
+
+One environment-only test was ignored.
+
+The package result is 64.73 percent line coverage.
+
+The package result is 61.61 percent function coverage.
+
+The package result is 63.23 percent region coverage.
+
+These results are below the 86 percent gate.
+
+The ingest pipeline file has 53.24 percent line coverage.
+
+This result is below the 75 percent critical-file gate.
+
+Test evidence: focused `cargo llvm-cov` with the isolated PostgreSQL service.
+
+### Xtream worker integration first run: FAILED
+
+The first Xtream refresh succeeded.
+
+The second Xtream refresh created a new active snapshot.
+
+The canonical channel lost its link to the replacement provider stream.
+
+The test failed with `RowNotFound` for the refreshed channel link.
+
+Test evidence: focused Xtream worker PostgreSQL integration test.
+
+### Xtream worker integration retry: PASS
+
+The worker completed two successful Xtream refreshes.
+
+The worker retained the canonical channel UUID after the stream-name change.
+
+The provider category ID mapped to the `Sports` group name.
+
+The encrypted endpoint contains one concrete stream URL after decryption.
+
+An authentication failure stopped all category and stream requests.
+
+An empty stream response preserved the active snapshot and channel link.
+
+Public and diagnostic database fields contain no credential canaries.
+
+Test evidence: focused Xtream worker test with the isolated PostgreSQL service.
+
+### Xtream server Clippy first run: FAILED
+
+Strict Clippy reports four test-code violations.
+
+The new Xtream helper has eight arguments.
+
+The new Xtream test has 277 lines.
+
+Two prior server tests also fail current line and range checks.
+
+Test evidence: `cargo clippy -p iptv-gateway --all-targets -- -D warnings`.
+
+### Rust format check after relink fix: FAILED
+
+The format check found one difference in the new persistence regression test.
+
+Test evidence: `cargo fmt --all --check`.
+
+### Rust format check after relink retry: PASS
+
+The complete Rust workspace has no format differences.
+
+Test evidence: `cargo fmt --all --check`.
+
+### Xtream server Clippy retry: PASS
+
+Strict Clippy passes for all `iptv-gateway` targets.
+
+Test evidence: `cargo clippy -p iptv-gateway --all-targets -- -D warnings`.
+
+### Complete server test target: PASS
+
+All 62 server tests passed with the isolated PostgreSQL service.
+
+The target includes M3U, XMLTV, Xtream, job, authentication, and redaction tests.
+
+Test evidence: `cargo test -p iptv-gateway --bin iptv-gateway` with the test database.
+
+### Complete Rust coverage run: FAILED
+
+The run completed all server, media, parser, domain, API, and ingest tests.
+
+One persistence integration test failed before coverage calculation.
+
+The alias test found an EPG mapping before it created the alias.
+
+No valid aggregate coverage result came from this run.
+
+Test evidence: complete workspace `cargo llvm-cov` output.
+
+### Complete Rust coverage retry: PASS
+
+All executable Rust tests pass with the isolated PostgreSQL service.
+
+The workspace has 90.68 percent line coverage.
+
+The workspace has 90.11 percent function coverage.
+
+The workspace has 89.34 percent region coverage.
+
+Each measured production file exceeds the 75 percent critical-file gate.
+
+The ingest pipeline has 91.03 percent line coverage.
+
+The ingest pipeline has 83.65 percent function coverage.
+
+The ingest pipeline has 89.96 percent region coverage.
+
+Test evidence: complete workspace `cargo llvm-cov` with the isolated PostgreSQL service.
+
+### Changed-line coverage script regression tests: PASS
+
+The script counts covered changed lines in Rust and TypeScript files.
+
+The script includes new production files.
+
+The script fails when coverage data omits a changed production file.
+
+Test evidence: `scripts/test-changed-line-coverage.sh`.
+
+### EPG alias mapping focused retry: FAILED
+
+The failure reproduces in the isolated focused test.
+
+The channel maps before the test creates its alias.
+
+Test evidence: focused persistence PostgreSQL test.
+
+### EPG alias mapping fixture correction: PASS
+
+The name normalizer removes the `HD` quality token by design.
+
+The old test expected `ESPN HD` and `ESPN` to remain different.
+
+The revised fixture uses two names that only an explicit alias can join.
+
+The focused PostgreSQL test passes.
+
+Test evidence: `reconcile_epg_mappings_by_channel_alias` with the isolated PostgreSQL service.
+
+### Dev stack after Xtream rebuild: PASS
+
+All five dev services remain active.
+
+The core, worker, web, and PostgreSQL services report healthy state.
+
+The core and worker use the latest successful release build.
+
+Test evidence: dev Compose state and reload logs.
+
+### Dev stack stability recheck: FAILED
+
+The sandbox denied access to the local Colima Docker socket.
+
+This result does not show a service failure.
+
+Test evidence: dev Compose state command in the restricted sandbox.
+
+### Dev stack stability recheck retry: PASS
+
+All five development services remain active after 17 hours.
+
+The core, worker, web, and PostgreSQL services report healthy state.
+
+The latest no-change Rust rebuild completed in 0.11 seconds.
+
+Test evidence: dev Compose state and service logs from Colima.
+
+### Compose configuration recheck: PASS
+
+The default, test, and development Compose configurations validate.
+
+The test profile reports only the expected empty live-source variable warning.
+
+Test evidence: `make compose-config`.
+
+### Dependency and license audit recheck: FAILED
+
+The sandbox denied the Cargo advisory database lock.
+
+This result does not show a dependency policy failure.
+
+Test evidence: `cargo deny check` in the restricted sandbox.
+
+### Dependency and license audit recheck retry: PASS
+
+The advisory, ban, license, and source checks pass.
+
+Cargo Deny reports unused permissive license allowances as warnings.
+
+Test evidence: `cargo deny check` with advisory database access.
+
+## Xtream persistence atomic reconciliation - 2026-09-01
+
+### Xtream reconciliation regression test: FAILED
+
+The test could not open the isolated PostgreSQL test connection.
+
+The sandbox returned `Operation not permitted` for port 54330.
+
+Test evidence: `IPTV_TEST_DATABASE_URL=postgres://iptv:iptv-development@127.0.0.1:54330/iptv cargo test -p iptv-persistence --test postgres reconcile_xtream_snapshots_retain_channels_and_replace_stream_links -- --exact`.
+
+### Xtream reconciliation regression test retry: PASS
+
+The test creates and replaces an Xtream stream link.
+
+The test verifies rollback after a forced stream-link insert failure.
+
+Test evidence: `IPTV_TEST_DATABASE_URL=postgres://iptv:iptv-development@127.0.0.1:54330/iptv cargo test -p iptv-persistence --test postgres reconcile_xtream_snapshots_retain_channels_and_replace_stream_links -- --exact`.
+
+### Xtream persistence Clippy: PASS
+
+Strict Clippy passes for all `iptv-persistence` targets.
+
+Test evidence: `cargo clippy -p iptv-persistence --all-targets -- -D warnings`.

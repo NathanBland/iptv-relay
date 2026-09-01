@@ -178,8 +178,8 @@ pub async fn download_http(
         .redirect(Policy::none())
         .gzip(false)
         .build()
-        .map_err(|error| {
-            debug!(error = %error, "HTTP client construction failed");
+        .map_err(|_error| {
+            debug!("HTTP client construction failed");
             IngestError::HttpRequest
         })?;
     let response = client
@@ -189,7 +189,9 @@ pub async fn download_http(
         .await
         .map_err(|error| {
             debug!(
-                error = %error,
+                timeout = error.is_timeout(),
+                connect = error.is_connect(),
+                request = error.is_request(),
                 stall_timeout = ?request.stall_timeout,
                 "HTTP request failed before a response was received"
             );
@@ -265,10 +267,7 @@ where
         let chunk_timeout = stall_timeout.min(remaining);
         let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
             Ok(Some(result)) => result.map_err(|_error| {
-                debug!(
-                    bytes_so_far = byte_count,
-                    "download stream chunk failed"
-                );
+                debug!(bytes_so_far = byte_count, "download stream chunk failed");
                 IngestError::HttpRequest
             })?,
             Ok(None) => break,

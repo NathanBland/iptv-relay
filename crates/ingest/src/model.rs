@@ -33,6 +33,7 @@ impl IngestFormat {
         match self {
             Self::M3u => "m3u",
             Self::Xmltv => "xmltv",
+            Self::Xtream(XtreamPayloadKind::ShortEpg) => "xtream-epg",
             Self::Xtream(_) => "xtream",
         }
     }

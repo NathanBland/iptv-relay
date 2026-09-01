@@ -5,6 +5,7 @@ mod model;
 mod parse;
 mod pipeline;
 mod store;
+mod xtream_endpoints;
 
 pub use artifact::{
     ArchiveFormat, ArtifactLimits, DecodedArtifact, DownloadRequest, DownloadedArtifact,
@@ -14,9 +15,12 @@ pub use model::{
     IngestFormat, IngestProgress, PreparedEpgChannel, PreparedProgramme, PreparedProviderStream,
     PreparedSnapshot, ProtectedEndpoint, SnapshotOwner, StagedRows, XtreamPayloadKind,
 };
-pub use parse::{ParsedArtifact, parse_artifact};
-pub use pipeline::{EndpointProtector, IngestRequest, IngestResult, Ingestor, JobControl};
+pub use parse::{ParsedArtifact, parse_artifact_with_source_timezone};
+pub use pipeline::{
+    EndpointProtector, IngestRequest, IngestResult, Ingestor, JobControl, prepare_snapshot,
+};
 pub use store::PgSnapshotStore;
+pub use xtream_endpoints::{XtreamEndpoints, XtreamPublicEndpoints, XtreamStreamEndpointTemplate};
 
 use thiserror::Error;
 

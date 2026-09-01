@@ -1,356 +1,369 @@
 # IPTV Gateway Implementation Plan
 
-Updated: 2026-08-20
+Updated: 2026-09-01
 
 ## Purpose
 
-This file defines the next implementation work for IPTV Gateway v1.
+This file defines the remaining work for IPTV Gateway v1.
 
 Use `IMPLEMENTATION_STATUS.md` as the test record.
 
-Do not mark work complete without current test evidence.
+Do not mark an item complete without current test evidence.
 
 Do not put credentials, secret URLs, or tokens in either file.
 
 ## Work Rules
 
 1. Select the first unassigned item in the highest priority section.
-2. Record the item owner before you change shared code.
-3. Preserve work from other agents.
+2. Record the owner before you change shared code.
+3. Preserve all unrelated changes from other workers.
 4. Add tests with each production change.
-5. Run the focused tests before you run broad tests.
-6. Update `IMPLEMENTATION_STATUS.md` after each verified test or confirmed failure.
-7. Update this file when an item changes state or priority.
-8. Use ASD-STE100 Issue 9 for all technical documentation.
+5. Keep Rust and TypeScript coverage at 86 percent or more.
+6. Keep changed production line coverage at 95 percent or more.
+7. Run focused tests before broad tests.
+8. Update `IMPLEMENTATION_STATUS.md` after each verified test or confirmed failure.
+9. Update this file when an item changes state or priority.
+10. Use ASD-STE100 Issue 9 for all technical documentation.
+11. Do not add DVR, VOD, catch-up, timeshift, or transcoding work to v1.
 
-## Current Gate State
+## Verified Baseline
 
-The web coverage gate passes.
+The live M3U parser processed 1,147,962 records in 39 seconds.
 
-The M3U and XMLTV parser coverage gates pass.
+The live XMLTV parser processed 305,713 records in eight seconds.
 
-The ingest parser and pipeline coverage gates pass.
+The Denver guide query returned 4,803 programmes for the current time.
 
-The mandatory 120-second media acceptance test passes both viewer scenarios.
+The deterministic media suite previously passed the three-channel and six-viewer scenarios.
 
-The API library line and function results exceed 82 percent.
+The current timezone path applies source timezones only to timestamps without offsets.
 
-The complete Rust aggregate coverage gate passes.
+The current timezone path stores UTC intervals and uses half-open current-programme selection.
 
-The core and four workers use one current Rust image.
+The dev Compose stack reached healthy state in 18 seconds after a warm start.
 
-The core and four workers stayed healthy for five minutes.
+The first dev Rust build used one compiler and completed in 94 seconds.
 
-The native HTTP MPEG-TS path owns the active shared sessions.
+The complete Rust coverage result is 90.68 percent for lines.
 
-The shared session manager owns native, FFmpeg, and VLC sessions.
+The complete Rust coverage result is 90.11 percent for functions.
 
-The credential broker supports direct MPEG-TS and bounded HLS resources.
+The complete Rust coverage result is 89.34 percent for regions.
 
-## Priority 0: Restore Required Gates
+The last changed-line coverage result is 89.91 percent.
 
-### P0.1 Restore the Compose Workers
+Four Playwright tests failed in the last complete browser run.
+
+The Xtream worker path is under integration test.
+
+The live acceptance program opens one provider stream without the gateway.
+
+## Priority 0: Restore Required Product Gates
+
+### P0.1 Stabilize Development Compose
 
 State: Complete
 
 Owner: Root
 
-1. Rebuild the `core` and `worker` images from the current workspace.
-2. Recreate the `core` and `worker` containers.
-3. Confirm that all migrations resolve in each process.
-4. Confirm that each worker stays active for five minutes.
-5. Confirm that each worker claims jobs with a unique worker ID.
-6. Run the base Compose health checks.
-7. Record the result in `IMPLEMENTATION_STATUS.md`.
+The dev stack uses one fixed project and one shared Cargo target volume.
+
+The core service owns all Rust builds.
+
+The worker restarts the shared binary without a Cargo process.
+
+The web and worker services wait for core health.
 
 Completion evidence:
 
-- The `core`, `web`, `postgres`, and all worker containers stay healthy.
-- No process reports a missing migration.
-- A durable test job reaches its terminal state.
+- `make compose-config` passes.
+- `make compose-dev-build` passes.
+- All five dev services report healthy.
+- The gateway live and ready routes pass.
+- A warm start reaches healthy state in 18 seconds.
 
-Current progress:
+### P0.2 Implement Xtream Live Runtime Ingestion
 
-- Compose builds one shared Rust image.
-- The core and four workers use the shared image.
-- The core and four workers stayed healthy for five minutes.
-- No recreated process reported a missing migration.
-- Four distinct hostnames provide four default worker IDs.
-- A durable no-op job reached `succeeded` after one attempt.
-- The complete base stack passed on alternate host port 18080.
-- The gateway core health route passed.
-- The gateway web route passed.
-
-Verified result:
-
-- The core, web, PostgreSQL, and four workers report healthy.
-- The four workers use unique default worker IDs.
-- A durable no-op job reached `succeeded`.
-- The gateway passed on a configurable host port.
-
-### P0.2 Restore the Rust Coverage Gate
-
-State: Active
-
-Owner: Root and changed-line gate agent
-
-1. Complete the active API and server coverage work.
-2. Run the complete Rust coverage command.
-3. Use the approved exclusions only for test-provider and load-generator binaries.
-4. Add tests for the largest uncovered production branches.
-5. Do not exclude parser, mapper, event, slot, session, buffer, recovery, authentication, or redaction code.
-6. Repeat the complete coverage command after each focused improvement.
-
-Completion evidence:
-
-- Rust line coverage is at least 86 percent.
-- Rust function coverage is at least 86 percent.
-- Rust region coverage is at least 86 percent.
-- Each critical production file has at least 75 percent coverage.
-- Changed production lines have at least 95 percent coverage.
-
-Current progress:
-
-- The API library has 82.77 percent line coverage.
-- The API library has 83.91 percent function coverage.
-- The API library has 80.53 percent region coverage.
-- All 43 API tests passed in the latest complete Rust run.
-- The generated-guide collision regression is resolved.
-- The focused PostgreSQL collision regression now passes.
-- Server line coverage is 87.19 percent.
-- Server function coverage is 89.53 percent.
-- Server region coverage is 87.79 percent.
-- Complete Rust line coverage is 92.12 percent.
-- Complete Rust function coverage is 91.77 percent.
-- Complete Rust region coverage is 90.54 percent.
-- The complete run passed all 61 gateway tests.
-- The complete run passed all 43 API tests.
-- The ingest library facade has 100 percent line coverage.
-- The ingest library facade has 100 percent function coverage.
-- The ingest library facade has 100 percent region coverage.
-- Each reported critical production file exceeds 75 percent line coverage.
-- The first changed-line run reported 76.36 percent.
-- That run sent TypeScript files to Rust coverage.
-- The changed-line gate needs separate Rust and TypeScript accounting.
-- Separate Rust and TypeScript accounting now works.
-- The truthful changed-line result is 89.91 percent.
-- The 95 percent changed-line requirement remains open.
-
-### P0.3 Make Process Shutdown Safe
-
-State: Complete
-
-Owner: Process session safety agent
-
-1. Keep the provider slot until the child process stops.
-2. Keep the provider slot until the credential broker stops.
-3. Reap each child process after the last viewer leaves.
-4. Add race tests for final-viewer shutdown.
-5. Add tests for child exit and broker exit.
-6. Run the strict media Clippy check.
-
-Completion evidence:
-
-- No test releases a slot before the process and broker stop.
-- No child process remains after the final viewer leaves.
-- All media tests pass.
-
-Verified result:
-
-- All 49 media tests pass.
-- The strict media Clippy check passes.
-- The provider slot remains active through child reap and broker shutdown.
-
-### P0.4 Run the Complete Local Gate
-
-State: Waiting for P0.1 and P0.2
+State: Runtime and workspace coverage verified; changed-line coverage required
 
 Owner: Root
 
-If all focused suites pass, run the complete local gate.
+The parser and storage layers support Xtream live streams.
 
-Run these checks:
+The worker now connects authentication, categories, live streams, and catalog reconciliation.
 
-- Rust formatting.
-- Rust tests with PostgreSQL.
-- Rust Clippy with warnings denied.
-- Rust coverage.
-- Changed-line coverage.
-- TypeScript type checks.
-- TypeScript lint.
-- TypeScript tests and coverage.
-- Playwright tests.
-- Dependency and license audit.
-- Base and test Compose validation.
-- Documentation link and format checks.
+Current evidence:
 
-Record each pass or failure in `IMPLEMENTATION_STATUS.md`.
+- Credential-safe endpoint tests pass.
+- Xtream ingest tests pass.
+- Xtream persistence and reconciliation tests pass.
+- The worker integration test passes.
+- Failed refreshes preserve the active snapshot and channel link.
+- The complete Rust coverage gate passes.
+- Each measured production file exceeds the critical-file gate.
+- The changed-line coverage gate requires a new result.
 
-## Priority 1: Complete the Media Plane
+Work:
 
-### P1.1 Activate FFmpeg and VLC for Shared Sessions
-
-State: Complete
-
-Owner: Root and API coverage agent
-
-1. Map the database adapter policy to each source specification.
-2. Apply the configured `auto`, `native-ts`, `ffmpeg`, or `vlc` policy.
-3. Keep one logical provider lease during reconnect and failover.
-4. Keep provider credentials out of child arguments.
-5. Publish typed adapter diagnostics without secret data.
-6. Add deterministic FFmpeg and VLC acceptance tests.
+1. Treat the saved player API URL as secret data.
+2. Derive the auth, category, and live-stream requests without exposing credentials.
+3. Validate the authentication response before other requests.
+4. Download each JSON response with the configured artifact limits.
+5. Map category identifiers to stable category names.
+6. Build protected live stream endpoints for each stream identifier.
+7. Activate the Xtream snapshot through the existing transaction path.
+8. Reconcile channels, EPG mappings, and dynamic events after activation.
+9. Preserve the prior snapshot after authentication, parse, or empty-result failure.
+10. Add a deterministic fake Xtream server.
+11. Add worker, redaction, parser, and PostgreSQL integration tests.
+12. Correct all documentation claims after the tests pass.
 
 Completion evidence:
 
-- Two viewers share one process and one provider slot.
-- A ring wrap does not stop the child process.
-- The final viewer stops the process within two seconds.
-- Redaction tests find no provider credential in arguments or diagnostics.
+- A refresh job reaches `succeeded` for a fake Xtream account.
+- The active snapshot contains the expected live streams.
+- The channel group uses the category name.
+- No stored diagnostic or log contains a credential.
+- A second refresh preserves stable channel identities.
+- An invalid or empty response preserves the prior active snapshot.
+- All focused coverage gates pass.
 
-Current progress:
+### P0.3 Implement Xtream Short EPG Jobs
 
-- All 52 media tests pass.
-- FFmpeg and VLC share one process and one provider slot for two viewers.
-- FFmpeg reaches `Streaming` only after a confirmed PAT and PMT boundary.
-- The final viewer stops the FFmpeg session within two seconds.
-- The control API applies the stored adapter policy.
-- Invalid stored adapter values return a redacted typed error.
-
-### P1.2 Add HLS Credential Brokerage
-
-State: Complete
-
-Owner: Process session safety agent
-
-1. Proxy the HLS manifest through a loopback broker.
-2. Rewrite each segment URL to a short-lived local URL.
-3. Support required provider headers for each request.
-4. Bound the token lifetime and request count.
-5. Redact upstream URLs and headers.
-6. Add malformed-manifest and expired-token tests.
-
-Completion evidence:
-
-- FFmpeg receives only loopback URLs.
-- The broker serves a manifest and all required segments.
-- An expired token cannot fetch a segment.
-- Logs and process arguments contain no provider credential.
-
-Current progress:
-
-- The HLS broker rewrites manifests and nested playlists.
-- The HLS broker proxies segments, AES keys, and maps.
-- The HLS broker enforces time, request, token, URI, and response limits.
-- The process start path accepts an explicit HLS format.
-- The FFmpeg manager test passes nested HLS resources through one shared process.
-- The credential broker has 93.72 percent line coverage.
-- The credential broker has 91.95 percent function coverage.
-- The credential broker has 92.37 percent region coverage.
-
-### P1.3 Complete Recovery and Failover
-
-State: Partial
+State: Pending
 
 Owner: Unassigned
 
-1. Coordinate reconnects once per canonical channel.
-2. Keep downstream connections open during the recovery window.
-3. Emit bounded MPEG-TS keepalive data after the ring empties.
-4. Resume at a confirmed PAT and PMT boundary.
-5. Rank alternate streams with current health data.
-6. Keep the same provider lease during failover.
+Start this item after P0.2 passes.
+
+Work:
+
+1. Schedule bounded short EPG requests for selected live streams.
+2. Respect account and shared-pool request policies.
+3. Normalize each programme interval to UTC.
+4. Preserve provider timestamps and provenance.
+5. Activate the guide only after all sanity checks pass.
+6. Preserve the prior guide after an empty or failed refresh.
+7. Add partial-failure, limit, timezone, and cancellation tests.
+
+Completion evidence:
+
+- The guide shows a current Xtream programme.
+- Explicit offsets override the configured source timezone.
+- Requests stay within configured bounds.
+- Failed short EPG requests do not clear a working guide.
+
+### P0.4 Restore Coverage Gates
+
+State: Active
+
+Owner: Root
+
+The current aggregate Rust results exceed all three 86 percent gates.
+
+Each measured production file exceeds the 75 percent critical-file gate.
+
+The focused ingest-only result remains below the aggregate gate.
+
+The complete suite gives the ingest pipeline 91.03 percent line coverage.
+
+Work:
+
+1. Keep the complete Rust coverage result current.
+2. Run the complete TypeScript coverage command.
+3. Run the changed-line coverage command.
+4. Add tests for each uncovered production branch.
+5. Keep each critical production file at 75 percent or more.
+6. Use only the approved coverage exclusions.
+
+Completion evidence:
+
+- Rust line, function, and region coverage reach 86 percent.
+- TypeScript line, function, and branch coverage reach 86 percent.
+- Changed production line coverage reaches 95 percent.
+- Each critical production file reaches 75 percent.
+
+### P0.5 Repair Browser Acceptance and Test Reports
+
+State: Active
+
+Owner: Playwright repair agent
+
+The last complete Playwright run has four failures.
+
+Current reports incorrectly label this result as a pass.
+
+Work:
+
+1. Reproduce all four failures against the current dev stack.
+2. Classify each failure as product, fixture, or test failure.
+3. Fix each confirmed failure.
+4. Remove false pass statements from test reports.
+5. Add the complete Playwright suite to the local gate.
+
+Completion evidence:
+
+- The complete Playwright suite passes.
+- The test report matches the command results.
+- `IMPLEMENTATION_STATUS.md` records each result accurately.
+
+### P0.6 Build Real Gateway Live Acceptance
+
+State: Pending
+
+Owner: Unassigned
+
+The current live program tests one direct provider connection for 30 seconds.
+
+Work:
+
+1. Select three stable channels with credential-independent identities.
+2. Probe candidates sequentially within the provider cap.
+3. Reset counters after candidate selection.
+4. Open three viewers through gateway output routes.
+5. Keep all three viewers active for 120 seconds.
+6. Open six viewers with two viewers per channel.
+7. Keep all six viewers active for 120 seconds.
+8. Assert exactly three upstream sessions.
+9. Assert that the high-water provider count equals three.
+10. Assert that no viewer drops after warmup.
+11. Add a configurable 30-minute soak mode.
+
+Completion evidence:
+
+- Both 120-second scenarios pass through the gateway.
+- Two viewers of one channel share one upstream session.
+- The provider connection count never exceeds three.
+- The final viewer closes its upstream and releases its slot.
+
+### P0.7 Complete the Local Gate Command
+
+State: Pending
+
+Owner: Unassigned
+
+The current `make ci` command omits required suites.
+
+Work:
+
+1. Add Playwright to the local gate.
+2. Add the fuzz smoke tests.
+3. Add deterministic media acceptance.
+4. Add fault acceptance.
+5. Add Compose health verification.
+6. Add the strict documentation build.
+7. Keep the live provider test as an explicit credentialed gate.
+8. Stop the command immediately after a failed required gate.
+
+Completion evidence:
+
+- One local command runs every non-secret required gate.
+- The command returns a failure status after any required failure.
+- The status file records the complete command result.
+
+## Priority 1: Complete the Media Plane
+
+### P1.1 Reverify Recovery and Failover
+
+State: Recheck required
+
+Owner: Unassigned
+
+The session code contains recovery tests that did not exist in the old plan.
+
+Work:
+
+1. Run all current recovery and failover tests.
+2. Map each test to the approved recovery requirements.
+3. Keep downstream connections open for the bounded recovery window.
+4. Emit bounded MPEG-TS keepalive data after the ring empties.
+5. Resume only at a PAT and PMT boundary.
+6. Coordinate one reconnect for all channel viewers.
+7. Keep one logical provider lease during failover.
+8. Add tests for each uncovered fault.
 
 Completion evidence:
 
 - One channel failure does not affect another channel.
-- Six viewers do not cause duplicate reconnects.
-- Recovery does not exceed the provider cap.
+- Six viewers cause one reconnect for their channel.
+- Recovery never exceeds the provider cap.
 - A failed recovery closes viewers with a typed error.
+
+### P1.2 Reverify FFmpeg, VLC, and HLS Brokerage
+
+State: Recheck required
+
+Owner: Unassigned
+
+The shared managers and credential broker have extensive focused tests.
+
+Work:
+
+1. Run the native, FFmpeg, VLC, and HLS focused suites.
+2. Verify process and broker shutdown after the final viewer.
+3. Verify credential redaction in arguments and diagnostics.
+4. Run repeated ring-wrap tests for each process adapter.
+
+Completion evidence:
+
+- Two viewers share one process and one provider slot.
+- Ring wrap does not restart an adapter.
+- Final-viewer shutdown completes within two seconds.
+- Child arguments contain no provider credential.
 
 ## Priority 2: Complete Catalog and Guide Behavior
 
-### P2.1 Generate Dynamic Event Programmes
+### P2.1 Complete Dynamic Event Programmes
 
 State: Partial
 
 Owner: Unassigned
 
-The event scan stores matched channels and durable generated programmes.
+Generated event programmes reach XMLTV output.
 
-Current progress:
+The TV Guide control API does not return generated programmes.
 
-- The parser builds deterministic multi-event schedules.
-- The parser prevents overlap and adds contiguous filler.
-- The parser accepts captured durations and IANA timezones.
-- The parser rejects ambiguous and nonexistent DST times.
-- The XMLTV output publishes durable event and filler intervals.
-- The event parser coverage passes every critical-file threshold.
-- The durable rescan bridge and PostgreSQL lifecycle test pass.
-- The worker invokes the dynamic scan after M3U reconciliation.
-- The worker skips the dynamic scan after a failure or XMLTV refresh.
-- The storage model stores event, filler, stable-key, title, and provenance data.
-- A conflicting template preserves the existing valid guide.
-- Clean storage line coverage is 95.93 percent.
-- Clean storage function coverage is 94.96 percent.
-- Clean storage region coverage is 92.27 percent.
-- The scan uses legacy templates and built-in sports rules.
-- Stored rule sets do not drive the scan.
-- Per-template filler and category settings do not drive generation.
-- Generated programmes do not have a control API view.
+Stored event rule sets do not control the scan.
 
-1. Parse event date, time, timezone, teams, league, and duration.
-2. Reject ambiguous or nonexistent local times.
-3. Build a stable event key.
-4. Generate one event programme at its UTC interval.
-5. Generate contiguous filler before and after each event.
-6. Prevent overlaps on one channel.
-7. Preserve the literal provider title and provenance.
-8. Add group templates and preview tests.
+Work:
+
+1. Connect stored rule sets to the event scan.
+2. Apply group timezone, duration, filler, and title settings.
+3. Return generated programmes through the control API.
+4. Show generated programmes in the TV Guide.
+5. Preserve the source title and provenance.
+6. Prevent overlaps after repeated scans.
+7. Add API, UI, database, and XMLTV tests.
 
 Completion evidence:
 
-- Built-in `v`, `vs`, `versus`, and `@` patterns pass.
-- ISO timestamp patterns pass.
-- DST gap and overlap tests pass.
-- XMLTV output contains the event and filler intervals.
+- The same event appears in the API and XMLTV output.
+- The TV Guide shows the event at its current local time.
 - A second scan updates the same stable event.
+- Filler remains contiguous and does not overlap the event.
 
-### P2.2 Correct Guide Timezones and Current Programme Selection
+### P2.2 Preserve Timezone Correctness
 
-State: Complete
+State: Complete with regression coverage required
 
-Owner: Dynamic programmes agent
+Owner: Unassigned
 
-1. Parse explicit XMLTV offsets and `Z` timestamps.
-2. Apply the source timezone only to timestamps without offsets.
-3. Store all programme intervals in UTC.
-4. Preserve each original timestamp and source timezone.
-5. Select current programmes with UTC half-open intervals.
-6. Serialize XMLTV timestamps with explicit offsets.
-7. Render guide times in the operator timezone.
-8. Add winter, summer, and DST boundary tests.
+The 2026-08-31 audit found no current timezone defect.
+
+Work:
+
+1. Keep explicit XMLTV offsets authoritative.
+2. Apply the source timezone only when the source omits an offset.
+3. Store programme intervals in UTC.
+4. Use half-open intervals for current programme selection.
+5. Add one real UI regression for the operator timezone.
 
 Completion evidence:
 
-- A current UTC programme appears in the current guide slot.
-- A Denver winter programme maps to UTC minus seven hours.
-- A Denver summer programme maps to UTC minus six hours.
-- Explicit XMLTV offsets override the source timezone.
-- Ambiguous and nonexistent local times produce diagnostics.
-- The output retains the correct programme interval.
-
-Verified result:
-
-- The XMLTV timezone suite passed all 17 tests.
-- UTC and explicit offset tests pass.
-- Denver winter and summer tests pass.
-- Ambiguous and nonexistent DST tests pass.
-- Literal XMLTV timestamps persist with normalized UTC instants.
-- A PostgreSQL query returns current, future, and past programmes in order.
-- The API suite passed all 43 tests.
-- The focused web suite passed all 33 tests.
-- The TV Guide uses the browser timezone for display.
+- A current Denver programme appears in the current guide slot.
+- Winter and summer offsets remain correct.
+- DST ambiguity produces a diagnostic.
+- XMLTV output contains explicit offsets.
 
 ### P2.3 Complete Mapping Review and Rollback
 
@@ -358,44 +371,93 @@ State: Partial
 
 Owner: Unassigned
 
-1. Store every automatic match score and reason.
-2. Send ambiguous matches to the review queue.
+Work:
+
+1. Store every automatic score and reason.
+2. Send ambiguous candidates to the review queue.
 3. Preserve each manual binding.
-4. Prevent an empty result from replacing a valid lineup.
+4. Prevent empty results from replacing a valid lineup.
 5. Add preview, confirmation, revision, and rollback operations.
-6. Add UI tests for bulk review and rollback.
+6. Add bulk review and rollback UI tests.
 
 Completion evidence:
 
 - Mapping order follows the approved precedence.
-- Permutation tests produce the same result.
+- Input permutations produce the same result.
 - A zero-result update preserves the active generation.
 - A rollback restores channels, streams, and EPG mappings.
 
-### P2.4 Meet the Scale Gates
+### P2.4 Verify Scale Gates
 
-State: Not verified on the required runner
+State: Partial
 
 Owner: Unassigned
+
+Live parse results exist, but the required pinned-runner gates remain incomplete.
+
+Work:
 
 1. Generate the 1.16-million-entry M3U fixture.
 2. Generate the 275,000-programme XMLTV fixture.
 3. Measure parse time and peak memory.
 4. Measure staging and activation time.
-5. Reject an allocation or time regression above ten percent.
+5. Require approval for regressions above ten percent.
 
 Completion evidence:
 
-- M3U parsing takes no more than 15 seconds.
-- M3U parsing uses no more than 512 MiB RSS.
-- M3U activation takes no more than 90 seconds.
-- XMLTV parsing takes no more than 10 seconds.
-- XMLTV parsing uses no more than 512 MiB RSS.
-- XMLTV activation takes no more than 45 seconds.
+- M3U parsing completes within 15 seconds and 512 MiB RSS.
+- M3U activation completes within 90 seconds.
+- XMLTV parsing completes within 10 seconds and 512 MiB RSS.
+- XMLTV activation completes within 45 seconds.
 
-## Priority 3: Complete Security and Operations
+## Priority 3: Complete Jellyfin Workflows
 
-### P3.1 Add OIDC
+### P3.1 Correct Jellyfin Setup URLs
+
+State: Pending
+
+Owner: Unassigned
+
+The UI displays hard-coded routes that the backend does not expose.
+
+Work:
+
+1. Load output profile data from the backend.
+2. Display tokenized M3U and XMLTV output routes.
+3. Display the tokenized HDHomeRun device route.
+4. Remove the in-memory Jellyfin settings path.
+5. Add copy, rotation, redaction, and expiration tests.
+
+Completion evidence:
+
+- Every displayed URL returns the expected output.
+- The UI does not display a raw stored token after navigation.
+- Token rotation supports the configured overlap window.
+
+### P3.2 Verify Jellyfin Imports
+
+State: Pending
+
+Owner: Unassigned
+
+Work:
+
+1. Add a Jellyfin service to an acceptance profile.
+2. Import the M3U and XMLTV output routes.
+3. Import the HDHomeRun device route.
+4. Verify the channel subset and stable identifiers.
+5. Verify tuner capacity and shared upstream sessions.
+6. Add the optional SSDP profile after token warnings exist.
+
+Completion evidence:
+
+- Jellyfin imports channels through M3U and HDHomeRun.
+- Jellyfin displays current programme data.
+- Multiple Jellyfin clients share each channel upstream.
+
+## Priority 4: Complete Security and Operations
+
+### P4.1 Add OIDC
 
 State: Not implemented
 
@@ -404,54 +466,47 @@ Owner: Unassigned
 1. Add the authorization-code flow with PKCE.
 2. Validate the configured issuer and client.
 3. Apply the approved subject or email allowlist.
-4. Retain the local administrator as break-glass access.
-5. Add callback, state, nonce, replay, and logout tests.
+4. Retain local administrator break-glass access.
+5. Add state, nonce, replay, callback, and logout tests.
 
-### P3.2 Add Operator API Tokens
+### P4.2 Add Operator API Tokens
 
 State: Not implemented
 
 Owner: Unassigned
 
-The bootstrap bearer disables after the first successful password sign-in.
-
 1. Store only operator token hashes.
-2. Add token creation, rotation, revocation, and audit events.
-3. Show plaintext only once after creation.
-4. Add scope checks for control API access.
-5. Add expiration and replay tests.
+2. Add creation, rotation, revocation, and audit events.
+3. Show each plaintext token only once.
+4. Add scope, expiration, and replay tests.
 
-### P3.3 Complete Revisions and Effective Configuration
+### P4.3 Complete Revisions and Effective Configuration
 
 State: Partial
 
 Owner: Unassigned
 
-1. Publish backend configuration descriptions and defaults.
+1. Publish backend descriptions and defaults.
 2. Return each effective value and inheritance source.
 3. State whether each change needs a restart or reimport.
 4. Require ETag checks for conflicting edits.
 5. Add revision history and rollback tests.
 
-### P3.4 Add Real Stream Health Jobs
+### P4.4 Add Stream Health Jobs
 
 State: Partial
 
 Owner: Unassigned
 
-The schema and API store stream health data.
-
-The worker does not run the complete probe policy.
-
 1. Acquire a low-priority provider slot before each probe.
-2. Skip the probe when provider capacity is full.
+2. Skip each probe when provider capacity is full.
 3. Validate PAT, PMT, audio, video, and sustained packet flow.
 4. Store redacted typed failures and quality data.
-5. Feed health data into alternate-stream rank.
+5. Use current health data for alternate stream rank.
 
-## Priority 4: Complete Product Workflows
+## Priority 5: Complete Product and Documentation Work
 
-### P4.1 Complete the Management UI
+### P5.1 Complete the Management UI
 
 State: Partial
 
@@ -461,62 +516,51 @@ Owner: Unassigned
 2. Complete mapping review and rollback workflows.
 3. Complete event rule previews.
 4. Complete provider pool and adapter policy forms.
-5. Complete active viewer and upstream diagnostics.
+5. Complete viewer and upstream diagnostics.
 6. Complete support bundle and redacted log workflows.
 7. Add accessibility tests for each workflow.
 
-### P4.2 Complete Jellyfin Setup Verification
+### P5.2 Align Technical Documentation
 
 State: Partial
 
 Owner: Unassigned
 
-1. Verify M3U and XMLTV import in a real Jellyfin container.
-2. Verify HDHomeRun discovery data and lineup data.
-3. Verify the configured tuner count.
-4. Verify output-token rotation and overlap.
-5. Verify profile channel subsets.
-6. Add the optional SSDP Compose profile.
+1. Remove each claim that lacks current test evidence.
+2. Correct the changed-line coverage threshold to 95 percent.
+3. Apply ASD-STE100 Issue 9 to each changed technical page.
+4. Add source, Jellyfin, security, backup, and recovery procedures.
+5. Add OpenAPI client generation and drift checks.
+6. Run the strict MkDocs build.
 
-### P4.3 Complete Documentation
+## Scope Control
 
-State: Partial
+Do not extend the v1 DVR, multi-user, or stream-profile work.
 
-Owner: Unassigned
+Keep existing out-of-scope code isolated until the v1 gates pass.
 
-1. Keep all documentation aligned with verified behavior.
-2. Apply ASD-STE100 Issue 9 to each technical page.
-3. Add source, Jellyfin, security, backup, and recovery procedures.
-4. Add a generated OpenAPI 3.1 contract.
-5. Add contract-drift checks for the TypeScript client.
-6. Install MkDocs in the documentation test environment.
-7. Run the strict documentation build.
+Defer these items:
 
-## Deferred Work
-
-Do not implement these items before the v1 local gates pass:
-
+- DVR, timeshift, catch-up, and VOD.
+- Video or audio transcoding.
+- DRM support.
+- Third-party plugin execution.
+- Active-active media clusters.
 - GitHub Actions image publication.
 - Multi-architecture image publication.
 - Software bills of materials.
 - Build provenance and image signatures.
-- Active-active media clusters.
-- DVR, timeshift, catch-up, and VOD.
-- DRM support.
-- Video or audio transcoding.
-- Third-party plugin execution.
 
 ## Required Final Verification
 
-When all v1 items are complete, run these acceptance tests:
-
 1. Run the three-channel test for 120 seconds.
 2. Run the six-viewer test for 120 seconds.
-3. Run the nightly media test for 30 minutes.
-4. Run the fault test with latency, stalls, resets, and child exits.
-5. Run the live-provider test with environment-injected credentials.
+3. Run the media soak for 30 minutes.
+4. Run fault tests for latency, stalls, resets, and child exits.
+5. Run the live provider gateway test.
 6. Run the complete Rust and TypeScript coverage gates.
 7. Run the dependency, license, security, and documentation gates.
 8. Run a clean Docker Compose installation.
+9. Verify M3U, XMLTV, and HDHomeRun imports in Jellyfin.
 
-Do not publish a v1 release until every required gate passes.
+Do not publish v1 until every required gate passes.

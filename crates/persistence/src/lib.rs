@@ -24,12 +24,13 @@ pub use catalog::{
     CreateEventTemplate, CreateRecordingInput, CreateRecordingRuleInput, CreateStreamProfileInput,
     CreateUserInput, ENVIRONMENT_OUTPUT_PROFILE_ID, ENVIRONMENT_OUTPUT_PROFILE_NAME,
     EpgChannelSearchRow, EpgMappingPage, EpgMappingRow, EpgMappingStats, EventChannelRow,
-    EventTemplateQuery, EventTemplateRow, LineupApplyStats, LineupCategoryRow, LineupChannelRow,
-    LineupTemplateRow, OutputProfileRow, OutputProfileTokenHash, ProgrammePage, ProgrammeQuery,
-    ProgrammeRow, ReconcileStats, RecordingRow, RecordingRuleRow, RecordingStats,
-    EventTemplateSuggestion, RegionFilterStats, RegionPrefixRow, RegionSettingsRow, ReviewCandidateRow, StreamHealthPage,
-    StreamHealthRow, StreamHealthStats, StreamHealthUpdate, StreamProfileRow, SystemCounts,
-    UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput, UserRow,
+    EventTemplateQuery, EventTemplateRow, EventTemplateSuggestion, LineupApplyStats,
+    LineupCategoryRow, LineupChannelRow, LineupTemplateRow, OutputProfileRow,
+    OutputProfileTokenHash, ProgrammePage, ProgrammeQuery, ProgrammeRow, ReconcileStats,
+    RecordingRow, RecordingRuleRow, RecordingStats, RegionFilterStats, RegionPrefixRow,
+    RegionSettingsRow, ReviewCandidateRow, StreamHealthPage, StreamHealthRow, StreamHealthStats,
+    StreamHealthUpdate, StreamProfileRow, SystemCounts, UnmappedChannelPage, UnmappedChannelRow,
+    UpdateUserInput, UserRow,
 };
 
 /// Embedded database migrations for the service schema.
@@ -445,6 +446,13 @@ pub struct DueSource {
     pub last_refreshed_at: Option<DateTime<Utc>>,
 }
 
+/// One Xtream live stream selected for a bounded short EPG request.
+#[derive(Clone, Debug, Eq, PartialEq, FromRow)]
+pub struct XtreamShortEpgStream {
+    pub stream_id: i64,
+    pub channel_id: String,
+}
+
 #[derive(Debug, FromRow)]
 struct DueSourceRow {
     id: Uuid,
@@ -739,7 +747,7 @@ impl SourceRepository {
         let rows = sqlx::query_as::<_, DueSourceRow>(
             r"
             WITH due AS (
-                SELECT id, 'm3u' AS kind, refresh_interval_seconds, last_refreshed_at
+                SELECT id, source_type AS kind, refresh_interval_seconds, last_refreshed_at
                 FROM provider_accounts
                 WHERE enabled = true AND refresh_interval_seconds > 0
                   AND (last_refreshed_at IS NULL
@@ -827,6 +835,50 @@ impl SourceRepository {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Selects active Xtream streams for one bounded short EPG job.
+    ///
+    /// The effective shared-pool or account capacity limits the selection.
+    /// The caller must set a small `requested_limit` for its request policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the selection fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn list_xtream_short_epg_streams(
+        &self,
+        source_id: Uuid,
+        requested_limit: i64,
+    ) -> Result<Vec<XtreamShortEpgStream>, PersistenceError> {
+        let limit = requested_limit.clamp(1, 64);
+        let rows = sqlx::query_as::<_, XtreamShortEpgStream>(
+            r"
+            SELECT ps.provider_stream_id::bigint AS stream_id,
+                   coalesce(nullif(ps.tvg_id, ''), ps.provider_stream_id) AS channel_id
+            FROM provider_accounts pa
+            LEFT JOIN connection_pools cp ON cp.id = pa.connection_pool_id
+            JOIN source_snapshots ss
+              ON ss.provider_account_id = pa.id
+             AND ss.kind = 'xtream'
+             AND ss.status = 'active'
+            JOIN provider_streams ps
+              ON ps.snapshot_id = ss.id
+             AND ps.provider_account_id = pa.id
+            WHERE pa.id = $1
+              AND pa.source_type = 'xtream'
+              AND pa.enabled
+              AND ps.supported
+              AND ps.provider_stream_id ~ '^[0-9]+$'
+            ORDER BY ps.channel_number NULLS LAST, ps.provider_stream_id
+            LIMIT least($2::bigint, coalesce(cp.max_connections, pa.max_connections)::bigint)
+            ",
+        )
+        .bind(source_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Updates configurable fields on a source.
@@ -1109,6 +1161,38 @@ impl JobRepository {
         .bind(job.max_attempts)
         .bind(job.available_at)
         .fetch_one(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    /// Enqueues one short EPG job when the source has no queued or running job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the insert fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn enqueue_xtream_short_epg(
+        &self,
+        source_id: Uuid,
+    ) -> Result<Option<JobRecord>, PersistenceError> {
+        let record = sqlx::query_as::<_, JobRecord>(
+            r"
+            INSERT INTO jobs (id, kind, payload, available_at)
+            SELECT $1, 'refresh-xtream-short-epg', $2, now()
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM jobs
+                WHERE kind = 'refresh-xtream-short-epg'
+                  AND payload->>'sourceId' = $3
+                  AND status IN ('queued', 'running')
+            )
+            RETURNING *
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(serde_json::json!({ "sourceId": source_id.to_string() }))
+        .bind(source_id.to_string())
+        .fetch_optional(&self.pool)
         .await?;
         Ok(record)
     }

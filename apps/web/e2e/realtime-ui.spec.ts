@@ -92,7 +92,14 @@ test.describe('realtime UI and management routes', () => {
     expect(eventsResponse.ok()).toBe(true)
     const events = await eventsResponse.json()
     if (Array.isArray(events) && events.length === 0) {
-      await expect(page.getByText('No dynamic events configured.')).toBeVisible()
+      const templatesResponse = await context.request.get('/api/v1/event-templates')
+      expect(templatesResponse.ok()).toBe(true)
+      const templates = await templatesResponse.json()
+      if (Array.isArray(templates) && templates.length === 0) {
+        await expect(page.getByText('No event templates configured.')).toBeVisible()
+      } else {
+        await expect(page.getByText('No event channels found.').first()).toBeVisible()
+      }
     }
     await expect(page.getByRole('alert')).toHaveCount(0)
   })
@@ -124,7 +131,13 @@ test.describe('realtime UI and management routes', () => {
   })
 
   test('sign out returns to login page', async ({ page }) => {
+    const overviewResponse = page.waitForResponse((response) => {
+      const pathname = new URL(response.url()).pathname
+      return pathname === '/api/v1/system' && response.ok()
+    })
     await page.goto('/sources')
+    await overviewResponse
+    await expect(page.getByRole('heading', { name: 'Sources', level: 1 })).toBeVisible()
     await page.getByRole('button', { name: 'Sign out' }).click()
     await expect(page).toHaveURL(/\/login(?:\?|$)/)
     await expect(page.getByRole('heading', { name: 'Sign in', level: 1 })).toBeVisible()

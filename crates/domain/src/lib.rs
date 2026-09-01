@@ -33,4 +33,4 @@ pub use reconcile::{
     MappingCandidate, MappingContext, MappingDecision, MappingMethod, StationEvidence,
     apply_non_destructive, reconcile_epg,
 };
-pub use regions::{suggested_prefixes_for_timezone, REGION_PREFIXES};
+pub use regions::{REGION_PREFIXES, suggested_prefixes_for_timezone};

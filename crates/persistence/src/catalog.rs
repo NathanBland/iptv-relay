@@ -72,8 +72,9 @@ impl CatalogRepository {
         Self { pool }
     }
 
-    /// Reconciles the active M3U snapshot for a provider account into canonical
-    /// channels and channel-stream links. Streams that share a non-blank
+    /// Reconciles active provider snapshots into canonical channels and
+    /// channel-stream links. The snapshots can have the M3U or Xtream kind.
+    /// Streams that share a non-blank
     /// `tvg_id` merge into one channel; streams without a `tvg_id` become their
     /// own channel. Prior automatic channels for the account are replaced.
     ///
@@ -85,35 +86,14 @@ impl CatalogRepository {
         &self,
         account_id: Uuid,
     ) -> Result<ReconcileStats, PersistenceError> {
-        let channel_stats = {
-            let mut transaction = self.pool.begin().await?;
-            sqlx::query("SET LOCAL statement_timeout = '120s'")
-                .execute(&mut *transaction)
-                .await?;
-            let stats = upsert_canonical_channels(&mut transaction, account_id).await?;
-            transaction.commit().await?;
-            stats
-        };
-
-        let link_count = {
-            let mut transaction = self.pool.begin().await?;
-            sqlx::query("SET LOCAL statement_timeout = '300s'")
-                .execute(&mut *transaction)
-                .await?;
-            let count = relink_channel_streams(&mut transaction, account_id).await?;
-            transaction.commit().await?;
-            count
-        };
-
-        let orphans_removed = {
-            let mut transaction = self.pool.begin().await?;
-            sqlx::query("SET LOCAL statement_timeout = '300s'")
-                .execute(&mut *transaction)
-                .await?;
-            let count = remove_orphaned_channels(&mut transaction, account_id).await?;
-            transaction.commit().await?;
-            count
-        };
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '300s'")
+            .execute(&mut *transaction)
+            .await?;
+        let channel_stats = upsert_canonical_channels(&mut transaction, account_id).await?;
+        let link_count = relink_channel_streams(&mut transaction, account_id).await?;
+        let orphans_removed = remove_orphaned_channels(&mut transaction, account_id).await?;
+        transaction.commit().await?;
 
         Ok(ReconcileStats {
             channels: channel_stats.channels,
@@ -2596,10 +2576,35 @@ pub struct EventTemplateSuggestion {
 /// in the stream name. Falls back to the provider group name, or "Sports"
 /// if no league prefix is found.
 const EVENT_LEAGUES: &[&str] = &[
-    "NBA", "NHL", "NFL", "MLB", "MLS", "EPL", "UFC", "BOXING", "F1",
-    "NASCAR", "PGA", "ATP", "WTA", "UCL", "UEL", "SERIE A", "LA LIGA",
-    "BUNDESLIGA", "LIGUE 1", "CHAMPIONS", "EUROPA", "WORLD CUP",
-    "COLLEGE", "NCAA", "CFL", "AFL", "RUGBY", "CRICKET", "IPL",
+    "NBA",
+    "NHL",
+    "NFL",
+    "MLB",
+    "MLS",
+    "EPL",
+    "UFC",
+    "BOXING",
+    "F1",
+    "NASCAR",
+    "PGA",
+    "ATP",
+    "WTA",
+    "UCL",
+    "UEL",
+    "SERIE A",
+    "LA LIGA",
+    "BUNDESLIGA",
+    "LIGUE 1",
+    "CHAMPIONS",
+    "EUROPA",
+    "WORLD CUP",
+    "COLLEGE",
+    "NCAA",
+    "CFL",
+    "AFL",
+    "RUGBY",
+    "CRICKET",
+    "IPL",
 ];
 
 fn detect_event_group_key(stream_name: &str, group_name: Option<&str>) -> String {
@@ -2651,12 +2656,12 @@ async fn upsert_canonical_channels(
 ) -> Result<ReconcileCountRow, PersistenceError> {
     let inserted: i64 = sqlx::query(
         r"
-        WITH active_snapshot AS (
+        WITH active_snapshots AS (
             SELECT id
             FROM source_snapshots
-            WHERE provider_account_id = $1 AND kind = 'm3u' AND status = 'active'
-            ORDER BY activated_at DESC NULLS LAST
-            LIMIT 1
+            WHERE provider_account_id = $1
+              AND kind IN ('m3u', 'xtream')
+              AND status = 'active'
         ),
         grouped AS (
             SELECT
@@ -2669,7 +2674,8 @@ async fn upsert_canonical_channels(
                 (array_agg(ps.channel_number ORDER BY ps.id)
                     FILTER (WHERE ps.channel_number IS NOT NULL AND ps.channel_number <> ''))[1] AS preferred_number
             FROM provider_streams ps
-            WHERE ps.snapshot_id = (SELECT id FROM active_snapshot) AND ps.supported
+            WHERE ps.snapshot_id IN (SELECT id FROM active_snapshots)
+              AND ps.supported
             GROUP BY canonical_key
         ),
         preferred_deduped AS (
@@ -2740,9 +2746,7 @@ async fn upsert_canonical_channels(
     .try_into()
     .unwrap_or(i64::MAX);
 
-    Ok(ReconcileCountRow {
-        channels: inserted,
-    })
+    Ok(ReconcileCountRow { channels: inserted })
 }
 
 async fn remove_orphaned_channels(
@@ -2760,7 +2764,7 @@ async fn remove_orphaned_channels(
               JOIN source_snapshots ss ON ss.id = ps.snapshot_id
               WHERE ss.provider_account_id = $1
                 AND ss.status = 'active'
-                AND ss.kind = 'm3u'
+                AND ss.kind IN ('m3u', 'xtream')
                 AND ps.supported
                 AND COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key) = c.canonical_key
           )
@@ -2780,6 +2784,33 @@ async fn relink_channel_streams(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
 ) -> Result<i64, PersistenceError> {
+    let deleted: i64 = sqlx::query(
+        r"
+        DELETE FROM channel_streams cs
+        USING channels c
+        WHERE cs.channel_id = c.id
+          AND c.provider_account_id = $1
+          AND c.managed_by = 'automatic'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM provider_streams ps
+              JOIN source_snapshots ss ON ss.id = ps.snapshot_id
+              WHERE ss.provider_account_id = $1
+                AND ss.status = 'active'
+                AND ss.kind IN ('m3u', 'xtream')
+                AND ps.supported
+                AND ps.id = cs.provider_stream_id
+                AND c.canonical_key = COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key)
+          )
+        ",
+    )
+    .bind(account_id)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected()
+    .try_into()
+    .unwrap_or(i64::MAX);
+
     let result = sqlx::query(
         r"
         INSERT INTO channel_streams (channel_id, provider_stream_id, priority, evidence)
@@ -2796,7 +2827,7 @@ async fn relink_channel_streams(
          AND c.canonical_key = COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key)
         WHERE ss.provider_account_id = $1
           AND ss.status = 'active'
-          AND ss.kind = 'm3u'
+          AND ss.kind IN ('m3u', 'xtream')
           AND ps.supported
         ON CONFLICT (channel_id, provider_stream_id) DO UPDATE SET
             priority = EXCLUDED.priority
@@ -2806,33 +2837,6 @@ async fn relink_channel_streams(
     .bind(account_id)
     .execute(&mut **transaction)
     .await?;
-
-    let deleted: i64 = sqlx::query(
-        r"
-        DELETE FROM channel_streams cs
-        USING channels c
-        WHERE cs.channel_id = c.id
-          AND c.provider_account_id = $1
-          AND c.managed_by = 'automatic'
-          AND NOT EXISTS (
-              SELECT 1
-              FROM provider_streams ps
-              JOIN source_snapshots ss ON ss.id = ps.snapshot_id
-              WHERE ss.provider_account_id = $1
-                AND ss.status = 'active'
-                AND ss.kind = 'm3u'
-                AND ps.supported
-                AND ps.id = cs.provider_stream_id
-                AND c.canonical_key = COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key)
-          )
-        ",
-    )
-    .bind(account_id)
-    .execute(&mut **transaction)
-    .await?
-    .rows_affected()
-    .try_into()
-    .unwrap_or(i64::MAX);
 
     let upserted: i64 = result.rows_affected().try_into().unwrap_or(i64::MAX);
     Ok(upserted + deleted)
@@ -4187,7 +4191,9 @@ impl CatalogRepository {
     ///
     /// Returns [`PersistenceError::Database`] when the query fails.
     #[allow(clippy::missing_errors_doc)]
-    pub async fn suggest_event_templates(&self) -> Result<Vec<EventTemplateSuggestion>, PersistenceError> {
+    pub async fn suggest_event_templates(
+        &self,
+    ) -> Result<Vec<EventTemplateSuggestion>, PersistenceError> {
         // Find provider streams that look like sports events: they contain
         // "vs", "vs.", "versus", "@", or "at" between two words, plus a
         // date-like pattern.

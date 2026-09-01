@@ -3,7 +3,7 @@ use iptv_parsers::{
     M3uPlaylist, ParseLimits, ParseStats, XmltvDocument, XtreamAuth, XtreamCategory,
     XtreamDocument, XtreamLiveStream, XtreamShortEpgEntry, parse_m3u, parse_xmltv,
     parse_xtream_auth, parse_xtream_live_categories, parse_xtream_live_streams,
-    parse_xtream_short_epg,
+    parse_xtream_short_epg_in_timezone,
 };
 use std::io::BufReader;
 
@@ -56,11 +56,26 @@ impl ParsedArtifact {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::missing_errors_doc)]
 pub fn parse_artifact(
     artifact: &DecodedArtifact,
     format: IngestFormat,
+    limits: ParseLimits,
+) -> Result<ParsedArtifact, IngestError> {
+    parse_artifact_with_source_timezone(artifact, format, limits, "UTC")
+}
+
+/// Parses one decoded artifact with the configured source timezone.
+///
+/// The timezone applies only to Xtream local short EPG timestamps. Explicit
+/// timestamp offsets remain authoritative.
+#[allow(clippy::missing_errors_doc)]
+pub fn parse_artifact_with_source_timezone(
+    artifact: &DecodedArtifact,
+    format: IngestFormat,
     mut limits: ParseLimits,
+    source_timezone: &str,
 ) -> Result<ParsedArtifact, IngestError> {
     limits.max_input_bytes = limits
         .max_input_bytes
@@ -104,7 +119,7 @@ pub fn parse_artifact(
                 })?
         }
         IngestFormat::Xtream(XtreamPayloadKind::ShortEpg) => {
-            parse_xtream_short_epg(BufReader::new(file), limits)
+            parse_xtream_short_epg_in_timezone(BufReader::new(file), limits, source_timezone)
                 .map(ParsedArtifact::XtreamEpg)
                 .map_err(|source| IngestError::Parse {
                     format: "Xtream short EPG",

@@ -1,16 +1,22 @@
-use std::{env, future::Future, net::SocketAddr, pin::Pin, process::Stdio, time::Duration};
+use std::{
+    collections::HashMap, env, future::Future, net::SocketAddr, pin::Pin, process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use iptv_api::{AppConfig, AppState, RuntimeVersions, hash_admin_password};
 use iptv_ingest::{
-    DownloadRequest, EndpointProtector, IngestError, IngestFormat, IngestProgress, IngestRequest,
-    IngestResult, Ingestor, JobControl, PgSnapshotStore, ProtectedEndpoint, SnapshotOwner,
+    ArtifactLimits, DownloadRequest, EndpointProtector, IngestError, IngestFormat, IngestProgress,
+    IngestRequest, IngestResult, Ingestor, JobControl, ParsedArtifact, PgSnapshotStore,
+    ProtectedEndpoint, SnapshotOwner, XtreamEndpoints, XtreamPayloadKind, download_http,
+    parse_artifact_with_source_timezone, prepare_snapshot, unpack_artifact,
 };
 use iptv_persistence::{
     CatalogRepository, Database, JobRecord, JobRepository, MasterKey, NewJob, SourceKind,
     SourceRepository,
 };
 use reqwest::Url;
+use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, process::Command, signal, time::sleep};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -359,7 +365,7 @@ async fn process_job(
         jobs.succeed(job.id, worker_id).await?;
         return Ok(());
     }
-    if job.kind != "refresh-source" {
+    if job.kind != "refresh-source" && job.kind != "refresh-xtream-short-epg" {
         warn!(job_id = %job.id, kind = %job.kind, "unsupported job kind");
         jobs.fail(
             job.id,
@@ -395,10 +401,18 @@ async fn process_job(
         }
     });
 
-    let refresh_result = run_source_refresh(
-        jobs, sources, snapshots, catalog, master_key, worker_id, &job,
-    )
-    .await;
+    let source_refresh = job.kind == "refresh-source";
+    let refresh_result = if source_refresh {
+        run_source_refresh(
+            jobs, sources, snapshots, catalog, master_key, worker_id, &job,
+        )
+        .await
+    } else {
+        run_xtream_short_epg_refresh(
+            jobs, sources, snapshots, catalog, master_key, worker_id, &job,
+        )
+        .await
+    };
     heartbeat_handle.abort();
 
     match refresh_result {
@@ -408,13 +422,18 @@ async fn process_job(
                 "percent": 100,
                 "bytesDownloaded": result.downloaded_bytes,
                 "recordsProcessed": result.records,
-                "message": "Source refresh completed",
+                "message": if source_refresh {
+                    "Source refresh completed"
+                } else {
+                    "Xtream short EPG refresh completed"
+                },
             });
             if let Err(error) = jobs.heartbeat(job.id, worker_id, &completed_progress).await {
                 warn!(job_id = %job.id, error = %error, "failed to report completed progress");
             }
             jobs.succeed(job.id, worker_id).await?;
-            if let Some(source_id) = source_id_from_payload(&job.payload)
+            if source_refresh
+                && let Some(source_id) = source_id_from_payload(&job.payload)
                 && let Err(error) = sources
                     .mark_source_refreshed(source_id, chrono::Utc::now())
                     .await
@@ -458,26 +477,14 @@ async fn run_source_refresh(
     job: &JobRecord,
 ) -> std::result::Result<IngestResult, RefreshError> {
     let source_id = source_id_from_payload(&job.payload).ok_or(RefreshError::InvalidPayload)?;
-    let source = sources
-        .load_for_job(source_id)
-        .await
-        .map_err(|error| {
-            warn!(source_id = %source_id, error = %error, "failed to load source for refresh");
-            RefreshError::SourceLoad
-        })?;
-    let (owner, format) = refresh_target(source.kind, source.id)?;
+    let source = sources.load_for_job(source_id).await.map_err(|error| {
+        warn!(source_id = %source_id, error = %error, "failed to load source for refresh");
+        RefreshError::SourceLoad
+    })?;
     let endpoint = Url::parse(&source.endpoint).map_err(|_| {
         debug!(source_id = %source_id, endpoint_len = source.endpoint.len(), "source endpoint is not a valid URL");
         RefreshError::InvalidEndpoint
     })?;
-    debug!(
-        job_id = %job.id,
-        source_id = %source_id,
-        format = ?format,
-        stall_timeout = ?Duration::from_mins(1),
-        max_timeout = ?Duration::from_mins(10),
-        "starting source download"
-    );
     let control = WorkerJobControl {
         repository: jobs.clone(),
         job_id: job.id,
@@ -487,17 +494,39 @@ async fn run_source_refresh(
         master_key: master_key.clone(),
         associated_data: format!("iptv-provider-stream:v1:{}", source.id),
     };
-    let request = IngestRequest {
-        owner,
-        format,
-        download: DownloadRequest::new(endpoint),
-        source_timezone: source.timezone,
-        xtream_stream_endpoint: None,
+    let result = if source.kind == SourceKind::Xtream {
+        run_xtream_refresh(
+            endpoint,
+            source.id,
+            source.timezone,
+            control,
+            protector,
+            snapshots,
+        )
+        .await?
+    } else {
+        let (owner, format) = refresh_target(source.kind, source.id)?;
+        debug!(
+            job_id = %job.id,
+            source_id = %source_id,
+            format = ?format,
+            stall_timeout = ?Duration::from_mins(1),
+            max_timeout = ?Duration::from_mins(10),
+            "starting source download"
+        );
+        let request = IngestRequest {
+            owner,
+            format,
+            download: DownloadRequest::new(endpoint),
+            source_timezone: source.timezone,
+            xtream_stream_endpoint: None,
+            xtream_category_names: HashMap::new(),
+        };
+        Ingestor::new(protector, control, snapshots.clone())
+            .run(&request)
+            .await
+            .map_err(RefreshError::Ingest)?
     };
-    let result = Ingestor::new(protector, control, snapshots.clone())
-        .run(&request)
-        .await
-        .map_err(RefreshError::Ingest)?;
     // Report the reconcile stage before catalog reconciliation starts. This
     // heartbeat is best-effort; a failure does not stop the refresh.
     let reconcile_progress = serde_json::json!({
@@ -510,12 +539,335 @@ async fn run_source_refresh(
     if let Err(error) = jobs.heartbeat(job.id, worker_id, &reconcile_progress).await {
         warn!(job_id = %job.id, error = %error, "failed to report reconcile progress");
     }
-    // A source snapshot is active before this work starts. A hook failure
-    // therefore leaves the previous catalog output intact and is logged.
-    if let Err(error) = run_post_refresh_catalog(source.kind, source.id, catalog).await {
-        warn!(job_id = %job.id, source_id = %source.id, error = %error, "catalog post-refresh work failed");
+    run_post_refresh_catalog(source.kind, source.id, catalog)
+        .await
+        .map_err(|error| {
+            warn!(job_id = %job.id, source_id = %source.id, error = %error, "catalog post-refresh work failed");
+            RefreshError::Catalog
+        })?;
+    if source.kind == SourceKind::Xtream {
+        match jobs.enqueue_xtream_short_epg(source.id).await {
+            Ok(Some(guide_job)) => {
+                info!(job_id = %guide_job.id, source_id = %source.id, "scheduled Xtream short EPG refresh");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(source_id = %source.id, error = %error, "failed to schedule Xtream short EPG refresh");
+            }
+        }
     }
     Ok(result)
+}
+
+const MAX_SHORT_EPG_STREAMS: i64 = 16;
+const SHORT_EPG_PROGRAMME_LIMIT: u16 = 4;
+
+#[allow(clippy::too_many_lines)]
+async fn run_xtream_short_epg_refresh(
+    jobs: &JobRepository,
+    sources: &SourceRepository,
+    snapshots: &PgSnapshotStore,
+    catalog: &CatalogRepository,
+    master_key: &MasterKey,
+    worker_id: &str,
+    job: &JobRecord,
+) -> std::result::Result<IngestResult, RefreshError> {
+    let source_id = source_id_from_payload(&job.payload).ok_or(RefreshError::InvalidPayload)?;
+    let source = sources.load_for_job(source_id).await.map_err(|error| {
+        warn!(source_id = %source_id, error = %error, "failed to load Xtream source for short EPG refresh");
+        RefreshError::SourceLoad
+    })?;
+    if source.kind != SourceKind::Xtream {
+        return Err(RefreshError::UnsupportedSource);
+    }
+    let endpoint = Url::parse(&source.endpoint).map_err(|_| RefreshError::InvalidEndpoint)?;
+    let endpoints =
+        XtreamEndpoints::from_player_api_url(endpoint.as_str()).map_err(RefreshError::Ingest)?;
+    let control = WorkerJobControl {
+        repository: jobs.clone(),
+        job_id: job.id,
+        worker_id: worker_id.to_owned(),
+    };
+    control
+        .checkpoint(&IngestProgress {
+            phase: "downloading".to_owned(),
+            ..IngestProgress::default()
+        })
+        .await
+        .map_err(RefreshError::Ingest)?;
+
+    let authentication = fetch_xtream_payload(
+        endpoints.authentication_request(),
+        XtreamPayloadKind::Auth,
+        &source.timezone,
+    )
+    .await
+    .map_err(RefreshError::Ingest)?;
+    match authentication.parsed {
+        ParsedArtifact::XtreamAuth(document)
+            if document.records.iter().any(|record| record.authenticated) => {}
+        ParsedArtifact::XtreamAuth(_) => {
+            return Err(RefreshError::Ingest(IngestError::InvalidRequest(
+                "Xtream authentication was rejected",
+            )));
+        }
+        _ => {
+            return Err(RefreshError::Ingest(IngestError::InvalidRequest(
+                "Xtream authentication response has an unexpected payload",
+            )));
+        }
+    }
+
+    let streams = sources
+        .list_xtream_short_epg_streams(source.id, MAX_SHORT_EPG_STREAMS)
+        .await
+        .map_err(|error| {
+            warn!(source_id = %source.id, error = %error, "failed to select Xtream short EPG streams");
+            RefreshError::SourceLoad
+        })?;
+    if streams.is_empty() {
+        return Err(RefreshError::Ingest(IngestError::EmptySnapshot {
+            format: "Xtream short EPG",
+        }));
+    }
+
+    let protector = StreamEndpointProtector {
+        master_key: master_key.clone(),
+        associated_data: format!("iptv-provider-stream:v1:{}", source.id),
+    };
+    let mut records = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut stats = iptv_parsers::ParseStats::default();
+    let mut downloaded_bytes = 0_u64;
+    let mut decoded_bytes = 0_u64;
+    let mut checksum = Sha256::new();
+    for stream in streams {
+        control
+            .checkpoint(&IngestProgress {
+                phase: "downloading".to_owned(),
+                downloaded_bytes,
+                decoded_bytes,
+                records_seen: stats.records_seen,
+                records_prepared: u64::try_from(records.len()).unwrap_or(u64::MAX),
+            })
+            .await
+            .map_err(RefreshError::Ingest)?;
+        let payload = fetch_xtream_payload(
+            endpoints.short_epg_request(
+                u64::try_from(stream.stream_id).map_err(|_| {
+                    RefreshError::Ingest(IngestError::InvalidRequest(
+                        "Xtream stream identifier is invalid",
+                    ))
+                })?,
+                SHORT_EPG_PROGRAMME_LIMIT,
+            ),
+            XtreamPayloadKind::ShortEpg,
+            &source.timezone,
+        )
+        .await
+        .map_err(RefreshError::Ingest)?;
+        downloaded_bytes = downloaded_bytes.saturating_add(payload.downloaded_bytes);
+        decoded_bytes = decoded_bytes.saturating_add(payload.decoded_bytes);
+        checksum.update(payload.checksum_sha256.as_bytes());
+        let ParsedArtifact::XtreamEpg(mut document) = payload.parsed else {
+            return Err(RefreshError::Ingest(IngestError::InvalidRequest(
+                "Xtream short EPG response has an unexpected payload",
+            )));
+        };
+        stats.bytes_read = stats.bytes_read.saturating_add(document.stats.bytes_read);
+        stats.records_seen = stats
+            .records_seen
+            .saturating_add(document.stats.records_seen);
+        stats.records_emitted = stats
+            .records_emitted
+            .saturating_add(document.stats.records_emitted);
+        stats.records_skipped = stats
+            .records_skipped
+            .saturating_add(document.stats.records_skipped);
+        stats.warnings = stats.warnings.saturating_add(document.stats.warnings);
+        stats.errors = stats.errors.saturating_add(document.stats.errors);
+        diagnostics.append(&mut document.diagnostics);
+        for entry in &mut document.records {
+            if entry.channel_id.is_none() && entry.epg_id.is_none() {
+                entry.channel_id = Some(stream.channel_id.clone());
+            }
+            entry.metadata.insert(
+                "requested_stream_id".to_owned(),
+                serde_json::json!(stream.stream_id),
+            );
+        }
+        records.extend(document.records);
+    }
+
+    let request = IngestRequest {
+        owner: SnapshotOwner::ProviderAccount(source.id),
+        format: IngestFormat::Xtream(XtreamPayloadKind::ShortEpg),
+        download: endpoints.authentication_request(),
+        source_timezone: source.timezone,
+        xtream_stream_endpoint: None,
+        xtream_category_names: HashMap::new(),
+    };
+    let parsed = ParsedArtifact::XtreamEpg(iptv_parsers::XtreamDocument {
+        records,
+        diagnostics,
+        stats,
+    });
+    let snapshot = prepare_snapshot(
+        &request,
+        parsed,
+        format!("{:x}", checksum.finalize()),
+        downloaded_bytes,
+        &protector,
+    )
+    .map_err(RefreshError::Ingest)?;
+    control
+        .checkpoint(&IngestProgress {
+            phase: "staging".to_owned(),
+            downloaded_bytes,
+            decoded_bytes,
+            records_seen: snapshot.record_count,
+            records_prepared: snapshot.record_count,
+        })
+        .await
+        .map_err(RefreshError::Ingest)?;
+    let snapshot_id = snapshots
+        .activate(&snapshot)
+        .await
+        .map_err(RefreshError::Ingest)?;
+    catalog.reconcile_epg_mappings().await.map_err(|error| {
+        warn!(source_id = %source.id, error = %error, "Xtream short EPG reconciliation failed");
+        RefreshError::Catalog
+    })?;
+    catalog.scan_all_event_channels().await.map_err(|error| {
+        warn!(source_id = %source.id, error = %error, "Xtream short EPG event scan failed");
+        RefreshError::Catalog
+    })?;
+    Ok(IngestResult {
+        snapshot_id,
+        checksum_sha256: snapshot.checksum_sha256,
+        downloaded_bytes,
+        decoded_bytes,
+        records: snapshot.record_count,
+    })
+}
+
+async fn run_xtream_refresh(
+    endpoint: Url,
+    source_id: Uuid,
+    source_timezone: String,
+    control: WorkerJobControl,
+    protector: StreamEndpointProtector,
+    snapshots: &PgSnapshotStore,
+) -> std::result::Result<IngestResult, RefreshError> {
+    let endpoints =
+        XtreamEndpoints::from_player_api_url(endpoint.as_str()).map_err(RefreshError::Ingest)?;
+
+    control
+        .checkpoint(&IngestProgress {
+            phase: "downloading".to_owned(),
+            ..IngestProgress::default()
+        })
+        .await
+        .map_err(RefreshError::Ingest)?;
+    let authentication = fetch_xtream_payload(
+        endpoints.authentication_request(),
+        XtreamPayloadKind::Auth,
+        &source_timezone,
+    )
+    .await
+    .map_err(RefreshError::Ingest)?;
+    match authentication.parsed {
+        ParsedArtifact::XtreamAuth(document)
+            if document.records.iter().any(|record| record.authenticated) => {}
+        ParsedArtifact::XtreamAuth(_) => {
+            return Err(RefreshError::Ingest(IngestError::InvalidRequest(
+                "Xtream authentication was rejected",
+            )));
+        }
+        _ => {
+            return Err(RefreshError::Ingest(IngestError::InvalidRequest(
+                "Xtream authentication response has an unexpected payload",
+            )));
+        }
+    }
+
+    let category_names = match fetch_xtream_payload(
+        endpoints.live_categories_request(),
+        XtreamPayloadKind::LiveCategories,
+        &source_timezone,
+    )
+    .await
+    {
+        Ok(XtreamPayload {
+            parsed: ParsedArtifact::XtreamCategories(document),
+            ..
+        }) => document
+            .records
+            .into_iter()
+            .map(|category| (category.id, category.name))
+            .collect(),
+        Ok(_) => {
+            return Err(RefreshError::Ingest(IngestError::InvalidRequest(
+                "Xtream category response has an unexpected payload",
+            )));
+        }
+        Err(IngestError::EmptySnapshot { .. }) => HashMap::new(),
+        Err(error) => return Err(RefreshError::Ingest(error)),
+    };
+
+    let live_streams_request = endpoints.live_streams_request();
+    let request = IngestRequest {
+        owner: SnapshotOwner::ProviderAccount(source_id),
+        format: IngestFormat::Xtream(XtreamPayloadKind::LiveStreams),
+        download: live_streams_request,
+        source_timezone,
+        xtream_stream_endpoint: Some(endpoints.into_stream_template()),
+        xtream_category_names: category_names,
+    };
+    Ingestor::new(protector, control, snapshots.clone())
+        .run(&request)
+        .await
+        .map_err(RefreshError::Ingest)
+}
+
+async fn fetch_xtream_payload(
+    request: DownloadRequest,
+    kind: XtreamPayloadKind,
+    source_timezone: &str,
+) -> std::result::Result<XtreamPayload, IngestError> {
+    let downloaded = download_http(&request, ArtifactLimits::default()).await?;
+    let downloaded_bytes = downloaded.byte_count;
+    let decoded =
+        tokio::task::spawn_blocking(move || unpack_artifact(downloaded, ArtifactLimits::default()))
+            .await
+            .map_err(|_| IngestError::ArtifactIo(std::io::Error::other("decode task failed")))??;
+    let decoded_bytes = decoded.decoded_byte_count;
+    let checksum_sha256 = decoded.sha256.clone();
+    let source_timezone = source_timezone.to_owned();
+    tokio::task::spawn_blocking(move || {
+        parse_artifact_with_source_timezone(
+            &decoded,
+            IngestFormat::Xtream(kind),
+            iptv_parsers::ParseLimits::default(),
+            &source_timezone,
+        )
+    })
+    .await
+    .map_err(|_| IngestError::ArtifactIo(std::io::Error::other("parse task failed")))?
+    .map(|parsed| XtreamPayload {
+        parsed,
+        downloaded_bytes,
+        decoded_bytes,
+        checksum_sha256,
+    })
+}
+
+#[derive(Debug)]
+struct XtreamPayload {
+    parsed: ParsedArtifact,
+    downloaded_bytes: u64,
+    decoded_bytes: u64,
+    checksum_sha256: String,
 }
 
 type CatalogFuture<'a> =
@@ -559,13 +911,13 @@ async fn run_post_refresh_catalog<C: PostRefreshCatalog>(
     catalog: &C,
 ) -> Result<(), iptv_persistence::PersistenceError> {
     match source_kind {
-        SourceKind::M3u => {
+        SourceKind::M3u | SourceKind::Xtream => {
             catalog.reconcile_provider_account(source_id).await?;
             catalog.reconcile_epg_mappings().await?;
             catalog.scan_all_event_channels().await?;
         }
         SourceKind::Xmltv => catalog.reconcile_epg_mappings().await?,
-        SourceKind::Xtream | SourceKind::NetworkTuner => {}
+        SourceKind::NetworkTuner => {}
     }
     Ok(())
 }
@@ -584,7 +936,11 @@ fn refresh_target(
     match kind {
         SourceKind::M3u => Ok((SnapshotOwner::ProviderAccount(source_id), IngestFormat::M3u)),
         SourceKind::Xmltv => Ok((SnapshotOwner::EpgSource(source_id), IngestFormat::Xmltv)),
-        SourceKind::Xtream | SourceKind::NetworkTuner => Err(RefreshError::UnsupportedSource),
+        SourceKind::Xtream => Ok((
+            SnapshotOwner::ProviderAccount(source_id),
+            IngestFormat::Xtream(XtreamPayloadKind::LiveStreams),
+        )),
+        SourceKind::NetworkTuner => Err(RefreshError::UnsupportedSource),
     }
 }
 
@@ -594,6 +950,7 @@ enum RefreshError {
     SourceLoad,
     InvalidEndpoint,
     UnsupportedSource,
+    Catalog,
     Ingest(IngestError),
 }
 
@@ -604,6 +961,7 @@ impl RefreshError {
             Self::SourceLoad => "source configuration could not be loaded",
             Self::InvalidEndpoint => "source endpoint is invalid",
             Self::UnsupportedSource => "source type is not supported by the refresh worker",
+            Self::Catalog => "source catalog reconciliation failed",
             Self::Ingest(error) => error.persisted_summary(),
         }
     }
@@ -641,7 +999,11 @@ impl JobControl for WorkerJobControl {
 /// Maps an ingest phase to the stage-based progress JSON reported through
 /// `JobRepository::heartbeat`. The stage names align with the public
 /// `GET /api/v1/sources/{source_id}/sync-status` contract.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
 fn refresh_progress_json(
     phase: &str,
     downloaded_bytes: u64,
@@ -774,8 +1136,20 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, routing::get};
-    use std::{collections::HashMap, sync::Mutex};
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        http::StatusCode,
+        response::{IntoResponse, Response},
+        routing::get,
+    };
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU8, AtomicUsize, Ordering},
+        },
+    };
 
     const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const OUTPUT_TOKEN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
@@ -818,6 +1192,124 @@ mod tests {
         }
     }
 
+    const XTREAM_PHASE_INITIAL: u8 = 0;
+    const XTREAM_PHASE_RENAMED: u8 = 1;
+    const XTREAM_PHASE_AUTH_FAILURE: u8 = 2;
+    const XTREAM_PHASE_EMPTY_STREAMS: u8 = 3;
+
+    #[derive(Default)]
+    struct XtreamFixtureState {
+        phase: AtomicU8,
+        authentication_requests: AtomicUsize,
+        category_requests: AtomicUsize,
+        stream_requests: AtomicUsize,
+    }
+
+    impl XtreamFixtureState {
+        fn phase(&self) -> u8 {
+            self.phase.load(Ordering::SeqCst)
+        }
+
+        fn set_phase(&self, phase: u8) {
+            self.phase.store(phase, Ordering::SeqCst);
+        }
+
+        fn request_counts(&self) -> (usize, usize, usize) {
+            (
+                self.authentication_requests.load(Ordering::SeqCst),
+                self.category_requests.load(Ordering::SeqCst),
+                self.stream_requests.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    async fn xtream_fixture_response(
+        State(state): State<Arc<XtreamFixtureState>>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Response {
+        let valid_credentials = query
+            .get("username")
+            .is_some_and(|value| value == "worker-user-canary")
+            && query
+                .get("password")
+                .is_some_and(|value| value == "worker-password-canary");
+        if !valid_credentials {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+
+        match query.get("action").map(String::as_str) {
+            None => {
+                state.authentication_requests.fetch_add(1, Ordering::SeqCst);
+                let authenticated = state.phase() != XTREAM_PHASE_AUTH_FAILURE;
+                Json(serde_json::json!({
+                    "user_info": {
+                        "auth": authenticated,
+                        "status": if authenticated { "Active" } else { "Disabled" },
+                        "username": "worker-user-canary",
+                        "password": "worker-password-canary",
+                    },
+                }))
+                .into_response()
+            }
+            Some("get_live_categories") => {
+                state.category_requests.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!([
+                    {"category_id": "10", "category_name": "Sports"}
+                ]))
+                .into_response()
+            }
+            Some("get_live_streams") => {
+                state.stream_requests.fetch_add(1, Ordering::SeqCst);
+                if state.phase() == XTREAM_PHASE_EMPTY_STREAMS {
+                    return Json(serde_json::json!([])).into_response();
+                }
+                let name = if state.phase() == XTREAM_PHASE_RENAMED {
+                    "Worker Sports 7 Updated"
+                } else {
+                    "Worker Sports 7"
+                };
+                Json(serde_json::json!([
+                    {
+                        "stream_id": 7,
+                        "name": name,
+                        "category_id": "10",
+                        "epg_channel_id": "worker-epg-7",
+                        "num": 7,
+                        "stream_type": "live",
+                        "access_token": "stream-access-token-canary",
+                    }
+                ]))
+                .into_response()
+            }
+            Some(_) => StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn process_source_refresh_job(
+        pool: &sqlx::PgPool,
+        jobs: &JobRepository,
+        sources: &SourceRepository,
+        snapshots: &PgSnapshotStore,
+        catalog: &CatalogRepository,
+        master_key: &MasterKey,
+        worker_id: &str,
+        job_id: Uuid,
+    ) {
+        sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE id = $1")
+            .bind(job_id)
+            .execute(pool)
+            .await
+            .expect("set source job max attempts");
+        force_running(pool, job_id, worker_id).await;
+        let job = fetch_job(pool, job_id).await;
+        process_job(
+            jobs, sources, snapshots, catalog, master_key, worker_id, job,
+        )
+        .await
+        .expect("process source refresh job");
+    }
+
     #[tokio::test]
     async fn m3u_post_refresh_scans_events_after_reconciliation() {
         let catalog = TestPostRefreshCatalog::default();
@@ -825,6 +1317,12 @@ mod tests {
             .await
             .expect("post-refresh work");
         assert_eq!(catalog.calls(), ["provider", "epg", "events"]);
+
+        let xtream = TestPostRefreshCatalog::default();
+        run_post_refresh_catalog(SourceKind::Xtream, Uuid::now_v7(), &xtream)
+            .await
+            .expect("Xtream post-refresh work");
+        assert_eq!(xtream.calls(), ["provider", "epg", "events"]);
     }
 
     #[tokio::test]
@@ -1088,10 +1586,13 @@ mod tests {
             refresh_target(SourceKind::Xmltv, source_id).expect("XMLTV target"),
             (SnapshotOwner::EpgSource(source_id), IngestFormat::Xmltv)
         );
-        assert!(matches!(
-            refresh_target(SourceKind::Xtream, source_id),
-            Err(RefreshError::UnsupportedSource)
-        ));
+        assert_eq!(
+            refresh_target(SourceKind::Xtream, source_id).expect("Xtream target"),
+            (
+                SnapshotOwner::ProviderAccount(source_id),
+                IngestFormat::Xtream(XtreamPayloadKind::LiveStreams)
+            )
+        );
         assert!(matches!(
             refresh_target(SourceKind::NetworkTuner, source_id),
             Err(RefreshError::UnsupportedSource)
@@ -1511,6 +2012,10 @@ mod tests {
             RefreshError::UnsupportedSource.persisted_summary(),
             "source type is not supported by the refresh worker"
         );
+        assert_eq!(
+            RefreshError::Catalog.persisted_summary(),
+            "source catalog reconciliation failed"
+        );
     }
 
     #[test]
@@ -1543,7 +2048,10 @@ mod tests {
         assert_eq!(one_mb["percent"], 1);
         let fifty_mb = refresh_progress_json("downloading", 50 * 1_048_576, 0);
         let pct = fifty_mb["percent"].as_u64().unwrap();
-        assert!(pct >= 8 && pct <= 14, "50MB should map to 8-14%, got {pct}");
+        assert!(
+            (8..=14).contains(&pct),
+            "50MB should map to 8-14%, got {pct}"
+        );
         let huge = refresh_progress_json("downloading", 500 * 1_048_576, 0);
         assert_eq!(huge["percent"], 14);
     }
@@ -1860,59 +2368,299 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_job_fails_refresh_source_for_unsupported_xtream_source() {
-        let Some(database) = integration_database().await else {
+    #[allow(clippy::too_many_lines)]
+    async fn process_job_refreshes_xtream_and_preserves_active_catalog_on_failure() {
+        let Some((admin, database, schema)) = isolated_integration_database().await else {
             eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
             return;
         };
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind Xtream fixture");
+        let address = listener.local_addr().expect("Xtream fixture address");
+        let fixture = Arc::new(XtreamFixtureState::default());
+        fixture.set_phase(XTREAM_PHASE_INITIAL);
+        let fixture_server = tokio::spawn({
+            let fixture = Arc::clone(&fixture);
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/player_api.php", get(xtream_fixture_response))
+                        .with_state(fixture),
+                )
+                .await
+                .expect("serve Xtream fixture");
+            }
+        });
+
         let pool = database.pool().clone();
+        let master_key = MasterKey::from_bytes([8_u8; 32]);
         let jobs = JobRepository::new(pool.clone());
-        let master_key = MasterKey::from_bytes([1_u8; 32]);
         let sources = SourceRepository::new(pool.clone(), master_key.clone());
         let snapshots = PgSnapshotStore::new(pool.clone());
         let catalog = CatalogRepository::new(pool.clone());
-        let worker_id = "test-worker-xtream";
-        let suffix = Uuid::now_v7();
-        let created = sources
+        let worker_id = "test-worker-xtream-success";
+        let source = sources
             .create(
                 &iptv_persistence::NewSource {
-                    name: format!("Xtream coverage test {suffix}"),
+                    name: format!("Xtream worker test {}", Uuid::now_v7()),
                     kind: SourceKind::Xtream,
-                    endpoint: "https://provider.test/live".to_owned(),
+                    endpoint: format!(
+                        "http://{address}/player_api.php?username=worker-user-canary&password=worker-password-canary&access_token=source-access-token-canary"
+                    ),
                 },
                 "coverage-test",
             )
             .await
-            .expect("create xtream source");
-        let source_id = created.source.id;
-        let job_id = created.refresh_job.id;
-        sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .expect("set max attempts");
-        force_running(&pool, job_id, worker_id).await;
-        let record = fetch_job(&pool, job_id).await;
-        process_job(
+            .expect("create Xtream source");
+        let source_id = source.source.id;
+        process_source_refresh_job(
+            &pool,
             &jobs,
             &sources,
             &snapshots,
             &catalog,
             &master_key,
             worker_id,
-            record,
+            source.refresh_job.id,
         )
+        .await;
+        assert_eq!(job_status(&pool, source.refresh_job.id).await, "succeeded");
+        assert_eq!(fixture.request_counts(), (1, 1, 1));
+
+        let active_snapshot_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM source_snapshots \
+             WHERE provider_account_id = $1 AND kind = 'xtream' AND status = 'active'",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
         .await
-        .expect("process xtream refresh");
-        assert_eq!(job_status(&pool, job_id).await, "failed");
-        let error = job_last_error(&pool, job_id)
+        .expect("fetch active Xtream snapshot");
+        let active_snapshot_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM source_snapshots \
+             WHERE provider_account_id = $1 AND kind = 'xtream' AND status = 'active'",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count active Xtream snapshots");
+        assert_eq!(active_snapshot_count, 1);
+
+        let (stable_key, group_name, endpoint_template, endpoint_ciphertext, attributes): (
+            String,
+            Option<String>,
+            String,
+            Option<Vec<u8>>,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT stable_key, group_name, url_template, url_secret_ciphertext, attributes \
+             FROM provider_streams WHERE snapshot_id = $1",
+        )
+        .bind(active_snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch Xtream provider stream");
+        assert_eq!(stable_key, "xtream:7");
+        assert_eq!(group_name.as_deref(), Some("Sports"));
+        assert!(!endpoint_template.contains("{stream_id}"));
+        assert_eq!(
+            attributes
+                .get("access_token")
+                .and_then(serde_json::Value::as_str),
+            Some("[REDACTED]")
+        );
+        let endpoint_ciphertext = endpoint_ciphertext.expect("encrypt Xtream stream endpoint");
+        let decrypted_endpoint = master_key
+            .decrypt_secret(
+                &endpoint_ciphertext,
+                format!("iptv-provider-stream:v1:{source_id}").as_bytes(),
+            )
+            .expect("decrypt concrete Xtream endpoint");
+        let decrypted_endpoint = String::from_utf8(decrypted_endpoint).expect("endpoint text");
+        assert!(
+            decrypted_endpoint.ends_with("/live/worker-user-canary/worker-password-canary/7.ts")
+        );
+        assert!(!decrypted_endpoint.contains("{stream_id}"));
+
+        let channel_id: Uuid = sqlx::query_scalar(
+            "SELECT c.id FROM channels c \
+             JOIN channel_streams cs ON cs.channel_id = c.id \
+             JOIN provider_streams ps ON ps.id = cs.provider_stream_id \
+             WHERE ps.snapshot_id = $1 AND ps.stable_key = 'xtream:7'",
+        )
+        .bind(active_snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch Xtream canonical channel link");
+
+        fixture.set_phase(XTREAM_PHASE_RENAMED);
+        let renamed_job = jobs
+            .enqueue(&NewJob::immediate(
+                "refresh-source",
+                serde_json::json!({"sourceId": source_id}),
+            ))
             .await
-            .expect("error was persisted");
-        assert!(error.contains("source type is not supported"));
+            .expect("enqueue renamed Xtream refresh");
+        process_source_refresh_job(
+            &pool,
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            renamed_job.id,
+        )
+        .await;
+        assert_eq!(job_status(&pool, renamed_job.id).await, "succeeded");
+        let refreshed_snapshot_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM source_snapshots \
+             WHERE provider_account_id = $1 AND kind = 'xtream' AND status = 'active'",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch refreshed Xtream snapshot");
+        assert_ne!(refreshed_snapshot_id, active_snapshot_id);
+        let refreshed_channel_id: Uuid = sqlx::query_scalar(
+            "SELECT c.id FROM channels c \
+             JOIN channel_streams cs ON cs.channel_id = c.id \
+             JOIN provider_streams ps ON ps.id = cs.provider_stream_id \
+             WHERE ps.snapshot_id = $1 AND ps.stable_key = 'xtream:7'",
+        )
+        .bind(refreshed_snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch refreshed Xtream canonical channel link");
+        assert_eq!(refreshed_channel_id, channel_id);
+
+        let counts_before_auth_failure = fixture.request_counts();
+        fixture.set_phase(XTREAM_PHASE_AUTH_FAILURE);
+        let auth_failure_job = jobs
+            .enqueue(&NewJob::immediate(
+                "refresh-source",
+                serde_json::json!({"sourceId": source_id}),
+            ))
+            .await
+            .expect("enqueue Xtream authentication failure");
+        process_source_refresh_job(
+            &pool,
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            auth_failure_job.id,
+        )
+        .await;
+        assert_eq!(job_status(&pool, auth_failure_job.id).await, "failed");
+        assert_eq!(
+            fixture.request_counts(),
+            (
+                counts_before_auth_failure.0 + 1,
+                counts_before_auth_failure.1,
+                counts_before_auth_failure.2,
+            )
+        );
+
+        let counts_before_empty_streams = fixture.request_counts();
+        fixture.set_phase(XTREAM_PHASE_EMPTY_STREAMS);
+        let empty_streams_job = jobs
+            .enqueue(&NewJob::immediate(
+                "refresh-source",
+                serde_json::json!({"sourceId": source_id}),
+            ))
+            .await
+            .expect("enqueue Xtream empty stream refresh");
+        process_source_refresh_job(
+            &pool,
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            empty_streams_job.id,
+        )
+        .await;
+        assert_eq!(job_status(&pool, empty_streams_job.id).await, "failed");
+        assert_eq!(
+            fixture.request_counts(),
+            (
+                counts_before_empty_streams.0 + 1,
+                counts_before_empty_streams.1 + 1,
+                counts_before_empty_streams.2 + 1,
+            )
+        );
+
+        let final_snapshot_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM source_snapshots \
+             WHERE provider_account_id = $1 AND kind = 'xtream' AND status = 'active'",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch preserved Xtream snapshot");
+        assert_eq!(final_snapshot_id, refreshed_snapshot_id);
+        let final_channel_id: Uuid = sqlx::query_scalar(
+            "SELECT c.id FROM channels c \
+             JOIN channel_streams cs ON cs.channel_id = c.id \
+             JOIN provider_streams ps ON ps.id = cs.provider_stream_id \
+             WHERE ps.snapshot_id = $1 AND ps.stable_key = 'xtream:7'",
+        )
+        .bind(final_snapshot_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch preserved Xtream channel link");
+        assert_eq!(final_channel_id, channel_id);
+
+        let public_or_diagnostic_data: String = sqlx::query_scalar(
+            "SELECT coalesce(string_agg(value, E'\\n'), '') FROM ( \
+                 SELECT base_url_template AS value FROM provider_accounts WHERE id = $1 \
+                 UNION ALL \
+                 SELECT diagnostics::text AS value FROM source_snapshots WHERE provider_account_id = $1 \
+                 UNION ALL \
+                 SELECT url_template AS value FROM provider_streams WHERE provider_account_id = $1 \
+                 UNION ALL \
+                 SELECT attributes::text AS value FROM provider_streams WHERE provider_account_id = $1 \
+                 UNION ALL \
+                 SELECT directives::text AS value FROM provider_streams WHERE provider_account_id = $1 \
+                 UNION ALL \
+                 SELECT payload::text AS value FROM jobs WHERE payload->>'sourceId' = $1::text \
+                 UNION ALL \
+                 SELECT progress::text AS value FROM jobs WHERE payload->>'sourceId' = $1::text \
+                 UNION ALL \
+                 SELECT coalesce(last_error, '') AS value FROM jobs WHERE payload->>'sourceId' = $1::text \
+                 UNION ALL \
+                 SELECT details::text AS value FROM audit_events WHERE resource_id = $1 \
+             ) AS stored_values",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read public and diagnostic data");
+        for canary in [
+            "worker-user-canary",
+            "worker-password-canary",
+            "source-access-token-canary",
+            "stream-access-token-canary",
+        ] {
+            assert!(
+                !public_or_diagnostic_data.contains(canary),
+                "public or diagnostic data contained a credential canary"
+            );
+        }
+
         delete_source(&pool, source_id).await;
+        fixture_server.abort();
+        drop(database);
+        drop_isolated_schema(&admin, &schema).await;
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn process_job_completes_a_local_m3u_refresh_and_reconciles_catalog() {
         let Some((admin, database, schema)) = isolated_integration_database().await else {
             eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");

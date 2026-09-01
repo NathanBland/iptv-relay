@@ -21,5 +21,5 @@ pub use xmltv::{
 pub use xtream::{
     XtreamAuth, XtreamCategory, XtreamDocument, XtreamLiveStream, XtreamShortEpgEntry,
     parse_xtream_auth, parse_xtream_live_categories, parse_xtream_live_streams,
-    parse_xtream_short_epg,
+    parse_xtream_short_epg, parse_xtream_short_epg_in_timezone,
 };

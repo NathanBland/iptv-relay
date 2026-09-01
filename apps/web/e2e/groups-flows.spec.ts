@@ -1,41 +1,58 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type APIRequestContext } from '@playwright/test'
 
-const bootstrapToken = process.env.IPTV_ADMIN_BOOTSTRAP_TOKEN ?? ''
+const adminPassword = process.env.IPTV_ADMIN_PASSWORD ?? ''
 
 type GroupState = { name: string; enabledCount: number; channelCount: number }
+
+async function signIn(request: APIRequestContext) {
+  const statusResponse = await request.get('/api/v1/auth/status')
+  expect(statusResponse.ok()).toBe(true)
+  const setCookie = statusResponse.headers()['set-cookie'] ?? ''
+  const csrfToken = setCookie.match(/iptv_csrf=([^;]+)/)?.[1] ?? ''
+  const loginResponse = await request.post('/api/v1/auth/login', {
+    headers: { 'X-CSRF-Token': decodeURIComponent(csrfToken) },
+    data: { username: 'operator', password: adminPassword },
+  })
+  expect(loginResponse.ok()).toBe(true)
+}
+
+async function csrfHeaders(request: APIRequestContext) {
+  const state = await request.storageState()
+  const csrfToken = state.cookies.find((cookie) => cookie.name === 'iptv_csrf')?.value ?? ''
+  return { 'X-CSRF-Token': decodeURIComponent(csrfToken) }
+}
 
 test.describe.serial('groups management API and UI', () => {
   let initialGroupStates: GroupState[] = []
 
   test.beforeAll(async ({ request }) => {
-    const response = await request.get('/api/v1/groups', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    await signIn(request)
+    const response = await request.get('/api/v1/groups')
     if (response.ok()) {
       initialGroupStates = await response.json()
     }
   })
 
   test.afterAll(async ({ request }) => {
+    await signIn(request)
     for (const group of initialGroupStates) {
       const wasFullyEnabled = group.enabledCount === group.channelCount
       const wasFullyDisabled = group.enabledCount === 0
       if (wasFullyEnabled || wasFullyDisabled) {
         await request.patch(`/api/v1/groups/${encodeURIComponent(group.name)}/enabled`, {
-          headers: {
-            Authorization: `Bearer ${bootstrapToken}`,
-            'Content-Type': 'application/json',
-          },
+          headers: await csrfHeaders(request),
           data: { enabled: wasFullyEnabled },
         })
       }
     }
   })
 
+  test.beforeEach(async ({ request }) => {
+    await signIn(request)
+  })
+
   test('groups API returns real data with enabled and total counts', async ({ request }) => {
-    const response = await request.get('/api/v1/groups', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const response = await request.get('/api/v1/groups')
     expect(response.ok()).toBe(true)
     const groups = await response.json()
     expect(Array.isArray(groups)).toBe(true)
@@ -51,9 +68,7 @@ test.describe.serial('groups management API and UI', () => {
   })
 
   test('set group enabled API toggles all channels in a group', async ({ request }) => {
-    const listResponse = await request.get('/api/v1/groups', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const listResponse = await request.get('/api/v1/groups')
     expect(listResponse.ok()).toBe(true)
     const groups = await listResponse.json()
     if (groups.length === 0) {
@@ -63,19 +78,14 @@ test.describe.serial('groups management API and UI', () => {
 
     const targetGroup = groups[0]
     const enableResponse = await request.patch(`/api/v1/groups/${encodeURIComponent(targetGroup.name)}/enabled`, {
-      headers: {
-        Authorization: `Bearer ${bootstrapToken}`,
-        'Content-Type': 'application/json',
-      },
+      headers: await csrfHeaders(request),
       data: { enabled: true },
     })
     expect(enableResponse.ok()).toBe(true)
     const result = await enableResponse.json()
     expect(result.ok).toBe(true)
 
-    const verifyResponse = await request.get('/api/v1/groups', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const verifyResponse = await request.get('/api/v1/groups')
     const verifyGroups = await verifyResponse.json()
     const verified = verifyGroups.find((g: { name: string }) => g.name === targetGroup.name)
     expect(verified).toBeTruthy()
@@ -84,19 +94,14 @@ test.describe.serial('groups management API and UI', () => {
 
   test('bulk set all groups enabled API updates all groups in one call', async ({ request }) => {
     const bulkResponse = await request.patch('/api/v1/groups/enabled', {
-      headers: {
-        Authorization: `Bearer ${bootstrapToken}`,
-        'Content-Type': 'application/json',
-      },
+      headers: await csrfHeaders(request),
       data: { enabled: true },
     })
     expect(bulkResponse.ok()).toBe(true)
     const result = await bulkResponse.json()
     expect(result.ok).toBe(true)
 
-    const verifyResponse = await request.get('/api/v1/groups', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const verifyResponse = await request.get('/api/v1/groups')
     const groups = await verifyResponse.json()
     for (const group of groups) {
       expect(group.enabledCount).toBe(group.channelCount)
@@ -139,9 +144,7 @@ test.describe.serial('groups management API and UI', () => {
     await expect(page.getByRole('heading', { name: 'Groups', level: 1 })).toBeVisible()
     await expect(page.getByRole('alert')).toHaveCount(0)
 
-    const groupsResponse = await context.request.get('/api/v1/groups', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const groupsResponse = await context.request.get('/api/v1/groups')
     const groups = await groupsResponse.json()
     if (groups.length > 0) {
       await expect(page.getByText(groups[0].name)).toBeVisible({ timeout: 10_000 })
@@ -182,9 +185,7 @@ test.describe.serial('groups management API and UI', () => {
       ])
     }
 
-    const groupsResponse = await context.request.get('/api/v1/groups', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const groupsResponse = await context.request.get('/api/v1/groups')
     const groups = await groupsResponse.json()
     if (groups.length === 0) {
       test.skip(true, 'No groups configured')

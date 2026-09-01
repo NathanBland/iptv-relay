@@ -19,6 +19,7 @@ COPY crates/media/src crates/media/src
 COPY crates/parsers/src crates/parsers/src
 COPY crates/persistence/src crates/persistence/src
 COPY migrations migrations
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
@@ -38,11 +39,13 @@ RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in arm64) ARCH=aarch64;; amd64) ARCH=x86_64;; esac && \
     curl -sSL -o /tmp/watchexec.deb "https://github.com/watchexec/watchexec/releases/download/v2.3.0/watchexec-2.3.0-${ARCH}-unknown-linux-musl.deb" && \
     dpkg -i /tmp/watchexec.deb && rm /tmp/watchexec.deb
-# Copy the cargo registry cache so cargo does not re-download dependencies.
-COPY --from=builder /usr/local/cargo/registry/cache /usr/local/cargo/registry/cache
+# Copy the Cargo registry data for runtime builds.
+COPY --from=builder /usr/local/cargo/registry /usr/local/cargo/registry
 # Copy the pre-cooked target directory. The named volume in docker-compose
 # preserves incremental compilation artifacts across container restarts.
 COPY --from=builder /build/target /build/target
 WORKDIR /build
 ENV CARGO_TARGET_DIR=/build/target
+ENV RUSTUP_TOOLCHAIN=1.97.1
 COPY scripts/dev-reload.sh /usr/local/bin/dev-reload.sh
+COPY scripts/dev-run-binary.sh /usr/local/bin/dev-run-binary.sh

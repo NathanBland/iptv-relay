@@ -706,7 +706,10 @@ fn event_control_routes() -> Router<AppState> {
             axum::routing::patch(update_event_template).delete(delete_event_template),
         )
         .route("/api/v1/event-channels", get(list_event_channels))
-        .route("/api/v1/event-templates/suggestions", get(suggest_event_templates))
+        .route(
+            "/api/v1/event-templates/suggestions",
+            get(suggest_event_templates),
+        )
         .route(
             "/api/v1/event-templates/{template_id}/scan",
             axum::routing::post(scan_event_channels),
@@ -812,7 +815,10 @@ fn configuration_control_routes() -> Router<AppState> {
             "/api/v1/region-settings",
             axum::routing::put(update_region_settings),
         )
-        .route("/api/v1/region-settings/apply", axum::routing::post(apply_region_filter))
+        .route(
+            "/api/v1/region-settings/apply",
+            axum::routing::post(apply_region_filter),
+        )
 }
 
 fn output_routes() -> Router<AppState> {
@@ -3414,9 +3420,7 @@ fn dedup_sync_progress(jobs: &[JobRecord]) -> Vec<(&str, &JobRecord)> {
         }
         match job.status.as_str() {
             "queued" | "running" => true,
-            "succeeded" | "failed" | "cancelled" => {
-                (now - job.updated_at).num_seconds() < 60
-            }
+            "succeeded" | "failed" | "cancelled" => (now - job.updated_at).num_seconds() < 60,
             _ => false,
         }
     }) {

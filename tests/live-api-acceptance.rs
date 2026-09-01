@@ -268,15 +268,13 @@ async fn source_list_contains_m3u_and_xmltv() -> anyhow::Result<()> {
         source["id"].as_str() == Some(M3U_SOURCE_ID)
             && source["kind"]
                 .as_str()
-                .map(|k| k.eq_ignore_ascii_case("m3u"))
-                .unwrap_or(false)
+                .is_some_and(|k| k.eq_ignore_ascii_case("m3u"))
     });
     let has_xmltv = items.iter().any(|source| {
         source["id"].as_str() == Some(XMLTV_SOURCE_ID)
             && source["kind"]
                 .as_str()
-                .map(|k| k.eq_ignore_ascii_case("xmltv"))
-                .unwrap_or(false)
+                .is_some_and(|k| k.eq_ignore_ascii_case("xmltv"))
     });
 
     anyhow::ensure!(has_m3u, "m3u source {M3U_SOURCE_ID} not found");

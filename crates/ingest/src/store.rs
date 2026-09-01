@@ -112,6 +112,7 @@ impl PgSnapshotStore {
         insert_epg_channels(
             &mut transaction,
             snapshot.id,
+            provider_account_id,
             epg_source_id,
             &snapshot.epg_channels,
         )
@@ -148,8 +149,8 @@ impl PgSnapshotStore {
 
 fn validate_owner(snapshot: &PreparedSnapshot) -> Result<(), IngestError> {
     match (snapshot.owner, snapshot.format.snapshot_kind()) {
-        (SnapshotOwner::ProviderAccount(_), "m3u" | "xtream")
-        | (SnapshotOwner::EpgSource(_), "xmltv" | "xtream") => Ok(()),
+        (SnapshotOwner::ProviderAccount(_), "m3u" | "xtream" | "xtream-epg")
+        | (SnapshotOwner::EpgSource(_), "xmltv") => Ok(()),
         _ => Err(IngestError::InvalidRequest(
             "snapshot owner does not match source format",
         )),
@@ -234,21 +235,24 @@ async fn insert_provider_streams(
 async fn insert_epg_channels(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
     snapshot_id: Uuid,
+    provider_account_id: Option<Uuid>,
     epg_source_id: Option<Uuid>,
     channels: &StagedRows<PreparedEpgChannel>,
 ) -> Result<(), IngestError> {
     if channels.is_empty() {
         return Ok(());
     }
-    let epg_source_id = epg_source_id.ok_or(IngestError::InvalidRequest(
-        "EPG channels require an EPG source owner",
-    ))?;
+    if provider_account_id.is_some() == epg_source_id.is_some() {
+        return Err(IngestError::InvalidRequest(
+            "EPG channels require exactly one source owner",
+        ));
+    }
     for chunk in channels.batches(EPG_CHANNEL_BATCH)? {
         let chunk = chunk?;
         let mut query = QueryBuilder::<Postgres>::new(
             r"
             INSERT INTO epg_channels (
-                id, source_snapshot_id, epg_source_id, xmltv_id,
+                id, source_snapshot_id, provider_account_id, epg_source_id, xmltv_id,
                 display_names, icon_urls, metadata
             )
             ",
@@ -256,6 +260,7 @@ async fn insert_epg_channels(
         query.push_values(&chunk, |mut row, channel| {
             row.push_bind(channel.id)
                 .push_bind(snapshot_id)
+                .push_bind(provider_account_id)
                 .push_bind(epg_source_id)
                 .push_bind(&channel.xmltv_id)
                 .push_bind(&channel.display_names)

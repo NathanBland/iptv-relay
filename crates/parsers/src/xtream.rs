@@ -3,7 +3,8 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
 };
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use serde_json::{Map, Value};
 use std::{collections::BTreeMap, io::Read};
 use url::Url;
@@ -295,6 +296,26 @@ pub fn parse_xtream_short_epg<R: Read>(
     reader: R,
     limits: ParseLimits,
 ) -> Result<XtreamDocument<XtreamShortEpgEntry>, ParseError> {
+    parse_xtream_short_epg_in_timezone(reader, limits, "UTC")
+}
+
+/// Parses a short EPG response with a timezone for local provider timestamps.
+///
+/// Explicit timestamp offsets remain authoritative. The source timezone applies
+/// only to timestamps that do not have an offset.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for malformed JSON, I/O failures, configured limits,
+/// or an invalid source timezone.
+pub fn parse_xtream_short_epg_in_timezone<R: Read>(
+    reader: R,
+    limits: ParseLimits,
+    source_timezone: &str,
+) -> Result<XtreamDocument<XtreamShortEpgEntry>, ParseError> {
+    let source_timezone = source_timezone.parse::<Tz>().map_err(|_| {
+        ParseError::MalformedXtream("short EPG source timezone is invalid".to_owned())
+    })?;
     let (root, bytes) = read_json(reader, limits)?;
     let values = root
         .get("epg_listings")
@@ -309,12 +330,17 @@ pub fn parse_xtream_short_epg<R: Read>(
             invalid_record(&mut document, "short EPG listing is not an object");
             continue;
         };
-        let Some(start) = parse_listing_time(object, &["start_timestamp", "start"]) else {
+        let Some(start) =
+            parse_listing_time(object, &["start_timestamp", "start"], source_timezone)
+        else {
             invalid_record(&mut document, "short EPG listing has no valid start");
             continue;
         };
-        let Some(stop) = parse_listing_time(object, &["stop_timestamp", "end_timestamp", "end"])
-        else {
+        let Some(stop) = parse_listing_time(
+            object,
+            &["stop_timestamp", "end_timestamp", "end"],
+            source_timezone,
+        ) else {
             invalid_record(&mut document, "short EPG listing has no valid stop");
             continue;
         };
@@ -537,7 +563,11 @@ fn unknown_fields(object: &Map<String, Value>, known: &[&str]) -> BTreeMap<Strin
         .collect()
 }
 
-fn parse_listing_time(object: &Map<String, Value>, keys: &[&str]) -> Option<DateTime<Utc>> {
+fn parse_listing_time(
+    object: &Map<String, Value>,
+    keys: &[&str],
+    source_timezone: Tz,
+) -> Option<DateTime<Utc>> {
     for key in keys {
         let Some(value) = object.get(*key) else {
             continue;
@@ -554,7 +584,10 @@ fn parse_listing_time(object: &Map<String, Value>, keys: &[&str]) -> Option<Date
             return Some(datetime.with_timezone(&Utc));
         }
         if let Ok(datetime) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-            return Some(Utc.from_utc_datetime(&datetime));
+            return match source_timezone.from_local_datetime(&datetime) {
+                LocalResult::Single(value) => Some(value.with_timezone(&Utc)),
+                LocalResult::Ambiguous(_, _) | LocalResult::None => None,
+            };
         }
     }
     None
@@ -647,6 +680,64 @@ mod tests {
             "2026-09-14T00:20:00+00:00"
         );
         assert_eq!(document.records[1].title, "Plain title");
+    }
+
+    #[test]
+    fn short_epg_uses_source_timezone_only_without_an_explicit_offset() {
+        let payload = r#"{
+            "epg_listings": [
+                {
+                    "title": "TG9jYWw=",
+                    "start": "2026-01-15 12:00:00",
+                    "end": "2026-01-15 13:00:00",
+                    "channel_id": "one"
+                },
+                {
+                    "title": "T2Zmc2V0",
+                    "start": "2026-01-15T12:00:00+02:00",
+                    "end": "2026-01-15T13:00:00+02:00",
+                    "channel_id": "one"
+                }
+            ]
+        }"#;
+        let document = parse_xtream_short_epg_in_timezone(
+            Cursor::new(payload),
+            ParseLimits::default(),
+            "America/Denver",
+        )
+        .expect("short EPG");
+
+        assert_eq!(
+            document.records[0].start.to_rfc3339(),
+            "2026-01-15T19:00:00+00:00"
+        );
+        assert_eq!(
+            document.records[1].start.to_rfc3339(),
+            "2026-01-15T10:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn short_epg_skips_ambiguous_or_nonexistent_local_timestamps() {
+        let payload = r#"{
+            "epg_listings": [
+                {
+                    "title": "U2tpcA==",
+                    "start": "2026-11-01 01:30:00",
+                    "end": "2026-11-01 02:30:00",
+                    "channel_id": "one"
+                }
+            ]
+        }"#;
+        let document = parse_xtream_short_epg_in_timezone(
+            Cursor::new(payload),
+            ParseLimits::default(),
+            "America/Denver",
+        )
+        .expect("short EPG");
+
+        assert!(document.records.is_empty());
+        assert_eq!(document.stats.records_skipped, 1);
     }
 
     #[test]

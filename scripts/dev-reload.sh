@@ -1,46 +1,67 @@
-#!/bin/bash
-# Poll-based reload script for Docker dev environments on macOS.
-# Docker bind mounts on macOS do not propagate inotify events,
-# so we poll file modification times instead.
-set -e
+#!/usr/bin/env bash
+set -uo pipefail
 
-WATCH_PATHS="$1"
-shift
-CMD="$@"
+watch_spec=$1
+mode=$2
+cargo_jobs=${IPTV_DEV_CARGO_JOBS:-2}
+binary=/build/target/release/iptv-gateway
+child_pid=
+last_hash=
 
-LAST_HASH=""
+IFS=: read -r -a watch_paths <<< "$watch_spec"
+
+stop_child() {
+    if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+        kill "$child_pid" 2>/dev/null || true
+        for _ in {1..20}; do
+            if ! kill -0 "$child_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        if kill -0 "$child_pid" 2>/dev/null; then
+            kill -KILL "$child_pid" 2>/dev/null || true
+        fi
+        wait "$child_pid" 2>/dev/null || true
+    fi
+    child_pid=
+}
+
+stop_all() {
+    stop_child
+    exit 0
+}
+
+source_hash() {
+    find "${watch_paths[@]}" -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.sql' \) -print0 2>/dev/null \
+        | sort -z \
+        | xargs -0 -r stat -c '%Y:%s:%n' 2>/dev/null \
+        | sha256sum \
+        | cut -d' ' -f1
+}
+
+trap stop_all INT TERM
 
 while true; do
-    # Compute a hash of all mtimes in the watched paths
-    CURRENT_HASH=$(find $WATCH_PATHS -type f -name '*.rs' -o -name '*.toml' -o -name '*.sql' 2>/dev/null | xargs stat -c '%Y %n' 2>/dev/null | sort | md5sum | cut -d' ' -f1)
+    current_hash=$(source_hash)
 
-    if [ "$CURRENT_HASH" != "$LAST_HASH" ]; then
-        if [ -n "$LAST_HASH" ]; then
-            echo "[dev-reload] Change detected, rebuilding..."
-            # Kill the previous process if it's running
-            if [ -n "$CHILD_PID" ]; then
-                kill "$CHILD_PID" 2>/dev/null || true
-                wait "$CHILD_PID" 2>/dev/null || true
-            fi
-            # Rebuild and run
-            $CMD &
-            CHILD_PID=$!
-            echo "[dev-reload] Started PID $CHILD_PID"
+    if [[ "$current_hash" != "$last_hash" ]]; then
+        stop_child
+        echo "[dev-reload] Build started."
+        if cargo build --release --locked -j "$cargo_jobs" -p iptv-gateway --bin iptv-gateway; then
+            "$binary" "$mode" &
+            child_pid=$!
+            echo "[dev-reload] Process started with PID $child_pid."
         else
-            # First run
-            echo "[dev-reload] Initial build..."
-            $CMD &
-            CHILD_PID=$!
-            echo "[dev-reload] Started PID $CHILD_PID"
+            echo "[dev-reload] Build failed. Change a source file to retry."
         fi
-        LAST_HASH="$CURRENT_HASH"
+        last_hash=$current_hash
     fi
 
-    # Check if the child process exited
-    if [ -n "$CHILD_PID" ] && ! kill -0 "$CHILD_PID" 2>/dev/null; then
-        echo "[dev-reload] Process exited. Waiting for changes..."
-        wait "$CHILD_PID" 2>/dev/null || true
-        CHILD_PID=""
+    if [[ -n "$child_pid" ]] && ! kill -0 "$child_pid" 2>/dev/null; then
+        wait "$child_pid" 2>/dev/null || true
+        child_pid=
+        echo "[dev-reload] Process stopped. Change a source file to retry."
     fi
 
     sleep 1

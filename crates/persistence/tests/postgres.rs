@@ -477,6 +477,169 @@ async fn reconcile_merges_streams_by_tvg_id_and_maps_epg() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn reconcile_xtream_snapshots_retain_channels_and_replace_stream_links() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let account_id = uuid::Uuid::now_v7();
+    let first_snapshot_id = uuid::Uuid::now_v7();
+    let first_stream_id = uuid::Uuid::now_v7();
+
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) \
+         VALUES ($1, $2, 'xtream', 'https://provider.test/player_api.php')",
+    )
+    .bind(account_id)
+    .bind(format!("Xtream reconciliation {}", uuid::Uuid::now_v7()))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots \
+         (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) \
+         VALUES ($1, $2, 'xtream', 'active', $3, 1, 1)",
+    )
+    .bind(first_snapshot_id)
+    .bind(account_id)
+    .bind(first_snapshot_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams \
+         (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, url_template, \
+          attributes, directives, supported) \
+         VALUES ($1, $2, $3, 'xtream:101', 'Xtream News', 'news.xtream', \
+                 'https://provider.test/live/101', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(first_stream_id)
+    .bind(first_snapshot_id)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let first = catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+    assert_eq!(first.channels, 1);
+    assert_eq!(first.stream_links, 1);
+    let channel_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM channels WHERE provider_account_id = $1 AND canonical_key = 'news.xtream'",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let second_snapshot_id = uuid::Uuid::now_v7();
+    let second_stream_id = uuid::Uuid::now_v7();
+    sqlx::query("UPDATE source_snapshots SET status = 'superseded' WHERE id = $1")
+        .bind(first_snapshot_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots \
+         (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) \
+         VALUES ($1, $2, 'xtream', 'active', $3, 1, 1)",
+    )
+    .bind(second_snapshot_id)
+    .bind(account_id)
+    .bind(second_snapshot_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams \
+         (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, url_template, \
+          attributes, directives, supported) \
+         VALUES ($1, $2, $3, 'xtream:102', 'Xtream News HD', 'news.xtream', \
+                 'https://provider.test/live/102', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(second_stream_id)
+    .bind(second_snapshot_id)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "CREATE FUNCTION reject_channel_stream_relink() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'relink rejection'; END; $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_channel_stream_relink_trigger \
+         BEFORE INSERT ON channel_streams \
+         FOR EACH ROW EXECUTE FUNCTION reject_channel_stream_relink()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        catalog
+            .reconcile_provider_account(account_id)
+            .await
+            .is_err()
+    );
+    let name_after_failure: String = sqlx::query_scalar("SELECT name FROM channels WHERE id = $1")
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(name_after_failure, "Xtream News");
+    let links_after_failure: Vec<uuid::Uuid> =
+        sqlx::query_scalar("SELECT provider_stream_id FROM channel_streams WHERE channel_id = $1")
+            .bind(channel_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(links_after_failure, vec![first_stream_id]);
+    sqlx::query("DROP TRIGGER reject_channel_stream_relink_trigger ON channel_streams")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP FUNCTION reject_channel_stream_relink()")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let second = catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+    assert_eq!(second.channels, 1);
+    let retained_channel_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM channels WHERE provider_account_id = $1 AND canonical_key = 'news.xtream'",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_channel_id, channel_id);
+    let linked_stream_ids: Vec<uuid::Uuid> =
+        sqlx::query_scalar("SELECT provider_stream_id FROM channel_streams WHERE channel_id = $1")
+            .bind(channel_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(linked_stream_ids, vec![second_stream_id]);
+
+    drop(catalog);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn reconcile_epg_mappings_by_channel_alias() {
     let Some(database_url) = database_url() else {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
@@ -487,9 +650,8 @@ async fn reconcile_epg_mappings_by_channel_alias() {
     let catalog = CatalogRepository::new(pool.clone());
     let suffix = uuid::Uuid::now_v7();
 
-    // Create a provider account with a channel named "ESPN HD" that has no
-    // tvg-id. The normalized name "espn hd" will not match the EPG channel
-    // "ESPN" (normalized "espn") because "HD" is a meaningful token.
+    // Create a provider account with a channel name that differs from the EPG name.
+    // Only an explicit alias can join these names.
     let mut transaction = pool.begin().await.unwrap();
     let account_id = uuid::Uuid::now_v7();
     let snapshot_id = uuid::Uuid::now_v7();
@@ -516,8 +678,8 @@ async fn reconcile_epg_mappings_by_channel_alias() {
     .bind(uuid::Uuid::now_v7())
     .bind(snapshot_id)
     .bind(account_id)
-    .bind("espn-hd")
-    .bind("ESPN HD")
+    .bind("arena-prime")
+    .bind("Arena Prime")
     .bind("200")
     .execute(&mut *transaction)
     .await
@@ -529,7 +691,7 @@ async fn reconcile_epg_mappings_by_channel_alias() {
         .await
         .unwrap();
 
-    // Create an EPG source with a channel named "ESPN".
+    // Create an EPG source with a different channel name.
     let epg_source_id = uuid::Uuid::now_v7();
     let epg_snapshot_id = uuid::Uuid::now_v7();
     let epg_channel_id = uuid::Uuid::now_v7();
@@ -547,11 +709,11 @@ async fn reconcile_epg_mappings_by_channel_alias() {
         .execute(&mut *transaction)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO epg_channels (id, source_snapshot_id, epg_source_id, xmltv_id, display_names) VALUES ($1, $2, $3, 'espn.us', $4)")
+    sqlx::query("INSERT INTO epg_channels (id, source_snapshot_id, epg_source_id, xmltv_id, display_names) VALUES ($1, $2, $3, 'stadium-one.us', $4)")
         .bind(epg_channel_id)
         .bind(epg_snapshot_id)
         .bind(epg_source_id)
-        .bind(json!([{"value": "ESPN"}]))
+        .bind(json!([{"value": "Stadium One"}]))
         .execute(&mut *transaction)
         .await
         .unwrap();
@@ -580,18 +742,18 @@ async fn reconcile_epg_mappings_by_channel_alias() {
     let channel_before = page_before
         .items
         .iter()
-        .find(|row| row.name == "ESPN HD")
+        .find(|row| row.name == "Arena Prime")
         .expect("channel exists");
     assert!(
         !channel_before.epg_mapped,
         "channel should not be mapped before alias is created"
     );
 
-    // Create a channel alias: "ESPN HD" -> "ESPN".
+    // Create a channel alias that joins both names.
     catalog
         .create_channel_alias(&iptv_persistence::CreateChannelAliasInput {
-            canonical_name: "ESPN".to_owned(),
-            alias: "ESPN HD".to_owned(),
+            canonical_name: "Stadium One".to_owned(),
+            alias: "Arena Prime".to_owned(),
             country: None,
             category: None,
         })
@@ -617,7 +779,7 @@ async fn reconcile_epg_mappings_by_channel_alias() {
     let mapped = page_after
         .items
         .iter()
-        .find(|row| row.name == "ESPN HD")
+        .find(|row| row.name == "Arena Prime")
         .expect("channel exists after alias reconciliation");
     assert!(mapped.epg_mapped, "channel should be EPG-mapped by alias");
 
@@ -633,20 +795,18 @@ async fn reconcile_epg_mappings_by_channel_alias() {
     assert_eq!(programmes.items[0].title, "SportsCenter");
 
     // Verify the mapping method is 'alias'.
-    let mappings = catalog
-        .list_epg_mappings(None, 100, 0)
-        .await
-        .unwrap();
+    let mappings = catalog.list_epg_mappings(None, 100, 0).await.unwrap();
     let alias_mapping = mappings
         .items
         .iter()
-        .find(|m| m.channel_name == "ESPN HD");
+        .find(|m| m.channel_name == "Arena Prime");
     assert!(
         alias_mapping.is_some(),
-        "mapping should exist for ESPN HD"
+        "mapping should exist for Arena Prime"
     );
     assert_eq!(
-        alias_mapping.unwrap().method, "alias",
+        alias_mapping.unwrap().method,
+        "alias",
         "mapping method should be 'alias'"
     );
 
@@ -677,7 +837,7 @@ async fn reconcile_epg_mappings_by_channel_alias() {
         .execute(&mut *transaction)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM channel_aliases WHERE canonical_name = 'ESPN'")
+    sqlx::query("DELETE FROM channel_aliases WHERE canonical_name = 'Stadium One'")
         .execute(&mut *transaction)
         .await
         .unwrap();
@@ -2580,6 +2740,41 @@ async fn source_configuration_and_job_management_work() {
     drop(jobs);
     drop(sources);
     drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn list_due_sources_preserves_xtream_provider_kind() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let sources =
+        SourceRepository::new(database.pool().clone(), MasterKey::from_bytes([32_u8; 32]));
+    let source_id = uuid::Uuid::now_v7();
+
+    sqlx::query(
+        "INSERT INTO provider_accounts \
+         (id, name, source_type, base_url_template, refresh_interval_seconds) \
+         VALUES ($1, $2, 'xtream', 'https://provider.test/player_api.php', 60)",
+    )
+    .bind(source_id)
+    .bind(format!("Due Xtream source {}", uuid::Uuid::now_v7()))
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let due = sources.list_due_sources().await.unwrap();
+    assert!(due.iter().any(|source| {
+        source.id == source_id
+            && source.kind == SourceKind::Xtream
+            && source.refresh_interval_seconds == 60
+            && source.last_refreshed_at.is_none()
+    }));
+
+    drop(sources);
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
 }

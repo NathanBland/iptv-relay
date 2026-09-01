@@ -1,13 +1,32 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type APIRequestContext } from '@playwright/test'
 
 const adminPassword = process.env.IPTV_ADMIN_PASSWORD ?? ''
-const bootstrapToken = process.env.IPTV_ADMIN_BOOTSTRAP_TOKEN ?? ''
+
+async function signIn(request: APIRequestContext) {
+  const statusResponse = await request.get('/api/v1/auth/status')
+  expect(statusResponse.ok()).toBe(true)
+  const setCookie = statusResponse.headers()['set-cookie'] ?? ''
+  const csrfToken = setCookie.match(/iptv_csrf=([^;]+)/)?.[1] ?? ''
+  const loginResponse = await request.post('/api/v1/auth/login', {
+    headers: { 'X-CSRF-Token': decodeURIComponent(csrfToken) },
+    data: { username: 'operator', password: adminPassword },
+  })
+  expect(loginResponse.ok()).toBe(true)
+}
+
+async function csrfHeaders(request: APIRequestContext) {
+  const state = await request.storageState()
+  const csrfToken = state.cookies.find((cookie) => cookie.name === 'iptv_csrf')?.value ?? ''
+  return { 'X-CSRF-Token': decodeURIComponent(csrfToken) }
+}
 
 test.describe.serial('event template and lineup API flows', () => {
+  test.beforeEach(async ({ request }) => {
+    await signIn(request)
+  })
+
   test('event templates API returns real data from the database', async ({ request }) => {
-    const response = await request.get('/api/v1/event-templates', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const response = await request.get('/api/v1/event-templates')
     expect(response.ok()).toBe(true)
     const templates = await response.json()
     expect(Array.isArray(templates)).toBe(true)
@@ -21,18 +40,14 @@ test.describe.serial('event template and lineup API flows', () => {
   })
 
   test('event channels API returns real data from the database', async ({ request }) => {
-    const response = await request.get('/api/v1/event-channels', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const response = await request.get('/api/v1/event-channels')
     expect(response.ok()).toBe(true)
     const channels = await response.json()
     expect(Array.isArray(channels)).toBe(true)
   })
 
   test('events API returns real data from the database', async ({ request }) => {
-    const response = await request.get('/api/v1/events', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const response = await request.get('/api/v1/events')
     expect(response.ok()).toBe(true)
     const events = await response.json()
     expect(Array.isArray(events)).toBe(true)
@@ -41,7 +56,7 @@ test.describe.serial('event template and lineup API flows', () => {
   test('event template create, scan, and delete cycle works end to end', async ({ request }) => {
     const templateName = `E2E Event ${Date.now()}`
     const createResponse = await request.post('/api/v1/event-templates', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
+      headers: await csrfHeaders(request),
       data: {
         name: templateName.toLowerCase().replace(/\s+/g, '-'),
         displayName: templateName,
@@ -59,22 +74,20 @@ test.describe.serial('event template and lineup API flows', () => {
 
     try {
       const scanResponse = await request.post(`/api/v1/event-templates/${template.id}/scan`, {
-        headers: { Authorization: `Bearer ${bootstrapToken}` },
+        headers: await csrfHeaders(request),
       })
       expect(scanResponse.ok()).toBe(true)
       const scanResult = await scanResponse.json()
       expect(scanResult.ok).toBe(true)
     } finally {
       await request.delete(`/api/v1/event-templates/${template.id}`, {
-        headers: { Authorization: `Bearer ${bootstrapToken}` },
+        headers: await csrfHeaders(request),
       })
     }
   })
 
   test('lineup templates API returns real data from the database', async ({ request }) => {
-    const response = await request.get('/api/v1/lineup-templates', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const response = await request.get('/api/v1/lineup-templates')
     expect(response.ok()).toBe(true)
     const templates = await response.json()
     expect(Array.isArray(templates)).toBe(true)
@@ -89,7 +102,7 @@ test.describe.serial('event template and lineup API flows', () => {
   test('lineup template create, list categories, apply, and delete cycle works end to end', async ({ request }) => {
     const templateName = `E2E Lineup ${Date.now()}`
     const createResponse = await request.post('/api/v1/lineup-templates', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
+      headers: await csrfHeaders(request),
       data: {
         name: templateName,
         packageName: 'E2E Test Package',
@@ -111,17 +124,13 @@ test.describe.serial('event template and lineup API flows', () => {
     expect(template.id).toBeTruthy()
 
     try {
-      const categoriesResponse = await request.get(`/api/v1/lineup-templates/${template.id}/categories`, {
-        headers: { Authorization: `Bearer ${bootstrapToken}` },
-      })
+      const categoriesResponse = await request.get(`/api/v1/lineup-templates/${template.id}/categories`)
       expect(categoriesResponse.ok()).toBe(true)
       const categories = await categoriesResponse.json()
       expect(categories.length).toBe(1)
       expect(categories[0].name).toBe('Test Category')
 
-      const channelsResponse = await request.get(`/api/v1/lineup-templates/${template.id}/channels`, {
-        headers: { Authorization: `Bearer ${bootstrapToken}` },
-      })
+      const channelsResponse = await request.get(`/api/v1/lineup-templates/${template.id}/channels`)
       expect(channelsResponse.ok()).toBe(true)
       const channels = await channelsResponse.json()
       expect(channels.length).toBe(1)
@@ -129,7 +138,7 @@ test.describe.serial('event template and lineup API flows', () => {
       expect(channels[0].channelNumber).toBe('100')
     } finally {
       await request.delete(`/api/v1/lineup-templates/${template.id}`, {
-        headers: { Authorization: `Bearer ${bootstrapToken}` },
+        headers: await csrfHeaders(request),
       })
     }
   })
@@ -170,9 +179,7 @@ test.describe.serial('event and lineup UI flows', () => {
   })
 
   test('events page loads without errors and shows real data', async ({ page, context }) => {
-    const templatesResponse = await context.request.get('/api/v1/event-templates', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const templatesResponse = await context.request.get('/api/v1/event-templates')
     const templates = await templatesResponse.json()
 
     await page.goto('/events')
@@ -187,9 +194,7 @@ test.describe.serial('event and lineup UI flows', () => {
   })
 
   test('events page scan button triggers backend scan', async ({ page, context }) => {
-    const templatesResponse = await context.request.get('/api/v1/event-templates', {
-      headers: { Authorization: `Bearer ${bootstrapToken}` },
-    })
+    const templatesResponse = await context.request.get('/api/v1/event-templates')
     const templates = await templatesResponse.json()
     if (templates.length === 0) {
       test.skip(true, 'No event templates configured')

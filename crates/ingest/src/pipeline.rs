@@ -1,8 +1,10 @@
+#[cfg(test)]
+use crate::parse::parse_artifact;
 use crate::{
     ArtifactLimits, DecodedArtifact, DownloadRequest, DownloadedArtifact, IngestError,
     IngestFormat, IngestProgress, ParsedArtifact, PgSnapshotStore, PreparedEpgChannel,
     PreparedProgramme, PreparedProviderStream, PreparedSnapshot, ProtectedEndpoint, SnapshotOwner,
-    StagedRows, download_stream, parse_artifact, unpack_artifact,
+    StagedRows, XtreamStreamEndpointTemplate, download_stream, unpack_artifact,
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -103,8 +105,10 @@ pub struct IngestRequest {
     pub download: DownloadRequest,
     /// IANA timezone used only when XMLTV timestamps omit an explicit offset.
     pub source_timezone: String,
-    /// Safe public template and encrypted secret template for Xtream stream IDs.
-    pub xtream_stream_endpoint: Option<ProtectedEndpoint>,
+    /// Secret Xtream template that creates one URL for each stream.
+    pub xtream_stream_endpoint: Option<XtreamStreamEndpointTemplate>,
+    /// Xtream category names keyed by provider category ID.
+    pub xtream_category_names: HashMap<String, String>,
 }
 
 impl fmt::Debug for IngestRequest {
@@ -116,6 +120,7 @@ impl fmt::Debug for IngestRequest {
             .field("download", &self.download)
             .field("source_timezone", &self.source_timezone)
             .field("xtream_stream_endpoint", &self.xtream_stream_endpoint)
+            .field("xtream_category_count", &self.xtream_category_names.len())
             .finish()
     }
 }
@@ -187,10 +192,7 @@ where
         }
 
         let artifact = self.download_with_progress(&request.download).await?;
-        info!(
-            downloaded_bytes = artifact.byte_count,
-            "download completed"
-        );
+        info!(downloaded_bytes = artifact.byte_count, "download completed");
         self.run_downloaded(request, artifact).await
     }
 
@@ -208,8 +210,8 @@ where
             .redirect(Policy::none())
             .gzip(false)
             .build()
-            .map_err(|error| {
-                debug!(error = %error, "HTTP client construction failed");
+            .map_err(|_error| {
+                debug!("HTTP client construction failed");
                 IngestError::HttpRequest
             })?;
         let response = client
@@ -218,7 +220,12 @@ where
             .send()
             .await
             .map_err(|error| {
-                debug!(error = %error, "streaming: HTTP request failed");
+                debug!(
+                    timeout = error.is_timeout(),
+                    connect = error.is_connect(),
+                    request = error.is_request(),
+                    "streaming: HTTP request failed"
+                );
                 IngestError::HttpRequest
             })?;
         let status = response.status();
@@ -320,11 +327,12 @@ where
             };
 
             let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
-            byte_count = byte_count
-                .checked_add(chunk_len)
-                .ok_or(IngestError::DownloadTooLarge {
-                    limit: max_download_bytes,
-                })?;
+            byte_count =
+                byte_count
+                    .checked_add(chunk_len)
+                    .ok_or(IngestError::DownloadTooLarge {
+                        limit: max_download_bytes,
+                    })?;
             if byte_count > max_download_bytes {
                 return Err(IngestError::DownloadTooLarge {
                     limit: max_download_bytes,
@@ -345,7 +353,10 @@ where
             if last_checkpoint.elapsed() >= Duration::from_secs(2) {
                 last_checkpoint = std::time::Instant::now();
                 let records = records_counter.load(Ordering::Relaxed);
-                if let Err(error) = self.checkpoint("downloading", byte_count, 0, records, 0).await {
+                if let Err(error) = self
+                    .checkpoint("downloading", byte_count, 0, records, 0)
+                    .await
+                {
                     debug!(error = ?error, "streaming: checkpoint failed");
                 }
             }
@@ -356,7 +367,9 @@ where
 
         // Report download completion with records parsed so far.
         let records_so_far = records_counter.load(Ordering::Relaxed);
-        let _ = self.checkpoint("downloaded", byte_count, 0, records_so_far, 0).await;
+        let _ = self
+            .checkpoint("downloaded", byte_count, 0, records_so_far, 0)
+            .await;
 
         // Flush and finalize the tempfile (for checksum).
         file.flush().await?;
@@ -377,8 +390,7 @@ where
 
         info!(
             downloaded_bytes = byte_count,
-            records_seen,
-            "streaming: download and parse completed"
+            records_seen, "streaming: download and parse completed"
         );
 
         // Finalize and activate the snapshot.
@@ -425,8 +437,8 @@ where
             .redirect(Policy::none())
             .gzip(false)
             .build()
-            .map_err(|error| {
-                debug!(error = %error, "HTTP client construction failed");
+            .map_err(|_error| {
+                debug!("HTTP client construction failed");
                 IngestError::HttpRequest
             })?;
         let response = client
@@ -436,7 +448,9 @@ where
             .await
             .map_err(|error| {
                 debug!(
-                    error = %error,
+                    timeout = error.is_timeout(),
+                    connect = error.is_connect(),
+                    request = error.is_request(),
                     stall_timeout = ?request.stall_timeout,
                     "HTTP request failed before a response was received"
                 );
@@ -537,8 +551,14 @@ where
             IngestFormat::Xtream(_) => {
                 // Xtream's JSON parsers remain materialized, but are bounded by both
                 // decoded bytes and max_records. M3U/XMLTV never take this path.
+                let source_timezone = request.source_timezone.clone();
                 let parsed = tokio::task::spawn_blocking(move || {
-                    parse_artifact(&decoded, format, parse_limits)
+                    crate::parse_artifact_with_source_timezone(
+                        &decoded,
+                        format,
+                        parse_limits,
+                        &source_timezone,
+                    )
                 })
                 .await
                 .map_err(|_| {
@@ -577,9 +597,7 @@ where
         .await?;
         info!(
             records,
-            downloaded_bytes,
-            decoded_bytes,
-            "ingestion completed"
+            downloaded_bytes, decoded_bytes, "ingestion completed"
         );
         Ok(IngestResult {
             snapshot_id,
@@ -600,11 +618,7 @@ where
     ) -> Result<(), IngestError> {
         debug!(
             phase,
-            downloaded_bytes,
-            decoded_bytes,
-            records_seen,
-            records_prepared,
-            "ingestion checkpoint"
+            downloaded_bytes, decoded_bytes, records_seen, records_prepared, "ingestion checkpoint"
         );
         self.control
             .checkpoint(&IngestProgress {
@@ -640,13 +654,20 @@ fn streaming_parse<P: EndpointProtector>(
             let mut callback_error = None;
             let mut stable_keys = HashMap::new();
             let summary = parse_m3u_visit(BufReader::new(reader), limits, |entry| {
-                if let Err(error) = stage_m3u_entry(&mut snapshot, entry, protector, &mut stable_keys) {
+                if let Err(error) =
+                    stage_m3u_entry(&mut snapshot, entry, protector, &mut stable_keys)
+                {
                     callback_error = Some(error);
-                    return Err(ParseError::Io(std::io::Error::other("M3U staging visitor failed")));
+                    return Err(ParseError::Io(std::io::Error::other(
+                        "M3U staging visitor failed",
+                    )));
                 }
                 let count = records_counter.fetch_add(1, Ordering::Relaxed) + 1;
                 if count.is_multiple_of(1000) {
-                    debug!(records_staged = count, "streaming_parse: M3U staging progress");
+                    debug!(
+                        records_staged = count,
+                        "streaming_parse: M3U staging progress"
+                    );
                 }
                 Ok(())
             });
@@ -656,7 +677,10 @@ fn streaming_parse<P: EndpointProtector>(
                     return Err(callback_error.expect("checked callback error"));
                 }
                 Err(source) => {
-                    return Err(IngestError::Parse { format: "M3U", source });
+                    return Err(IngestError::Parse {
+                        format: "M3U",
+                        source,
+                    });
                 }
             };
             snapshot.diagnostic_count = summary.stats.warnings + summary.stats.errors;
@@ -685,7 +709,10 @@ fn streaming_parse<P: EndpointProtector>(
                         )));
                     }
                     let channel_id = state.channel_id(&programme.channel_id);
-                    if let Err(error) = state.programmes.push(prepared_programme(programme, channel_id)) {
+                    if let Err(error) = state
+                        .programmes
+                        .push(prepared_programme(programme, channel_id))
+                    {
                         state.error = Some(error);
                         return Err(ParseError::Io(std::io::Error::other(
                             "XMLTV staging visitor failed",
@@ -702,13 +729,18 @@ fn streaming_parse<P: EndpointProtector>(
                     return Err(state.error.take().expect("checked callback error"));
                 }
                 Err(source) => {
-                    return Err(IngestError::Parse { format: "XMLTV", source });
+                    return Err(IngestError::Parse {
+                        format: "XMLTV",
+                        source,
+                    });
                 }
             };
             let channels = std::mem::take(&mut state.channels);
             for channel in channels {
                 let id = state.channel_id(&channel.id);
-                snapshot.epg_channels.push(prepared_epg_channel(channel, id))?;
+                snapshot
+                    .epg_channels
+                    .push(prepared_epg_channel(channel, id))?;
             }
             for (xmltv_id, id) in state.ids {
                 if !state.declared.contains_key(&xmltv_id) {
@@ -1060,7 +1092,12 @@ fn finalize_snapshot(snapshot: &mut PreparedSnapshot) -> Result<(), IngestError>
 }
 
 #[allow(clippy::too_many_lines)]
-fn prepare_snapshot<P: EndpointProtector>(
+/// Prepares one bounded snapshot before activation.
+///
+/// Call this after all source responses pass validation. The caller must
+/// activate the returned snapshot in one transaction.
+#[allow(clippy::missing_errors_doc)]
+pub fn prepare_snapshot<P: EndpointProtector>(
     request: &IngestRequest,
     parsed: ParsedArtifact,
     checksum_sha256: String,
@@ -1186,16 +1223,23 @@ fn prepare_snapshot<P: EndpointProtector>(
                     .xtream_stream_endpoint
                     .as_ref()
                     .ok_or(IngestError::InvalidRequest(
-                        "Xtream live streams require a protected stream template",
+                        "Xtream live streams require a stream endpoint template",
                     ))?;
-            validate_public_template(&template.template)?;
             for stream in document.records {
+                let endpoint = protector.protect(&template.url_for(stream.stream_id)?)?;
+                let group_name = stream.category_id.as_ref().map(|category_id| {
+                    request
+                        .xtream_category_names
+                        .get(category_id)
+                        .cloned()
+                        .unwrap_or_else(|| category_id.clone())
+                });
                 snapshot.provider_streams.push(PreparedProviderStream {
                     id: Uuid::now_v7(),
                     stable_key: format!("xtream:{}", stream.stream_id),
                     provider_stream_id: Some(stream.stream_id.to_string()),
                     name: stream.name,
-                    group_name: stream.category_id,
+                    group_name,
                     tvg_id: stream.epg_channel_id,
                     tvg_name: None,
                     logo_url: stream
@@ -1203,12 +1247,7 @@ fn prepare_snapshot<P: EndpointProtector>(
                         .as_ref()
                         .and_then(|url| safe_public_url(url.as_str())),
                     channel_number: stream.channel_number.map(|value| value.to_string()),
-                    endpoint: ProtectedEndpoint {
-                        template: template
-                            .template
-                            .replace("{stream_id}", &stream.stream_id.to_string()),
-                        secret_ciphertext: template.secret_ciphertext.clone(),
-                    },
+                    endpoint,
                     attributes: sanitize_json(Value::Object(
                         stream.metadata.into_iter().collect::<Map<_, _>>(),
                     )),
@@ -1422,20 +1461,6 @@ fn sanitize_json(value: Value) -> Value {
     }
 }
 
-fn validate_public_template(template: &str) -> Result<(), IngestError> {
-    if !template.contains("{stream_id}") {
-        return Err(IngestError::InvalidRequest(
-            "Xtream stream template lacks {stream_id}",
-        ));
-    }
-    let candidate = template.replace("{stream_id}", "1");
-    let url = Url::parse(&candidate).map_err(|_| IngestError::EndpointProtection)?;
-    if has_url_credentials(&url) {
-        return Err(IngestError::EndpointProtection);
-    }
-    Ok(())
-}
-
 fn diagnostics_json(diagnostics: &[Diagnostic]) -> Value {
     Value::Array(
         diagnostics
@@ -1455,7 +1480,7 @@ fn diagnostics_json(diagnostics: &[Diagnostic]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ArtifactLimits, DownloadedArtifact, XtreamPayloadKind};
+    use crate::{ArtifactLimits, DownloadedArtifact, XtreamEndpoints, XtreamPayloadKind};
     use chrono::TimeZone;
     use std::{io::Write, sync::Mutex};
 
@@ -1535,9 +1560,7 @@ mod tests {
     fn request(format: IngestFormat) -> IngestRequest {
         IngestRequest {
             owner: match format {
-                IngestFormat::Xmltv | IngestFormat::Xtream(XtreamPayloadKind::ShortEpg) => {
-                    SnapshotOwner::EpgSource(Uuid::now_v7())
-                }
+                IngestFormat::Xmltv => SnapshotOwner::EpgSource(Uuid::now_v7()),
                 _ => SnapshotOwner::ProviderAccount(Uuid::now_v7()),
             },
             format,
@@ -1546,6 +1569,7 @@ mod tests {
             ),
             source_timezone: "UTC".to_owned(),
             xtream_stream_endpoint: None,
+            xtream_category_names: HashMap::new(),
         }
     }
 
@@ -1692,22 +1716,13 @@ mod tests {
     }
 
     #[test]
-    fn xtream_template_must_be_public_and_contain_stream_id() {
-        assert!(validate_public_template("https://example.test/live/{stream_id}.ts").is_ok());
-        assert!(validate_public_template("https://example.test/live/static.ts").is_err());
-        assert!(
-            validate_public_template("https://alice:secret@example.test/live/{stream_id}.ts")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn request_debug_redacts_download_and_encrypted_template() {
+    fn request_debug_redacts_download_and_xtream_template() {
         let mut request = request(IngestFormat::Xtream(XtreamPayloadKind::LiveStreams));
-        request.xtream_stream_endpoint = Some(ProtectedEndpoint {
-            template: "https://example.test/live/{stream_id}".into(),
-            secret_ciphertext: Some(b"top-secret".to_vec()),
-        });
+        let endpoints = XtreamEndpoints::from_player_api_url(
+            "https://example.test/player_api.php?username=user&password=top-secret",
+        )
+        .expect("Xtream endpoints");
+        request.xtream_stream_endpoint = Some(endpoints.into_stream_template());
         let debug = format!("{request:?}");
         assert!(!debug.contains("password"));
         assert!(!debug.contains("top-secret"));
@@ -1716,10 +1731,14 @@ mod tests {
     fn xtream_request(kind: XtreamPayloadKind) -> IngestRequest {
         let mut request = request(IngestFormat::Xtream(kind));
         if kind == XtreamPayloadKind::LiveStreams {
-            request.xtream_stream_endpoint = Some(ProtectedEndpoint {
-                template: "https://example.test/live/{stream_id}.ts".into(),
-                secret_ciphertext: Some(b"secret".to_vec()),
-            });
+            let endpoints = XtreamEndpoints::from_player_api_url(
+                "https://example.test/player_api.php?username=user&password=secret",
+            )
+            .expect("Xtream endpoints");
+            request.xtream_stream_endpoint = Some(endpoints.into_stream_template());
+            request
+                .xtream_category_names
+                .insert("1".to_owned(), "News".to_owned());
         }
         request
     }
@@ -1842,6 +1861,43 @@ mod tests {
         assert_eq!(result.records, 1);
         let keys = ingestor.store.stable_keys.lock().expect("lock");
         assert_eq!(keys.as_slice(), ["xtream:7"]);
+    }
+
+    #[test]
+    fn xtream_stream_preparation_maps_categories_and_protects_each_url() {
+        let payload = br#"[{"stream_id":7,"name":"First","category_id":"1"},{"stream_id":8,"name":"Second","category_id":"unknown"}]"#;
+        let decoded =
+            unpack_artifact(downloaded(payload), ArtifactLimits::default()).expect("decode");
+        let parsed = parse_artifact(
+            &decoded,
+            IngestFormat::Xtream(XtreamPayloadKind::LiveStreams),
+            ParseLimits::default(),
+        )
+        .expect("Xtream stream parse");
+        let request = xtream_request(XtreamPayloadKind::LiveStreams);
+        let snapshot = prepare_snapshot(
+            &request,
+            parsed,
+            "checksum".to_owned(),
+            payload.len() as u64,
+            &TestProtector,
+        )
+        .expect("Xtream stream snapshot");
+        let streams = snapshot
+            .provider_streams
+            .batches(10)
+            .expect("stream batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stream rows")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(streams[0].group_name.as_deref(), Some("News"));
+        assert_eq!(streams[1].group_name.as_deref(), Some("unknown"));
+        assert_ne!(
+            streams[0].endpoint.secret_ciphertext,
+            streams[1].endpoint.secret_ciphertext
+        );
     }
 
     #[tokio::test]
