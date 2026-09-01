@@ -1,6 +1,14 @@
-# IPTV Gateway Implementation Status
+# Archived IPTV Gateway Implementation Status
 
-Last update: 2026-09-01 (complete Rust coverage)
+Archived: 2026-09-01
+
+Kaneo is the authoritative project and task tracker.
+
+Use the `iptv-relay` Kaneo project for current verification records.
+
+Do not update this file.
+
+This file preserves the status history that was migrated into Kaneo.
 
 ## Ingest store coverage
 

@@ -478,7 +478,7 @@ mkdocs serve
 
 Open the local site at `http://127.0.0.1:8000`.
 
-See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for verified feature status.
+Use the `iptv-relay` Kaneo project for current tasks and verified feature status.
 
 ## License
 

@@ -523,10 +523,11 @@ data for media servers like Jellyfin:
 The project has these documentation files:
 
 - `README.md` — Project overview and quick start.
-- `AGENTS.md` — Agent instructions and language rules.
-- `IMPLEMENTATION_STATUS.md` — Verified implementation status. Update this
-  file after each verified test or confirmed failure.
+- `AGENTS.md` — Agent instructions, Kaneo workflow, and language rules.
+- Kaneo `iptv-relay` — Authoritative tasks, decisions, and verification records.
 - `IPTV_End_to_End_Field_Guide.md` — Agent-readable research reference.
+- `IMPLEMENTATION_PLAN.md` — Archived migration record.
+- `IMPLEMENTATION_STATUS.md` — Archived migration record.
 
 ## Rules
 
@@ -550,13 +551,15 @@ Follow the instructions in AGENTS.md for all documentation:
 - Use vertical lists for complex information.
 - Use consistent punctuation and capitalization.
 
-## Status documentation rules
+## Kaneo record rules
 
-When you update `IMPLEMENTATION_STATUS.md`:
+When you complete verification:
 
-- Do not list an item as working without test evidence.
-- Do not put credentials, secret URLs, or tokens in the status file.
-- Keep documentation concise and technical.
+- Add the result to the active Kaneo task.
+- Include the exact test command and result.
+- Do not claim success without test evidence.
+- Do not put credentials, secret URLs, or tokens in Kaneo.
+- Do not update the archived implementation files.
 
 ## Workflow
 

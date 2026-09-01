@@ -1,30 +1,16 @@
-# IPTV Gateway Implementation Plan
+# Archived IPTV Gateway Implementation Plan
 
-Updated: 2026-09-01
+Archived: 2026-09-01
 
-## Purpose
+Kaneo is the authoritative project and task tracker.
 
-This file defines the remaining work for IPTV Gateway v1.
+Use the `iptv-relay` Kaneo project for all current work.
 
-Use `IMPLEMENTATION_STATUS.md` as the test record.
+Do not update this file.
 
-Do not mark an item complete without current test evidence.
+This file preserves the plan state that was migrated into Kaneo.
 
-Do not put credentials, secret URLs, or tokens in either file.
-
-## Work Rules
-
-1. Select the first unassigned item in the highest priority section.
-2. Record the owner before you change shared code.
-3. Preserve all unrelated changes from other workers.
-4. Add tests with each production change.
-5. Keep Rust and TypeScript coverage at 86 percent or more.
-6. Keep changed production line coverage at 95 percent or more.
-7. Run focused tests before broad tests.
-8. Update `IMPLEMENTATION_STATUS.md` after each verified test or confirmed failure.
-9. Update this file when an item changes state or priority.
-10. Use ASD-STE100 Issue 9 for all technical documentation.
-11. Do not add DVR, VOD, catch-up, timeshift, or transcoding work to v1.
+Do not put credentials, secret URLs, or tokens in project records.
 
 ## Verified Baseline
 

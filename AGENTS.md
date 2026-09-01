@@ -28,13 +28,44 @@ Use the official Issue 9 standard as the authority:
 
 - <https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf>
 
-## Status records
+## Kaneo project tracking
 
-Update `IMPLEMENTATION_STATUS.md` after each verified test or confirmed failure.
+Kaneo is the authoritative project and task tracker for this repository.
 
-Do not list an item as working without test evidence.
+Use the `iptv-relay` Kaneo project.
 
-Do not put credentials, secret URLs, or tokens in the status file.
+Before substantial work:
+
+1. Search Kaneo for an existing task that describes the work.
+2. Use the existing task when it has the correct scope.
+3. Create a task when no appropriate task exists.
+4. Give each new task a clear problem statement and expected outcome.
+5. Move the task to `In Progress` when implementation starts.
+
+During work:
+
+- Add comments for discoveries, decisions, blockers, and scope changes.
+- Keep the task description and status aligned with the actual work.
+- Link related tasks when appropriate.
+- Do not mark a task `Done` because code exists.
+
+When work finishes:
+
+1. Verify the requested behavior.
+2. Add a concise completion comment.
+3. State what changed and how verification passed.
+4. Move the task to `Done` only after validation succeeds.
+5. Document outstanding work and keep the task in the correct nonfinal stage.
+
+Never invent Kaneo task IDs, project IDs, user IDs, or status names.
+
+Query Kaneo before you use those values.
+
+Do not use `IMPLEMENTATION_PLAN.md` or `IMPLEMENTATION_STATUS.md` as active trackers.
+
+Treat both files as archived migration records.
+
+Do not put credentials, secret URLs, or tokens in Kaneo.
 
 ## Git commits
 
