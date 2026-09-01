@@ -29,6 +29,7 @@ use crate::{
 };
 
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_VIEWER_BATCH_PACKETS: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const MAX_PRIMING_PACKETS: usize = 16_384;
 
@@ -184,6 +185,7 @@ pub struct HttpTsSourceSpec {
     process_input_format: BrokeredInputFormat,
     ring: MpegTsRingConfig,
     startup_timeout: Duration,
+    read_timeout: Duration,
     viewer_batch_packets: NonZeroUsize,
     recovery: RecoveryPolicy,
 }
@@ -199,6 +201,7 @@ impl fmt::Debug for HttpTsSourceSpec {
             .field("process_input_format", &self.process_input_format)
             .field("ring", &self.ring)
             .field("startup_timeout", &self.startup_timeout)
+            .field("read_timeout", &self.read_timeout)
             .field("viewer_batch_packets", &self.viewer_batch_packets)
             .field("recovery", &self.recovery)
             .finish()
@@ -214,6 +217,7 @@ impl HttpTsSourceSpec {
             process_input_format: BrokeredInputFormat::DirectMpegTs,
             ring,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+            read_timeout: DEFAULT_READ_TIMEOUT,
             viewer_batch_packets: DEFAULT_VIEWER_BATCH_PACKETS,
             recovery: RecoveryPolicy::default(),
         }
@@ -255,6 +259,10 @@ impl HttpTsSourceSpec {
         self.startup_timeout = timeout;
     }
 
+    pub fn set_read_timeout(&mut self, timeout: Duration) {
+        self.read_timeout = timeout;
+    }
+
     pub fn set_viewer_batch_packets(&mut self, packets: NonZeroUsize) {
         self.viewer_batch_packets = packets;
     }
@@ -272,6 +280,7 @@ impl PartialEq for HttpTsSourceSpec {
             && self.process_input_format == other.process_input_format
             && self.ring == other.ring
             && self.startup_timeout == other.startup_timeout
+            && self.read_timeout == other.read_timeout
             && self.viewer_batch_packets == other.viewer_batch_packets
             && self.recovery == other.recovery
     }
@@ -663,6 +672,7 @@ async fn start_native_http_ts_session(
         diagnostics: Arc::clone(&diagnostics),
         recovery: source.recovery,
         startup_timeout: source.startup_timeout,
+        read_timeout: source.read_timeout,
     };
     let task = tokio::spawn(pump_http_ts(response, ring.clone(), lease, pump_config));
     let abort_handle = task.abort_handle();
@@ -782,6 +792,7 @@ async fn pump_http_ts(
         diagnostics,
         recovery,
         startup_timeout,
+        read_timeout,
     } = config;
     let mut resources = PumpResources {
         body: Some(Box::pin(response.bytes_stream())),
@@ -815,6 +826,7 @@ async fn pump_http_ts(
                     &ring,
                     &diagnostics,
                     &mut packetizer,
+                    read_timeout,
                 )
                 .await
             }
@@ -861,6 +873,7 @@ async fn pump_http_ts(
             &ring,
             &diagnostics,
             &mut packetizer,
+            read_timeout,
         )
         .await;
     }
@@ -875,6 +888,7 @@ struct HttpPumpConfig {
     diagnostics: Arc<SessionDiagnostics>,
     recovery: RecoveryPolicy,
     startup_timeout: Duration,
+    read_timeout: Duration,
 }
 
 struct RecoveredStream {
@@ -1011,6 +1025,11 @@ async fn recover_session(
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
+        // Push one null packet before the keepalive task stops. This guarantees
+        // that at least one null packet reaches faulted viewers even when the
+        // keepalive interval has not ticked before recovery completes.
+        push_final_keepalive_null(ring, diagnostics);
+
         keepalive.stop().await;
         let generation = ring.start_new_generation().ok()?;
         diagnostics.set_generation(generation);
@@ -1098,10 +1117,11 @@ async fn stream_until_failure(
     ring: &MpegTsRing,
     diagnostics: &SessionDiagnostics,
     packetizer: &mut MpegTsPacketizer,
+    read_timeout: Duration,
 ) -> SessionFailureKind {
     loop {
-        match body.next().await {
-            Some(Ok(chunk)) => match packetizer.push(&chunk) {
+        match tokio::time::timeout(read_timeout, body.next()).await {
+            Ok(Some(Ok(chunk))) => match packetizer.push(&chunk) {
                 Ok(packets) => {
                     if push_packets(ring, diagnostics, &packets).is_err() {
                         return SessionFailureKind::Packetization;
@@ -1109,8 +1129,8 @@ async fn stream_until_failure(
                 }
                 Err(_) => return SessionFailureKind::Packetization,
             },
-            Some(Err(_)) => return SessionFailureKind::Http,
-            None => {
+            Ok(Some(Err(_))) | Err(_) => return SessionFailureKind::Http,
+            Ok(None) => {
                 return if packetizer.pending_bytes() == 0 {
                     SessionFailureKind::UpstreamEnded
                 } else {
@@ -1189,6 +1209,15 @@ fn null_packet(continuity_counter: u8) -> [u8; MPEG_TS_PACKET_SIZE] {
     packet[2] = 0xff;
     packet[3] = 0x10 | (continuity_counter & 0x0f);
     packet
+}
+
+/// Pushes one null packet so faulted viewers receive a keepalive before the
+/// recovery keepalive task stops.
+fn push_final_keepalive_null(ring: &MpegTsRing, diagnostics: &SessionDiagnostics) {
+    let packet = null_packet(0);
+    if ring.push(&packet).is_ok() {
+        diagnostics.record_write(0);
+    }
 }
 
 /// One viewer's independent cursor and strong reference to a shared session.
@@ -1346,7 +1375,7 @@ impl Stream for ViewerByteStream {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::psi::test_support::{TEST_VIDEO_PID, pat_packet, pmt_packet};
+    use crate::psi::test_support::{TEST_PMT_PID, TEST_VIDEO_PID, pat_packet, pmt_packet};
 
     use super::*;
 
@@ -2005,6 +2034,7 @@ mod tests {
                 &ring,
                 &diagnostics,
                 &mut MpegTsPacketizer::new(),
+                Duration::from_secs(1),
             )
             .await,
             SessionFailureKind::Packetization
@@ -2021,6 +2051,7 @@ mod tests {
                 &closed,
                 &diagnostics,
                 &mut MpegTsPacketizer::new(),
+                Duration::from_secs(1),
             )
             .await,
             SessionFailureKind::Packetization
@@ -2728,6 +2759,1553 @@ mod tests {
         assert!(state.requests.load(Ordering::SeqCst) > 1);
 
         drop(stream);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn six_viewers_share_one_single_flight_reconnect_and_all_resume() {
+        const VIEWER_COUNT: usize = 6;
+        use std::{
+            collections::HashMap,
+            convert::Infallible,
+            sync::{Arc, Mutex},
+        };
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::{Path, State},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, sync::Notify, time::timeout};
+
+        #[derive(Clone)]
+        struct RecoveryState {
+            requests: Arc<Mutex<HashMap<String, usize>>>,
+            end_primary: Arc<Notify>,
+        }
+
+        async fn upstream(Path(source): Path<String>, State(state): State<RecoveryState>) -> Body {
+            *state
+                .requests
+                .lock()
+                .unwrap()
+                .entry(source.clone())
+                .or_default() += 1;
+            let base = match source.as_str() {
+                "primary" => 1,
+                "alternate" => 100,
+                _ => unreachable!(),
+            };
+            let stream = async_stream::stream! {
+                yield Ok::<_, Infallible>(labelled_generation(base));
+                if source == "primary" {
+                    state.end_primary.notified().await;
+                    return;
+                }
+                let mut next = base + 2;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    yield Ok::<_, Infallible>(labelled_generation(next));
+                    next = next.saturating_add(2);
+                }
+            };
+            Body::from_stream(stream)
+        }
+
+        async fn next_media(stream: &mut ViewerByteStream) -> Bytes {
+            loop {
+                let bytes = timeout(Duration::from_secs(2), stream.next())
+                    .await
+                    .expect("viewer must remain live during coordinated recovery")
+                    .expect("viewer stream must remain open")
+                    .expect("recovery must not surface an error");
+                if !bytes
+                    .chunks_exact(MPEG_TS_PACKET_SIZE)
+                    .all(|packet| packet_pid(packet) == 0x1fff)
+                {
+                    return bytes;
+                }
+            }
+        }
+
+        let state = RecoveryState {
+            requests: Arc::new(Mutex::new(HashMap::new())),
+            end_primary: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/{source}", get(upstream))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 2));
+        manager.configure_provider(ProviderSpec::new("alternate-provider", 1));
+        let recovery = RecoveryPolicy::new(
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let mut flaky = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "flaky-six", 1),
+            format!("http://{address}/primary?token=primary-secret"),
+            MpegTsRingConfig::new(32, 32).unwrap(),
+        );
+        flaky.add_alternate(HttpTsEndpoint::for_provider(
+            "alternate-provider",
+            format!("http://{address}/alternate?token=alternate-secret"),
+        ));
+        flaky.set_recovery_policy(recovery);
+
+        let anchor = manager.open(flaky.clone()).await.unwrap();
+        let anchor_lease = anchor.lease_id();
+        let mut viewers: Vec<ViewerByteStream> = Vec::with_capacity(VIEWER_COUNT);
+        viewers.push(anchor.into_byte_stream());
+        for _ in 1..VIEWER_COUNT {
+            let extra = manager.open(flaky.clone()).await.unwrap();
+            assert_eq!(extra.lease_id(), anchor_lease);
+            viewers.push(extra.into_byte_stream());
+        }
+
+        for viewer in &mut viewers {
+            let initial = next_media(viewer).await;
+            assert!(
+                media_labels(&initial).iter().all(|label| *label < 100),
+                "all viewers must start on the primary generation"
+            );
+        }
+        assert_eq!(
+            manager
+                .list_snapshots()
+                .into_iter()
+                .next()
+                .unwrap()
+                .viewer_count,
+            VIEWER_COUNT
+        );
+
+        state.end_primary.notify_waiters();
+        for viewer in &mut viewers {
+            let resumed = next_media(viewer).await;
+            assert_eq!(packet_pid(&resumed[..MPEG_TS_PACKET_SIZE]), 0);
+            assert!(
+                media_labels(&resumed).iter().all(|label| *label >= 100),
+                "all viewers must resume on the alternate generation"
+            );
+        }
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = manager
+                    .list_snapshots()
+                    .into_iter()
+                    .next()
+                    .expect("the shared session must remain live");
+                if snapshot.state == SessionState::Streaming && snapshot.upstream_generation == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the single pump must recover for all six viewers");
+
+        let snapshot = manager
+            .list_snapshots()
+            .into_iter()
+            .next()
+            .expect("the shared session must remain live");
+        assert_eq!(snapshot.viewer_count, VIEWER_COUNT);
+        assert_eq!(
+            snapshot.reconnect_attempts, 1,
+            "one pump serves all viewers as a single flight"
+        );
+        assert_eq!(snapshot.failover_attempts, 1);
+        assert_eq!(snapshot.failure_count, 1);
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.get("primary"), Some(&1));
+        assert_eq!(requests.get("alternate"), Some(&1));
+        drop(requests);
+
+        drop(viewers);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn same_pool_failover_retains_one_lease_and_recovers() {
+        use std::{
+            collections::HashMap,
+            convert::Infallible,
+            sync::{Arc, Mutex},
+        };
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::{Path, State},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, sync::Notify, time::timeout};
+
+        #[derive(Clone)]
+        struct RecoveryState {
+            requests: Arc<Mutex<HashMap<String, usize>>>,
+            end_primary: Arc<Notify>,
+        }
+
+        async fn upstream(Path(source): Path<String>, State(state): State<RecoveryState>) -> Body {
+            *state
+                .requests
+                .lock()
+                .unwrap()
+                .entry(source.clone())
+                .or_default() += 1;
+            let base = match source.as_str() {
+                "primary" => 1,
+                "alternate" => 100,
+                _ => unreachable!(),
+            };
+            let stream = async_stream::stream! {
+                yield Ok::<_, Infallible>(labelled_generation(base));
+                if source == "primary" {
+                    state.end_primary.notified().await;
+                    return;
+                }
+                let mut next = base + 2;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    yield Ok::<_, Infallible>(labelled_generation(next));
+                    next = next.saturating_add(2);
+                }
+            };
+            Body::from_stream(stream)
+        }
+
+        async fn next_media(stream: &mut ViewerByteStream) -> Bytes {
+            loop {
+                let bytes = timeout(Duration::from_secs(2), stream.next())
+                    .await
+                    .expect("viewer must remain live during same-pool recovery")
+                    .expect("viewer stream must remain open")
+                    .expect("same-pool recovery must not surface an error");
+                if !bytes
+                    .chunks_exact(MPEG_TS_PACKET_SIZE)
+                    .all(|packet| packet_pid(packet) == 0x1fff)
+                {
+                    return bytes;
+                }
+            }
+        }
+
+        let state = RecoveryState {
+            requests: Arc::new(Mutex::new(HashMap::new())),
+            end_primary: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/{source}", get(upstream))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("shared-pool", 2));
+        let recovery = RecoveryPolicy::new(
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("shared-pool", "same-pool-flaky", 1),
+            format!("http://{address}/primary?token=primary-secret"),
+            MpegTsRingConfig::new(32, 32).unwrap(),
+        );
+        // The alternate endpoint omits an explicit pool, so it inherits the
+        // source key pool. Both endpoints share one provider lease.
+        source.add_alternate(HttpTsEndpoint::new(format!(
+            "http://{address}/alternate?token=alternate-secret"
+        )));
+        source.set_recovery_policy(recovery);
+
+        let first = manager.open(source.clone()).await.unwrap();
+        let second = manager.open(source).await.unwrap();
+        assert_eq!(first.lease_id(), second.lease_id());
+        assert_eq!(
+            manager
+                .provider_snapshot("shared-pool")
+                .unwrap()
+                .active_sessions,
+            1
+        );
+
+        let mut first = first.into_byte_stream();
+        let mut second = second.into_byte_stream();
+        let initial = next_media(&mut first).await;
+        let _ = next_media(&mut second).await;
+        assert!(media_labels(&initial).iter().all(|label| *label < 100));
+
+        state.end_primary.notify_waiters();
+        let resumed = next_media(&mut first).await;
+        let _ = next_media(&mut second).await;
+        assert!(
+            media_labels(&resumed).iter().all(|label| *label >= 100),
+            "same-pool failover must resume from the alternate endpoint"
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = manager
+                    .list_snapshots()
+                    .into_iter()
+                    .next()
+                    .expect("the shared session must remain live");
+                if snapshot.state == SessionState::Streaming && snapshot.upstream_generation == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same-pool failover must recover");
+
+        let snapshot = manager
+            .list_snapshots()
+            .into_iter()
+            .next()
+            .expect("the shared session must remain live");
+        assert_eq!(snapshot.failover_attempts, 1);
+        assert_eq!(snapshot.reconnect_attempts, 1);
+        let pool = manager.provider_snapshot("shared-pool").unwrap();
+        assert_eq!(
+            pool.active_sessions, 1,
+            "same-pool failover must not acquire a second lease"
+        );
+        assert_eq!(pool.high_watermark, 1);
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.get("primary"), Some(&1));
+        assert_eq!(requests.get("alternate"), Some(&1));
+        drop(requests);
+
+        drop(first);
+        drop(second);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn provider_capacity_during_recovery_retries_and_recovers_via_primary() {
+        use std::{
+            collections::HashMap,
+            convert::Infallible,
+            sync::{Arc, Mutex},
+        };
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::{Path, State},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, sync::Notify, time::timeout};
+
+        #[derive(Clone)]
+        struct RecoveryState {
+            requests: Arc<Mutex<HashMap<String, usize>>>,
+            end_primary: Arc<Notify>,
+        }
+
+        async fn upstream(Path(source): Path<String>, State(state): State<RecoveryState>) -> Body {
+            let request_number = {
+                let mut requests = state.requests.lock().unwrap();
+                let count = requests.entry(source.clone()).or_default();
+                *count += 1;
+                *count
+            };
+            let base = match source.as_str() {
+                "primary" if request_number == 1 => 1,
+                "primary" => 5,
+                "alternate" => 100,
+                "occupier" => 200,
+                _ => unreachable!(),
+            };
+            let stream = async_stream::stream! {
+                yield Ok::<_, Infallible>(labelled_generation(base));
+                if source == "primary" && request_number == 1 {
+                    state.end_primary.notified().await;
+                    return;
+                }
+                let mut next = base + 2;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    yield Ok::<_, Infallible>(labelled_generation(next));
+                    next = next.saturating_add(2);
+                }
+            };
+            Body::from_stream(stream)
+        }
+
+        async fn next_media(stream: &mut ViewerByteStream) -> Bytes {
+            loop {
+                let bytes = timeout(Duration::from_secs(2), stream.next())
+                    .await
+                    .expect("viewer must remain live during capacity-constrained recovery")
+                    .expect("viewer stream must remain open")
+                    .expect("recovery must not surface an error");
+                if !bytes
+                    .chunks_exact(MPEG_TS_PACKET_SIZE)
+                    .all(|packet| packet_pid(packet) == 0x1fff)
+                {
+                    return bytes;
+                }
+            }
+        }
+
+        let state = RecoveryState {
+            requests: Arc::new(Mutex::new(HashMap::new())),
+            end_primary: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/{source}", get(upstream))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("primary-pool", 1));
+        manager.configure_provider(ProviderSpec::new("alternate-pool", 1));
+
+        // Occupy the alternate pool so recovery cannot acquire a second lease.
+        let occupier = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("alternate-pool", "occupier", 1),
+            format!("http://{address}/occupier"),
+            MpegTsRingConfig::new(32, 32).unwrap(),
+        );
+        let occupier_viewer = manager.open(occupier).await.unwrap();
+        assert_eq!(
+            manager
+                .provider_snapshot("alternate-pool")
+                .unwrap()
+                .active_sessions,
+            1
+        );
+
+        let recovery = RecoveryPolicy::new(
+            Duration::from_millis(800),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let mut flaky = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("primary-pool", "capacity-flaky", 1),
+            format!("http://{address}/primary?token=primary-secret"),
+            MpegTsRingConfig::new(32, 32).unwrap(),
+        );
+        flaky.add_alternate(HttpTsEndpoint::for_provider(
+            "alternate-pool",
+            format!("http://{address}/alternate?token=alternate-secret"),
+        ));
+        flaky.set_recovery_policy(recovery);
+
+        let first = manager.open(flaky.clone()).await.unwrap();
+        let second = manager.open(flaky).await.unwrap();
+        let mut first = first.into_byte_stream();
+        let mut second = second.into_byte_stream();
+        let initial = next_media(&mut first).await;
+        let _ = next_media(&mut second).await;
+        assert!(media_labels(&initial).iter().all(|label| *label < 5));
+
+        state.end_primary.notify_waiters();
+        let resumed = next_media(&mut first).await;
+        let _ = next_media(&mut second).await;
+        assert!(
+            media_labels(&resumed)
+                .iter()
+                .all(|label| *label >= 5 && *label < 100),
+            "recovery must resume from the primary after the alternate pool rejected capacity"
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = manager
+                    .list_snapshots()
+                    .into_iter()
+                    .find(|snapshot| snapshot.key.source_id.as_ref() == "capacity-flaky")
+                    .expect("the flaky session must remain live");
+                if snapshot.state == SessionState::Streaming {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("recovery must succeed after capacity rejection");
+
+        let snapshot = manager
+            .list_snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.key.source_id.as_ref() == "capacity-flaky")
+            .expect("the flaky session must remain live");
+        assert!(
+            snapshot.reconnect_attempts >= 2,
+            "recovery must retry after the alternate pool rejects capacity"
+        );
+        let alternate_pool = manager.provider_snapshot("alternate-pool").unwrap();
+        assert_eq!(alternate_pool.active_sessions, 1);
+        assert_eq!(alternate_pool.high_watermark, 1);
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(
+            requests.get("primary"),
+            Some(&2),
+            "the primary must serve the initial and recovery requests"
+        );
+        assert_eq!(
+            requests.get("alternate"),
+            None,
+            "capacity rejection must prevent any alternate HTTP request"
+        );
+        drop(requests);
+
+        drop(first);
+        drop(second);
+        drop(occupier_viewer);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn recovery_response_timeout_expires_with_typed_http_failures() {
+        use std::convert::Infallible;
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::State,
+            response::{IntoResponse, Response},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, sync::Notify, time::timeout};
+
+        #[derive(Clone)]
+        struct TimeoutState {
+            requests: Arc<AtomicUsize>,
+            end_initial: Arc<Notify>,
+        }
+
+        async fn upstream(State(state): State<TimeoutState>) -> Response {
+            let request = state.requests.fetch_add(1, Ordering::SeqCst);
+            if request == 0 {
+                let stream = async_stream::stream! {
+                    yield Ok::<_, Infallible>(labelled_generation(1));
+                    state.end_initial.notified().await;
+                };
+                return Body::from_stream(stream).into_response();
+            }
+            // Recovery requests never respond; they exceed the startup timeout.
+            std::future::pending::<Response>().await
+        }
+
+        let state = TimeoutState {
+            requests: Arc::new(AtomicUsize::new(0)),
+            end_initial: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/live", get(upstream))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "hangs", 1),
+            format!("http://{address}/live?token=provider-secret"),
+            MpegTsRingConfig::new(32, 32).unwrap(),
+        );
+        source.set_startup_timeout(Duration::from_millis(40));
+        source.set_recovery_policy(
+            RecoveryPolicy::new(
+                Duration::from_millis(300),
+                Duration::from_millis(5),
+                Duration::from_millis(20),
+                Duration::from_millis(30),
+            )
+            .unwrap(),
+        );
+        let viewer = manager.open(source).await.unwrap();
+        let mut stream = viewer.into_byte_stream();
+        let initial = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet_pid(&initial[..MPEG_TS_PACKET_SIZE]), 0);
+        state.end_initial.notify_waiters();
+
+        let attempts = timeout(Duration::from_secs(2), async {
+            loop {
+                match stream.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(ViewerStreamError::RecoveryExpired { attempts })) => break attempts,
+                    event => panic!("unexpected recovery-timeout event: {event:?}"),
+                }
+            }
+        })
+        .await
+        .expect("bounded recovery must expire when responses hang");
+
+        let snapshot = manager
+            .list_snapshots()
+            .into_iter()
+            .next()
+            .expect("the session must remain observable until expiry");
+        assert_eq!(snapshot.state, SessionState::Failed);
+        assert_eq!(
+            snapshot.last_failure,
+            Some(SessionFailureKind::RecoveryExpired)
+        );
+        assert_eq!(snapshot.reconnect_attempts, attempts);
+        assert!(
+            snapshot.failure_count >= 2,
+            "the initial failure and at least one timeout must be recorded"
+        );
+        assert!(
+            state.requests.load(Ordering::SeqCst) > 1,
+            "recovery must attempt more than one request before expiry"
+        );
+        assert!(!format!("{snapshot:?}").contains("provider-secret"));
+
+        drop(stream);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn keepalive_null_packets_respect_the_configured_interval() {
+        use std::convert::Infallible;
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::State,
+            response::{IntoResponse, Response},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, sync::Notify, time::timeout};
+
+        #[derive(Clone)]
+        struct KeepaliveState {
+            requests: Arc<AtomicUsize>,
+            end_initial: Arc<Notify>,
+        }
+
+        async fn upstream(State(state): State<KeepaliveState>) -> Response {
+            let request = state.requests.fetch_add(1, Ordering::SeqCst);
+            if request == 0 {
+                let stream = async_stream::stream! {
+                    yield Ok::<_, Infallible>(labelled_generation(1));
+                    state.end_initial.notified().await;
+                };
+                return Body::from_stream(stream).into_response();
+            }
+            std::future::pending::<Response>().await
+        }
+
+        let state = KeepaliveState {
+            requests: Arc::new(AtomicUsize::new(0)),
+            end_initial: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/live", get(upstream))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "keepalive-timing", 1),
+            format!("http://{address}/live?token=provider-secret"),
+            MpegTsRingConfig::new(64, 64).unwrap(),
+        );
+        source.set_startup_timeout(Duration::from_millis(30));
+        let keepalive_interval = Duration::from_millis(50);
+        source.set_recovery_policy(
+            RecoveryPolicy::new(
+                Duration::from_millis(500),
+                Duration::from_millis(10),
+                keepalive_interval,
+                Duration::from_millis(30),
+            )
+            .unwrap(),
+        );
+        let viewer = manager.open(source).await.unwrap();
+        let mut stream = viewer.into_byte_stream();
+        let initial = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet_pid(&initial[..MPEG_TS_PACKET_SIZE]), 0);
+        state.end_initial.notify_waiters();
+
+        let mut null_packets = 0_u32;
+        let attempts = timeout(Duration::from_secs(2), async {
+            loop {
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        assert_eq!(bytes.len() % MPEG_TS_PACKET_SIZE, 0);
+                        if bytes
+                            .chunks_exact(MPEG_TS_PACKET_SIZE)
+                            .all(|packet| packet_pid(packet) == 0x1fff)
+                        {
+                            null_packets = null_packets.saturating_add(
+                                u32::try_from(bytes.len() / MPEG_TS_PACKET_SIZE)
+                                    .unwrap_or(u32::MAX),
+                            );
+                        }
+                    }
+                    Some(Err(ViewerStreamError::RecoveryExpired { attempts })) => break attempts,
+                    event => panic!("unexpected keepalive-timing event: {event:?}"),
+                }
+            }
+        })
+        .await
+        .expect("bounded recovery must expire");
+
+        // The recovery window is 500 ms and the keepalive interval is 50 ms.
+        // Assert a bounded range so the test stays deterministic across CI
+        // schedulers while it still verifies interval-paced emission.
+        assert!(
+            null_packets >= 3,
+            "keepalive must emit null packets at the configured interval; saw {null_packets}"
+        );
+        assert!(
+            null_packets <= 20,
+            "keepalive must not emit null packets faster than the configured interval; saw {null_packets}"
+        );
+        assert!(attempts > 0);
+
+        drop(stream);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn multi_alternate_sequencing_cycles_to_the_second_alternate() {
+        use std::{
+            collections::HashMap,
+            convert::Infallible,
+            sync::{Arc, Mutex},
+        };
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::{Path, State},
+            http::StatusCode,
+            response::{IntoResponse, Response},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, sync::Notify, time::timeout};
+
+        #[derive(Clone)]
+        struct SequencingState {
+            requests: Arc<Mutex<HashMap<String, usize>>>,
+            end_primary: Arc<Notify>,
+        }
+
+        async fn upstream(
+            Path(source): Path<String>,
+            State(state): State<SequencingState>,
+        ) -> Response {
+            *state
+                .requests
+                .lock()
+                .unwrap()
+                .entry(source.clone())
+                .or_default() += 1;
+            match source.as_str() {
+                "primary" => {
+                    let stream = async_stream::stream! {
+                        yield Ok::<_, Infallible>(labelled_generation(1));
+                        state.end_primary.notified().await;
+                    };
+                    Body::from_stream(stream).into_response()
+                }
+                "alternate-one" => (StatusCode::SERVICE_UNAVAILABLE, Body::empty()).into_response(),
+                "alternate-two" => {
+                    let stream = async_stream::stream! {
+                        let mut next = 200_u32;
+                        loop {
+                            yield Ok::<_, Infallible>(labelled_generation(next));
+                            next = next.saturating_add(2);
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    };
+                    Body::from_stream(stream).into_response()
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        async fn next_media(stream: &mut ViewerByteStream) -> Bytes {
+            loop {
+                let bytes = timeout(Duration::from_secs(2), stream.next())
+                    .await
+                    .expect("viewer must remain live during multi-alternate recovery")
+                    .expect("viewer stream must remain open")
+                    .expect("multi-alternate recovery must not surface an error");
+                if !bytes
+                    .chunks_exact(MPEG_TS_PACKET_SIZE)
+                    .all(|packet| packet_pid(packet) == 0x1fff)
+                {
+                    return bytes;
+                }
+            }
+        }
+
+        let state = SequencingState {
+            requests: Arc::new(Mutex::new(HashMap::new())),
+            end_primary: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/{source}", get(upstream))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("primary-pool", 1));
+        manager.configure_provider(ProviderSpec::new("alternate-pool", 2));
+        let recovery = RecoveryPolicy::new(
+            Duration::from_millis(800),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("primary-pool", "multi-alternate", 1),
+            format!("http://{address}/primary?token=primary-secret"),
+            MpegTsRingConfig::new(32, 32).unwrap(),
+        );
+        source.add_alternate(HttpTsEndpoint::for_provider(
+            "alternate-pool",
+            format!("http://{address}/alternate-one?token=alt-one-secret"),
+        ));
+        source.add_alternate(HttpTsEndpoint::for_provider(
+            "alternate-pool",
+            format!("http://{address}/alternate-two?token=alt-two-secret"),
+        ));
+        source.set_recovery_policy(recovery);
+
+        let first = manager.open(source.clone()).await.unwrap();
+        let second = manager.open(source).await.unwrap();
+        let mut first = first.into_byte_stream();
+        let mut second = second.into_byte_stream();
+        let initial = next_media(&mut first).await;
+        let _ = next_media(&mut second).await;
+        assert!(media_labels(&initial).iter().all(|label| *label < 100));
+
+        state.end_primary.notify_waiters();
+        let resumed = next_media(&mut first).await;
+        let _ = next_media(&mut second).await;
+        assert!(
+            media_labels(&resumed).iter().all(|label| *label >= 200),
+            "recovery must sequence past the failed first alternate to the second"
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = manager
+                    .list_snapshots()
+                    .into_iter()
+                    .find(|snapshot| snapshot.key.source_id.as_ref() == "multi-alternate")
+                    .expect("the session must remain live");
+                if snapshot.state == SessionState::Streaming {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("multi-alternate recovery must complete");
+
+        let snapshot = manager
+            .list_snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.key.source_id.as_ref() == "multi-alternate")
+            .expect("the session must remain live");
+        assert_eq!(
+            snapshot.reconnect_attempts, 2,
+            "recovery must try the first alternate then the second"
+        );
+        assert_eq!(snapshot.failover_attempts, 2);
+
+        let requests = state.requests.lock().unwrap();
+        assert_eq!(requests.get("primary"), Some(&1));
+        assert_eq!(requests.get("alternate-one"), Some(&1));
+        assert_eq!(requests.get("alternate-two"), Some(&1));
+        drop(requests);
+
+        drop(first);
+        drop(second);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn resumed_generation_boundary_includes_pat_then_pmt_before_media() {
+        use std::{convert::Infallible, sync::Arc};
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::State,
+            response::{IntoResponse, Response},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, sync::Notify, time::timeout};
+
+        #[derive(Clone)]
+        struct BoundaryState {
+            end_primary: Arc<Notify>,
+        }
+
+        async fn upstream(State(state): State<BoundaryState>) -> Response {
+            let stream = async_stream::stream! {
+                yield Ok::<_, Infallible>(labelled_generation(1));
+                state.end_primary.notified().await;
+            };
+            Body::from_stream(stream).into_response()
+        }
+
+        let state = BoundaryState {
+            end_primary: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/primary", get(upstream))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        manager.configure_provider(ProviderSpec::new("alternate-provider", 1));
+        let recovery = RecoveryPolicy::new(
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "boundary", 1),
+            format!("http://{address}/primary?token=primary-secret"),
+            MpegTsRingConfig::new(32, 32).unwrap(),
+        );
+        source.add_alternate(HttpTsEndpoint::for_provider(
+            "alternate-provider",
+            format!("http://{address}/primary?token=alternate-secret"),
+        ));
+        source.set_recovery_policy(recovery);
+
+        let viewer = manager.open(source).await.unwrap();
+        let mut stream = viewer.into_byte_stream();
+
+        // Drain the initial generation until the first non-null media chunk.
+        let mut saw_initial = false;
+        let initial = timeout(Duration::from_secs(2), async {
+            loop {
+                let bytes = stream
+                    .next()
+                    .await
+                    .expect("initial stream must remain open")
+                    .expect("initial stream must not error");
+                if bytes
+                    .chunks_exact(MPEG_TS_PACKET_SIZE)
+                    .any(|packet| packet_pid(packet) != 0x1fff)
+                {
+                    saw_initial = true;
+                    return bytes;
+                }
+            }
+        })
+        .await
+        .expect("initial media must arrive");
+        assert!(saw_initial);
+        // The initial generation must also start with PAT then PMT.
+        assert_eq!(packet_pid(&initial[..MPEG_TS_PACKET_SIZE]), 0);
+        assert_eq!(
+            packet_pid(&initial[MPEG_TS_PACKET_SIZE..2 * MPEG_TS_PACKET_SIZE]),
+            TEST_PMT_PID
+        );
+
+        state.end_primary.notify_waiters();
+
+        // Collect the resumed generation. Skip null keepalive packets and
+        // gather the first non-null chunk so the boundary is observable.
+        let resumed = timeout(Duration::from_secs(2), async {
+            loop {
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        if bytes
+                            .chunks_exact(MPEG_TS_PACKET_SIZE)
+                            .any(|packet| packet_pid(packet) != 0x1fff)
+                        {
+                            return bytes;
+                        }
+                    }
+                    Some(Err(error)) => panic!("recovery must not error: {error}"),
+                    None => panic!("recovery must not close the viewer"),
+                }
+            }
+        })
+        .await
+        .expect("resumed media must arrive after failover");
+
+        let pids: Vec<u16> = resumed
+            .chunks_exact(MPEG_TS_PACKET_SIZE)
+            .map(packet_pid)
+            .collect();
+        assert_eq!(
+            pids[0], 0,
+            "the resumed generation must start with a PAT packet"
+        );
+        assert_eq!(
+            pids[1], TEST_PMT_PID,
+            "the resumed generation must include a PMT packet before any media"
+        );
+        assert!(
+            pids.contains(&TEST_VIDEO_PID),
+            "the resumed generation must include media packets after PAT and PMT"
+        );
+        // No media packet may appear before both PAT and PMT.
+        let media_index = pids
+            .iter()
+            .position(|pid| *pid == TEST_VIDEO_PID)
+            .expect("media must be present");
+        assert!(
+            media_index >= 2,
+            "PAT and PMT must precede the first media packet; saw media at index {media_index}"
+        );
+
+        let snapshot = manager
+            .list_snapshots()
+            .into_iter()
+            .next()
+            .expect("the session must remain live");
+        assert_eq!(snapshot.upstream_generation, 1);
+        assert_eq!(snapshot.reconnect_attempts, 1);
+
+        drop(stream);
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn native_http_ts_two_viewers_share_one_session_wrap_ring_without_restart_and_shutdown_within_two_seconds()
+     {
+        use std::convert::Infallible;
+
+        use axum::{Router, body::Body, extract::State, http::header, routing::get};
+        use tokio::{net::TcpListener, time::timeout};
+
+        #[derive(Clone)]
+        struct UpstreamState {
+            requests: Arc<AtomicUsize>,
+            disconnects: Arc<AtomicUsize>,
+        }
+
+        struct DisconnectGuard(Arc<AtomicUsize>);
+
+        impl Drop for DisconnectGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        async fn upstream(State(state): State<UpstreamState>) -> Body {
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            let disconnects = Arc::clone(&state.disconnects);
+            let stream = async_stream::stream! {
+                let _guard = DisconnectGuard(disconnects);
+                let mut id = 0_u32;
+                loop {
+                    yield Ok::<_, Infallible>(Bytes::copy_from_slice(&packet(id)));
+                    id = id.wrapping_add(1);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            };
+            Body::from_stream(stream)
+        }
+
+        let state = UpstreamState {
+            requests: Arc::new(AtomicUsize::new(0)),
+            disconnects: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route("/live.ts", get(upstream))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "native-wrap", 1),
+            format!("http://{address}/live.ts?username=provider-user&password=provider-password"),
+            MpegTsRingConfig::new(3, 0).unwrap(),
+        );
+        source.headers_mut().insert(
+            header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer provider-secret"),
+        );
+
+        let first = manager.open(source.clone()).await.unwrap();
+        let second = manager.open(source).await.unwrap();
+        assert_eq!(first.lease_id(), second.lease_id());
+        assert_eq!(first.input_adapter(), SessionInputAdapter::NativeTs);
+        assert_eq!(second.input_adapter(), SessionInputAdapter::NativeTs);
+        assert_eq!(state.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager
+                .provider_snapshot("provider")
+                .unwrap()
+                .active_sessions,
+            1
+        );
+
+        // Wait for the bounded ring to wrap while the single HTTP request keeps
+        // streaming. A wrapped ring with one request proves no restart.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let ring = first.ring_snapshot();
+                if ring.first_sequence > 0
+                    && ring.retained_packets == 3
+                    && ring.closed.is_none()
+                    && first.session_snapshot().state == SessionState::Streaming
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the native ring must wrap without restarting the upstream");
+        assert_eq!(
+            state.requests.load(Ordering::SeqCst),
+            1,
+            "ring wrap must not restart the native HTTP request"
+        );
+        let diagnostics = format!("{:?}", manager.list_adapter_diagnostics());
+        for secret in ["provider-user", "provider-password", "provider-secret"] {
+            assert!(
+                !diagnostics.contains(secret),
+                "native diagnostics must not disclose {secret}"
+            );
+        }
+
+        drop(first);
+        assert_eq!(
+            manager
+                .provider_snapshot("provider")
+                .unwrap()
+                .active_sessions,
+            1,
+            "one remaining viewer must keep the shared session alive"
+        );
+        drop(second);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state.disconnects.load(Ordering::SeqCst) == 1
+                    && manager
+                        .provider_snapshot("provider")
+                        .unwrap()
+                        .active_sessions
+                        == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the final native viewer must shut down within two seconds");
+        assert_eq!(state.disconnects.load(Ordering::SeqCst), 1);
+
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
+    async fn fixed_adapter_ring_wrap_keeps_one_process_and_one_request(
+        policy: InputAdapterPolicy,
+        expected_adapter: SessionInputAdapter,
+        upstream_is_live: bool,
+    ) {
+        use std::convert::Infallible;
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::State,
+            http::{HeaderMap, HeaderValue, header},
+            response::Response,
+            routing::get,
+        };
+        use tokio::{net::TcpListener, time::timeout};
+
+        #[derive(Clone)]
+        struct UpstreamState {
+            requests: Arc<AtomicUsize>,
+            disconnects: Arc<AtomicUsize>,
+            fixture: Arc<Vec<u8>>,
+            live: bool,
+        }
+
+        struct DisconnectGuard(Arc<AtomicUsize>);
+
+        impl Drop for DisconnectGuard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        async fn upstream(State(state): State<UpstreamState>, headers: HeaderMap) -> Response {
+            assert_eq!(
+                headers.get(header::AUTHORIZATION),
+                Some(&HeaderValue::from_static("Bearer provider-secret"))
+            );
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            let stream = async_stream::stream! {
+                let _guard = DisconnectGuard(Arc::clone(&state.disconnects));
+                loop {
+                    yield Ok::<_, Infallible>(Bytes::copy_from_slice(&state.fixture));
+                    if !state.live {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            };
+            let mut response = Response::new(Body::from_stream(stream));
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp2t"));
+            response
+        }
+
+        let state = UpstreamState {
+            requests: Arc::new(AtomicUsize::new(0)),
+            disconnects: Arc::new(AtomicUsize::new(0)),
+            fixture: Arc::new(fixed_adapter_fixture()),
+            live: upstream_is_live,
+        };
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/live.ts", get(upstream))
+                    .with_state(server_state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "wrap-channel", 1),
+            format!("http://{address}/live.ts?username=provider-user&password=provider-password"),
+            MpegTsRingConfig::new(3, 0).unwrap(),
+        );
+        source.set_adapter_policy(policy);
+        source.headers_mut().insert(
+            header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Bearer provider-secret"),
+        );
+
+        let first = manager.open(source.clone()).await.unwrap();
+        let second = manager.open(source).await.unwrap();
+        assert_eq!(first.lease_id(), second.lease_id());
+        assert_eq!(first.input_adapter(), expected_adapter);
+        assert_eq!(second.input_adapter(), expected_adapter);
+        let diagnostics = manager.list_adapter_diagnostics();
+        assert_eq!(diagnostics.len(), 1, "two viewers must share one process");
+        assert!(diagnostics[0].process_id.is_some());
+        assert_eq!(
+            manager
+                .provider_snapshot("provider")
+                .unwrap()
+                .active_sessions,
+            1,
+            "two viewers must share one provider slot"
+        );
+
+        // Wait for the bounded ring to wrap while one process keeps streaming.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let ring = first.ring_snapshot();
+                let wrapped = ring.next_sequence > 3 && ring.retained_packets == 3;
+                let still_open = if upstream_is_live {
+                    ring.closed.is_none()
+                        && first.session_snapshot().state == SessionState::Streaming
+                } else {
+                    true
+                };
+                if wrapped && still_open {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the fixed adapter must wrap its bounded ring without exit");
+        assert_eq!(
+            state.requests.load(Ordering::SeqCst),
+            1,
+            "ring wrap must not restart the fixed adapter upstream request"
+        );
+        let diagnostic_debug = format!("{:?}", manager.list_adapter_diagnostics());
+        for secret in ["provider-user", "provider-password", "provider-secret"] {
+            assert!(
+                !diagnostic_debug.contains(secret),
+                "fixed adapter diagnostics must not disclose {secret}"
+            );
+        }
+
+        drop(first);
+        drop(second);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if state.disconnects.load(Ordering::SeqCst) == 1
+                    && manager
+                        .provider_snapshot("provider")
+                        .unwrap()
+                        .active_sessions
+                        == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the final fixed adapter viewer must shut down within two seconds");
+
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ffmpeg_ring_wrap_does_not_restart_the_upstream() {
+        fixed_adapter_ring_wrap_keeps_one_process_and_one_request(
+            InputAdapterPolicy::Ffmpeg,
+            SessionInputAdapter::Ffmpeg,
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn vlc_ring_wrap_does_not_restart_the_upstream() {
+        fixed_adapter_ring_wrap_keeps_one_process_and_one_request(
+            InputAdapterPolicy::Vlc,
+            SessionInputAdapter::Vlc,
+            false,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
+    async fn hls_ffmpeg_ring_wrap_does_not_restart_manifest_and_shares_one_process_slot() {
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
+        use axum::{
+            Router,
+            body::Body,
+            extract::{Path, State},
+            http::{HeaderMap, HeaderValue, header},
+            response::Response,
+            routing::get,
+        };
+        use tokio::{net::TcpListener, time::timeout};
+
+        #[derive(Clone)]
+        struct UpstreamState {
+            requests: Arc<Mutex<HashMap<String, usize>>>,
+            fixture: Arc<Vec<u8>>,
+        }
+
+        async fn upstream(
+            State(state): State<UpstreamState>,
+            Path(path): Path<String>,
+            headers: HeaderMap,
+        ) -> Response {
+            assert_eq!(
+                headers.get(header::AUTHORIZATION),
+                Some(&HeaderValue::from_static("Bearer provider-secret"))
+            );
+            *state
+                .requests
+                .lock()
+                .unwrap()
+                .entry(path.clone())
+                .or_default() += 1;
+            let body = match path.as_str() {
+                "master.m3u8" => "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=1\nnested/child.m3u8\n".as_bytes().to_vec(),
+                "nested/child.m3u8" => "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1,Segment\nsegment.ts\n#EXT-X-ENDLIST\n".as_bytes().to_vec(),
+                "nested/segment.ts" => state.fixture.as_ref().clone(),
+                _ => Vec::new(),
+            };
+            let mut response = Response::new(Body::from(body));
+            if std::path::Path::new(&path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("m3u8"))
+            {
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/vnd.apple.mpegurl"),
+                );
+            }
+            response
+        }
+
+        let state = UpstreamState {
+            requests: Arc::new(Mutex::new(HashMap::new())),
+            fixture: Arc::new(fixed_adapter_fixture()),
+        };
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/{*path}", get(upstream))
+                    .with_state(server_state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "hls-wrap", 1),
+            format!(
+                "http://{address}/master.m3u8?username=provider-user&password=provider-password"
+            ),
+            MpegTsRingConfig::new(3, 0).unwrap(),
+        );
+        source.set_adapter_policy(InputAdapterPolicy::Ffmpeg);
+        source
+            .set_process_input_format(BrokeredInputFormat::Hls(crate::HlsBrokerConfig::default()));
+        source.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer provider-secret"),
+        );
+
+        let first = manager.open(source.clone()).await.unwrap();
+        let second = manager.open(source).await.unwrap();
+        assert_eq!(first.lease_id(), second.lease_id());
+        assert_eq!(first.input_adapter(), SessionInputAdapter::Ffmpeg);
+        let diagnostics = manager.list_adapter_diagnostics();
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "two HLS viewers must share one process"
+        );
+        assert!(diagnostics[0].process_id.is_some());
+        assert_eq!(
+            manager
+                .provider_snapshot("provider")
+                .unwrap()
+                .active_sessions,
+            1,
+            "two HLS viewers must share one provider slot"
+        );
+
+        // Wait for the bounded ring to wrap while the single FFmpeg process
+        // reads the manifest and segment exactly once.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let ring = first.ring_snapshot();
+                if ring.next_sequence > 3 && ring.retained_packets == 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the HLS ring must wrap during one segment read");
+        {
+            let requests = state.requests.lock().unwrap();
+            assert_eq!(
+                requests.get("master.m3u8"),
+                Some(&1),
+                "ring wrap must not restart the HLS manifest fetch"
+            );
+            assert_eq!(requests.get("nested/child.m3u8"), Some(&1));
+            assert_eq!(requests.get("nested/segment.ts"), Some(&1));
+        }
+        let diagnostic_debug = format!("{:?}", manager.list_adapter_diagnostics());
+        for secret in ["provider-user", "provider-password", "provider-secret"] {
+            assert!(
+                !diagnostic_debug.contains(secret),
+                "HLS diagnostics must not disclose {secret}"
+            );
+        }
+
+        drop(first);
+        drop(second);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if manager
+                    .provider_snapshot("provider")
+                    .unwrap()
+                    .active_sessions
+                    == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the final HLS viewer must release the process slot within two seconds");
+
         server.abort();
     }
 }
