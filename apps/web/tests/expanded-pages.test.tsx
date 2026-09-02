@@ -24,8 +24,8 @@ describe('expanded management pages', () => {
   it('renders dynamic event states and starts a template scan', async () => {
     const client = new MockIptvApiClient()
     vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
-      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: '(?<home>.+) vs (?<away>.+)', channelNameFormat: '{home} vs {away}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
-      { id: 'disabled', name: 'disabled', displayName: 'Empty events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Events', eventDurationHours: 2, pastDateGraceHours: 1, futureDateDays: 2, enabled: false },
+      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: '(?<home>.+) vs (?<away>.+)', channelNameFormat: '{home} vs {away}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
+      { id: 'disabled', name: 'disabled', displayName: 'Empty events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Events', eventDurationHours: 2, pastDateGraceHours: 1, futureDateDays: 2, timezone: 'UTC', fillerTitle: 'No programs available', enabled: false },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue((['live', 'scheduled', 'ended', 'hidden'] as const).map((state, index) => ({
       id: `event-${index}`,
@@ -51,11 +51,11 @@ describe('expanded management pages', () => {
   it('toggles event template enabled state through the partial PATCH control', async () => {
     const client = new MockIptvApiClient()
     vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
-      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([])
     const update = vi.spyOn(client, 'updateEventTemplate').mockResolvedValue({
-      id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: false,
+      id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: false,
     })
     renderWithQuery(<EventsPage client={client} />)
     const disableButton = await screen.findByRole('button', { name: 'Disable NFL events' })
@@ -69,7 +69,7 @@ describe('expanded management pages', () => {
     vi.spyOn(client, 'getEventTemplates').mockResolvedValue([])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([])
     const create = vi.spyOn(client, 'createEventTemplate').mockResolvedValue({
-      id: 'new', name: 'nba', displayName: 'NBA Games', matchRegex: 'NBA.*vs.*', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 4, pastDateGraceHours: 2, futureDateDays: 5, enabled: true,
+      id: 'new', name: 'nba', displayName: 'NBA Games', matchRegex: 'NBA.*vs.*', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 4, pastDateGraceHours: 2, futureDateDays: 5, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true,
     })
     renderWithQuery(<EventsPage client={client} />)
     await screen.findByText(/No event templates configured/)
@@ -90,10 +90,31 @@ describe('expanded management pages', () => {
     })))
   })
 
+  it('edits timezone and filler title through the event template form', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
+      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 4, futureDateDays: 2, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
+    ])
+    vi.spyOn(client, 'getEventChannels').mockResolvedValue([])
+    const update = vi.spyOn(client, 'updateEventTemplate').mockResolvedValue({
+      id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 4, futureDateDays: 2, timezone: 'America/Denver', fillerTitle: 'Off air', enabled: true,
+    })
+    renderWithQuery(<EventsPage client={client} />)
+    await screen.findByText('NFL events')
+    await userEvent.click(screen.getByRole('button', { name: 'Edit NFL events' }))
+    expect(screen.getByRole('heading', { name: 'Edit NFL events' })).toBeInTheDocument()
+    await userEvent.clear(screen.getByLabelText('Timezone'))
+    await userEvent.type(screen.getByLabelText('Timezone'), 'America/Denver')
+    await userEvent.clear(screen.getByLabelText('Filler title'))
+    await userEvent.type(screen.getByLabelText('Filler title'), 'Off air')
+    await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+    await waitFor(() => expect(update).toHaveBeenCalledWith('enabled', expect.objectContaining({ timezone: 'America/Denver', fillerTitle: 'Off air' })))
+  })
+
   it('renders event timestamps in the browser timezone instead of America/Denver', async () => {
     const client = new MockIptvApiClient()
     vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
-      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([
       { id: 'event-1', templateId: 'enabled', channelId: null, slotNumber: 1, eventTitle: 'Broncos game', eventStart: '2026-09-14T00:20:00Z', eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
@@ -751,7 +772,7 @@ describe('expanded management pages', () => {
       ])
       .mockResolvedValueOnce([])
     const create = vi.spyOn(client, 'createEventTemplate').mockResolvedValue({
-      id: 'nba', name: 'nba', displayName: 'NBA Games', matchRegex: 'NBA.*vs.*', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 2, futureDateDays: 5, enabled: true,
+      id: 'nba', name: 'nba', displayName: 'NBA Games', matchRegex: 'NBA.*vs.*', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 2, futureDateDays: 5, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true,
     })
     renderWithQuery(<EventsPage client={client} />)
     await screen.findByText(/No event templates configured/)
@@ -780,7 +801,7 @@ describe('expanded management pages', () => {
   it('confirms and cancels event template deletion', async () => {
     const client = new MockIptvApiClient()
     vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
-      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([])
     const remove = vi.spyOn(client, 'deleteEventTemplate').mockResolvedValue()
@@ -800,7 +821,7 @@ describe('expanded management pages', () => {
   it('surfaces invalid regex in the event rule preview and edits the group name field', async () => {
     const client = new MockIptvApiClient()
     vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
-      { id: 'bad', name: 'bad', displayName: 'Bad regex', matchRegex: '(unclosed', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+      { id: 'bad', name: 'bad', displayName: 'Bad regex', matchRegex: '(unclosed', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([
       { id: 'event-1', templateId: 'bad', channelId: null, slotNumber: 1, eventTitle: 'Title', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
@@ -821,9 +842,9 @@ describe('expanded management pages', () => {
   it('renders matched, unmatched, and empty-sample rule preview states', async () => {
     const client = new MockIptvApiClient()
     vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
-      { id: 'match', name: 'match', displayName: 'Matched', matchRegex: '(?<home>.+) vs (?<away>.+)', channelNameFormat: '{home} vs {away}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
-      { id: 'nomatch', name: 'nomatch', displayName: 'No match', matchRegex: 'zzz', channelNameFormat: '{x}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
-      { id: 'empty', name: 'empty', displayName: 'Empty regex', matchRegex: '', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+      { id: 'match', name: 'match', displayName: 'Matched', matchRegex: '(?<home>.+) vs (?<away>.+)', channelNameFormat: '{home} vs {away}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
+      { id: 'nomatch', name: 'nomatch', displayName: 'No match', matchRegex: 'zzz', channelNameFormat: '{x}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
+      { id: 'empty', name: 'empty', displayName: 'Empty regex', matchRegex: '', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([
       { id: 'm1', templateId: 'match', channelId: null, slotNumber: 1, eventTitle: 'Game', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos vs Chiefs', state: 'scheduled' },

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { loginSchema, sourceSchema, sourceUpdateSchema } from '@/lib/validation'
+import { eventTemplateDefaults, eventTemplateSchema, loginSchema, sourceSchema, sourceUpdateSchema } from '@/lib/validation'
 
 describe('management form schemas', () => {
   it('accepts the login values used by the authentication API', () => {
@@ -37,5 +37,23 @@ describe('management form schemas', () => {
   it('requires safe provider settings when a source is edited', () => {
     expect(sourceUpdateSchema.safeParse({ maxConnections: 3, timezone: 'America/Denver', enabled: true }).success).toBe(true)
     expect(sourceUpdateSchema.safeParse({ maxConnections: 0, timezone: ' ', enabled: true }).success).toBe(false)
+  })
+
+  it('validates event template guide settings and exposes API defaults', () => {
+    expect(eventTemplateDefaults).toEqual({
+      eventDurationHours: 3,
+      pastDateGraceHours: 4,
+      futureDateDays: 2,
+      timezone: 'UTC',
+      fillerTitle: 'No programs available',
+    })
+    expect(eventTemplateSchema.safeParse({
+      name: 'nfl', displayName: 'NFL', matchRegex: 'NFL.*', channelNameFormat: '{event}', groupName: 'Sports',
+      eventDurationHours: 3, pastDateGraceHours: 4, futureDateDays: 2, timezone: 'America/Denver', fillerTitle: 'Off air',
+    }).success).toBe(true)
+    expect(eventTemplateSchema.safeParse({
+      name: 'nfl', displayName: 'NFL', matchRegex: 'NFL.*', channelNameFormat: '{event}', groupName: 'Sports',
+      eventDurationHours: 0, pastDateGraceHours: 4, futureDateDays: 2, timezone: ' ', fillerTitle: '',
+    }).success).toBe(false)
   })
 })

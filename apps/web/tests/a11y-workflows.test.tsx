@@ -123,7 +123,7 @@ describe('management workflow accessibility', () => {
   it('event rule preview exposes a labeled sample input and live result region', async () => {
     const client = new MockIptvApiClient()
     vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
-      { id: 'nfl', name: 'nfl', displayName: 'NFL events', matchRegex: '(?<home>.+) vs (?<away>.+)', channelNameFormat: '{home} vs {away}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+      { id: 'nfl', name: 'nfl', displayName: 'NFL events', matchRegex: '(?<home>.+) vs (?<away>.+)', channelNameFormat: '{home} vs {away}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([
       { id: 'event-1', templateId: 'nfl', channelId: null, slotNumber: 1, eventTitle: 'Broncos game', eventStart: timestamp, eventEnd: null, rawStreamName: 'NFL 08/19 1:00 PM Broncos vs Chiefs', state: 'scheduled' },
