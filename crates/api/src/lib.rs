@@ -8328,6 +8328,35 @@ mod tests {
         )
     }
 
+    fn state_with_oidc(issuer_url: String) -> AppState {
+        static PASSWORD_HASH: OnceLock<String> = OnceLock::new();
+        let oidc = OidcConfig::new(
+            issuer_url,
+            "gateway-client",
+            None,
+            "http://localhost:8080/api/v1/auth/oidc/callback",
+            vec!["subject-1".to_owned()],
+            vec![],
+            vec![],
+        )
+        .expect("valid OIDC test configuration");
+        AppState::new(
+            None,
+            AppConfig {
+                public_base_url: "http://gateway.test".into(),
+                output_token: "output-secret".into(),
+                admin_bootstrap_token: "admin-secret".into(),
+                admin_password_hash: PASSWORD_HASH
+                    .get_or_init(|| hash_admin_password("admin-password").unwrap())
+                    .clone(),
+                master_key: MasterKey::from_bytes([7_u8; 32]),
+                tuner_count: 3,
+                runtime_versions: RuntimeVersions::default(),
+                oidc: Some(oidc),
+            },
+        )
+    }
+
     #[tokio::test]
     async fn output_only_operator_token_cannot_open_admin_channel_stream() {
         let app_state = state();
@@ -8348,6 +8377,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn configured_oidc_routes_start_cancel_and_keep_local_logout_available() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let issuer = format!("http://127.0.0.1:{}/issuer", address.port());
+        let provider = Router::new().route(
+            "/issuer/.well-known/openid-configuration",
+            get({
+                let issuer = issuer.clone();
+                move || {
+                    let issuer = issuer.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "issuer": issuer,
+                            "authorization_endpoint": format!("{issuer}/authorize"),
+                            "token_endpoint": format!("{issuer}/token"),
+                            "jwks_uri": format!("{issuer}/keys"),
+                            "token_endpoint_auth_methods_supported": ["none"]
+                        }))
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider).await.unwrap();
+        });
+
+        let app = router(state_with_oidc(issuer));
+        let status = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status_body: serde_json::Value =
+            serde_json::from_str(&response_text(status).await).unwrap();
+        assert_eq!(
+            status_body,
+            serde_json::json!({"authenticated": false, "oidcEnabled": true})
+        );
+
+        let start = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/oidc/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(start.headers().get(header::LOCATION).is_some());
+        let state_cookie = response_cookies(&start)
+            .into_iter()
+            .find(|cookie| cookie.starts_with("iptv_oidc_state="))
+            .expect("OIDC start sets a state cookie");
+        let state = cookie_value(std::slice::from_ref(&state_cookie), "iptv_oidc_state");
+
+        let callback = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/v1/auth/oidc/callback?error=access_denied&state={state}"
+                ))
+                .header(header::COOKIE, state_cookie.split(';').next().unwrap())
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(callback.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(callback.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(
+            response_cookies(&callback)
+                .iter()
+                .any(|cookie| cookie.starts_with("iptv_oidc_state=;"))
+        );
+        let callback_body: serde_json::Value =
+            serde_json::from_str(&response_text(callback).await).unwrap();
+        assert_eq!(callback_body["code"], "oidc-invalid-callback");
+
+        let pre_login = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pre_login_cookies = response_cookies(&pre_login);
+        let pre_login_csrf = cookie_value(&pre_login_cookies, "iptv_csrf").to_owned();
+        let login = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, request_cookie_header(&pre_login_cookies))
+                    .header("x-csrf-token", &pre_login_csrf)
+                    .body(Body::from(
+                        r#"{"username":"operator","password":"admin-password"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let login_cookies = response_cookies(&login);
+        let login_cookie_header = request_cookie_header(&login_cookies);
+        let login_csrf = cookie_value(&login_cookies, "iptv_csrf");
+        let logout = app
+            .oneshot(
+                Request::post("/api/v1/auth/logout")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, login_cookie_header)
+                    .header("x-csrf-token", login_csrf)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::OK);
+        server.abort();
     }
 
     async fn response_text(response: Response) -> String {
