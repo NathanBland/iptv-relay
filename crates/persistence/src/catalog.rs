@@ -5,6 +5,7 @@
 //! control API with paginated, real data.
 
 use chrono::{DateTime, Duration, Utc};
+use chrono_tz::Tz;
 use iptv_domain::builtin_sports_event_rules;
 use iptv_parsers::{
     CompiledEventRules, EventCandidate, EventGuideInput, GeneratedProgramme,
@@ -1538,7 +1539,7 @@ impl CatalogRepository {
             r"
             SELECT id, name, display_name, match_regex, channel_name_format,
                    group_name, event_duration_hours, past_date_grace_hours,
-                   future_date_days, enabled
+                   future_date_days, timezone, filler_title, enabled
             FROM event_templates
             WHERE ($1::boolean IS FALSE OR enabled = true)
             ORDER BY name
@@ -1560,15 +1561,17 @@ impl CatalogRepository {
         &self,
         input: CreateEventTemplate,
     ) -> Result<EventTemplateRow, PersistenceError> {
+        validate_event_template_settings(&input.timezone, &input.filler_title)?;
         let row = sqlx::query_as::<_, EventTemplateRow>(
             r"
             INSERT INTO event_templates
                 (name, display_name, match_regex, channel_name_format, group_name,
-                 event_duration_hours, past_date_grace_hours, future_date_days)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 event_duration_hours, past_date_grace_hours, future_date_days,
+                 timezone, filler_title)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             RETURNING id, name, display_name, match_regex, channel_name_format,
                       group_name, event_duration_hours, past_date_grace_hours,
-                      future_date_days, enabled
+                      future_date_days, timezone, filler_title, enabled
             ",
         )
         .bind(input.name)
@@ -1579,6 +1582,8 @@ impl CatalogRepository {
         .bind(input.event_duration_hours)
         .bind(input.past_date_grace_hours)
         .bind(input.future_date_days)
+        .bind(input.timezone)
+        .bind(input.filler_title)
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
@@ -1595,6 +1600,7 @@ impl CatalogRepository {
         id: Uuid,
         input: CreateEventTemplate,
     ) -> Result<EventTemplateRow, PersistenceError> {
+        validate_event_template_settings(&input.timezone, &input.filler_title)?;
         let row = sqlx::query_as::<_, EventTemplateRow>(
             r"
             UPDATE event_templates SET
@@ -1606,11 +1612,13 @@ impl CatalogRepository {
                 event_duration_hours = $7,
                 past_date_grace_hours = $8,
                 future_date_days = $9,
+                timezone = $10,
+                filler_title = $11,
                 updated_at = now()
             WHERE id = $1
             RETURNING id, name, display_name, match_regex, channel_name_format,
                       group_name, event_duration_hours, past_date_grace_hours,
-                      future_date_days, enabled
+                      future_date_days, timezone, filler_title, enabled
             ",
         )
         .bind(id)
@@ -1622,6 +1630,8 @@ impl CatalogRepository {
         .bind(input.event_duration_hours)
         .bind(input.past_date_grace_hours)
         .bind(input.future_date_days)
+        .bind(input.timezone)
+        .bind(input.filler_title)
         .fetch_optional(&self.pool)
         .await?;
         row.ok_or(PersistenceError::SourceNotFound(id))
@@ -1641,6 +1651,16 @@ impl CatalogRepository {
         id: Uuid,
         input: &EventTemplateUpdate,
     ) -> Result<EventTemplateRow, PersistenceError> {
+        if let Some(timezone) = input.timezone.as_deref() {
+            validate_event_template_timezone(timezone)?;
+        }
+        if let Some(filler_title) = input.filler_title.as_deref()
+            && filler_title.trim().is_empty()
+        {
+            return Err(PersistenceError::InvalidSource(
+                "filler title must not be blank".to_owned(),
+            ));
+        }
         let row = sqlx::query_as::<_, EventTemplateRow>(
             r"
             UPDATE event_templates SET
@@ -1652,12 +1672,14 @@ impl CatalogRepository {
                 event_duration_hours = COALESCE($7, event_duration_hours),
                 past_date_grace_hours = COALESCE($8, past_date_grace_hours),
                 future_date_days = COALESCE($9, future_date_days),
-                enabled = COALESCE($10, enabled),
+                timezone = COALESCE($10, timezone),
+                filler_title = COALESCE($11, filler_title),
+                enabled = COALESCE($12, enabled),
                 updated_at = now()
             WHERE id = $1
             RETURNING id, name, display_name, match_regex, channel_name_format,
                       group_name, event_duration_hours, past_date_grace_hours,
-                      future_date_days, enabled
+                      future_date_days, timezone, filler_title, enabled
             ",
         )
         .bind(id)
@@ -1669,6 +1691,8 @@ impl CatalogRepository {
         .bind(input.event_duration_hours)
         .bind(input.past_date_grace_hours)
         .bind(input.future_date_days)
+        .bind(input.timezone.as_deref())
+        .bind(input.filler_title.as_deref())
         .bind(input.enabled)
         .fetch_optional(&self.pool)
         .await?;
@@ -1774,7 +1798,7 @@ impl CatalogRepository {
             r"
             SELECT id, name, display_name, match_regex, channel_name_format,
                    group_name, event_duration_hours, past_date_grace_hours,
-                   future_date_days, enabled
+                   future_date_days, timezone, filler_title, enabled
             FROM event_templates
             WHERE id = $1
             ",
@@ -1821,7 +1845,9 @@ impl CatalogRepository {
             .unwrap_or(u64::MAX)
             .saturating_mul(3_600);
         for rule in &mut rules.0 {
+            rule.timezone.clone_from(&template.timezone);
             rule.guide.duration_seconds = duration_seconds;
+            rule.guide.filler_title.clone_from(&template.filler_title);
             rule.guide
                 .title_template
                 .clone_from(&template.channel_name_format);
@@ -1879,7 +1905,7 @@ impl CatalogRepository {
                 })
                 .unwrap_or(last_start);
             let Ok(schedule) =
-                generate_event_schedule(&inputs, window_start, window_end, "No programs available")
+                generate_event_schedule(&inputs, window_start, window_end, &template.filler_title)
             else {
                 continue;
             };
@@ -2735,6 +2761,8 @@ pub struct EventTemplateRow {
     pub event_duration_hours: i32,
     pub past_date_grace_hours: i32,
     pub future_date_days: i32,
+    pub timezone: String,
+    pub filler_title: String,
     pub enabled: bool,
 }
 
@@ -2756,7 +2784,7 @@ pub struct EventTemplateQuery {
     pub enabled_only: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CreateEventTemplate {
     pub name: String,
     pub display_name: String,
@@ -2766,6 +2794,25 @@ pub struct CreateEventTemplate {
     pub event_duration_hours: i32,
     pub past_date_grace_hours: i32,
     pub future_date_days: i32,
+    pub timezone: String,
+    pub filler_title: String,
+}
+
+impl Default for CreateEventTemplate {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            display_name: String::new(),
+            match_regex: String::new(),
+            channel_name_format: String::new(),
+            group_name: String::new(),
+            event_duration_hours: 0,
+            past_date_grace_hours: 0,
+            future_date_days: 0,
+            timezone: "UTC".to_owned(),
+            filler_title: "No programs available".to_owned(),
+        }
+    }
 }
 
 /// Partial update for an event template. Only `Some` fields are applied.
@@ -2780,7 +2827,37 @@ pub struct EventTemplateUpdate {
     pub event_duration_hours: Option<i32>,
     pub past_date_grace_hours: Option<i32>,
     pub future_date_days: Option<i32>,
+    pub timezone: Option<String>,
+    pub filler_title: Option<String>,
     pub enabled: Option<bool>,
+}
+
+fn validate_event_template_settings(
+    timezone: &str,
+    filler_title: &str,
+) -> Result<(), PersistenceError> {
+    validate_event_template_timezone(timezone)?;
+    if filler_title.trim().is_empty() {
+        return Err(PersistenceError::InvalidSource(
+            "filler title must not be blank".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_event_template_timezone(value: &str) -> Result<(), PersistenceError> {
+    let timezone = value.trim();
+    if timezone != value || timezone.is_empty() {
+        return Err(PersistenceError::InvalidSource(
+            "event template timezone must be a nonblank IANA timezone".to_owned(),
+        ));
+    }
+    if timezone != "UTC" && (!timezone.contains('/') || timezone.parse::<Tz>().is_err()) {
+        return Err(PersistenceError::InvalidSource(
+            "event template timezone must be UTC or a valid IANA timezone".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]

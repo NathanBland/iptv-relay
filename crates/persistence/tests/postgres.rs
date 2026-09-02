@@ -2551,6 +2551,8 @@ async fn event_template_and_channel_lifecycle_work() {
             event_duration_hours: 3,
             past_date_grace_hours: 4,
             future_date_days: 2,
+            timezone: "America/Denver".to_owned(),
+            filler_title: "No coverage".to_owned(),
         })
         .await
         .unwrap();
@@ -2573,11 +2575,15 @@ async fn event_template_and_channel_lifecycle_work() {
                 event_duration_hours: 4,
                 past_date_grace_hours: 5,
                 future_date_days: 3,
+                timezone: "America/New_York".to_owned(),
+                filler_title: "Off air".to_owned(),
             },
         )
         .await
         .unwrap();
     assert_eq!(updated.name, updated_name);
+    assert_eq!(updated.timezone, "America/New_York");
+    assert_eq!(updated.filler_title, "Off air");
     assert!(matches!(
         catalog
             .update_event_template(uuid::Uuid::now_v7(), CreateEventTemplate::default())
@@ -2710,6 +2716,8 @@ async fn event_template_partial_update_persists_enabled_and_optional_fields() {
             event_duration_hours: 3,
             past_date_grace_hours: 4,
             future_date_days: 2,
+            timezone: "UTC".to_owned(),
+            filler_title: "No programs available".to_owned(),
         })
         .await
         .unwrap();
@@ -2729,6 +2737,8 @@ async fn event_template_partial_update_persists_enabled_and_optional_fields() {
         .unwrap();
     assert!(!disabled.enabled);
     assert_eq!(disabled.event_duration_hours, 6);
+    assert_eq!(disabled.timezone, "UTC");
+    assert_eq!(disabled.filler_title, "No programs available");
     // Omitted fields keep their stored values.
     assert_eq!(disabled.display_name, "Partial league");
     assert_eq!(disabled.past_date_grace_hours, 4);
@@ -2819,6 +2829,8 @@ async fn event_scan_persists_idempotent_non_overlapping_generated_guides() {
             event_duration_hours: 3,
             past_date_grace_hours: 1,
             future_date_days: 1,
+            timezone: "America/Denver".to_owned(),
+            filler_title: "Off air".to_owned(),
         })
         .await
         .unwrap();
@@ -2894,7 +2906,7 @@ async fn event_scan_persists_idempotent_non_overlapping_generated_guides() {
     assert_eq!(
         first
             .iter()
-            .filter(|programme| programme.title == "No programs available")
+            .filter(|programme| programme.title == "Off air")
             .count(),
         3
     );
@@ -2914,6 +2926,16 @@ async fn event_scan_persists_idempotent_non_overlapping_generated_guides() {
         .map(|programme| programme.title.as_str())
         .collect();
     assert_eq!(event_titles, ["Broncos vs Chiefs", "Rams vs Seahawks"]);
+    let first_event = first
+        .iter()
+        .find(|programme| programme.title == "Broncos vs Chiefs")
+        .expect("first event programme");
+    assert_eq!(
+        first_event.starts_at,
+        chrono::DateTime::parse_from_rfc3339("2026-09-14T06:20:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    );
     assert!(first.iter().all(|programme| {
         programme.description.is_some()
             && programme
@@ -2932,6 +2954,8 @@ async fn event_scan_persists_idempotent_non_overlapping_generated_guides() {
             event_duration_hours: 3,
             past_date_grace_hours: 1,
             future_date_days: 1,
+            timezone: "UTC".to_owned(),
+            filler_title: "No programs available".to_owned(),
         })
         .await
         .unwrap();

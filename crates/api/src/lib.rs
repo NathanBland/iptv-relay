@@ -527,6 +527,8 @@ struct EventTemplateResponse {
     event_duration_hours: i32,
     past_date_grace_hours: i32,
     future_date_days: i32,
+    timezone: String,
+    filler_title: String,
     enabled: bool,
 }
 
@@ -544,6 +546,10 @@ struct CreateEventTemplateRequest {
     past_date_grace_hours: i32,
     #[serde(default = "default_future_days")]
     future_date_days: i32,
+    #[serde(default = "default_event_timezone")]
+    timezone: String,
+    #[serde(default = "default_filler_title")]
+    filler_title: String,
 }
 
 /// Partial update body for an event template. All fields are optional.
@@ -568,6 +574,10 @@ struct UpdateEventTemplateRequest {
     #[serde(default)]
     future_date_days: Option<i32>,
     #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    filler_title: Option<String>,
+    #[serde(default)]
     enabled: Option<bool>,
 }
 
@@ -579,6 +589,12 @@ fn default_grace() -> i32 {
 }
 fn default_future_days() -> i32 {
     2
+}
+fn default_event_timezone() -> String {
+    "UTC".to_owned()
+}
+fn default_filler_title() -> String {
+    "No programs available".to_owned()
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -4769,6 +4785,8 @@ async fn create_event_template(
         event_duration_hours: request.event_duration_hours,
         past_date_grace_hours: request.past_date_grace_hours,
         future_date_days: request.future_date_days,
+        timezone: request.timezone,
+        filler_title: request.filler_title,
     };
     match catalog.create_event_template(input).await {
         Ok(row) => (
@@ -4827,6 +4845,8 @@ async fn update_event_template(
         event_duration_hours: request.event_duration_hours,
         past_date_grace_hours: request.past_date_grace_hours,
         future_date_days: request.future_date_days,
+        timezone: request.timezone,
+        filler_title: request.filler_title,
         enabled: request.enabled,
     };
     match catalog.update_event_template_partial(id, &input).await {
@@ -5054,6 +5074,8 @@ fn event_template_response_from_row(
         event_duration_hours: row.event_duration_hours,
         past_date_grace_hours: row.past_date_grace_hours,
         future_date_days: row.future_date_days,
+        timezone: row.timezone.clone(),
+        filler_title: row.filler_title.clone(),
         enabled: row.enabled,
     }
 }
@@ -11248,7 +11270,7 @@ mod tests {
         let pool = database.pool().clone();
         let app = router(state_with_database(Some(database.clone())));
 
-        let template_body = r#"{"name":"Patch events","displayName":"Patch Events","matchRegex":"Patch.*","channelNameFormat":"Patch {slot}","groupName":"Events","eventDurationHours":3,"pastDateGraceHours":4,"futureDateDays":2}"#;
+        let template_body = r#"{"name":"Patch events","displayName":"Patch Events","matchRegex":"Patch.*","channelNameFormat":"Patch {slot}","groupName":"Events","eventDurationHours":3,"pastDateGraceHours":4,"futureDateDays":2,"timezone":"America/Denver","fillerTitle":"Off air"}"#;
         let created = app
             .clone()
             .oneshot(admin_request(
@@ -11264,6 +11286,8 @@ mod tests {
         let template_id = template["id"].as_str().unwrap();
         assert_eq!(template["enabled"], serde_json::Value::Bool(true));
         assert_eq!(template["eventDurationHours"], serde_json::json!(3));
+        assert_eq!(template["timezone"], serde_json::json!("America/Denver"));
+        assert_eq!(template["fillerTitle"], serde_json::json!("Off air"));
 
         // Partial patch: toggle enabled off and adjust duration only.
         let disabled = app
@@ -11286,6 +11310,11 @@ mod tests {
             serde_json::json!("Patch Events")
         );
         assert_eq!(disabled_body["futureDateDays"], serde_json::json!(2));
+        assert_eq!(
+            disabled_body["timezone"],
+            serde_json::json!("America/Denver")
+        );
+        assert_eq!(disabled_body["fillerTitle"], serde_json::json!("Off air"));
 
         // Empty patch still succeeds and refreshes updated_at.
         let empty = app
@@ -11347,7 +11376,8 @@ mod tests {
             sqlx::query_as::<_, iptv_persistence::EventTemplateRow>(
                 r"SELECT id, name, display_name, match_regex, channel_name_format,
                           group_name, event_duration_hours, past_date_grace_hours,
-                          future_date_days, enabled FROM event_templates WHERE id = $1",
+                          future_date_days, timezone, filler_title, enabled
+                   FROM event_templates WHERE id = $1",
             )
             .bind(Uuid::parse_str(template_id).unwrap())
             .fetch_one(&pool)
@@ -11356,6 +11386,8 @@ mod tests {
         assert!(stored.enabled);
         assert_eq!(stored.event_duration_hours, 5);
         assert_eq!(stored.display_name, "Renamed Events");
+        assert_eq!(stored.timezone, "America/Denver");
+        assert_eq!(stored.filler_title, "Off air");
 
         drop(app);
         drop(pool);
@@ -11621,6 +11653,8 @@ mod tests {
             event_duration_hours: 3,
             past_date_grace_hours: 4,
             future_date_days: 2,
+            timezone: "UTC".to_owned(),
+            filler_title: "No programs available".to_owned(),
             enabled: true,
         });
         assert_serializes(EventChannelResponse {

@@ -3919,6 +3919,8 @@ mod tests {
                 event_duration_hours: 3,
                 past_date_grace_hours: 1,
                 future_date_days: 1,
+                timezone: "UTC".to_owned(),
+                filler_title: "No programs available".to_owned(),
             })
             .await
             .expect("create event template");
