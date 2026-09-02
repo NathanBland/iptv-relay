@@ -1,8 +1,10 @@
 //! HTTP control and Jellyfin-facing output APIs.
 
 mod auth;
+mod oidc;
 
 pub use auth::hash_admin_password;
+pub use oidc::OidcConfig;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -18,7 +20,7 @@ use axum::{
     extract::{Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{
-        IntoResponse, Response,
+        IntoResponse, Redirect, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
@@ -46,10 +48,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower_http::{catch_panic::CatchPanicLayer, compression::CompressionLayer};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::auth::{AuthManager, LoginError};
+use crate::oidc::OidcError;
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -60,6 +63,7 @@ pub struct AppConfig {
     pub master_key: MasterKey,
     pub tuner_count: u16,
     pub runtime_versions: RuntimeVersions,
+    pub oidc: Option<OidcConfig>,
 }
 
 impl fmt::Debug for AppConfig {
@@ -73,6 +77,7 @@ impl fmt::Debug for AppConfig {
             .field("master_key", &self.master_key)
             .field("tuner_count", &self.tuner_count)
             .field("runtime_versions", &self.runtime_versions)
+            .field("oidc", &self.oidc)
             .finish()
     }
 }
@@ -144,10 +149,11 @@ impl AppState {
             public_base_url: config.public_base_url.trim_end_matches('/').into(),
             output_token_hash: token_hash(&config.output_token),
             environment_output_token: Arc::from(config.output_token.as_str()),
-            auth: AuthManager::new(
+            auth: AuthManager::new_with_oidc(
                 config.admin_password_hash,
                 &config.admin_bootstrap_token,
                 secure_cookies,
+                config.oidc,
             ),
             tuner_count: config.tuner_count,
             runtime_versions: config.runtime_versions,
@@ -216,6 +222,17 @@ impl AppState {
         if !database.bootstrap_bearer_enabled().await? {
             self.auth.disable_bootstrap_bearer();
         }
+        Ok(())
+    }
+
+    /// Disable the bootstrap bearer after a successful administrator sign-in.
+    ///
+    /// The local password remains available as break-glass access.
+    async fn disable_bootstrap_bearer(&self) -> Result<(), PersistenceError> {
+        if let Some(database) = &self.database {
+            database.disable_bootstrap_bearer().await?;
+        }
+        self.auth.disable_bootstrap_bearer();
         Ok(())
     }
 
@@ -291,7 +308,7 @@ pub struct ProgrammeRecord {
     pub categories: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct CreateChannelRequest {
     pub number: String,
     pub name: String,
@@ -659,6 +676,14 @@ struct LoginRequest {
     password: String,
 }
 
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[serde(rename_all = "snake_case")]
+struct OidcCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct LogoutRequest {}
@@ -713,8 +738,8 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, system_info, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
-    components(schemas(LoginRequest, LogoutRequest, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
+    paths(auth_status, login, logout, oidc_start, oidc_callback, system_info, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -743,6 +768,8 @@ fn source_control_routes() -> Router<AppState> {
         .route("/api/v1/auth/status", get(auth_status))
         .route("/api/v1/auth/login", axum::routing::post(login))
         .route("/api/v1/auth/logout", axum::routing::post(logout))
+        .route("/api/v1/auth/oidc/start", get(oidc_start))
+        .route("/api/v1/auth/oidc/callback", get(oidc_callback))
         .route("/api/v1/system", get(system_info))
         .route("/api/v1/settings/schema", get(settings_schema))
         .route("/api/v1/settings/effective", get(get_effective_settings))
@@ -1237,6 +1264,155 @@ async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> Respo
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/v1/auth/oidc/start",
+    tag = "authentication",
+    responses((status = 307), (status = 404, body = ProblemDetails), (status = 503, body = ProblemDetails))
+)]
+async fn oidc_start(State(state): State<AppState>) -> Response {
+    match state.auth.start_oidc().await {
+        Ok(authorization) => {
+            let mut response = Redirect::temporary(&authorization.location).into_response();
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&authorization.state_cookie)
+                    .expect("generated OIDC state cookie is valid"),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => oidc_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/oidc/callback",
+    tag = "authentication",
+    params(OidcCallbackQuery),
+    responses((status = 307), (status = 400, body = ProblemDetails), (status = 403, body = ProblemDetails), (status = 503, body = ProblemDetails))
+)]
+async fn oidc_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OidcCallbackQuery>,
+) -> Response {
+    let callback_state = query.state.as_deref().unwrap_or_default();
+    let result = if query.error.is_some() {
+        state
+            .auth
+            .cancel_oidc(&headers, callback_state)
+            .map(|()| IssuedOidcResult::Rejected)
+    } else {
+        state
+            .auth
+            .complete_oidc_login(&headers, callback_state, query.code.as_deref())
+            .await
+            .map(IssuedOidcResult::Session)
+    };
+
+    let mut response = match result {
+        Ok(IssuedOidcResult::Rejected) => oidc_error_response(OidcError::InvalidCallback),
+        Ok(IssuedOidcResult::Session(session)) => {
+            if state.disable_bootstrap_bearer().await.is_err() {
+                ProblemDetails::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication-unavailable",
+                    "Authentication unavailable",
+                    "the authentication service could not update the bootstrap authorization state",
+                )
+                .response()
+            } else {
+                let mut response =
+                    Redirect::temporary(state.public_base_url.as_ref()).into_response();
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_str(&session.session_cookie)
+                        .expect("generated session cookie is valid"),
+                );
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_str(&session.csrf_cookie)
+                        .expect("generated CSRF cookie is valid"),
+                );
+                response
+            }
+        }
+        Err(error) => oidc_error_response(error),
+    };
+    let clear_cookie = state.auth.clear_oidc_state_cookie();
+    if !clear_cookie.is_empty() {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&clear_cookie).expect("generated OIDC clearing cookie is valid"),
+        );
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+enum IssuedOidcResult {
+    Rejected,
+    Session(crate::auth::IssuedSession),
+}
+
+fn oidc_error_response(error: OidcError) -> Response {
+    let (status, code, title, detail) = match error {
+        OidcError::NotConfigured => (
+            StatusCode::NOT_FOUND,
+            "oidc-not-configured",
+            "OIDC is not configured",
+            "configure an OIDC issuer, client, and allowlist before using this sign-in method",
+        ),
+        OidcError::InvalidConfiguration | OidcError::InvalidProvider => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oidc-provider-invalid",
+            "OIDC provider unavailable",
+            "the configured OIDC provider metadata is invalid",
+        ),
+        OidcError::ProviderUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oidc-provider-unavailable",
+            "OIDC provider unavailable",
+            "the OIDC provider did not complete the sign-in request",
+        ),
+        OidcError::InvalidState => (
+            StatusCode::BAD_REQUEST,
+            "oidc-invalid-state",
+            "Invalid OIDC state",
+            "the OIDC sign-in request expired or did not originate from this browser",
+        ),
+        OidcError::InvalidCallback => (
+            StatusCode::BAD_REQUEST,
+            "oidc-invalid-callback",
+            "Invalid OIDC callback",
+            "the OIDC provider returned an incomplete sign-in response",
+        ),
+        OidcError::IdentityNotAllowed => (
+            StatusCode::FORBIDDEN,
+            "oidc-identity-not-allowed",
+            "OIDC identity not allowed",
+            "the signed-in OIDC identity is not in the approved allowlist",
+        ),
+        OidcError::InvalidIdentityToken => (
+            StatusCode::BAD_REQUEST,
+            "oidc-invalid-identity-token",
+            "Invalid OIDC identity token",
+            "the OIDC identity token failed validation",
+        ),
+    };
+    let mut response = ProblemDetails::new(status, code, title, detail).response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[utoipa::path(
     post,
     path = "/api/v1/auth/login",
     tag = "authentication",
@@ -1285,17 +1461,14 @@ async fn login(
             .response();
         }
     };
-    if let Some(database) = &state.database {
-        if database.disable_bootstrap_bearer().await.is_err() {
-            return ProblemDetails::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication-unavailable",
-                "Authentication unavailable",
-                "the authentication service could not update the bootstrap authorization state",
-            )
-            .response();
-        }
-        state.auth.disable_bootstrap_bearer();
+    if state.disable_bootstrap_bearer().await.is_err() {
+        return ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication-unavailable",
+            "Authentication unavailable",
+            "the authentication service could not update the bootstrap authorization state",
+        )
+        .response();
     }
     let session = match state.auth.complete_login(verified) {
         Ok(session) => session,
@@ -7578,6 +7751,7 @@ mod tests {
                 master_key: MasterKey::from_bytes([7_u8; 32]),
                 tuner_count: 3,
                 runtime_versions: RuntimeVersions::default(),
+                oidc: None,
             },
         )
     }
@@ -9707,6 +9881,7 @@ mod tests {
             master_key: MasterKey::from_bytes([9_u8; 32]),
             tuner_count: 3,
             runtime_versions: RuntimeVersions::default(),
+            oidc: None,
         };
         let debug = format!("{config:?}");
         assert!(debug.contains("https://gateway.test"));

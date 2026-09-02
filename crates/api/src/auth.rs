@@ -16,6 +16,8 @@ use axum::http::{HeaderMap, header};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
+use crate::oidc::{OidcAuthorization, OidcClient, OidcConfig, OidcError};
+
 const SESSION_COOKIE: &str = "iptv_session";
 const CSRF_COOKIE: &str = "iptv_csrf";
 const CSRF_HEADER: &str = "x-csrf-token";
@@ -36,6 +38,7 @@ struct AuthInner {
     secure_cookies: bool,
     sessions: Mutex<HashMap<[u8; 32], SessionRecord>>,
     login_csrf_tokens: Mutex<HashMap<[u8; 32], Instant>>,
+    oidc: Option<OidcClient>,
 }
 
 impl fmt::Debug for AuthManager {
@@ -73,10 +76,22 @@ pub(crate) enum Authorization {
 }
 
 impl AuthManager {
+    /// Create an authentication manager with OIDC disabled.
+    #[allow(dead_code)]
     pub(crate) fn new(
         password_hash: impl Into<Arc<str>>,
         bearer_token: &str,
         secure_cookies: bool,
+    ) -> Self {
+        Self::new_with_oidc(password_hash, bearer_token, secure_cookies, None)
+    }
+
+    /// Create an authentication manager with optional OIDC configuration.
+    pub(crate) fn new_with_oidc(
+        password_hash: impl Into<Arc<str>>,
+        bearer_token: &str,
+        secure_cookies: bool,
+        oidc_config: Option<OidcConfig>,
     ) -> Self {
         Self {
             inner: Arc::new(AuthInner {
@@ -86,6 +101,7 @@ impl AuthManager {
                 secure_cookies,
                 sessions: Mutex::new(HashMap::new()),
                 login_csrf_tokens: Mutex::new(HashMap::new()),
+                oidc: oidc_config.map(OidcClient::new),
             }),
         }
     }
@@ -183,6 +199,52 @@ impl AuthManager {
             session_cookie: self.session_cookie(&session_token),
             csrf_cookie: self.csrf_cookie(&csrf_token, SESSION_TTL),
         })
+    }
+
+    pub(crate) async fn start_oidc(&self) -> Result<OidcAuthorization, OidcError> {
+        let client = self.inner.oidc.as_ref().ok_or(OidcError::NotConfigured)?;
+        client.start(self.inner.secure_cookies).await
+    }
+
+    pub(crate) async fn complete_oidc_login(
+        &self,
+        headers: &HeaderMap,
+        state: &str,
+        code: Option<&str>,
+    ) -> Result<IssuedSession, OidcError> {
+        let client = self.inner.oidc.as_ref().ok_or(OidcError::NotConfigured)?;
+        client.callback(headers, state, code).await?;
+        let session_token = random_token().map_err(|_| OidcError::ProviderUnavailable)?;
+        let csrf_token = random_token().map_err(|_| OidcError::ProviderUnavailable)?;
+        let mut sessions = self.lock_sessions();
+        sessions.insert(
+            digest(&session_token),
+            SessionRecord {
+                csrf_hash: digest(&csrf_token),
+                expires_at: Instant::now() + SESSION_TTL,
+            },
+        );
+        drop(sessions);
+        Ok(IssuedSession {
+            session_cookie: self.session_cookie(&session_token),
+            csrf_cookie: self.csrf_cookie(&csrf_token, SESSION_TTL),
+        })
+    }
+
+    /// Revoke an OIDC authorization attempt after the provider reports an error.
+    ///
+    /// The state cookie and the server-side state entry remain single-use.
+    pub(crate) fn cancel_oidc(&self, headers: &HeaderMap, state: &str) -> Result<(), OidcError> {
+        let client = self.inner.oidc.as_ref().ok_or(OidcError::NotConfigured)?;
+        client.cancel(headers, state)
+    }
+
+    pub(crate) fn clear_oidc_state_cookie(&self) -> String {
+        self.inner
+            .oidc
+            .as_ref()
+            .map(|_| crate::oidc::OidcClient::clear_state_cookie(self.inner.secure_cookies))
+            .unwrap_or_default()
     }
 
     pub(crate) fn authorize(
@@ -361,7 +423,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
 }
 
-fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()

@@ -85,6 +85,7 @@ struct ServerEnvironment {
     admin_password_hash: String,
     master_key: MasterKey,
     tuner_count: u16,
+    oidc: Option<iptv_api::OidcConfig>,
 }
 
 impl std::fmt::Debug for ServerEnvironment {
@@ -98,6 +99,7 @@ impl std::fmt::Debug for ServerEnvironment {
             .field("admin_password_hash", &"<redacted>")
             .field("master_key", &self.master_key)
             .field("tuner_count", &self.tuner_count)
+            .field("oidc", &self.oidc)
             .finish()
     }
 }
@@ -112,6 +114,7 @@ impl ServerEnvironment {
             master_key: self.master_key,
             tuner_count: self.tuner_count,
             runtime_versions,
+            oidc: self.oidc,
         }
     }
 }
@@ -139,10 +142,13 @@ where
         }
     };
 
+    let public_base_url =
+        lookup("IPTV_PUBLIC_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_owned());
+    let oidc = oidc_config_from(&mut lookup, &public_base_url)?;
+
     Ok(ServerEnvironment {
         bind,
-        public_base_url: lookup("IPTV_PUBLIC_BASE_URL")
-            .unwrap_or_else(|_| "http://localhost:8080".to_owned()),
+        public_base_url,
         output_token: required_token_from(&mut lookup, "IPTV_OUTPUT_TOKEN")?,
         admin_bootstrap_token: required_token_from(&mut lookup, "IPTV_ADMIN_BOOTSTRAP_TOKEN")?,
         admin_password_hash,
@@ -154,7 +160,77 @@ where
             .and_then(|value| value.parse().ok())
             .filter(|count| *count > 0)
             .unwrap_or(1),
+        oidc,
     })
+}
+
+fn oidc_config_from<F>(
+    lookup: &mut F,
+    public_base_url: &str,
+) -> Result<Option<iptv_api::OidcConfig>>
+where
+    F: FnMut(&str) -> std::result::Result<String, env::VarError>,
+{
+    let issuer = lookup("IPTV_OIDC_ISSUER_URL").unwrap_or_default();
+    let client_id = lookup("IPTV_OIDC_CLIENT_ID").unwrap_or_default();
+    let client_secret = lookup("IPTV_OIDC_CLIENT_SECRET").ok();
+    let redirect_url = lookup("IPTV_OIDC_REDIRECT_URL").unwrap_or_else(|_| {
+        format!(
+            "{}/api/v1/auth/oidc/callback",
+            public_base_url.trim_end_matches('/')
+        )
+    });
+    let allowed_subjects =
+        parse_oidc_entries(&lookup("IPTV_OIDC_ALLOWED_SUBJECTS").unwrap_or_default());
+    let allowed_emails =
+        parse_oidc_entries(&lookup("IPTV_OIDC_ALLOWED_EMAILS").unwrap_or_default());
+    let scopes = parse_oidc_entries(&lookup("IPTV_OIDC_SCOPES").unwrap_or_default());
+
+    let configured = [
+        issuer.trim(),
+        client_id.trim(),
+        client_secret.as_deref().unwrap_or_default().trim(),
+        allowed_subjects
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default(),
+        allowed_emails
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default(),
+    ]
+    .iter()
+    .any(|value| !value.is_empty());
+    if !configured {
+        return Ok(None);
+    }
+    if issuer.trim().is_empty() {
+        bail!("IPTV_OIDC_ISSUER_URL is required when OIDC settings are present");
+    }
+    if client_id.trim().is_empty() {
+        bail!("IPTV_OIDC_CLIENT_ID is required when OIDC is enabled");
+    }
+    iptv_api::OidcConfig::new(
+        issuer,
+        client_id,
+        client_secret,
+        redirect_url,
+        allowed_subjects,
+        allowed_emails,
+        scopes,
+    )
+    .map(Some)
+    .map_err(anyhow::Error::msg)
+    .context("parse OIDC configuration")
+}
+
+fn parse_oidc_entries(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| character == ',' || character.is_ascii_whitespace())
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn required_password_from<F>(lookup: &mut F) -> Result<String>
@@ -2323,6 +2399,13 @@ mod tests {
                 "IPTV_BIND",
                 "IPTV_ADMIN_PASSWORD_HASH",
                 "IPTV_PUBLIC_BASE_URL",
+                "IPTV_OIDC_ISSUER_URL",
+                "IPTV_OIDC_CLIENT_ID",
+                "IPTV_OIDC_CLIENT_SECRET",
+                "IPTV_OIDC_REDIRECT_URL",
+                "IPTV_OIDC_ALLOWED_SUBJECTS",
+                "IPTV_OIDC_ALLOWED_EMAILS",
+                "IPTV_OIDC_SCOPES",
                 "IPTV_OUTPUT_TOKEN",
                 "IPTV_ADMIN_BOOTSTRAP_TOKEN",
                 "IPTV_MASTER_KEY",
