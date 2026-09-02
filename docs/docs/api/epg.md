@@ -71,10 +71,10 @@ curl http://localhost:8080/api/v1/epg/review/{channel_id}/candidates \
 curl -X POST http://localhost:8080/api/v1/epg/review/{channel_id}/resolve \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"candidateId": "...", "action": "accept"}'
+  -d '{"accept": true, "epgChannelId": "..."}'
 ```
 
-Use `action: "reject"` to reject a candidate.
+Set `accept` to `true` to accept a candidate. Set `accept` to `false` to reject a candidate. Supply `epgChannelId` when you accept a candidate.
 
 ## Search EPG channels
 

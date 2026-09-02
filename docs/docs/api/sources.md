@@ -1,6 +1,6 @@
 # Sources API
 
-The sources API manages M3U, Xtream, and XMLTV sources. All endpoints require admin authentication.
+The sources API manages M3U, Xtream, XMLTV, and network-tuner sources. All endpoints require admin authentication.
 
 ## Endpoints
 
@@ -12,6 +12,10 @@ The sources API manages M3U, Xtream, and XMLTV sources. All endpoints require ad
 | DELETE | `/api/v1/sources/{source_id}` | Delete a source and related data. |
 | PATCH | `/api/v1/sources/{source_id}/refresh-interval` | Set the refresh interval. |
 | POST | `/api/v1/sources/{source_id}/sync` | Trigger a manual source sync. |
+| GET | `/api/v1/sources/{source_id}/sync-status` | Read the current sync status. |
+| POST | `/api/v1/sources/{source_id}/sync/cancel` | Cancel an active sync. |
+| GET | `/api/v1/sources/{source_id}/reconcile/revisions` | List reconciliation revisions. |
+| POST | `/api/v1/sources/{source_id}/reconcile/rollback` | Roll back to a revision. |
 
 ## List sources
 
@@ -35,11 +39,13 @@ curl -X POST http://localhost:8080/api/v1/sources \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "type": "m3u",
+    "kind": "M3U",
     "name": "My M3U source",
-    "url": "https://example.com/playlist.m3u"
+    "endpoint": "https://example.com/playlist.m3u"
   }'
 ```
+
+The `kind` value is case-sensitive. Use `M3U`, `Xtream`, `XMLTV`, or `Network tuner`.
 
 Set `timezone` in the request when the XMLTV source uses local wall-clock values without offsets:
 
@@ -48,9 +54,9 @@ curl -X POST http://localhost:8080/api/v1/sources \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "type": "xmltv",
+    "kind": "XMLTV",
     "name": "Local XMLTV guide",
-    "url": "https://example.com/guide.xml",
+    "endpoint": "https://example.com/guide.xml",
     "timezone": "America/Denver"
   }'
 ```
@@ -88,6 +94,24 @@ curl -X POST http://localhost:8080/api/v1/sources/{source_id}/sync \
 
 The endpoint returns `202` with the job ID. A second sync request returns `409` when a refresh job is already active.
 
+## Read sync status
+
+```bash
+curl http://localhost:8080/api/v1/sources/{source_id}/sync-status \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+The endpoint returns the current job status, progress, and attempts. The endpoint returns `404` when no refresh job exists for the source.
+
+## Cancel a sync
+
+```bash
+curl -X POST http://localhost:8080/api/v1/sources/{source_id}/sync/cancel \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+The endpoint returns `200` when the cancel succeeds. The endpoint returns `404` when no active job exists. The endpoint returns `409` when the job is already in a terminal state.
+
 ## Delete a source
 
 ```bash
@@ -96,3 +120,23 @@ curl -X DELETE http://localhost:8080/api/v1/sources/{source_id} \
 ```
 
 The deletion removes the source record and all related data.
+
+## Reconciliation revisions
+
+```bash
+curl http://localhost:8080/api/v1/sources/{source_id}/reconcile/revisions \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+The response returns the revision history, newest first.
+
+## Reconciliation rollback
+
+```bash
+curl -X POST http://localhost:8080/api/v1/sources/{source_id}/reconcile/rollback \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"revision": 3}'
+```
+
+The rollback restores channels, streams, and EPG mappings to the target revision.

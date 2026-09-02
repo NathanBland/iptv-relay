@@ -6,6 +6,7 @@
 
 pub mod broker;
 pub mod credential_broker;
+pub mod probe;
 pub mod process;
 mod psi;
 pub mod recovery;
@@ -17,6 +18,9 @@ pub use broker::{AcquireError, PoolSnapshot, ProviderSlotBroker, SlotLease};
 pub use credential_broker::{
     CredentialBroker, CredentialBrokerEndpoint, CredentialBrokerError, HlsBrokerConfig,
     HlsBrokerConfigError,
+};
+pub use probe::{
+    StreamProbe, StreamProbeFailure, StreamProbeOutcome, StreamProbeQuality, StreamProbeSpec,
 };
 pub use process::{
     AuditedProcessCommand, BrokeredInputFormat, BrokeredProcessInputSession,

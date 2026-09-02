@@ -11,11 +11,14 @@ use iptv_ingest::{
     ProtectedEndpoint, SnapshotOwner, XtreamEndpoints, XtreamPayloadKind, download_http,
     parse_artifact_with_source_timezone, prepare_snapshot, unpack_artifact,
 };
+use iptv_media::{
+    ProviderSlotBroker, StreamProbe, StreamProbeFailure, StreamProbeOutcome, StreamProbeSpec,
+};
 use iptv_persistence::{
     CatalogRepository, Database, JobRecord, JobRepository, MasterKey, NewJob, SourceKind,
-    SourceRepository,
+    SourceRepository, StreamHealthUpdate, StreamProbeTargetRow,
 };
-use reqwest::Url;
+use reqwest::{Client, Url, header::HeaderMap};
 use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, process::Command, signal, time::sleep};
 use tracing::{debug, error, info, warn};
@@ -293,6 +296,13 @@ async fn worker() -> Result<()> {
         refresh_scheduler(&scheduler_sources, &scheduler_jobs).await;
     });
 
+    // Spawn the scheduler that enqueues low-priority health probe jobs.
+    let probe_catalog = catalog.clone();
+    let probe_jobs = repository.clone();
+    let probe_scheduler_handle = tokio::spawn(async move {
+        health_probe_scheduler(&probe_catalog, &probe_jobs).await;
+    });
+
     // Spawn the reaper that resets jobs whose heartbeat is older than the
     // lease timeout. A worker that crashed or lost its lease leaves a job
     // stuck in `running`; the reaper returns it to `queued`.
@@ -347,6 +357,7 @@ async fn worker() -> Result<()> {
     }
 
     scheduler_handle.abort();
+    probe_scheduler_handle.abort();
     reaper_handle.abort();
     info!(%worker_id, "worker stopped");
     Ok(())
@@ -365,6 +376,9 @@ async fn process_job(
         jobs.succeed(job.id, worker_id).await?;
         return Ok(());
     }
+    if job.kind == "health-probe" {
+        return run_health_probe_job(jobs, catalog, master_key, worker_id, &job).await;
+    }
     if job.kind != "refresh-source" && job.kind != "refresh-xtream-short-epg" {
         warn!(job_id = %job.id, kind = %job.kind, "unsupported job kind");
         jobs.fail(
@@ -378,6 +392,23 @@ async fn process_job(
         return Ok(());
     }
 
+    run_refresh_job(
+        jobs, sources, snapshots, catalog, master_key, worker_id, job,
+    )
+    .await
+}
+
+/// Runs one source or Xtream short-EPG refresh job with a heartbeat task and
+/// persists the typed result.
+async fn run_refresh_job(
+    jobs: &JobRepository,
+    sources: &SourceRepository,
+    snapshots: &PgSnapshotStore,
+    catalog: &CatalogRepository,
+    master_key: &MasterKey,
+    worker_id: &str,
+    job: JobRecord,
+) -> Result<()> {
     // Spawn a heartbeat task that keeps the job lease fresh during long
     // downloads. The ingest pipeline reports progress through checkpoints,
     // but a slow download can leave the heartbeat stale. This task touches
@@ -749,6 +780,301 @@ async fn run_xtream_short_epg_refresh(
         decoded_bytes,
         records: snapshot.record_count,
     })
+}
+
+/// The low-priority pool capacity for health probes. Probes use a dedicated
+/// pool identifier suffix so they never consume a live viewer slot.
+const HEALTH_PROBE_POOL_CAPACITY: usize = 1;
+/// The minimum transport packets required before a probe declares a stream
+/// alive.
+const HEALTH_PROBE_MIN_PACKETS: usize = 32;
+/// The maximum wall-clock duration for one probe window.
+const HEALTH_PROBE_MAX_DURATION: Duration = Duration::from_secs(8);
+/// The startup timeout for the upstream to return response headers.
+const HEALTH_PROBE_STARTUP_TIMEOUT: Duration = Duration::from_secs(4);
+/// The interval at which the health probe scheduler runs.
+const HEALTH_PROBE_SCHEDULER_INTERVAL: Duration = Duration::from_mins(2);
+/// A stream in `checking` status longer than this is considered stranded.
+const HEALTH_PROBE_STRANDED_TIMEOUT_SECONDS: i64 = 300;
+/// The job priority for health-probe jobs. Jobs are claimed in descending
+/// priority order, so a value below the refresh job priority of `0` keeps
+/// health probes behind source refreshes when the queue is contested.
+const HEALTH_PROBE_JOB_PRIORITY: i32 = -1;
+/// The maximum retry attempts for one health-probe job.
+const HEALTH_PROBE_JOB_MAX_ATTEMPTS: i32 = 2;
+
+/// Handles one `health-probe` job. Loads the stream target, decrypts the URL,
+/// acquires a low-priority provider slot, runs the probe, and persists the
+/// result with re-ranking.
+async fn run_health_probe_job(
+    jobs: &JobRepository,
+    catalog: &CatalogRepository,
+    master_key: &MasterKey,
+    worker_id: &str,
+    job: &JobRecord,
+) -> Result<()> {
+    let Some(provider_stream_id) = provider_stream_id_from_payload(&job.payload) else {
+        jobs.fail(
+            job.id,
+            worker_id,
+            job.attempts,
+            job.max_attempts,
+            "health probe payload is invalid",
+        )
+        .await?;
+        return Ok(());
+    };
+    let outcome = run_health_probe(catalog, master_key, provider_stream_id).await;
+    match outcome {
+        Ok(HealthProbeResult::Skipped) => {
+            // The probe did not run: the stream was already being probed by
+            // another worker, or the low-priority pool was full. Succeed the
+            // job without a health update so the known-good status and ranking
+            // are preserved. The scheduler re-enqueues the stream later.
+            jobs.succeed(job.id, worker_id).await?;
+        }
+        Ok(HealthProbeResult::Applied | HealthProbeResult::Missing) => {
+            jobs.succeed(job.id, worker_id).await?;
+        }
+        Err(error) => {
+            let summary = format!("{error:#}");
+            warn!(job_id = %job.id, error = %summary, "health probe failed");
+            jobs.fail(job.id, worker_id, job.attempts, job.max_attempts, &summary)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The outcome of one health probe attempt.
+#[derive(Debug, Eq, PartialEq)]
+enum HealthProbeResult {
+    /// The probe ran and persisted a health update.
+    Applied,
+    /// The probe did not run because the stream was already being probed or the
+    /// low-priority pool was full. No health update is persisted.
+    Skipped,
+    /// The stream target was missing or disabled.
+    Missing,
+}
+
+/// Runs one health probe and persists the typed, redacted result.
+///
+/// The probe first claims the stream with an atomic `unknown`/`dead` to
+/// `checking` transition. A second worker that targets the same stream sees
+/// the `checking` status and returns [`HealthProbeResult::Skipped`] without
+/// running a probe or persisting an update. A skipped probe never overwrites a
+/// known-good health status or quality ranking.
+async fn run_health_probe(
+    catalog: &CatalogRepository,
+    master_key: &MasterKey,
+    provider_stream_id: Uuid,
+) -> std::result::Result<HealthProbeResult, anyhow::Error> {
+    let Some(target) = catalog.load_stream_probe_target(provider_stream_id).await? else {
+        return Ok(HealthProbeResult::Missing);
+    };
+    // Atomically claim the stream so two workers cannot probe it at the same
+    // time. A stream that is already `checking` or `alive` is left untouched.
+    let claimed = catalog.try_mark_stream_checking(provider_stream_id).await?;
+    if !claimed {
+        info!(
+            provider_stream_id = %provider_stream_id,
+            "health probe skipped: stream is already being probed or is alive"
+        );
+        return Ok(HealthProbeResult::Skipped);
+    }
+    let url = decrypt_probe_url(master_key, &target)?;
+    let pool_id = format!("{}:probe", target.provider_pool_id);
+    let broker = ProviderSlotBroker::new(pool_id, HEALTH_PROBE_POOL_CAPACITY);
+    let client = Client::new();
+    let spec = StreamProbeSpec {
+        url: url.into(),
+        headers: HeaderMap::new(),
+        pool_id: target.provider_pool_id.to_string().into(),
+        session_key: provider_stream_id.to_string().into(),
+        max_connections: HEALTH_PROBE_POOL_CAPACITY,
+        startup_timeout: HEALTH_PROBE_STARTUP_TIMEOUT,
+        max_duration: HEALTH_PROBE_MAX_DURATION,
+        min_packets: HEALTH_PROBE_MIN_PACKETS,
+    };
+    let probe = StreamProbe::new(broker, client);
+    let outcome = probe.run(&spec).await;
+    // A skipped probe (low-priority pool full) must not persist an update. The
+    // `stream_health_checks.status` check constraint only allows `alive`,
+    // `dead`, and `error`, so an `unknown` row would violate it. Skipping the
+    // update also preserves the known-good health status and ranking.
+    if let Some(update) = stream_health_update_for(provider_stream_id, &outcome) {
+        catalog.update_stream_health_and_rank(&update).await?;
+    }
+    info!(
+        provider_stream_id = %provider_stream_id,
+        outcome = ?outcome,
+        "health probe completed"
+    );
+    Ok(if matches!(outcome, StreamProbeOutcome::Skipped) {
+        HealthProbeResult::Skipped
+    } else {
+        HealthProbeResult::Applied
+    })
+}
+
+/// Decrypts the probe target URL. Falls back to the template when no
+/// ciphertext is present.
+fn decrypt_probe_url(
+    master_key: &MasterKey,
+    target: &StreamProbeTargetRow,
+) -> std::result::Result<String, anyhow::Error> {
+    let Some(ciphertext) = target.url_secret_ciphertext.as_deref() else {
+        return Ok(target.url_template.clone());
+    };
+    let associated_data = format!("iptv-provider-stream:v1:{}", target.provider_account_id);
+    let plaintext = master_key
+        .decrypt_secret(ciphertext, associated_data.as_bytes())
+        .map_err(anyhow::Error::msg)
+        .context("decrypt stream URL for health probe")?;
+    String::from_utf8(plaintext).context("decrypted stream URL is not valid UTF-8")
+}
+
+/// Builds a typed, redacted [`StreamHealthUpdate`] from a probe outcome.
+///
+/// Returns `None` for a skipped probe. A skipped probe must not persist an
+/// update because the `stream_health_checks.status` check constraint only
+/// allows `alive`, `dead`, and `error`, and because a skip must not overwrite a
+/// known-good health status or quality ranking.
+fn stream_health_update_for(
+    provider_stream_id: Uuid,
+    outcome: &StreamProbeOutcome,
+) -> Option<StreamHealthUpdate> {
+    match outcome {
+        StreamProbeOutcome::Alive {
+            quality,
+            packets_seen: _,
+            duration_ms,
+        } => Some(StreamHealthUpdate {
+            provider_stream_id,
+            status: "alive".to_owned(),
+            error: None,
+            video_codec: quality.video_codec.clone(),
+            video_resolution: None,
+            video_width: None,
+            video_height: None,
+            video_fps: None,
+            audio_codec: quality.audio_codec.clone(),
+            audio_channels: None,
+            audio_sample_rate: None,
+            bitrate_kbps: None,
+            check_duration_ms: Some(i32::try_from(*duration_ms).unwrap_or(i32::MAX)),
+        }),
+        StreamProbeOutcome::Dead(failure) => Some(StreamHealthUpdate {
+            provider_stream_id,
+            status: "dead".to_owned(),
+            error: Some(redacted_failure_message(failure)),
+            video_codec: None,
+            video_resolution: None,
+            video_width: None,
+            video_height: None,
+            video_fps: None,
+            audio_codec: None,
+            audio_channels: None,
+            audio_sample_rate: None,
+            bitrate_kbps: None,
+            check_duration_ms: None,
+        }),
+        StreamProbeOutcome::Skipped => None,
+    }
+}
+
+/// Returns a redacted, human-readable failure message. No URL or credential
+/// data is included.
+fn redacted_failure_message(failure: &StreamProbeFailure) -> String {
+    match failure {
+        StreamProbeFailure::CapacityFull => "provider pool at capacity".to_owned(),
+        StreamProbeFailure::StartupTimeout => "upstream startup timeout".to_owned(),
+        StreamProbeFailure::Http => "upstream HTTP request failed".to_owned(),
+        StreamProbeFailure::HttpStatus => "upstream returned an unsuccessful status".to_owned(),
+        StreamProbeFailure::NoPat => "no PAT section observed".to_owned(),
+        StreamProbeFailure::NoPmt => "no PMT section observed".to_owned(),
+        StreamProbeFailure::NoVideo => "no video elementary stream declared".to_owned(),
+        StreamProbeFailure::NoAudio => "no audio elementary stream declared".to_owned(),
+        StreamProbeFailure::InsufficientPackets { seen, required } => {
+            format!("insufficient packet flow: saw {seen} of {required} required packets")
+        }
+        StreamProbeFailure::MalformedTransport => "transport stream data was malformed".to_owned(),
+    }
+}
+
+/// Extracts the provider stream ID from a `health-probe` job payload.
+fn provider_stream_id_from_payload(payload: &serde_json::Value) -> Option<Uuid> {
+    payload
+        .get("providerStreamId")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+/// Periodically enqueues low-priority health probe jobs for streams that need
+/// a check. Recovers stranded `checking` records before each cycle.
+async fn health_probe_scheduler(catalog: &CatalogRepository, jobs: &JobRepository) {
+    info!("health probe scheduler started");
+    loop {
+        tokio::select! {
+            () = shutdown_signal() => {
+                info!("health probe scheduler stopping");
+                return;
+            }
+            () = tokio::time::sleep(HEALTH_PROBE_SCHEDULER_INTERVAL) => {}
+        }
+        if let Err(error) = catalog
+            .recover_stranded_checking_streams(HEALTH_PROBE_STRANDED_TIMEOUT_SECONDS)
+            .await
+        {
+            warn!(error = %error, "health probe scheduler failed to recover stranded checking streams");
+        }
+        match catalog
+            .list_streams_for_health_probe(50, HEALTH_PROBE_STRANDED_TIMEOUT_SECONDS)
+            .await
+        {
+            Ok(streams) => {
+                if streams.is_empty() {
+                    continue;
+                }
+                debug!(
+                    probe_count = streams.len(),
+                    "enqueuing scheduled health probes"
+                );
+                for stream in streams {
+                    // Enqueue only when no queued or running health-probe job
+                    // already targets this stream. The atomic guard prevents
+                    // duplicate per-worker probes across overlapping cycles.
+                    match jobs
+                        .enqueue_health_probe_if_idle(
+                            stream.provider_stream_id,
+                            HEALTH_PROBE_JOB_PRIORITY,
+                            HEALTH_PROBE_JOB_MAX_ATTEMPTS,
+                        )
+                        .await
+                    {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            debug!(
+                                provider_stream_id = %stream.provider_stream_id,
+                                "health probe job already queued or running"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                provider_stream_id = %stream.provider_stream_id,
+                                error = %error,
+                                "failed to enqueue scheduled health probe"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(error = %error, "health probe scheduler failed to list streams for probe");
+            }
+        }
+    }
 }
 
 async fn run_xtream_refresh(
@@ -1143,6 +1469,7 @@ mod tests {
         response::{IntoResponse, Response},
         routing::get,
     };
+    use iptv_media::StreamProbeQuality;
     use std::{
         collections::HashMap,
         sync::{
@@ -1642,6 +1969,91 @@ mod tests {
         ] {
             assert_eq!(source_id_from_payload(&payload), None);
         }
+    }
+
+    #[test]
+    fn health_probe_payload_requires_a_valid_provider_stream_id() {
+        let stream_id = Uuid::now_v7();
+        assert_eq!(
+            provider_stream_id_from_payload(&serde_json::json!({
+                "providerStreamId": stream_id
+            })),
+            Some(stream_id)
+        );
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"providerStreamId": null}),
+            serde_json::json!({"providerStreamId": "invalid"}),
+        ] {
+            assert_eq!(provider_stream_id_from_payload(&payload), None);
+        }
+    }
+
+    #[test]
+    fn redacted_failure_messages_omit_urls_and_credentials() {
+        for failure in [
+            StreamProbeFailure::CapacityFull,
+            StreamProbeFailure::StartupTimeout,
+            StreamProbeFailure::Http,
+            StreamProbeFailure::HttpStatus,
+            StreamProbeFailure::NoPat,
+            StreamProbeFailure::NoPmt,
+            StreamProbeFailure::NoVideo,
+            StreamProbeFailure::NoAudio,
+            StreamProbeFailure::InsufficientPackets {
+                seen: 3,
+                required: 32,
+            },
+            StreamProbeFailure::MalformedTransport,
+        ] {
+            let message = redacted_failure_message(&failure);
+            assert!(!message.contains("http"));
+            assert!(!message.contains("://"));
+            assert!(!message.contains("token"));
+            assert!(!message.is_empty());
+        }
+    }
+
+    #[test]
+    fn stream_health_update_for_alive_carries_quality_data() {
+        let stream_id = Uuid::now_v7();
+        let outcome = StreamProbeOutcome::Alive {
+            quality: StreamProbeQuality {
+                video_codec: Some("h264".to_owned()),
+                audio_codec: Some("mp2".to_owned()),
+            },
+            packets_seen: 64,
+            duration_ms: 1_200,
+        };
+        let update = stream_health_update_for(stream_id, &outcome)
+            .expect("alive outcome produces a health update");
+        assert_eq!(update.provider_stream_id, stream_id);
+        assert_eq!(update.status, "alive");
+        assert_eq!(update.video_codec.as_deref(), Some("h264"));
+        assert_eq!(update.audio_codec.as_deref(), Some("mp2"));
+        assert_eq!(update.check_duration_ms, Some(1_200));
+        assert!(update.error.is_none());
+    }
+
+    #[test]
+    fn stream_health_update_for_dead_carries_redacted_error() {
+        let stream_id = Uuid::now_v7();
+        let outcome = StreamProbeOutcome::Dead(StreamProbeFailure::NoPmt);
+        let update = stream_health_update_for(stream_id, &outcome)
+            .expect("dead outcome produces a health update");
+        assert_eq!(update.status, "dead");
+        assert_eq!(update.error.as_deref(), Some("no PMT section observed"));
+    }
+
+    #[test]
+    fn stream_health_update_for_skipped_returns_none() {
+        let stream_id = Uuid::now_v7();
+        let outcome = StreamProbeOutcome::Skipped;
+        let update = stream_health_update_for(stream_id, &outcome);
+        // A skipped probe must not persist an update so the
+        // stream_health_checks.status check constraint is not violated and the
+        // known-good health status and ranking are preserved.
+        assert!(update.is_none());
     }
 
     #[test]

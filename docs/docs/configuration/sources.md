@@ -1,14 +1,17 @@
 # Sources
 
-A source is an M3U playlist, an Xtream Codes account, or an XMLTV guide. The worker downloads, parses, and activates each source on a schedule.
+A source is an M3U playlist, an Xtream Codes account, an XMLTV guide, or a network tuner. The worker downloads, parses, and activates each source on a schedule.
 
 ## Source types
 
-| Type | Description |
-|------|-------------|
-| M3U | HTTP playlist of `#EXTINF` stream entries. |
-| Xtream | Xtream Codes live-stream account. |
-| XMLTV | XMLTV guide document. |
+| Type | `kind` value | Description |
+|------|--------------|-------------|
+| M3U | `M3U` | HTTP playlist of `#EXTINF` stream entries. |
+| Xtream | `Xtream` | Xtream Codes live-stream account. |
+| XMLTV | `XMLTV` | XMLTV guide document. |
+| Network tuner | `Network tuner` | HDHomeRun or similar network tuner. |
+
+The `kind` value is case-sensitive. Use the exact value from the table.
 
 ## Add a source with the API
 
@@ -19,9 +22,9 @@ curl -X POST http://localhost:8080/api/v1/sources \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "type": "m3u",
+    "kind": "M3U",
     "name": "My M3U source",
-    "url": "https://example.com/playlist.m3u"
+    "endpoint": "https://example.com/playlist.m3u"
   }'
 ```
 
@@ -40,9 +43,9 @@ curl -X POST http://localhost:8080/api/v1/sources \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "type": "xmltv",
+    "kind": "XMLTV",
     "name": "Local XMLTV guide",
-    "url": "https://example.com/guide.xml",
+    "endpoint": "https://example.com/guide.xml",
     "timezone": "America/Denver"
   }'
 ```
@@ -52,7 +55,7 @@ curl -X POST http://localhost:8080/api/v1/sources \
 1. Open the **Sources** page.
 2. Select **Add source**.
 3. Choose the source type.
-4. Enter the source name and URL.
+4. Enter the source name and endpoint URL.
 5. Save the source.
 
 The sources page shows the source state, last refreshed time, and refresh interval.
@@ -82,6 +85,28 @@ curl -X POST http://localhost:8080/api/v1/sources/{source_id}/sync \
 ```
 
 The endpoint returns `202` with the job ID. A second sync request returns `409` when a refresh job is already active.
+
+## Sync status
+
+Read the sync status for one source:
+
+```bash
+curl http://localhost:8080/api/v1/sources/{source_id}/sync-status \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+The endpoint returns the current job status, progress, and attempts. The endpoint returns `404` when no refresh job exists for the source.
+
+## Cancel a sync
+
+Cancel an active refresh job for one source:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/sources/{source_id}/sync/cancel \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+The endpoint returns `200` when the cancel succeeds. The endpoint returns `404` when no active job exists. The endpoint returns `409` when the job is already in a terminal state.
 
 ## Edit a source
 
@@ -113,3 +138,23 @@ The deletion removes the source record, provider streams, and related catalog da
 ## Reconciliation
 
 The worker calls reconciliation after each successful source refresh. Reconciliation groups provider streams by `tvg-id` and merges streams that share the same identifier. Streams without a `tvg-id` receive a fallback canonical key.
+
+## Reconciliation history and rollback
+
+List the reconciliation revisions for one source:
+
+```bash
+curl http://localhost:8080/api/v1/sources/{source_id}/reconcile/revisions \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+Roll back to a previous revision:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/sources/{source_id}/reconcile/rollback \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"revision": 3}'
+```
+
+The rollback restores channels, streams, and EPG mappings to the target revision.

@@ -62,16 +62,27 @@ curl http://localhost:8080/out/{token}/hdhr/discover.json
 curl http://localhost:8080/out/{token}/hdhr/lineup.json
 ```
 
-## Jellyfin configuration
+## Jellyfin setup
 
-Save the Jellyfin configuration:
+The gateway does not accept a `PUT /api/v1/jellyfin` request. Use the Jellyfin setup endpoints to read the published URLs and to rotate the output token.
+
+Read the published setup URLs:
 
 ```bash
-curl -X PUT http://localhost:8080/api/v1/jellyfin \
+curl http://localhost:8080/api/v1/jellyfin/setup \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+Rotate the output token:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/jellyfin/setup/rotate \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"url": "http://jellyfin:8096"}'
+  -d '{"overlapSeconds": 300}'
 ```
+
+See the [Jellyfin configuration guide](../configuration/jellyfin.md) for the full setup procedure.
 
 ## Security
 

@@ -114,7 +114,7 @@
 
 ## 7. UI Flow Results
 
-The non-credentialed Playwright suite ran against the healthy dev stack through the Caddy gateway at `http://127.0.0.1:8080`. The dev stack had two configured sources and zero channels, groups, or programmes.
+The non-credentialed Playwright suite ran against the healthy dev stack through the Caddy gateway at `http://127.0.0.1:8080`. The dev stack had zero configured sources and zero channels, groups, or programmes.
 
 | Page | URL | Key elements visible | Status |
 |---|---|---|---|
@@ -135,9 +135,9 @@ The non-credentialed run uses `make test-e2e-ci`, which excludes the `@live` dat
 | Suite | Tests passed | Tests skipped | Tests failed | Status |
 |---|---|---|---|---|
 | EPG mappings management | 4 | 2 | 0 | PASS |
-| Event and lineup UI flows | 7 | 1 | 0 | PASS |
+| Event and lineup UI flows | 8 | 1 | 0 | PASS |
 | Groups management API and UI | 4 | 2 | 0 | PASS |
-| Source deletion and channel filtering | 12 | 2 | 0 | PASS |
+| Source deletion and channel filtering | 14 | 2 | 0 | PASS |
 | Realtime UI and management routes | 10 | 0 | 0 | PASS |
 | Real-source flow (credentialed) | 0 | 1 | 0 | SKIP (explicit) |
 | Live data acceptance (`@live`) | 0 | 7 | 0 | SKIP (explicit) |
@@ -171,12 +171,12 @@ This summary records the current non-credentialed verification against the healt
 | Non-credentialed Playwright suite | `40 passed, 7 skipped, 0 failed` |
 | Credentialed real-source flow | `skipped (explicit, requires IPTV_E2E_REAL_SOURCES=true)` |
 | Live data acceptance (`@live`) | `skipped (explicit, requires IPTV_E2E_LIVE_DATA=true)` |
-| Web Vitest tests | `81 passed, 0 failed` |
+| Web Vitest tests | `89 passed, 0 failed` |
 | Web typecheck | `PASS` |
 | Web lint | `PASS` |
 | API endpoint checks (dev stack) | `10 endpoints returned 200` |
 | Critical acceptance criteria status | `PASS` (non-credentialed suite passes against the healthy dev stack) |
-| Overall status | `PASS` |
+| Overall status | `PASS` (Playwright suite, Vitest, web typecheck, and web lint pass) |
 
 ### Notes
 
@@ -184,7 +184,7 @@ Record the test notes in this section. Do not put credentials, secret URLs,
 or tokens in the notes. Add one note per line.
 
 - The non-credentialed Playwright suite ran through `make test-e2e-ci` against the healthy dev stack.
-- The dev stack had two configured sources and zero channels, groups, or programmes.
+- The dev stack had zero configured sources and zero channels, groups, or programmes.
 - Data-dependent tests skip when no channels or groups are configured.
 - The credentialed `real-source-flow` test skips gracefully when credentials or the `IPTV_E2E_REAL_SOURCES` flag are absent.
 - The `@live` data acceptance tests require `IPTV_E2E_LIVE_DATA=true` and a populated stack.
@@ -192,3 +192,4 @@ or tokens in the notes. Add one note per line.
 - The historical live data acceptance values in sections 2 through 6 remain from the prior live run.
 - The realtime SSE stream delivered overview and heartbeat events on the dev stack.
 - The UI updated without manual refresh through the SSE subscription.
+- The web typecheck now passes after the `a11y-workflows.test.tsx` type error was fixed; the overall status is PASS.

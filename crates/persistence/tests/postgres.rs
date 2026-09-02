@@ -1212,6 +1212,212 @@ async fn stream_health_updates_quality_ranking_and_stats() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
+async fn health_probe_target_loads_url_and_recovers_stranded_checking() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+
+    let mut transaction = pool.begin().await.unwrap();
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    let stream_id = uuid::Uuid::now_v7();
+    let channel_id = uuid::Uuid::now_v7();
+
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template, max_connections) VALUES ($1, $2, 'm3u', 'https://provider.test/', 2)",
+    )
+    .bind(account_id)
+    .bind(format!("Probe target account {suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, group_name, url_template, url_secret_ciphertext, supported) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)",
+    )
+    .bind(stream_id)
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind("probe-key")
+    .bind("Probe Stream")
+    .bind("news")
+    .bind("https://provider.test/[encrypted]")
+    .bind(vec![1_u8, 2, 3, 4])
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO channels (id, channel_number, name, group_name, provider_account_id, canonical_key) VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(channel_id)
+    .bind(format!("probe-{suffix}"))
+    .bind("Probe News")
+    .bind("news")
+    .bind(account_id)
+    .bind("probe-news")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO channel_streams (channel_id, provider_stream_id, priority) VALUES ($1, $2, 0)",
+    )
+    .bind(channel_id)
+    .bind(stream_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+
+    // The probe target must load the URL template, ciphertext, and pool data.
+    let target = catalog
+        .load_stream_probe_target(stream_id)
+        .await
+        .unwrap()
+        .expect("probe target exists");
+    assert_eq!(target.provider_stream_id, stream_id);
+    assert_eq!(target.provider_account_id, account_id);
+    assert_eq!(target.max_connections, 2);
+    assert_eq!(target.input_adapter, "auto");
+    assert_eq!(target.url_template, "https://provider.test/[encrypted]");
+    assert_eq!(target.url_secret_ciphertext, Some(vec![1, 2, 3, 4]));
+    // The Debug output must redact the URL and ciphertext.
+    let debug = format!("{target:?}");
+    assert!(!debug.contains("encrypted]"));
+    assert!(!debug.contains("1, 2, 3"));
+
+    // A fresh stream is `unknown` and appears in the probe list.
+    let needs_probe = catalog
+        .list_streams_for_health_probe(10, 300)
+        .await
+        .unwrap();
+    assert!(
+        needs_probe
+            .iter()
+            .any(|row| row.provider_stream_id == stream_id)
+    );
+
+    // Mark the stream as checking with an old timestamp to simulate a stranded
+    // probe. The recovery method must reset it to `unknown`.
+    sqlx::query(
+        "UPDATE provider_streams SET health_status = 'checking', health_checked_at = now() - interval '1 hour' WHERE id = $1",
+    )
+    .bind(stream_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let recovered = catalog
+        .recover_stranded_checking_streams(300)
+        .await
+        .unwrap();
+    assert!(recovered >= 1);
+    let status: String =
+        sqlx::query_scalar("SELECT health_status FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "unknown");
+
+    // update_stream_health_and_rank must persist the update and re-rank the
+    // linked channel.
+    catalog
+        .update_stream_health_and_rank(&StreamHealthUpdate {
+            provider_stream_id: stream_id,
+            status: "alive".to_owned(),
+            error: None,
+            video_codec: Some("h264".to_owned()),
+            video_resolution: None,
+            video_width: Some(1920),
+            video_height: Some(1080),
+            video_fps: Some(30.0),
+            audio_codec: Some("mp2".to_owned()),
+            audio_channels: None,
+            audio_sample_rate: None,
+            bitrate_kbps: Some(4000),
+            check_duration_ms: Some(500),
+        })
+        .await
+        .unwrap();
+
+    let final_status: String =
+        sqlx::query_scalar("SELECT health_status FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(final_status, "alive");
+    let rank: i32 = sqlx::query_scalar(
+        "SELECT quality_rank FROM channel_streams WHERE provider_stream_id = $1",
+    )
+    .bind(stream_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rank, 1);
+
+    // channels_for_stream must return the linked channel.
+    let channels = catalog.channels_for_stream(stream_id).await.unwrap();
+    assert_eq!(channels, vec![channel_id]);
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM channel_streams WHERE provider_stream_id = $1")
+        .bind(stream_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stream_health_checks WHERE provider_stream_id = $1")
+        .bind(stream_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM provider_streams WHERE id = $1")
+        .bind(stream_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM channels WHERE id = $1")
+        .bind(channel_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM source_snapshots WHERE id = $1")
+        .bind(snapshot_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn playback_plan_uses_ranked_candidates_and_effective_pool_caps() {
     let Some(database_url) = database_url() else {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
@@ -4186,4 +4392,272 @@ async fn jobs_cancel(pool: &sqlx::PgPool, job_id: uuid::Uuid) -> Result<(), sqlx
     .execute(pool)
     .await
     .map(|_| ())
+}
+
+/// Inserts one supported provider stream and returns its ID.
+async fn insert_probe_stream(
+    pool: &sqlx::PgPool,
+    suffix: uuid::Uuid,
+) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+    let mut transaction = pool.begin().await.unwrap();
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    let stream_id = uuid::Uuid::now_v7();
+
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template, max_connections) \
+         VALUES ($1, $2, 'm3u', 'https://provider.test/', 2)",
+    )
+    .bind(account_id)
+    .bind(format!("Dedup account {suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) \
+         VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, group_name, url_template, supported) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, true)",
+    )
+    .bind(stream_id)
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(format!("dedup-key-{suffix}"))
+    .bind("Dedup Stream")
+    .bind("news")
+    .bind("https://provider.test/stream.ts")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    (account_id, snapshot_id, stream_id)
+}
+
+async fn delete_probe_stream(
+    pool: &sqlx::PgPool,
+    account_id: uuid::Uuid,
+    snapshot_id: uuid::Uuid,
+    stream_id: uuid::Uuid,
+) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM stream_health_checks WHERE provider_stream_id = $1")
+        .bind(stream_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM provider_streams WHERE id = $1")
+        .bind(stream_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM source_snapshots WHERE id = $1")
+        .bind(snapshot_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn try_mark_stream_checking_deduplicates_concurrent_probes() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+    let (account_id, snapshot_id, stream_id) = insert_probe_stream(&pool, suffix).await;
+
+    // A fresh stream is `unknown`. The first claim must transition it to
+    // `checking` and return true.
+    let first = catalog.try_mark_stream_checking(stream_id).await.unwrap();
+    assert!(first, "first claim must succeed for an unknown stream");
+    let status: String =
+        sqlx::query_scalar("SELECT health_status FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "checking");
+
+    // A second concurrent claim must return false and leave the stream in
+    // `checking` so a second worker does not probe the same stream.
+    let second = catalog.try_mark_stream_checking(stream_id).await.unwrap();
+    assert!(!second, "second claim must be suppressed while checking");
+
+    // An `alive` stream must not be claimed by a probe.
+    sqlx::query("UPDATE provider_streams SET health_status = 'alive' WHERE id = $1")
+        .bind(stream_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let alive_claim = catalog.try_mark_stream_checking(stream_id).await.unwrap();
+    assert!(!alive_claim, "an alive stream must not be claimed");
+
+    delete_probe_stream(&pool, account_id, snapshot_id, stream_id).await;
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn enqueue_health_probe_if_idle_deduplicates_active_jobs() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let jobs = JobRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+    let (account_id, snapshot_id, stream_id) = insert_probe_stream(&pool, suffix).await;
+
+    // The first enqueue creates one queued low-priority health-probe job.
+    let first = jobs
+        .enqueue_health_probe_if_idle(stream_id, -1, 2)
+        .await
+        .unwrap()
+        .expect("first enqueue creates a job");
+    assert_eq!(first.kind, "health-probe");
+    assert_eq!(first.priority, -1);
+    assert_eq!(first.status, "queued");
+
+    // A second enqueue while the first is queued is suppressed.
+    let second = jobs
+        .enqueue_health_probe_if_idle(stream_id, -1, 2)
+        .await
+        .unwrap();
+    assert!(
+        second.is_none(),
+        "duplicate queued enqueue must be suppressed"
+    );
+    let queued_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs \
+         WHERE kind = 'health-probe' \
+           AND payload->>'providerStreamId' = $1 \
+           AND status = 'queued'",
+    )
+    .bind(stream_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        queued_count, 1,
+        "only one queued health-probe job may exist"
+    );
+
+    // While the job is running the dedup guard still suppresses a new enqueue.
+    sqlx::query(
+        "UPDATE jobs SET status = 'running', locked_by = 'worker', locked_at = now() WHERE id = $1",
+    )
+    .bind(first.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let while_running = jobs
+        .enqueue_health_probe_if_idle(stream_id, -1, 2)
+        .await
+        .unwrap();
+    assert!(
+        while_running.is_none(),
+        "enqueue while running must be suppressed"
+    );
+
+    // After the running job completes, a fresh enqueue creates a new job.
+    sqlx::query("UPDATE jobs SET status = 'succeeded', completed_at = now() WHERE id = $1")
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next = jobs
+        .enqueue_health_probe_if_idle(stream_id, -1, 2)
+        .await
+        .unwrap()
+        .expect("enqueue after completion creates a job");
+    assert_ne!(next.id, first.id);
+
+    jobs_cancel(&pool, first.id).await.ok();
+    jobs_cancel(&pool, next.id).await.ok();
+    delete_probe_stream(&pool, account_id, snapshot_id, stream_id).await;
+    drop(jobs);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn skipped_probe_does_not_persist_an_invalid_health_check_status() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+    let (account_id, snapshot_id, stream_id) = insert_probe_stream(&pool, suffix).await;
+
+    // Seed a known-good alive health check so a skipped probe must not overwrite
+    // it with an invalid `unknown` status.
+    catalog
+        .update_stream_health(&StreamHealthUpdate {
+            provider_stream_id: stream_id,
+            status: "alive".to_owned(),
+            error: None,
+            video_codec: Some("h264".to_owned()),
+            video_resolution: None,
+            video_width: Some(1920),
+            video_height: Some(1080),
+            video_fps: Some(30.0),
+            audio_codec: Some("mp2".to_owned()),
+            audio_channels: None,
+            audio_sample_rate: None,
+            bitrate_kbps: Some(4000),
+            check_duration_ms: Some(500),
+        })
+        .await
+        .unwrap();
+
+    // A skipped probe persists no update. The caller (gateway) is responsible
+    // for not calling this method on a skipped outcome; this test verifies the
+    // known-good row is untouched when no update is written.
+    let status: String =
+        sqlx::query_scalar("SELECT health_status FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "alive");
+    let checks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM stream_health_checks WHERE provider_stream_id = $1",
+    )
+    .bind(stream_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(checks, 1, "only the seeded alive check row exists");
+
+    delete_probe_stream(&pool, account_id, snapshot_id, stream_id).await;
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
 }

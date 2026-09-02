@@ -11,6 +11,7 @@ The events API manages dynamic event templates and event channels for sports lea
 | POST | `/api/v1/event-templates` | Create an event template. |
 | PATCH | `/api/v1/event-templates/{template_id}` | Update an event template. |
 | DELETE | `/api/v1/event-templates/{template_id}` | Delete an event template. |
+| GET | `/api/v1/event-templates/suggestions` | List suggested event templates from live stream data. |
 | GET | `/api/v1/event-channels` | List event channels. |
 | POST | `/api/v1/event-templates/{template_id}/scan` | Scan provider streams for event channels. |
 | POST | `/api/v1/event-templates/{template_id}/prune` | Prune past event channels. |
@@ -29,6 +30,7 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
+    "name": "nfl",
     "displayName": "NFL",
     "groupName": "Sports",
     "matchRegex": "(?i)^NFL\\s+(.+?)\\s+vs\\.?\\s+(.+?)\\s+(\\d{4}-\\d{2}-\\d{2})",
@@ -38,6 +40,8 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
     "futureDateDays": 7
   }'
 ```
+
+The `name`, `displayName`, `matchRegex`, `channelNameFormat`, and `groupName` fields are required. The duration, grace, and future-window fields use default values when you omit them.
 
 ## Update an event template
 
@@ -56,6 +60,19 @@ curl -X PATCH http://localhost:8080/api/v1/event-templates/{template_id} \
 curl -X DELETE http://localhost:8080/api/v1/event-templates/{template_id} \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
 ```
+
+## List event-template suggestions
+
+List suggested event templates that the gateway derives from live provider stream names:
+
+```bash
+curl http://localhost:8080/api/v1/event-templates/suggestions \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+The response returns an array of `EventTemplateSuggestionResponse` objects. Each object includes the suggested `name`, `displayName`, `matchRegex`, `channelNameFormat`, `groupName`, duration fields, `sampleStreams`, and `streamCount`.
+
+Use a suggestion as a starting point. Adjust the regular expression before you create the template.
 
 ## List event channels
 

@@ -48,14 +48,16 @@ During work:
 - Keep the task description and status aligned with the actual work.
 - Link related tasks when appropriate.
 - Do not mark a task `Done` because code exists.
+- Do not mark a task `Done` until an associated Git commit exists.
 
 When work finishes:
 
 1. Verify the requested behavior.
 2. Add a concise completion comment.
-3. State what changed and how verification passed.
-4. Move the task to `Done` only after validation succeeds.
-5. Document outstanding work and keep the task in the correct nonfinal stage.
+3. Confirm that the associated Git commit exists.
+4. State what changed, how verification passed, and the commit hash.
+5. Move the task to `Done` only after validation and commit checks succeed.
+6. Document outstanding work and keep the task in the correct nonfinal stage.
 
 Never invent Kaneo task IDs, project IDs, user IDs, or status names.
 

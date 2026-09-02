@@ -63,7 +63,7 @@ The Caddy gateway routes `/api/*`, `/auth/*`, `/health/*`, `/metrics`, and `/out
 
 ## Migrations
 
-The project uses 17 sequential SQL migrations. A `build.rs` file in `crates/persistence` forces recompilation when migration files change.
+The project uses 27 sequential SQL migrations. A `build.rs` file in `crates/persistence` forces recompilation when migration files change.
 
 All migrations use idempotent SQL constructs such as `CREATE TABLE IF NOT EXISTS` and `ADD COLUMN IF NOT EXISTS`.
 

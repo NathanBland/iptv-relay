@@ -25,10 +25,11 @@ Return each proposed comment and status change to the parent.
 
 1. Use only the verified Kaneo task context that the parent supplies.
 2. Confirm that the task has validation evidence.
-3. Confirm that the completion comment states changes and verification.
-4. Confirm that outstanding work has related tasks.
-5. Return an incomplete task to its correct nonfinal stage.
-6. Add an audit comment only when it adds useful information.
+3. Confirm that an associated Git commit exists.
+4. Confirm that the completion comment states changes, verification, and the commit hash.
+5. Confirm that outstanding work has related tasks.
+6. Return an incomplete task to its correct nonfinal stage.
+7. Add an audit comment only when it adds useful information.
 
 Do not change production code.
 

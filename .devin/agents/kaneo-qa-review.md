@@ -32,8 +32,9 @@ Return each proposed comment and status change to the parent.
 5. Run focused tests before broad tests.
 6. Record exact commands and results.
 7. Return failed work to `In Progress`.
-8. Add a concise verification comment when all criteria pass.
-9. Move fully verified work to `Done`.
+8. Confirm that an associated Git commit exists when all criteria pass.
+9. Add a concise verification comment with the changes, test results, and commit hash.
+10. Move fully verified work to `Done` only after the commit check passes.
 
 Do not expand product scope.
 

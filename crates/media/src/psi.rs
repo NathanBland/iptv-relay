@@ -13,6 +13,8 @@ const MAX_SECTION_BYTES: usize = 1_024;
 pub(crate) struct PatPmtTracker {
     pat: SectionAssembler,
     candidate: Option<PmtCandidate>,
+    last_pmt_section: Option<Vec<u8>>,
+    last_program_number: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -50,6 +52,8 @@ impl PatPmtTracker {
             return None;
         }
         let boundary = candidate.pat_start_sequence;
+        self.last_pmt_section = Some(section.bytes.clone());
+        self.last_program_number = Some(candidate.program_number);
         self.candidate = None;
         Some(boundary)
     }
@@ -58,6 +62,13 @@ impl PatPmtTracker {
         self.candidate
             .as_ref()
             .map(|candidate| candidate.pat_start_sequence)
+    }
+
+    /// Returns the most recently validated PMT section and its program number.
+    pub(crate) fn completed_pmt(&self) -> Option<(&[u8], u16)> {
+        self.last_pmt_section
+            .as_deref()
+            .zip(self.last_program_number)
     }
 
     pub(crate) fn reset(&mut self) {
@@ -209,6 +220,56 @@ fn parse_pat(section: &[u8]) -> Option<(u16, u16)> {
     })
 }
 
+/// One elementary stream declared inside a PMT section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ElementaryStreamInfo {
+    pub stream_type: u8,
+    pub pid: u16,
+}
+
+/// Parses a validated PMT section and returns its elementary stream entries.
+///
+/// Returns `None` when the section is not a valid PMT for `expected_program`.
+/// The caller validates the CRC separately, so this function trusts the bytes.
+pub(crate) fn parse_pmt_elementary_streams(
+    section: &[u8],
+    expected_program: u16,
+) -> Option<Vec<ElementaryStreamInfo>> {
+    if section.len() < 16
+        || section[0] != PMT_TABLE_ID
+        || section[1] & 0x80 == 0
+        || section[5] & 0x01 == 0
+        || u16::from_be_bytes([section[3], section[4]]) != expected_program
+    {
+        return None;
+    }
+    let program_info_length = (usize::from(section[10] & 0x0f) << 8) | usize::from(section[11]);
+    let mut offset = 12_usize.checked_add(program_info_length)?;
+    let streams_end = section.len().saturating_sub(4);
+    if offset > streams_end {
+        return None;
+    }
+    let mut streams = Vec::new();
+    while offset < streams_end {
+        let header = section.get(offset..offset.saturating_add(5))?;
+        let stream_type = header[0];
+        let pid = (u16::from(header[1] & 0x1f) << 8) | u16::from(header[2]);
+        let es_info_length = (usize::from(header[3] & 0x0f) << 8) | usize::from(header[4]);
+        let next = offset
+            .checked_add(5)
+            .and_then(|offset| offset.checked_add(es_info_length))?;
+        if next > streams_end {
+            return None;
+        }
+        streams.push(ElementaryStreamInfo { stream_type, pid });
+        offset = next;
+    }
+    if offset != streams_end {
+        return None;
+    }
+    Some(streams)
+}
+
 fn is_matching_pmt(section: &[u8], expected_program: u16) -> bool {
     if section.len() < 16
         || section[0] != PMT_TABLE_ID
@@ -343,6 +404,39 @@ pub(crate) mod test_support {
         section
     }
 
+    /// Builds a PMT section that declares one video and one audio elementary
+    /// stream. The audio PID is distinct from the video PID.
+    pub(crate) fn pmt_section_with_audio(video_pid: u16, audio_pid: u16) -> Vec<u8> {
+        let mut section = vec![
+            PMT_TABLE_ID,
+            0xb0,
+            0x17,
+            0x00,
+            0x01,
+            0xc1,
+            0x00,
+            0x00,
+            0xe0 | u8::try_from((video_pid >> 8) & 0x1f).unwrap(),
+            u8::try_from(video_pid & 0xff).unwrap(),
+            0xf0,
+            0x00,
+            // Video elementary stream: H.264 (stream_type 0x1b).
+            0x1b,
+            0xe0 | u8::try_from((video_pid >> 8) & 0x1f).unwrap(),
+            u8::try_from(video_pid & 0xff).unwrap(),
+            0xf0,
+            0x00,
+            // Audio elementary stream: MPEG-2 audio (stream_type 0x04).
+            0x04,
+            0xe0 | u8::try_from((audio_pid >> 8) & 0x1f).unwrap(),
+            u8::try_from(audio_pid & 0xff).unwrap(),
+            0xf0,
+            0x00,
+        ];
+        append_crc(&mut section);
+        section
+    }
+
     fn append_crc(section: &mut Vec<u8>) {
         let crc = mpeg_crc32(section);
         section.extend_from_slice(&crc.to_be_bytes());
@@ -425,5 +519,49 @@ mod tests {
     fn append_test_crc(section: &mut Vec<u8>) {
         let crc = mpeg_crc32(section);
         section.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    #[test]
+    fn completed_pmt_exposes_elementary_streams_for_audio_and_video() {
+        const TEST_AUDIO_PID: u16 = 0x102;
+        let pat = pat_packet();
+        let pmt = psi_packet(
+            TEST_PMT_PID,
+            &pmt_section_with_audio(TEST_VIDEO_PID, TEST_AUDIO_PID),
+            0,
+            0,
+        );
+        let mut tracker = PatPmtTracker::default();
+        assert_eq!(tracker.observe(&pat, 0), None);
+        assert_eq!(tracker.observe(&pmt, 1), Some(0));
+
+        let (section, program) = tracker
+            .completed_pmt()
+            .expect("completed PMT section is retained");
+        assert_eq!(program, 1);
+        let streams = parse_pmt_elementary_streams(section, program)
+            .expect("elementary streams parse from a valid PMT");
+        assert_eq!(streams.len(), 2);
+        assert_eq!(
+            streams[0],
+            ElementaryStreamInfo {
+                stream_type: 0x1b,
+                pid: TEST_VIDEO_PID
+            }
+        );
+        assert_eq!(
+            streams[1],
+            ElementaryStreamInfo {
+                stream_type: 0x04,
+                pid: TEST_AUDIO_PID
+            }
+        );
+    }
+
+    #[test]
+    fn parse_pmt_elementary_streams_rejects_wrong_program_and_bad_sections() {
+        assert!(parse_pmt_elementary_streams(&pmt_section(TEST_VIDEO_PID), 999).is_none());
+        assert!(parse_pmt_elementary_streams(&[], 1).is_none());
+        assert!(parse_pmt_elementary_streams(&pat_section(TEST_PMT_PID), 1).is_none());
     }
 }

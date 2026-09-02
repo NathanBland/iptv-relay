@@ -37,6 +37,7 @@ nav:
       - DVR: configuration/dvr.md
       - Channel Aliases: configuration/channel-aliases.md
       - Jellyfin: configuration/jellyfin.md
+      - Security, Backup, and Recovery: configuration/security.md
   - API Reference:
       - Authentication: api/authentication.md
       - Sources: api/sources.md
@@ -44,10 +45,13 @@ nav:
       - EPG: api/epg.md
       - Events: api/events.md
       - Sessions: api/sessions.md
+      - Settings: api/settings.md
+      - Region Settings: api/region-settings.md
       - Output: api/output.md
   - Development:
       - Local Setup: development/local-setup.md
       - Testing: development/testing.md
+      - OpenAPI Drift Check: development/openapi-drift-check.md
       - Architecture: development/architecture.md
 plugins:
   - search

@@ -44,6 +44,7 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
+    "name": "nfl",
     "displayName": "NFL",
     "groupName": "Sports",
     "matchRegex": "(?i)^NFL\\s+(.+?)\\s+vs\\.?\\s+(.+?)\\s+(\\d{4}-\\d{2}-\\d{2})",
@@ -53,6 +54,19 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
     "futureDateDays": 7
   }'
 ```
+
+The `name`, `displayName`, `matchRegex`, `channelNameFormat`, and `groupName` fields are required. The duration, grace, and future-window fields use default values when you omit them.
+
+## Suggest a template record
+
+Use this endpoint to list suggested templates from live provider stream names.
+
+```bash
+curl http://localhost:8080/api/v1/event-templates/suggestions \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+The response returns an array of suggestion objects. Each object includes the suggested fields and a sample of matching stream names. Use a suggestion as a starting point. Adjust the regular expression before you create the template.
 
 ## Scan or prune records
 

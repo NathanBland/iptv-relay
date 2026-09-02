@@ -1,4 +1,4 @@
-.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-coverage-script postgres-test coverage coverage-rust coverage-web coverage-changed fuzz-smoke ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
+.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-coverage-script test-openapi-drift-check postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
 
 DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
 
@@ -62,6 +62,19 @@ coverage: coverage-rust coverage-web
 test-coverage-script:
 	./scripts/test-changed-line-coverage.sh
 
+test-openapi-drift-check:
+	./scripts/test-openapi-drift-check.sh
+
+# Regenerate the checked-in OpenAPI reference snapshot from the ApiDoc.
+# This target needs no database and no secrets.
+openapi-snapshot:
+	cargo run -p iptv-api --example print-openapi --quiet 2>/dev/null | jq -S . > tests/fixtures/openapi.json
+
+# Compare the live /api/v1/openapi.json contract against the reference snapshot.
+# Set OPENAPI_BASE_URL to a running core service (default: http://127.0.0.1:8081).
+openapi-drift-check:
+	./scripts/openapi-drift-check.sh
+
 coverage-changed: postgres-test
 	IPTV_TEST_DATABASE_URL=$(IPTV_TEST_DATABASE_URL) ./scripts/changed-line-coverage.sh "$(COVERAGE_CHANGED_THRESHOLD)" "$(COVERAGE_BASE_REF)"
 
@@ -74,7 +87,7 @@ fuzz-smoke:
 	cargo +nightly fuzz run xtream -- -max_total_time=60
 	cargo +nightly fuzz run events -- -max_total_time=60
 
-ci: fmt lint audit coverage test-coverage-script coverage-changed test-e2e-ci compose-config
+ci: fmt lint audit coverage test-coverage-script test-openapi-drift-check coverage-changed test-e2e-ci compose-config
 
 build:
 	cargo build --workspace --release

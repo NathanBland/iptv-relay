@@ -94,7 +94,27 @@ Run the changed-line coverage gate:
 make coverage-changed
 ```
 
-The script compares changed production lines against LLVM coverage data. The threshold defaults to 80%.
+The script compares changed production lines against LLVM coverage data. The threshold defaults to 95 percent.
+
+Override the threshold with the `COVERAGE_CHANGED_THRESHOLD` variable:
+
+```bash
+make coverage-changed COVERAGE_CHANGED_THRESHOLD=90
+```
+
+Pass a base git ref with `COVERAGE_BASE_REF`:
+
+```bash
+make coverage-changed COVERAGE_BASE_REF=origin/main
+```
+
+The gate counts only production files. The gate excludes tests, benches, examples, fuzz targets, migrations, scripts, and deploy files.
+
+Run the script self-tests:
+
+```bash
+make test-coverage-script
+```
 
 ## Lint and format
 

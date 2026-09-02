@@ -3414,6 +3414,38 @@ impl CatalogRepository {
         Ok(rows)
     }
 
+    /// Atomically transitions one stream from `unknown` or `dead` to
+    /// `checking`.
+    ///
+    /// The probe worker calls this before it runs a probe so two workers cannot
+    /// probe the same stream at the same time. Returns `true` when this call
+    /// claimed the stream, and `false` when another worker already owns the
+    /// `checking` transition or the stream is `alive`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn try_mark_stream_checking(
+        &self,
+        provider_stream_id: Uuid,
+    ) -> Result<bool, PersistenceError> {
+        let rows = sqlx::query(
+            r"
+            UPDATE provider_streams SET
+                health_status = 'checking',
+                health_checked_at = now()
+            WHERE id = $1
+              AND health_status IN ('unknown', 'dead')
+            ",
+        )
+        .bind(provider_stream_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(rows != 0)
+    }
+
     /// Lists streams that need health checking (unknown or dead status).
     ///
     /// # Errors
@@ -3633,6 +3665,162 @@ impl CatalogRepository {
             checking: row.3,
         })
     }
+
+    /// Loads the probe target data for one provider stream.
+    ///
+    /// The URL ciphertext stays inside the returned row. The caller decrypts
+    /// it with the master key and the provider account associated data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn load_stream_probe_target(
+        &self,
+        provider_stream_id: Uuid,
+    ) -> Result<Option<StreamProbeTargetRow>, PersistenceError> {
+        let row = sqlx::query_as::<_, StreamProbeTargetRow>(
+            r"
+            SELECT
+                ps.id AS provider_stream_id,
+                ps.provider_account_id,
+                COALESCE(pa.connection_pool_id, pa.id) AS provider_pool_id,
+                COALESCE(cp.max_connections, pa.max_connections) AS max_connections,
+                pa.input_adapter,
+                ps.url_template,
+                ps.url_secret_ciphertext
+            FROM provider_streams ps
+            JOIN provider_accounts pa ON pa.id = ps.provider_account_id
+            LEFT JOIN connection_pools cp ON cp.id = pa.connection_pool_id
+            WHERE ps.id = $1
+              AND ps.supported = true
+              AND pa.enabled = true
+            ",
+        )
+        .bind(provider_stream_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Lists provider streams that need a health probe.
+    ///
+    /// The query selects streams in `unknown` or `dead` status, plus streams
+    /// stuck in `checking` longer than `stranded_timeout_seconds`. The
+    /// scheduler uses this to enqueue low-priority probe jobs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn list_streams_for_health_probe(
+        &self,
+        limit: i64,
+        stranded_timeout_seconds: i64,
+    ) -> Result<Vec<StreamHealthRow>, PersistenceError> {
+        let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        let rows: Vec<StreamHealthRow> = sqlx::query_as(
+            r"
+            SELECT ps.id AS provider_stream_id, ps.name AS stream_name,
+                   ps.group_name, ps.health_status, ps.health_checked_at,
+                   ps.health_error, ps.video_codec, ps.video_resolution,
+                   ps.video_width, ps.video_height,
+                   ps.video_fps::double precision AS video_fps,
+                   ps.audio_codec, ps.audio_channels, ps.audio_sample_rate,
+                   ps.bitrate_kbps, ps.provider_account_id
+            FROM provider_streams ps
+            JOIN provider_accounts pa ON pa.id = ps.provider_account_id
+            WHERE ps.supported = true
+              AND pa.enabled = true
+              AND (
+                  ps.health_status IN ('unknown', 'dead')
+                  OR (ps.health_status = 'checking'
+                      AND ps.health_checked_at < now() - make_interval(secs => $2))
+              )
+            ORDER BY ps.health_status, ps.name
+            LIMIT $1
+            ",
+        )
+        .bind(limit)
+        .bind(stranded_timeout_seconds)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Resets streams stuck in `checking` status back to `unknown`.
+    ///
+    /// A worker that crashed mid-probe leaves a stream in `checking`. This
+    /// method returns those stranded records to the probe queue after the
+    /// configured timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn recover_stranded_checking_streams(
+        &self,
+        stranded_timeout_seconds: i64,
+    ) -> Result<i64, PersistenceError> {
+        let result = sqlx::query(
+            r"
+            UPDATE provider_streams SET
+                health_status = 'unknown'
+            WHERE health_status = 'checking'
+              AND health_checked_at < now() - make_interval(secs => $1)
+            ",
+        )
+        .bind(stranded_timeout_seconds)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected().try_into().unwrap_or(i64::MAX))
+    }
+
+    /// Lists the channel IDs linked to one provider stream.
+    ///
+    /// The probe uses this to re-rank affected channels after a health update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn channels_for_stream(
+        &self,
+        provider_stream_id: Uuid,
+    ) -> Result<Vec<Uuid>, PersistenceError> {
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r"
+            SELECT channel_id FROM channel_streams
+            WHERE provider_stream_id = $1
+            ",
+        )
+        .bind(provider_stream_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Updates stream health data and re-ranks every linked channel.
+    ///
+    /// The probe calls this after a successful or failed probe so that the
+    /// alternate ranking reflects the current health status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when any query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn update_stream_health_and_rank(
+        &self,
+        update: &StreamHealthUpdate,
+    ) -> Result<i64, PersistenceError> {
+        self.update_stream_health(update).await?;
+        let channel_ids = self.channels_for_stream(update.provider_stream_id).await?;
+        let mut ranked = 0_i64;
+        for channel_id in channel_ids {
+            ranked += self.rank_channel_streams_by_quality(channel_id).await?;
+        }
+        Ok(ranked)
+    }
 }
 
 /// Stream health statistics for dashboard display.
@@ -3642,6 +3830,37 @@ pub struct StreamHealthStats {
     pub dead: i64,
     pub unknown: i64,
     pub checking: i64,
+}
+
+/// One provider stream selected for a low-priority health probe.
+///
+/// The `url_secret_ciphertext` field holds the encrypted full URL. The probe
+/// decrypts it inside the trusted worker process and never persists the
+/// plaintext.
+#[derive(Clone, FromRow)]
+pub struct StreamProbeTargetRow {
+    pub provider_stream_id: Uuid,
+    pub provider_account_id: Uuid,
+    pub provider_pool_id: Uuid,
+    pub max_connections: i32,
+    pub input_adapter: String,
+    pub url_template: String,
+    pub url_secret_ciphertext: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for StreamProbeTargetRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamProbeTargetRow")
+            .field("provider_stream_id", &self.provider_stream_id)
+            .field("provider_account_id", &self.provider_account_id)
+            .field("provider_pool_id", &self.provider_pool_id)
+            .field("max_connections", &self.max_connections)
+            .field("input_adapter", &self.input_adapter)
+            .field("url_template", &"<redacted>")
+            .field("url_secret_ciphertext", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A user account row.

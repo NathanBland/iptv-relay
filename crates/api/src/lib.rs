@@ -3622,12 +3622,12 @@ async fn rollback_reconciliation(
         .rollback_reconciliation(account_id, request.revision, "operator")
         .await
     {
-        Ok(stats) => Json(ReconciliationRollbackResponse {
-            target_revision: stats.target_revision,
-            channels_removed: stats.channels_removed,
-            channels_restored: stats.channels_restored,
-            stream_links_restored: stats.stream_links_restored,
-            epg_mappings_restored: stats.epg_mappings_restored,
+        Ok(rollback_stats) => Json(ReconciliationRollbackResponse {
+            target_revision: rollback_stats.target_revision,
+            channels_removed: rollback_stats.channels_removed,
+            channels_restored: rollback_stats.channels_restored,
+            stream_links_restored: rollback_stats.stream_links_restored,
+            epg_mappings_restored: rollback_stats.epg_mappings_restored,
         })
         .into_response(),
         Err(error) => persistence_error_response(error),
@@ -8111,7 +8111,7 @@ mod tests {
             .clone()
             .oneshot(admin_request(
                 "GET",
-                &format!("/api/v1/sources/{account_id}/reconcile/revisions"),
+                format!("/api/v1/sources/{account_id}/reconcile/revisions"),
                 None,
             ))
             .await
@@ -8152,7 +8152,7 @@ mod tests {
             .clone()
             .oneshot(admin_request(
                 "POST",
-                &format!("/api/v1/sources/{account_id}/reconcile/rollback"),
+                format!("/api/v1/sources/{account_id}/reconcile/rollback"),
                 Some(r#"{"revision":1}"#.to_owned()),
             ))
             .await
@@ -8177,7 +8177,7 @@ mod tests {
             .clone()
             .oneshot(admin_request(
                 "POST",
-                &format!("/api/v1/sources/{account_id}/reconcile/rollback"),
+                format!("/api/v1/sources/{account_id}/reconcile/rollback"),
                 Some(r#"{"revision":99}"#.to_owned()),
             ))
             .await

@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Braces, CalendarClock, Power, Radio, ScanLine, Sparkles, Trash2, X } from 'lucide-react'
+import { Braces, CalendarClock, Eye, Power, Radio, ScanLine, Sparkles, Trash2, X } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
 import { LoadingPage } from '@/components/loading-page'
 import { Badge } from '@/components/ui/badge'
@@ -25,6 +25,48 @@ function formatTimestamp(value: string | null): string {
   return new Date(value).toLocaleString('en-US', {
     dateStyle: 'medium',
     timeStyle: 'short',
+  })
+}
+
+export interface RulePreviewMatch {
+  sample: string
+  matched: boolean
+  channelName: string | null
+  groups: Record<string, string>
+  error: string | null
+}
+
+/**
+ * Apply an event template regex and channel name format to sample stream
+ * names. The evaluation runs client-side against real stream names supplied
+ * by the caller (existing event channel raw stream names or operator-entered
+ * samples). No data is fabricated.
+ */
+export function previewEventRule(
+  regexSource: string,
+  channelNameFormat: string,
+  samples: string[],
+): RulePreviewMatch[] {
+  if (!regexSource.trim()) return []
+  let pattern: RegExp
+  try {
+    pattern = new RegExp(regexSource)
+  } catch {
+    return samples.map((sample) => ({
+      sample,
+      matched: false,
+      channelName: null,
+      groups: {},
+      error: 'The match pattern is not valid regex.',
+    }))
+  }
+  return samples.map((sample) => {
+    if (!sample) return { sample, matched: false, channelName: null, groups: {}, error: null }
+    const match = pattern.exec(sample)
+    if (!match) return { sample, matched: false, channelName: null, groups: {}, error: null }
+    const groups = match.groups ?? {}
+    const channelName = channelNameFormat.replace(/\{(\w+)\}/g, (_whole, key: string) => groups[key] ?? '')
+    return { sample, matched: true, channelName, groups, error: null }
   })
 }
 
@@ -53,6 +95,17 @@ function TemplateCard({
   onToggleEnabled: () => void
   togglingEnabled: boolean
 }) {
+  const [showPreview, setShowPreview] = useState(false)
+  const previewSamples = useMemo(
+    () => channels.map((channel) => channel.rawStreamName).filter((name): name is string => Boolean(name)),
+    [channels],
+  )
+  const previewMatches = useMemo(
+    () => (showPreview ? previewEventRule(template.matchRegex, template.channelNameFormat, previewSamples) : []),
+    [showPreview, template.matchRegex, template.channelNameFormat, previewSamples],
+  )
+  const matchedCount = previewMatches.filter((match) => match.matched).length
+
   return (
     <Card>
       <CardHeader>
@@ -78,6 +131,17 @@ function TemplateCard({
           >
             <Power aria-hidden="true" className="size-4" />
             {togglingEnabled ? 'Wait…' : template.enabled ? 'Disable' : 'Enable'}
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setShowPreview((value) => !value)}
+            aria-expanded={showPreview}
+            aria-controls={`event-rule-preview-${template.id}`}
+            aria-label={`Preview rule for ${template.displayName}`}
+          >
+            <Eye aria-hidden="true" className="size-4" />
+            {showPreview ? 'Hide preview' : 'Preview'}
           </Button>
           <Button variant="secondary" size="sm" onClick={onScan} disabled={scanning}>
             <ScanLine aria-hidden="true" className="size-4" />
@@ -117,6 +181,18 @@ function TemplateCard({
           <span>Past grace: {template.pastDateGraceHours}h</span>
           <span>Future window: {template.futureDateDays}d</span>
         </div>
+        {showPreview ? (
+          <EventRulePreviewPanel
+            id={`event-rule-preview-${template.id}`}
+            matches={previewMatches}
+            emptyMessage={previewSamples.length === 0
+              ? 'No scanned stream names are available for this template. Scan provider streams to populate the preview.'
+              : 'The match pattern did not match any scanned stream names.'}
+            summary={previewSamples.length > 0
+              ? `${matchedCount} of ${previewSamples.length} scanned stream names match.`
+              : null}
+          />
+        ) : null}
         {channels.length === 0 ? (
           <p className="rounded-lg border border-white/8 bg-white/3 px-4 py-3 text-center text-xs text-slate-500">
             No event channels found. Scan provider streams to detect events.
@@ -155,6 +231,57 @@ function TemplateCard({
         )}
       </CardContent>
     </Card>
+  )
+}
+
+function EventRulePreviewPanel({
+  id,
+  matches,
+  emptyMessage,
+  summary,
+}: {
+  id: string
+  matches: RulePreviewMatch[]
+  emptyMessage: string
+  summary: string | null
+}) {
+  return (
+    <section id={id} aria-label="Event rule preview" className="rounded-lg border border-white/8 bg-ink-950/50 p-4">
+      <p className="text-xs font-medium text-slate-300">Rule preview</p>
+      <p className="mt-1 text-[0.68rem] text-slate-500">
+        The preview applies the match pattern and channel name format to real scanned stream names. No data is fabricated.
+      </p>
+      {summary ? <p role="status" className="mt-2 text-xs text-slate-300">{summary}</p> : null}
+      {matches.every((match) => !match.matched && !match.error) ? (
+        <p className="mt-2 text-xs text-slate-500">{emptyMessage}</p>
+      ) : (
+        <ul className="mt-3 space-y-1.5">
+          {matches.map((match, index) => (
+            <li
+              key={`${match.sample}-${index}`}
+              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-white/5 bg-white/3 px-3 py-2 text-xs"
+            >
+              <div className="min-w-0">
+                <p className="truncate font-mono text-slate-300">{match.sample || '(empty)'}</p>
+                {match.error ? (
+                  <p role="alert" className="mt-0.5 text-red-300">{match.error}</p>
+                ) : match.matched ? (
+                  <p className="mt-0.5 text-cyan-300">
+                    <span className="text-slate-500">channel: </span>
+                    {match.channelName || '(empty format)'}
+                  </p>
+                ) : (
+                  <p className="mt-0.5 text-slate-500">No match</p>
+                )}
+              </div>
+              <Badge tone={match.matched ? 'success' : match.error ? 'danger' : 'neutral'}>
+                {match.matched ? 'Match' : match.error ? 'Error' : 'Skip'}
+              </Badge>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   )
 }
 
@@ -436,6 +563,13 @@ function EventTemplateForm({
   const [eventDurationHours, setEventDurationHours] = useState('3')
   const [pastDateGraceHours, setPastDateGraceHours] = useState('4')
   const [futureDateDays, setFutureDateDays] = useState('2')
+  const [previewSample, setPreviewSample] = useState('')
+
+  const previewMatches = useMemo(
+    () => (previewSample.trim() ? previewEventRule(matchRegex, channelNameFormat, [previewSample]) : []),
+    [matchRegex, channelNameFormat, previewSample],
+  )
+  const previewResult = previewMatches[0]
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -521,6 +655,36 @@ function EventTemplateForm({
                 required
               />
             </label>
+          </div>
+          <div className="rounded-lg border border-white/8 bg-ink-950/50 p-4">
+            <p className="text-xs font-medium text-slate-300">Rule preview</p>
+            <p className="mt-1 text-[0.68rem] text-slate-500">
+              Enter a real provider stream name to test the match pattern and channel name format before you save. No data is fabricated.
+            </p>
+            <label className="mt-3 block text-xs font-medium text-slate-300">
+              <span className="sr-only">Sample stream name for preview</span>
+              <Input
+                className="mt-1 font-mono text-xs"
+                value={previewSample}
+                onChange={(e) => setPreviewSample(e.target.value)}
+                placeholder="NBA 08/19 1:00 PM Broncos vs Chiefs"
+                aria-label="Sample stream name for preview"
+              />
+            </label>
+            {previewResult ? (
+              <div className="mt-3 space-y-1 text-xs" role="status" aria-live="polite">
+                {previewResult.error ? (
+                  <p role="alert" className="text-red-300">{previewResult.error}</p>
+                ) : previewResult.matched ? (
+                  <p className="text-cyan-300">
+                    <span className="text-slate-500">Match. Channel name: </span>
+                    {previewResult.channelName || '(empty format)'}
+                  </p>
+                ) : (
+                  <p className="text-slate-500">No match for this stream name.</p>
+                )}
+              </div>
+            ) : null}
           </div>
           {error ? <p role="alert" className="text-sm text-red-300">{error}</p> : null}
           <div className="flex justify-end gap-2">

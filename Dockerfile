@@ -36,8 +36,13 @@ RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo 
 COPY . .
 RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 2 -p iptv-gateway
 # Build the deterministic scale gate binary. The `scale-gate` feature enables
-# the fixture generators in `iptv-parsers` and adds no new dependencies.
-RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 2 -p iptv-gateway --features scale-gate --bin scale-gate
+# the fixture generators in `iptv-parsers` and adds no new dependencies. Limit
+# parallelism to one job because the scale-gate feature expands the fixture
+# generators in `iptv-parsers` and raises peak rustc memory above the 1.9 GiB
+# Docker Desktop limit. Two jobs OOM-kill rustc on the second build while the
+# first core build at two jobs stays below the limit. One job keeps the scale
+# budgets and the other build settings unchanged.
+RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 1 -p iptv-gateway --features scale-gate --bin scale-gate
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

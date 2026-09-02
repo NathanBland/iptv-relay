@@ -7,8 +7,10 @@ A lineup template defines a set of categories, channels, and aliases. The apply 
 A lineup template contains:
 
 - A name.
+- A package name.
 - One or more categories.
 - One or more channels per category.
+- A channel number per channel.
 - Optional aliases per channel.
 
 ## Create a template with the API
@@ -19,17 +21,21 @@ curl -X POST http://localhost:8080/api/v1/lineup-templates \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Sports lineup",
+    "packageName": "sports",
     "categories": [
       {
         "name": "Sports",
+        "sortOrder": 1,
         "channels": [
-          {"name": "ESPN", "aliases": ["ESPN HD", "ESPN UHD"]},
-          {"name": "NFL Network", "aliases": ["NFL"]}
+          {"name": "ESPN", "channelNumber": "100", "aliases": ["ESPN HD", "ESPN UHD"]},
+          {"name": "NFL Network", "channelNumber": "101", "aliases": ["NFL"]}
         ]
       }
     ]
   }'
 ```
+
+The `name` and `packageName` fields are required. Each channel requires a `name` and a `channelNumber`. The `country` field defaults to `US`.
 
 All lineup endpoints require admin authentication.
 

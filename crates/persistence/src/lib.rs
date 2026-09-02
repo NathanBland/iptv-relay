@@ -31,8 +31,8 @@ pub use catalog::{
     ProgrammeQuery, ProgrammeRow, ReconcileStats, ReconciliationRevisionRow,
     ReconciliationRollbackStats, RecordingRow, RecordingRuleRow, RecordingStats, RegionFilterStats,
     RegionPrefixRow, RegionSettingsRow, ReviewCandidateRow, StreamHealthPage, StreamHealthRow,
-    StreamHealthStats, StreamHealthUpdate, StreamProfileRow, SystemCounts, UnmappedChannelPage,
-    UnmappedChannelRow, UpdateUserInput, UserRow,
+    StreamHealthStats, StreamHealthUpdate, StreamProbeTargetRow, StreamProfileRow, SystemCounts,
+    UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput, UserRow,
 };
 
 /// Embedded database migrations for the service schema.
@@ -1216,6 +1216,46 @@ impl JobRepository {
         .bind(Uuid::now_v7())
         .bind(serde_json::json!({ "sourceId": source_id.to_string() }))
         .bind(source_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    /// Enqueues one low-priority `health-probe` job only when no queued or
+    /// running `health-probe` job already targets the stream.
+    ///
+    /// The atomic `INSERT ... WHERE NOT EXISTS` guard prevents duplicate
+    /// per-worker probes when the scheduler cycle overlaps a slow worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the insert fails.
+    pub async fn enqueue_health_probe_if_idle(
+        &self,
+        provider_stream_id: Uuid,
+        priority: i32,
+        max_attempts: i32,
+    ) -> Result<Option<JobRecord>, PersistenceError> {
+        let stream_id = provider_stream_id.to_string();
+        let record = sqlx::query_as::<_, JobRecord>(
+            r"
+            INSERT INTO jobs (id, kind, priority, payload, max_attempts, available_at)
+            SELECT $1, 'health-probe', $2, $3, $4, now()
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM jobs
+                WHERE kind = 'health-probe'
+                  AND payload->>'providerStreamId' = $5
+                  AND status IN ('queued', 'running')
+            )
+            RETURNING *
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(priority)
+        .bind(serde_json::json!({ "providerStreamId": stream_id }))
+        .bind(max_attempts)
+        .bind(stream_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(record)
