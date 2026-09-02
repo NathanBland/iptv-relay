@@ -5183,13 +5183,10 @@ async fn jellyfin_setup(State(state): State<AppState>, headers: HeaderMap) -> Re
         return response;
     }
     let setup = state.jellyfin_setup.read().await.clone();
-    let mut response = Json(setup).into_response();
+    let response = Json(setup).into_response();
     // The response may embed the output token in each URL path. Prevent
     // intermediary and browser caching so token-bearing URLs do not persist.
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
+    no_store_response(response)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -5265,11 +5262,8 @@ async fn rotate_jellyfin_token(
             // Mark future GET responses as regeneration-required because the
             // plaintext token is not retained after this response.
             *state.jellyfin_setup.write().await = JellyfinSetup::regeneration_required();
-            let mut response = Json(setup).into_response();
-            response
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            response
+            let response = Json(setup).into_response();
+            no_store_response(response)
         }
         Err(error) => persistence_error_response(error),
     }
@@ -9304,7 +9298,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(setup.status(), StatusCode::OK);
-        assert_eq!(setup.headers()[header::CACHE_CONTROL], "no-store");
+        assert_no_store(&setup);
         let setup_body: serde_json::Value =
             serde_json::from_str(&response_text(setup).await).unwrap();
         assert_eq!(setup_body["status"], "available");
@@ -9361,7 +9355,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(restarted_setup.status(), StatusCode::OK);
-        assert_eq!(restarted_setup.headers()[header::CACHE_CONTROL], "no-store");
+        assert_no_store(&restarted_setup);
         let restarted_body: serde_json::Value =
             serde_json::from_str(&response_text(restarted_setup).await).unwrap();
         assert_eq!(restarted_body["status"], "regeneration-required");
@@ -9424,6 +9418,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_active_rotated.status(), StatusCode::OK);
+
+        let api_rotated_response = restarted_app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/jellyfin/setup/rotate")
+                    .header(header::AUTHORIZATION, "Bearer admin-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(api_rotated_response.status(), StatusCode::OK);
+        assert_no_store(&api_rotated_response);
 
         drop(restarted_app);
         drop(restarted_state);
@@ -10183,7 +10191,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(setup.status(), StatusCode::OK);
-        assert_eq!(setup.headers()[header::CACHE_CONTROL], "no-store");
+        assert_no_store(&setup);
         let setup_body: serde_json::Value =
             serde_json::from_str(&response_text(setup).await).unwrap();
         assert_eq!(setup_body["status"], "available");
