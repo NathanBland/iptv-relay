@@ -7,8 +7,10 @@ license.workspace = true
 
 [features]
 # Builds the deterministic pinned-runner scale gate binary. Enables the
-# `scale` fixture generators in `iptv-parsers`. Adds no new dependencies.
-scale-gate = ["iptv-parsers/scale"]
+# `scale` fixture generators in `iptv-parsers`. The scale-gate runner activates
+# snapshots against an optional test database, so the feature pulls in `sqlx`
+# for the deterministic test-only owner setup and cleanup.
+scale-gate = ["iptv-parsers/scale", "dep:sqlx"]
 
 [dependencies]
 anyhow.workspace = true
@@ -27,6 +29,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+sqlx = { workspace = true, optional = true }
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -49,12 +49,34 @@ use iptv_parsers::{
 use iptv_persistence::Database;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use tokio::runtime::Runtime;
 use url::Url;
 use uuid::Uuid;
 
 const DEFAULT_BASELINE: &str = "tests/fixtures/scale-gate-baseline.json";
 const DATABASE_URL_ENV: &str = "IPTV_TEST_DATABASE_URL";
+
+/// Deterministic test-only provider account id used by the scale-gate runner.
+///
+/// The runner inserts a matching `provider_accounts` row when a database URL is
+/// supplied. The row is isolated to this id and the runner removes only the
+/// snapshots it owns after each run. Real provider accounts use time-based ids,
+/// so this fixed value cannot collide with production data.
+const SCALE_GATE_PROVIDER_ACCOUNT_ID: Uuid = Uuid::from_u128(
+    0x5c41_3e2a_19a7_4f3e_8b1c_2d5e_6a7b_8c9d,
+);
+
+/// Deterministic test-only EPG source id used by the scale-gate runner for the
+/// XMLTV activation path. The runner inserts a matching `epg_sources` row and
+/// removes only the snapshots it owns after each run.
+const SCALE_GATE_EPG_SOURCE_ID: Uuid = Uuid::from_u128(
+    0x7d52_4f3b_2ab8_404e_9c2d_3e6f_7a8b_9c0e,
+);
+
+/// Stable name shared by the runner-owned `provider_accounts` and `epg_sources`
+/// rows. The name makes the test-only rows easy to identify.
+const SCALE_GATE_OWNER_NAME: &str = "scale-gate-test-runner";
 
 fn main() -> Result<()> {
     let runtime = Runtime::new()?;
@@ -448,8 +470,17 @@ fn measure_staging(path: &Path, format: IngestFormat, timezone: &str) -> Result<
 
 fn staging_request(format: IngestFormat) -> IngestRequest {
     let endpoint = Url::parse("https://fixture.example/scale").expect("static url");
+    // The owner must match the snapshot kind. M3U snapshots are provider-owned
+    // and XMLTV snapshots are EPG-source-owned. The deterministic ids below are
+    // resolved to real `provider_accounts` and `epg_sources` rows by
+    // `ensure_test_owners` when a database URL is supplied. Staging never
+    // validates the owner, so the same ids are safe without a database.
+    let owner = match format {
+        IngestFormat::Xmltv => SnapshotOwner::EpgSource(SCALE_GATE_EPG_SOURCE_ID),
+        _ => SnapshotOwner::ProviderAccount(SCALE_GATE_PROVIDER_ACCOUNT_ID),
+    };
     IngestRequest {
-        owner: SnapshotOwner::ProviderAccount(Uuid::nil()),
+        owner,
         format,
         download: DownloadRequest::new(endpoint),
         source_timezone: "UTC".to_owned(),
@@ -485,15 +516,89 @@ async fn run_activation(
         .await
         .context("connect database")?;
     database.migrate().await.context("migrate database")?;
-    let store = PgSnapshotStore::new(database.pool().clone());
+    let pool = database.pool().clone();
+    let store = PgSnapshotStore::new(pool.clone());
 
-    let m3u_activation = activate_snapshot(m3u_path, IngestFormat::M3u, &store).await?;
-    let xmltv_activation = activate_snapshot(xmltv_path, IngestFormat::Xmltv, &store).await?;
+    // Insert deterministic test-only owner rows. The inserts are idempotent so
+    // repeated pinned-runner runs do not conflict. The rows are isolated to the
+    // fixed ids above and never touch production data.
+    ensure_test_owners(&pool)
+        .await
+        .context("ensure scale-gate test owners")?;
 
-    Ok(ActivationResult {
-        m3u_activation_seconds: m3u_activation,
-        xmltv_activation_seconds: xmltv_activation,
-    })
+    // Activate both snapshots. The owner ids resolve to the rows above, so the
+    // foreign-key and owner-kind constraints succeed.
+    let activation = async {
+        let m3u_activation = activate_snapshot(m3u_path, IngestFormat::M3u, &store).await?;
+        let xmltv_activation = activate_snapshot(xmltv_path, IngestFormat::Xmltv, &store).await?;
+        Ok::<_, anyhow::Error>(ActivationResult {
+            m3u_activation_seconds: m3u_activation,
+            xmltv_activation_seconds: xmltv_activation,
+        })
+    }
+    .await;
+
+    // Best-effort cleanup of runner-owned snapshots. Always attempt it so a
+    // failed activation does not leave staged rows behind. Cascading deletes
+    // remove the associated streams, channels, and programmes. The deterministic
+    // owner rows remain for the next run.
+    if let Err(cleanup_error) = cleanup_runner_snapshots(&pool).await {
+        activation?;
+        return Err(cleanup_error).context("cleanup scale-gate runner snapshots");
+    }
+
+    activation
+}
+
+/// Inserts deterministic test-only `provider_accounts` and `epg_sources` rows.
+///
+/// The inserts use `ON CONFLICT (id) DO NOTHING` so repeated runs are safe. The
+/// rows are isolated to the fixed scale-gate ids and use a clearly named owner.
+async fn ensure_test_owners(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r"
+        INSERT INTO provider_accounts (
+            id, name, source_type, base_url_template
+        )
+        VALUES ($1, $2, 'm3u', 'https://fixture.example/scale')
+        ON CONFLICT (id) DO NOTHING
+        ",
+    )
+    .bind(SCALE_GATE_PROVIDER_ACCOUNT_ID)
+    .bind(SCALE_GATE_OWNER_NAME)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r"
+        INSERT INTO epg_sources (id, name, url_template)
+        VALUES ($1, $2, 'https://fixture.example/scale')
+        ON CONFLICT (id) DO NOTHING
+        ",
+    )
+    .bind(SCALE_GATE_EPG_SOURCE_ID)
+    .bind(SCALE_GATE_OWNER_NAME)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Removes only the snapshots owned by the deterministic scale-gate ids.
+///
+/// Cascading foreign keys delete the associated `provider_streams`,
+/// `epg_channels`, and `programmes` rows. The deterministic `provider_accounts`
+/// and `epg_sources` rows remain for the next run.
+async fn cleanup_runner_snapshots(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM source_snapshots WHERE provider_account_id = $1")
+        .bind(SCALE_GATE_PROVIDER_ACCOUNT_ID)
+        .execute(pool)
+        .await?;
+    sqlx::query("DELETE FROM source_snapshots WHERE epg_source_id = $1")
+        .bind(SCALE_GATE_EPG_SOURCE_ID)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 async fn activate_snapshot(

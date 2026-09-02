@@ -90,4 +90,71 @@ if printf '%s\n' "$FUZZ_OUTPUT" | grep -q 'fuzz/fuzz_targets'; then
   exit 1
 fi
 
+# A cfg(test) module must not count its added lines as production lines,
+# even when the coverage report marks those lines as uncovered.
+rm -f "$TEST_DIR/src/new.rs" "$TEST_DIR/src/missing.rs" "$TEST_DIR/apps/web/uncovered.ts"
+printf '%s\n' 'export const baseline = true' > "$TEST_DIR/apps/web/ui.ts"
+{
+  printf '%s\n' 'fn baseline() {}'
+  printf '%s\n' 'fn prod() {}'
+  printf '%s\n' '#[cfg(test)]'
+  printf '%s\n' 'mod tests {'
+  printf '%s\n' '    fn helper() {}'
+  printf '%s\n' '}'
+} > "$TEST_DIR/src/lib.rs"
+
+CFG_TEST_OUTPUT=$(cd "$TEST_DIR" && \
+  FAKE_COVERAGE_JSON='{"data":[{"files":[{"filename":"src/lib.rs","lines":[{"line_number":2,"count":1},{"line_number":4,"count":0},{"line_number":5,"count":0}]}]}]}' \
+  PATH="$TEST_DIR/bin:$PATH" \
+  GITHUB_BASE_REF=base \
+  "$COVERAGE_SCRIPT" 95)
+if ! printf '%s\n' "$CFG_TEST_OUTPUT" | grep -q 'PASS'; then
+  echo "Expected cfg(test) module lines to be excluded from the production gate." >&2
+  printf '%s\n' "$CFG_TEST_OUTPUT" >&2
+  exit 1
+fi
+if printf '%s\n' "$CFG_TEST_OUTPUT" | grep -q 'Total changed lines: [^1]'; then
+  echo "Expected only the real production line to count after cfg(test) exclusion." >&2
+  printf '%s\n' "$CFG_TEST_OUTPUT" >&2
+  exit 1
+fi
+
+# A cfg(test) module with an uncovered real production line must still fail.
+{
+  printf '%s\n' 'fn baseline() {}'
+  printf '%s\n' 'fn prod() {}'
+  printf '%s\n' '#[cfg(test)]'
+  printf '%s\n' 'mod tests {'
+  printf '%s\n' '    fn helper() {}'
+  printf '%s\n' '}'
+} > "$TEST_DIR/src/lib.rs"
+
+if (cd "$TEST_DIR" && \
+  FAKE_COVERAGE_JSON='{"data":[{"files":[{"filename":"src/lib.rs","lines":[{"line_number":2,"count":0},{"line_number":4,"count":0},{"line_number":5,"count":0}]}]}]}' \
+  PATH="$TEST_DIR/bin:$PATH" \
+  GITHUB_BASE_REF=base \
+  "$COVERAGE_SCRIPT" 95); then
+  echo "Expected uncovered real production line to fail the production gate." >&2
+  exit 1
+fi
+
+# A cfg(all(test, ...)) variant must also be excluded.
+{
+  printf '%s\n' 'fn baseline() {}'
+  printf '%s\n' 'fn prod() {}'
+  printf '%s\n' '#[cfg(all(test, feature = "extra"))]'
+  printf '%s\n' 'mod tests {'
+  printf '%s\n' '    fn helper() {}'
+  printf '%s\n' '}'
+} > "$TEST_DIR/src/lib.rs"
+
+if ! (cd "$TEST_DIR" && \
+  FAKE_COVERAGE_JSON='{"data":[{"files":[{"filename":"src/lib.rs","lines":[{"line_number":2,"count":1},{"line_number":4,"count":0},{"line_number":5,"count":0}]}]}]}' \
+  PATH="$TEST_DIR/bin:$PATH" \
+  GITHUB_BASE_REF=base \
+  "$COVERAGE_SCRIPT" 95); then
+  echo "Expected cfg(all(test, ...)) module lines to be excluded from the production gate." >&2
+  exit 1
+fi
+
 echo "Changed-line coverage script tests passed."
