@@ -3548,14 +3548,8 @@ async fn channel_stream(
     headers: HeaderMap,
     Path(channel_id): Path<String>,
 ) -> Response {
-    if state.auth.authorize(&headers, false).is_none() {
-        return ProblemDetails::new(
-            StatusCode::UNAUTHORIZED,
-            "authentication-required",
-            "Authentication required",
-            "sign in as the local administrator or provide the bootstrap bearer token",
-        )
-        .response();
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
     }
     let Some(uuid) = Uuid::parse_str(&channel_id).ok() else {
         return not_found();
@@ -8143,6 +8137,28 @@ mod tests {
                 oidc: None,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn output_only_operator_token_cannot_open_admin_channel_stream() {
+        let app_state = state();
+        let token = "output-only-token";
+        app_state.auth.add_operator_token(OperatorTokenRecord {
+            id: Uuid::now_v7(),
+            token_hash: token_hash(token),
+            scopes: vec![OPERATOR_TOKEN_OUTPUT_SCOPE.to_owned()],
+            expires_at: None,
+        });
+        let response = router(app_state)
+            .oneshot(
+                Request::get(format!("/api/v1/channels/{}/stream", Uuid::now_v7()))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
     async fn response_text(response: Response) -> String {

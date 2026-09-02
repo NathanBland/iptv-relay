@@ -391,12 +391,17 @@ impl Database {
             transaction.rollback().await?;
             return Ok(None);
         }
-        sqlx::query(
+        let revoked = sqlx::query(
             "UPDATE operator_api_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
         )
         .bind(old_id)
         .execute(&mut *transaction)
-        .await?;
+        .await?
+        .rows_affected();
+        if revoked != 1 {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
         let row = sqlx::query_as::<_, OperatorApiTokenRow>(
             r"
             INSERT INTO operator_api_tokens
