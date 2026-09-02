@@ -163,6 +163,31 @@ test.describe('Live data acceptance', { tag: '@live' }, () => {
     }
   })
 
+  test('TV Guide shows the current Denver programme in the On now section', async ({ browser }) => {
+    const context = await browser.newContext({ baseURL: liveBaseURL, timezoneId: 'America/Denver', storageState: liveStorageStatePath })
+    try {
+      const page = await context.newPage()
+      const body = await fetchProgrammes(context, { limit: 200 })
+      const now = Date.now()
+      const current = body.items.find((programme) => {
+        const start = Date.parse(programme.start)
+        const end = Date.parse(programme.end ?? '')
+        return Number.isFinite(start) && Number.isFinite(end) && start <= now && end > now
+      })
+      test.skip(!current, 'No current programme is available for this test.')
+
+      await page.goto('/tv-guide')
+      await expect(page.getByRole('heading', { name: 'TV Guide', level: 1 })).toBeVisible({ timeout: 15_000 })
+      await expect(page.getByRole('heading', { name: 'On now' })).toBeVisible({ timeout: 15_000 })
+      await expect(page.getByText(current!.title, { exact: true }).first()).toBeVisible({ timeout: 15_000 })
+
+      const timeFormatter = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Denver' })
+      await expect(page.getByText(timeFormatter.format(new Date(current!.start)), { exact: true }).first()).toBeVisible({ timeout: 15_000 })
+    } finally {
+      await context.close()
+    }
+  })
+
   test('EPG mappings page shows mapped and unmapped channels', async ({ page, context }) => {
     await page.goto('/epg-mappings')
     await expect(page.getByRole('heading', { name: 'EPG Mappings', level: 1 })).toBeVisible({ timeout: 15_000 })
@@ -206,7 +231,7 @@ async function fetchGroups(context: BrowserContext) {
 async function fetchProgrammes(context: BrowserContext, query: { limit: number }) {
   const response = await context.request.get(`/api/v1/programmes?limit=${query.limit}`)
   expect(response.ok(), 'The programmes API did not return a success response.').toBe(true)
-  return (await response.json()) as { items: Array<{ id: string; title: string; start: string; channel: string; source: string; confidence: number }>; total: number }
+  return (await response.json()) as { items: Array<{ id: string; title: string; start: string; end?: string; channel: string; source: string; confidence: number }>; total: number }
 }
 
 async function fetchMapped(context: BrowserContext, query: { reviewStatus: string; limit: number }) {
