@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Braces, CalendarClock, Radio, ScanLine, Sparkles, Trash2, X } from 'lucide-react'
+import { Braces, CalendarClock, Power, Radio, ScanLine, Sparkles, Trash2, X } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
 import { LoadingPage } from '@/components/loading-page'
 import { Badge } from '@/components/ui/badge'
@@ -9,7 +9,7 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
-import type { CreateEventTemplateInput, EventChannel, EventTemplate, EventTemplateSuggestion, IptvApiClient } from '@/lib/api/types'
+import type { CreateEventTemplateInput, EventChannel, EventTemplate, EventTemplateSuggestion, IptvApiClient, UpdateEventTemplateInput } from '@/lib/api/types'
 
 const channelTones: Record<EventChannel['state'], 'success' | 'info' | 'warning' | 'neutral'> = {
   live: 'success',
@@ -20,8 +20,9 @@ const channelTones: Record<EventChannel['state'], 'success' | 'info' | 'warning'
 
 function formatTimestamp(value: string | null): string {
   if (!value) return 'Not scheduled'
+  // Render in the browser timezone. Omitting timeZone lets the runtime use
+  // the viewer's local timezone instead of a hardcoded region.
   return new Date(value).toLocaleString('en-US', {
-    timeZone: 'America/Denver',
     dateStyle: 'medium',
     timeStyle: 'short',
   })
@@ -37,6 +38,8 @@ function TemplateCard({
   deletePending,
   onConfirmDelete,
   onCancelDelete,
+  onToggleEnabled,
+  togglingEnabled,
 }: {
   template: EventTemplate
   channels: EventChannel[]
@@ -47,6 +50,8 @@ function TemplateCard({
   deletePending: boolean
   onConfirmDelete: () => void
   onCancelDelete: () => void
+  onToggleEnabled: () => void
+  togglingEnabled: boolean
 }) {
   return (
     <Card>
@@ -63,6 +68,17 @@ function TemplateCard({
           </p>
         </div>
         <div className="flex items-center gap-1">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={onToggleEnabled}
+            disabled={togglingEnabled}
+            aria-label={`${template.enabled ? 'Disable' : 'Enable'} ${template.displayName}`}
+            aria-pressed={template.enabled}
+          >
+            <Power aria-hidden="true" className="size-4" />
+            {togglingEnabled ? 'Wait…' : template.enabled ? 'Disable' : 'Enable'}
+          </Button>
           <Button variant="secondary" size="sm" onClick={onScan} disabled={scanning}>
             <ScanLine aria-hidden="true" className="size-4" />
             {scanning ? 'Scanning' : 'Scan'}
@@ -218,6 +234,7 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [suggestions, setSuggestions] = useState<EventTemplateSuggestion[] | null>(null)
   const [creatingName, setCreatingName] = useState<string | null>(null)
+  const [togglingId, setTogglingId] = useState<string | null>(null)
 
   const templatesQuery = useQuery({ ...apiQueries(client).eventTemplates })
   const channelsQuery = useQuery({ ...apiQueries(client).eventChannels() })
@@ -246,6 +263,19 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
       void queryClient.invalidateQueries({ queryKey: ['event-templates'] })
       void queryClient.invalidateQueries({ queryKey: ['event-channels'] })
       setConfirmDelete(null)
+    },
+  })
+
+  const toggleEnabledMutation = useMutation({
+    mutationFn: ({ template, enabled }: { template: EventTemplate; enabled: boolean }) =>
+      client.updateEventTemplate(template.id, { enabled } satisfies UpdateEventTemplateInput),
+    onMutate: ({ template }) => setTogglingId(template.id),
+    onSettled: () => setTogglingId(null),
+    onSuccess: (_data, { template }) => {
+      void queryClient.invalidateQueries({ queryKey: ['event-templates'] })
+      void queryClient.invalidateQueries({ queryKey: ['event-channels'] })
+      void queryClient.invalidateQueries({ queryKey: ['events'] })
+      void queryClient.invalidateQueries({ queryKey: ['event-templates', template.id] })
     },
   })
 
@@ -375,6 +405,10 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
               deletePending={deleteMutation.isPending}
               onConfirmDelete={() => deleteMutation.mutate(template.id)}
               onCancelDelete={() => setConfirmDelete(null)}
+              onToggleEnabled={() =>
+                toggleEnabledMutation.mutate({ template, enabled: !template.enabled })
+              }
+              togglingEnabled={togglingId === template.id || toggleEnabledMutation.isPending}
             />
           ))
         )}
@@ -399,10 +433,22 @@ function EventTemplateForm({
   const [matchRegex, setMatchRegex] = useState('')
   const [channelNameFormat, setChannelNameFormat] = useState('{event}')
   const [groupName, setGroupName] = useState('Sports')
+  const [eventDurationHours, setEventDurationHours] = useState('3')
+  const [pastDateGraceHours, setPastDateGraceHours] = useState('4')
+  const [futureDateDays, setFutureDateDays] = useState('2')
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    onSubmit({ name, displayName, matchRegex, channelNameFormat, groupName })
+    onSubmit({
+      name,
+      displayName,
+      matchRegex,
+      channelNameFormat,
+      groupName,
+      eventDurationHours: Number(eventDurationHours),
+      pastDateGraceHours: Number(pastDateGraceHours),
+      futureDateDays: Number(futureDateDays),
+    })
   }
 
   return (
@@ -435,6 +481,47 @@ function EventTemplateForm({
             Group name
             <Input className="mt-1" value={groupName} onChange={(e) => setGroupName(e.target.value)} placeholder="Sports" required />
           </label>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <label className="block text-xs font-medium text-slate-300">
+              Duration (hours)
+              <Input
+                className="mt-1"
+                type="number"
+                min={1}
+                step={1}
+                value={eventDurationHours}
+                onChange={(e) => setEventDurationHours(e.target.value)}
+                placeholder="3"
+                required
+              />
+            </label>
+            <label className="block text-xs font-medium text-slate-300">
+              Past grace (hours)
+              <Input
+                className="mt-1"
+                type="number"
+                min={0}
+                step={1}
+                value={pastDateGraceHours}
+                onChange={(e) => setPastDateGraceHours(e.target.value)}
+                placeholder="4"
+                required
+              />
+            </label>
+            <label className="block text-xs font-medium text-slate-300">
+              Future window (days)
+              <Input
+                className="mt-1"
+                type="number"
+                min={0}
+                step={1}
+                value={futureDateDays}
+                onChange={(e) => setFutureDateDays(e.target.value)}
+                placeholder="2"
+                required
+              />
+            </label>
+          </div>
           {error ? <p role="alert" className="text-sm text-red-300">{error}</p> : null}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" size="sm" onClick={onCancel}>Cancel</Button>

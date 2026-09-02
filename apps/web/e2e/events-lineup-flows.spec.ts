@@ -86,6 +86,66 @@ test.describe.serial('event template and lineup API flows', () => {
     }
   })
 
+  test('event template partial PATCH toggles enabled and persists optional fields', async ({ request }) => {
+    const templateName = `E2E Patch ${Date.now()}`
+    const createResponse = await request.post('/api/v1/event-templates', {
+      headers: await csrfHeaders(request),
+      data: {
+        name: templateName.toLowerCase().replace(/\s+/g, '-'),
+        displayName: templateName,
+        groupName: 'E2E Patch',
+        matchRegex: '(?i)e2e_patch_event',
+        channelNameFormat: 'E2E Patch',
+        eventDurationHours: 3,
+        pastDateGraceHours: 1,
+        futureDateDays: 7,
+      },
+    })
+    expect(createResponse.ok()).toBe(true)
+    const template = await createResponse.json()
+    expect(template.id).toBeTruthy()
+    expect(template.enabled).toBe(true)
+
+    try {
+      const disableResponse = await request.patch(`/api/v1/event-templates/${template.id}`, {
+        headers: await csrfHeaders(request),
+        data: { enabled: false, eventDurationHours: 5 },
+      })
+      expect(disableResponse.ok()).toBe(true)
+      const disabled = await disableResponse.json()
+      expect(disabled.enabled).toBe(false)
+      expect(disabled.eventDurationHours).toBe(5)
+      // Omitted fields keep their stored values.
+      expect(disabled.displayName).toBe(templateName)
+      expect(disabled.futureDateDays).toBe(7)
+
+      const emptyResponse = await request.patch(`/api/v1/event-templates/${template.id}`, {
+        headers: await csrfHeaders(request),
+        data: {},
+      })
+      expect(emptyResponse.ok()).toBe(true)
+
+      const reenableResponse = await request.patch(`/api/v1/event-templates/${template.id}`, {
+        headers: await csrfHeaders(request),
+        data: { enabled: true, displayName: 'Renamed E2E Patch' },
+      })
+      expect(reenableResponse.ok()).toBe(true)
+      const reenabled = await reenableResponse.json()
+      expect(reenabled.enabled).toBe(true)
+      expect(reenabled.displayName).toBe('Renamed E2E Patch')
+
+      const missingResponse = await request.patch(`/api/v1/event-templates/00000000-0000-0000-0000-000000000000`, {
+        headers: await csrfHeaders(request),
+        data: { enabled: false },
+      })
+      expect(missingResponse.status()).toBe(404)
+    } finally {
+      await request.delete(`/api/v1/event-templates/${template.id}`, {
+        headers: await csrfHeaders(request),
+      })
+    }
+  })
+
   test('lineup templates API returns real data from the database', async ({ request }) => {
     const response = await request.get('/api/v1/lineup-templates')
     expect(response.ok()).toBe(true)

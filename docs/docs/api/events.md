@@ -41,11 +41,13 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
 
 ## Update an event template
 
+Send a partial update. Omitted fields keep their stored values. Set `enabled` to toggle the template.
+
 ```bash
 curl -X PATCH http://localhost:8080/api/v1/event-templates/{template_id} \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"enabled": true}'
+  -d '{"enabled": false, "eventDurationHours": 5}'
 ```
 
 ## Delete an event template

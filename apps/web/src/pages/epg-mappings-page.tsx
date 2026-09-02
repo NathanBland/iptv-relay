@@ -1,15 +1,16 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, ChevronLeft, ChevronRight, Link2, RefreshCw, Search, Unlink, X } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, History, Link2, RefreshCw, RotateCcw, Search, Unlink, X } from 'lucide-react'
 import { useState } from 'react'
 import { LoadingPage } from '@/components/loading-page'
 import { PageHeader } from '@/components/page-header'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card } from '@/components/ui/card'
+import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { apiClient } from '@/lib/api/client'
-import type { EpgMapping, IptvApiClient } from '@/lib/api/types'
+import { apiClient, IptvApiError } from '@/lib/api/client'
+import { apiQueries } from '@/lib/api/queries'
+import type { EpgMapping, IptvApiClient, ReconciliationRevision } from '@/lib/api/types'
 
 const PAGE_SIZE = 50
 
@@ -86,6 +87,8 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
           <span>Review queued: <strong className="text-white">{reconcileMutation.data.reviewQueued.toLocaleString()}</strong></span>
         </div>
       ) : null}
+
+      <ReconciliationRollbackCard client={client} />
 
       <Card>
         <div className="flex flex-col gap-3 border-b border-white/8 p-4 sm:flex-row sm:items-center sm:justify-between">
@@ -435,5 +438,105 @@ function CandidateReviewRow({
         </div>
       </TableCell>
     </TableRow>
+  )
+}
+
+function ReconciliationRollbackCard({ client }: { client: IptvApiClient }) {
+  const queryClient = useQueryClient()
+  const [sourceId, setSourceId] = useState('')
+  const [rollbackTarget, setRollbackTarget] = useState<number | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const revisionsQuery = useQuery({
+    ...apiQueries(client).reconciliationRevisions(sourceId),
+    enabled: sourceId.trim().length > 0,
+  })
+
+  const rollbackMutation = useMutation({
+    mutationFn: (revision: number) => client.rollbackReconciliation(sourceId, { revision }),
+    onSuccess: () => {
+      setError(null)
+      setRollbackTarget(null)
+      queryClient.invalidateQueries({ queryKey: ['reconciliation', 'revisions', sourceId] })
+      queryClient.invalidateQueries({ queryKey: ['epg-mappings'] })
+      queryClient.invalidateQueries({ queryKey: ['epg-unmapped'] })
+      queryClient.invalidateQueries({ queryKey: ['epg-review'] })
+      queryClient.invalidateQueries({ queryKey: ['overview'] })
+    },
+    onError: (failure: unknown) => {
+      if (failure instanceof IptvApiError) {
+        setError(failure.problem.detail ?? failure.problem.title)
+      } else {
+        setError('The rollback failed. Try again.')
+      }
+    },
+  })
+
+  const revisions: ReconciliationRevision[] = revisionsQuery.data ?? []
+
+  return (
+    <Card>
+      <CardHeader>
+        <div>
+          <p className="text-lg font-semibold text-white">Reconciliation rollback</p>
+          <p className="mt-1 text-xs text-slate-500">
+            Restore channels, streams, and EPG mappings for one source to a prior reconciliation revision.
+          </p>
+        </div>
+        <History aria-hidden="true" className="size-5 text-slate-500" />
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <label className="block max-w-md">
+          <span className="sr-only">Source id</span>
+          <Input
+            aria-label="Source id"
+            value={sourceId}
+            onChange={(event) => { setSourceId(event.target.value); setError(null) }}
+            placeholder="Enter a source id to load reconciliation history"
+          />
+        </label>
+        {sourceId.trim().length === 0 ? (
+          <p className="text-sm text-slate-500">Enter a source id to load its reconciliation revision history.</p>
+        ) : revisionsQuery.isLoading ? (
+          <p role="status" className="text-sm text-slate-500">Loading revisions…</p>
+        ) : revisions.length === 0 ? (
+          <p className="text-sm text-slate-500">No reconciliation revisions recorded for this source.</p>
+        ) : (
+          <div className="space-y-2">
+            {revisions.map((revision) => (
+              <div
+                key={revision.revision}
+                className="flex items-center justify-between rounded-lg border border-white/5 bg-ink-900/50 px-4 py-3"
+              >
+                <div>
+                  <p className="text-sm font-medium text-white">Revision {revision.revision}</p>
+                  <p className="text-xs text-slate-500">
+                    {revision.actor} · {new Date(revision.createdAt).toLocaleString()}
+                  </p>
+                </div>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={rollbackMutation.isPending && rollbackTarget === revision.revision}
+                  onClick={() => {
+                    setRollbackTarget(revision.revision)
+                    rollbackMutation.mutate(revision.revision)
+                  }}
+                >
+                  <RotateCcw aria-hidden="true" className="size-4" />
+                  Roll back
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+        {rollbackMutation.data ? (
+          <p role="status" className="text-xs text-mint-400">
+            Restored {rollbackMutation.data.channelsRestored} channel(s), {rollbackMutation.data.streamLinksRestored} stream link(s), and {rollbackMutation.data.epgMappingsRestored} EPG mapping(s) to revision {rollbackMutation.data.targetRevision}.
+          </p>
+        ) : null}
+        {error ? <p role="alert" className="text-sm text-red-400">{error}</p> : null}
+      </CardContent>
+    </Card>
   )
 }

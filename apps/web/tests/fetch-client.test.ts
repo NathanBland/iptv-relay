@@ -78,6 +78,7 @@ describe('FetchIptvApiClient', () => {
       client.getEvents(),
       client.getEventTemplates(),
       client.createEventTemplate({ name: 'sports', displayName: 'Sports', matchRegex: '(.+)', channelNameFormat: '$1', groupName: 'Sports' }),
+      client.updateEventTemplate('template / one', { enabled: false, eventDurationHours: 5 }),
       client.deleteEventTemplate('template / one'),
       client.getEventChannels('template / one'),
       client.scanEventTemplate('template / one'),
@@ -339,6 +340,8 @@ describe('FetchIptvApiClient', () => {
     await expect(client.removeChannelEpgMapping('id')).resolves.toBeUndefined()
     await expect(client.resolveReview('id', false)).resolves.toBeUndefined()
     await expect(client.createEventTemplate({ name: 'n', displayName: 'N', matchRegex: 'x', channelNameFormat: 'x', groupName: 'g' })).resolves.toMatchObject({ eventDurationHours: 3 })
+    await expect(client.updateEventTemplate('id', { enabled: false })).resolves.toMatchObject({ enabled: false })
+    await expect(client.updateEventTemplate('id', { eventDurationHours: 9 })).resolves.toMatchObject({ eventDurationHours: 9 })
     await expect(client.deleteEventTemplate('id')).resolves.toBeUndefined()
     await expect(client.getEventChannels('id')).resolves.toEqual([])
     await expect(client.scanEventTemplate('id')).resolves.toMatchObject({ ok: true })

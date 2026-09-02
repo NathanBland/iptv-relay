@@ -218,7 +218,7 @@ fn applied(
 }
 
 fn unique_or_review(
-    candidates: Vec<&StationEvidence>,
+    mut candidates: Vec<&StationEvidence>,
     method: MappingMethod,
     confidence: f32,
     evidence: &str,
@@ -226,18 +226,23 @@ fn unique_or_review(
     match candidates.as_slice() {
         [] => None,
         [candidate] => Some(applied(&candidate.id, method, confidence, evidence)),
-        _ => Some(MappingDecision::Review {
-            candidates: candidates
-                .into_iter()
-                .map(|candidate| MappingCandidate {
-                    epg_id: candidate.id.clone(),
-                    method,
-                    confidence,
-                    evidence: vec![format!("ambiguous exact {evidence}")],
-                })
-                .collect(),
-            reason: format!("multiple EPG channels share the same {evidence}"),
-        }),
+        _ => {
+            // Deterministic tie-break: sort ambiguous candidates by EPG id so
+            // the review queue is stable across input permutations and replays.
+            candidates.sort_by(|left, right| left.id.cmp(&right.id));
+            Some(MappingDecision::Review {
+                candidates: candidates
+                    .into_iter()
+                    .map(|candidate| MappingCandidate {
+                        epg_id: candidate.id.clone(),
+                        method,
+                        confidence,
+                        evidence: vec![format!("ambiguous exact {evidence}")],
+                    })
+                    .collect(),
+                reason: format!("multiple EPG channels share the same {evidence}"),
+            })
+        }
     }
 }
 
@@ -430,6 +435,50 @@ mod tests {
             apply_non_destructive(Some("working"), &applied).as_deref(),
             Some("replacement")
         );
+    }
+
+    #[test]
+    fn ambiguous_exact_candidates_are_stable_across_input_permutations() {
+        let mut source = station("stream", "Denver Sports Network HD");
+        source.tvg_id = Some("duplicate".into());
+        let mut one = station("epg-b", "Denver Sports Network");
+        one.tvg_id = Some("duplicate".into());
+        let mut two = one.clone();
+        two.id = "epg-a".into();
+        let mut three = one.clone();
+        three.id = "epg-c".into();
+
+        let baseline = reconcile_epg(
+            &source,
+            &[one.clone(), two.clone(), three.clone()],
+            &MappingContext::with_safe_defaults(),
+        );
+        let MappingDecision::Review {
+            candidates: baseline_candidates,
+            ..
+        } = &baseline
+        else {
+            panic!("expected review decision: {baseline:?}");
+        };
+        // The tie-break orders candidates by EPG id, not by input order.
+        let baseline_ids: Vec<&str> = baseline_candidates
+            .iter()
+            .map(|c| c.epg_id.as_str())
+            .collect();
+        assert_eq!(baseline_ids, vec!["epg-a", "epg-b", "epg-c"]);
+
+        for permutation in [
+            vec![three.clone(), two.clone(), one.clone()],
+            vec![two.clone(), three.clone(), one.clone()],
+            vec![one.clone(), three.clone(), two.clone()],
+        ] {
+            let decision =
+                reconcile_epg(&source, &permutation, &MappingContext::with_safe_defaults());
+            assert_eq!(
+                decision, baseline,
+                "permutation must not change the decision"
+            );
+        }
     }
 
     #[test]
