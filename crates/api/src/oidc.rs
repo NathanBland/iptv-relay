@@ -974,7 +974,7 @@ mod tests {
     }
 
     // Test-only key. The matching public modulus appears in the JWKS fixture below.
-    const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC4G5PzhDelj2Kf\nVqoPaCmjULd403IqRHKhLl0MsG2lhOZB19c7X+fVymtE2P3ar4SHTpufZY+YrjHY\nq17xSPd+3kzBHnMH6XOQUH13Tg8+6xh1xjtJOItYan80dIBlWkyEyiIGMhKDI00j\nNUv+euRY+nTIwYrlm0oBhlTSVr7eDWHsiTpM4FxqvbYi0nfU/K2CmvHP7t1sTEUM\n6Kq02tBgpLgsabaup0/1CLQ26gAwDCSabAUyVtcZMXBi9cMe4V3dAhdzq+HJjb6Y\n6WbuyZbxuCp3tqXmPbAoxuwdxUh7rJGgwzcdweKQhDgWd7xW3XSf7AXGxiEKm35J\nNQtQwXE3AgMBAAECggEATIb+GU+At/thcb0a5FuWTzHqiblOr74S7eexOuiNMyuK\ncJ0Q9Le5TNcefpg58PBbRMkKjBexuDPUOW2GggIkCmLKAc4v336NEFQ8yt4yHSOo\n36++DgIIfgCKjpnMkxSVUO8adHvU0RjX5AYv6ABaMZgt+hLlMuq5OOgHEwWGwhKW\ncPHN3rNAeyURmEa5paBLJ/YjRTkfBkOmLIDtMcFyTDk/7aIFDigd99Hvx35c4ivJ\n5aPgFddI7KHB9LAUnfBvAlTZbkyLAAUEUK3lKm08kf/sKQiWgLP9iVWWIlnxXbuR\nBLXqslVIl/sJOSGA+0OfHUbr8Jys7YN6cNfwCBP6UQKBgQDe+/QMKzO/YKqFLnuK\nvuhjpykxCJ/h43F+x5MDBhMA2S+jNcOoufpcpGzRTT67F8PJWbow9YO/6e5x8YGf\nZ+MURYJxyxugIt0Mhnm8Rj5Wgk5vPGgzn0paAHsB0Q3pcoX45xqZ4R7ikiFsuthl\nBXset9xU7W96Jf7v20ip34T00QKBgQDTXgqp87XXCo73mUVSHVutmCpYMiYdkrm\ni2kGpFuBO51u2diVLHY3+k79sjMKVk3VotWITx4tnytTX3iqjIVrEoRX5eaXreXb\nv20/jYli5xp40z3fqkgJutMjyfzrZ0kRlTrqCiiby7y9a4GzVvXlJdDuyX9/WgAZ\nWmzCkvCnhwKBgA6nekNud2klXi+AfYgBwd4Ct1dMnM1ImEXfsc6qEIemvlW4i9JD\n3qtF9wzOScgb6LcL2YusJutu4UfFumISfr7vToJR+c/NWr+e+tMfvqsKx0LSMnrq\nBgXiMDNPXN2xtBJGhd4FCHWVavLtWJlTAeNj6+v86q2ZX6a9v4nCccdxAoGAKatI\nfujE2HgEZ1uYBvAyuq5c6rY4PWxHmh4xvlV4lKmkB856nC3/wFlgaTNQTKFnBs7r\nOcwfLu9KI02XBEhfpRQpcwqnww9NWV0LtJO6mfzlgxxh/k4blY93QH75lY7vIMBC\ntRD7oHsx4kXnc+uY3mvuHKUstXaQvm7NMi61stECgYBF+BydGz589gSfkzBzRrd/\n/RLlJ//jU51293CMdrtW24x/J8c6/C9OFp9L8Hxr98JpgVu2Lh2NTeMFNis2Oqxl\nxofYGvpGV/dIClWFzEbUdXIC/Zbs30WcW8ryzFJkkvyprIdBx0VJu6klczPevITK\n+Q24I1fjx8H5entR6bN3PQ==\n-----END PRIVATE KEY-----\n";
+    const TEST_PRIVATE_KEY: &str = include_str!("../../../test-fixtures/oidc-test-key.pem");
 
     #[tokio::test]
     #[ignore = "requires loopback socket access for the provider fixture"]
@@ -1018,7 +1018,7 @@ mod tests {
                         "kid": "test-key",
                         "alg": "RS256",
                         "use": "sig",
-                        "n": "uBuT84Q3pY9in1aqD2gpo1C3eNNyKkRyoS5dDLBtpYTmQdfXO1_n1cprRNj92q-Eh06bn2WPmK4x2Kte8Uj3ft5MwR5zB-lzkFB9d04PPusYdcY7STiLWGp_NHSAZVpMhMoiBjISgyNNIzVL_nrkWPp0yMGK5ZtKAYZU0la-3g1h7Ik6TOBcar22ItJ31Pytgprxz-7dbExFDOiqtNrQYKS4LGm2rqdP9Qi0NuoAMAwkmmwFMlbXGTFwYvXDHuFd3QIXc6vhyY2-mOlm7smW8bgqd7al5j2wKMbsHcVIe6yRoMM3HcHikIQ4Fne8Vt10n-wFxsYhCpt-STULUMFxNw",
+                        "n": "12qJJN3hBLmSswLBTiu1F1OU8qcLbiiqE6EDYW1eWPtcDW5pCW7X8JRidSW_Nd-nFRcEg1Vuf8FnAuK09JHhpe1N7j5K3IOmgu2e7jvEgncZtAJQ4tz7w4QUElI7HNgn1naVBKHxbtmUZ4IIjeMjF-1r006eswOmyRIlob9Jc0soBBiYrMuXxzjt9_v9-IYkmtc8u0xwFAhdI7OcAU_rQi9ATa-lRMdAQqZ8M8FiI2h5uGEuAp0vKFsXTMnwHudNiyW12Y4FGhDDPJ_1Gs017RNFwzCNcmvryJ2e9h5c6JdryC8KOXt36YUncJ_z60JEcu4APRGmaTi3eWFHnoN85Q",
                         "e": "AQAB"
                     }]}))
                 }),
