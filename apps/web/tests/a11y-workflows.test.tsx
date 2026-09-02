@@ -13,6 +13,7 @@ import { OperatorSettingsPage } from '@/pages/operator-settings-page'
 import { OverviewPage } from '@/pages/overview-page'
 import { RecordingsPage } from '@/pages/recordings-page'
 import { SessionsPage } from '@/pages/sessions-page'
+import { SupportPage } from '@/pages/support-page'
 import { SourcesPage } from '@/pages/sources-page'
 import { StreamHealthPage } from '@/pages/stream-health-page'
 import { StreamProfilesPage } from '@/pages/stream-profiles-page'
@@ -164,6 +165,17 @@ describe('management workflow accessibility', () => {
     expect(table).toHaveAccessibleName('Live shared IPTV upstream sessions')
     // Ring utilization progressbars have accessible names tied to the source.
     expect(screen.getAllByRole('progressbar', { name: /ring utilization/ }).length).toBeGreaterThan(0)
+    expectNoAlert()
+  })
+
+  it('support diagnostics expose redaction status, download, and log controls', async () => {
+    const client = new MockIptvApiClient()
+    renderWithQuery(<SupportPage client={client} />)
+    expect(await screen.findByRole('heading', { name: 'Support diagnostics', level: 1 })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Download support bundle' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Redaction status' })).toBeInTheDocument()
+    expect(await screen.findByRole('log', { name: 'Redacted support logs' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh logs' })).toBeInTheDocument()
     expectNoAlert()
   })
 

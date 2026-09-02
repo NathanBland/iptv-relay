@@ -37,12 +37,12 @@ use iptv_media::{
     SessionFailureKind, SessionStartError, SessionState, ViewerHandle,
 };
 use iptv_persistence::{
-    CatalogRepository, ChannelPlaybackCandidateRow, ChannelPlaybackPlan, ChannelQuery,
-    CreateEventTemplate, Database, EventTemplateQuery, EventTemplateUpdate, JobRecord,
-    JobRepository, LineupApplyStats, LineupCategoryRow, LineupChannelRow, LineupTemplateRow,
-    MasterKey, NewSource, OperatorSettingScopeState, OutputProfileRow, OutputProfileTokenHash,
-    PersistenceError, ProgrammeQuery, SourceKind, SourceRepository, SourceSummary,
-    redact_diagnostics, redact_error,
+    AuditEventRecord, CatalogRepository, ChannelPlaybackCandidateRow, ChannelPlaybackPlan,
+    ChannelQuery, CreateEventTemplate, Database, EventTemplateQuery, EventTemplateUpdate,
+    JobRecord, JobRepository, LineupApplyStats, LineupCategoryRow, LineupChannelRow,
+    LineupTemplateRow, MasterKey, NewSource, OperatorSettingScopeState, OutputProfileRow,
+    OutputProfileTokenHash, PersistenceError, ProgrammeQuery, SourceKind, SourceRepository,
+    SourceSummary, redact_diagnostics, redact_error,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -687,6 +687,28 @@ struct SaveResult {
     message: String,
 }
 
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SupportLogEntry {
+    timestamp: DateTime<Utc>,
+    level: String,
+    message: String,
+    context: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SupportBundleResponse {
+    schema_version: String,
+    generated_at: DateTime<Utc>,
+    redaction: String,
+    system: SystemInfo,
+    jobs: Vec<JobResponse>,
+    sessions: Vec<SessionResponse>,
+    stream_health: StreamHealthStatsResponse,
+    logs: Vec<SupportLogEntry>,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 struct LoginRequest {
@@ -800,8 +822,8 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
-    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
+    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SupportLogEntry, SupportBundleResponse, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -994,6 +1016,8 @@ fn operations_control_routes() -> Router<AppState> {
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/session-events", get(session_events))
         .route("/api/v1/catalog-events", get(catalog_events))
+        .route("/api/v1/support/bundle", get(support_bundle))
+        .route("/api/v1/support/logs", get(support_logs))
         .route("/api/v1/jellyfin/setup", get(jellyfin_setup))
         .route("/api/v1/jellyfin/setup/rotate", post(rotate_jellyfin_token))
         .route(
@@ -2010,6 +2034,11 @@ async fn system_info(State(state): State<AppState>, headers: HeaderMap) -> Respo
     if let Some(response) = require_admin(&state, &headers) {
         return response;
     }
+    Json(system_info_value(&state).await).into_response()
+}
+
+#[allow(clippy::cast_precision_loss)]
+async fn system_info_value(state: &AppState) -> SystemInfo {
     let mut pools = HashSet::new();
     let mut provider_connections = 0;
     let mut provider_limit = 0;
@@ -2062,7 +2091,7 @@ async fn system_info(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 coverage,
             )
         };
-    Json(SystemInfo {
+    SystemInfo {
         channels: usize::try_from(channels).unwrap_or(usize::MAX),
         healthy_streams: usize::try_from(healthy_streams).unwrap_or(usize::MAX),
         active_sessions: provider_connections,
@@ -2070,9 +2099,143 @@ async fn system_info(State(state): State<AppState>, headers: HeaderMap) -> Respo
         provider_connections,
         provider_limit,
         uptime_seconds: state.started_at.elapsed().as_secs(),
-        versions: state.runtime_versions,
+        versions: state.runtime_versions.clone(),
+    }
+}
+
+fn support_log_from_audit(record: AuditEventRecord) -> SupportLogEntry {
+    SupportLogEntry {
+        timestamp: record.created_at,
+        level: "info".to_owned(),
+        message: record.action,
+        context: redact_diagnostics(&serde_json::json!({
+            "actor": record.actor,
+            "resourceType": record.resource_type,
+            "resourceId": record.resource_id,
+            "correlationId": record.correlation_id,
+            "details": record.details,
+        })),
+    }
+}
+
+fn support_log_from_job(job: &JobRecord) -> Option<SupportLogEntry> {
+    job.last_error.as_ref().map(|error| SupportLogEntry {
+        timestamp: job.updated_at,
+        level: "error".to_owned(),
+        message: redact_error(error),
+        context: redact_diagnostics(&serde_json::json!({
+            "jobId": job.id,
+            "kind": job.kind,
+            "status": job.status,
+            "attempts": job.attempts,
+            "progress": job.progress,
+        })),
     })
-    .into_response()
+}
+
+async fn support_log_entries(state: &AppState) -> Result<Vec<SupportLogEntry>, PersistenceError> {
+    let mut entries = Vec::new();
+    if let Some(database) = &state.database {
+        entries.extend(
+            database
+                .list_recent_audit_events(100)
+                .await?
+                .into_iter()
+                .map(support_log_from_audit),
+        );
+    }
+    if let Some(repository) = &state.job_repository {
+        entries.extend(
+            repository
+                .list_recent(100)
+                .await?
+                .iter()
+                .filter_map(support_log_from_job),
+        );
+    }
+    entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    entries.truncate(100);
+    Ok(entries)
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/support/bundle",
+    tag = "system",
+    responses(
+        (status = 200, description = "A redacted support bundle", body = SupportBundleResponse),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 503, body = ProblemDetails),
+    )
+)]
+async fn support_bundle(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    let jobs = match &state.job_repository {
+        Some(repository) => match repository.list_recent(100).await {
+            Ok(jobs) => jobs.iter().map(JobResponse::from).collect(),
+            Err(error) => return persistence_error_response(error),
+        },
+        None => Vec::new(),
+    };
+    let logs = match support_log_entries(&state).await {
+        Ok(logs) => logs,
+        Err(error) => return persistence_error_response(error),
+    };
+    let stream_health = match &state.catalog_repository {
+        Some(repository) => match repository.stream_health_stats().await {
+            Ok(stats) => StreamHealthStatsResponse::from(stats),
+            Err(error) => return persistence_error_response(error),
+        },
+        None => StreamHealthStatsResponse {
+            alive: 0,
+            dead: 0,
+            unknown: 0,
+            checking: 0,
+        },
+    };
+    let bundle = SupportBundleResponse {
+        schema_version: "1".to_owned(),
+        generated_at: Utc::now(),
+        redaction:
+            "Secrets, tokens, credentials, URLs, and sensitive diagnostic fields are redacted."
+                .to_owned(),
+        system: system_info_value(&state).await,
+        jobs,
+        sessions: session_responses(&state.media),
+        stream_health,
+        logs,
+    };
+    // Redact the complete serialized document as a final defense against new
+    // diagnostic fields that could contain credentials.
+    let value =
+        redact_diagnostics(&serde_json::to_value(bundle).expect("support bundle serializes"));
+    Json(value).into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/support/logs",
+    tag = "system",
+    responses(
+        (status = 200, description = "Recent redacted support log entries", body = [SupportLogEntry]),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails),
+    )
+)]
+async fn support_logs(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    match support_log_entries(&state).await {
+        Ok(entries) => Json(redact_diagnostics(
+            &serde_json::to_value(entries).expect("support logs serialize"),
+        ))
+        .into_response(),
+        Err(error) => persistence_error_response(error),
+    }
 }
 
 #[utoipa::path(get, path = "/api/v1/settings/schema", tag = "settings", responses((status = 200, body = [SettingDefinition]), (status = 401, body = ProblemDetails)))]
@@ -8318,6 +8481,38 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             "application/problem+json"
         );
+    }
+
+    #[tokio::test]
+    async fn support_routes_require_admin_and_return_redacted_bundle_contract() {
+        let app = router(state());
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/support/bundle")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(admin_request("GET", "/api/v1/support/bundle", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bundle: serde_json::Value =
+            serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(bundle["schemaVersion"], "1");
+        assert!(bundle["logs"].is_array());
+        assert!(bundle["sessions"].is_array());
+        assert!(!bundle.to_string().contains("output-secret"));
+        assert!(!bundle.to_string().contains("admin-secret"));
+
+        let openapi = ApiDoc::openapi();
+        assert!(openapi.paths.paths.contains_key("/api/v1/support/bundle"));
+        assert!(openapi.paths.paths.contains_key("/api/v1/support/logs"));
     }
 
     #[tokio::test]

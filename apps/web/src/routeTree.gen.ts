@@ -24,6 +24,7 @@ import { Route as SessionsRouteImport } from './routes/sessions'
 import { Route as SourcesRouteImport } from './routes/sources'
 import { Route as StreamHealthRouteImport } from './routes/stream-health'
 import { Route as StreamProfilesRouteImport } from './routes/stream-profiles'
+import { Route as SupportRouteImport } from './routes/support'
 import { Route as TvGuideRouteImport } from './routes/tv-guide'
 import { Route as UsersRouteImport } from './routes/users'
 
@@ -102,6 +103,11 @@ const StreamProfilesRoute = StreamProfilesRouteImport.update({
   path: '/stream-profiles',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SupportRoute = SupportRouteImport.update({
+  id: '/support',
+  path: '/support',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const TvGuideRoute = TvGuideRouteImport.update({
   id: '/tv-guide',
   path: '/tv-guide',
@@ -129,6 +135,7 @@ export interface FileRoutesByFullPath {
   '/sources': typeof SourcesRoute
   '/stream-health': typeof StreamHealthRoute
   '/stream-profiles': typeof StreamProfilesRoute
+  '/support': typeof SupportRoute
   '/tv-guide': typeof TvGuideRoute
   '/users': typeof UsersRoute
 }
@@ -148,6 +155,7 @@ export interface FileRoutesByTo {
   '/sources': typeof SourcesRoute
   '/stream-health': typeof StreamHealthRoute
   '/stream-profiles': typeof StreamProfilesRoute
+  '/support': typeof SupportRoute
   '/tv-guide': typeof TvGuideRoute
   '/users': typeof UsersRoute
 }
@@ -168,6 +176,7 @@ export interface FileRoutesById {
   '/sources': typeof SourcesRoute
   '/stream-health': typeof StreamHealthRoute
   '/stream-profiles': typeof StreamProfilesRoute
+  '/support': typeof SupportRoute
   '/tv-guide': typeof TvGuideRoute
   '/users': typeof UsersRoute
 }
@@ -189,6 +198,7 @@ export interface FileRouteTypes {
     | '/sources'
     | '/stream-health'
     | '/stream-profiles'
+    | '/support'
     | '/tv-guide'
     | '/users'
   fileRoutesByTo: FileRoutesByTo
@@ -208,6 +218,7 @@ export interface FileRouteTypes {
     | '/sources'
     | '/stream-health'
     | '/stream-profiles'
+    | '/support'
     | '/tv-guide'
     | '/users'
   id:
@@ -227,6 +238,7 @@ export interface FileRouteTypes {
     | '/sources'
     | '/stream-health'
     | '/stream-profiles'
+    | '/support'
     | '/tv-guide'
     | '/users'
   fileRoutesById: FileRoutesById
@@ -247,6 +259,7 @@ export interface RootRouteChildren {
   SourcesRoute: typeof SourcesRoute
   StreamHealthRoute: typeof StreamHealthRoute
   StreamProfilesRoute: typeof StreamProfilesRoute
+  SupportRoute: typeof SupportRoute
   TvGuideRoute: typeof TvGuideRoute
   UsersRoute: typeof UsersRoute
 }
@@ -358,6 +371,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof StreamProfilesRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/support': {
+      id: '/support'
+      path: '/support'
+      fullPath: '/support'
+      preLoaderRoute: typeof SupportRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/tv-guide': {
       id: '/tv-guide'
       path: '/tv-guide'
@@ -391,6 +411,7 @@ const rootRouteChildren: RootRouteChildren = {
   SourcesRoute: SourcesRoute,
   StreamHealthRoute: StreamHealthRoute,
   StreamProfilesRoute: StreamProfilesRoute,
+  SupportRoute: SupportRoute,
   TvGuideRoute: TvGuideRoute,
   UsersRoute: UsersRoute,
 }

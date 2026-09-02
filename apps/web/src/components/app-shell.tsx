@@ -14,6 +14,7 @@ import {
   RadioTower,
   Settings,
   Settings2,
+  ShieldCheck,
   Tv,
   Tv2,
   Workflow,
@@ -43,6 +44,7 @@ const navigation = [
   { to: '/recordings', label: 'Recordings', icon: Video },
   { to: '/stream-profiles', label: 'Stream profiles', icon: Settings },
   { to: '/jellyfin', label: 'Jellyfin setup', icon: Settings2 },
+  { to: '/support', label: 'Support', icon: ShieldCheck },
 ] as const
 
 function Navigation({ compact = false }: { compact?: boolean }) {

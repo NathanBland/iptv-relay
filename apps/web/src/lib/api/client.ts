@@ -52,6 +52,8 @@ import type {
   RotateJellyfinTokenInput,
   SaveResult,
   Session,
+  SupportBundle,
+  SupportLogEntry,
   SettingDefinition,
   Source,
   SourceInput,
@@ -105,6 +107,8 @@ const API_PATHS = {
   eventChannels: '/api/v1/event-channels',
   lineupTemplates: '/api/v1/lineup-templates',
   sessions: '/api/v1/sessions',
+  supportBundle: '/api/v1/support/bundle',
+  supportLogs: '/api/v1/support/logs',
   jellyfinSetup: '/api/v1/jellyfin/setup',
   groups: '/api/v1/groups',
   regionSettings: '/api/v1/region-settings',
@@ -813,6 +817,14 @@ export class FetchIptvApiClient implements IptvApiClient {
     return this.request(API_PATHS.sessions, (value) => asObjectArray<Session>(value, 'Sessions response'))
   }
 
+  async getSupportBundle(): Promise<SupportBundle> {
+    return this.request(API_PATHS.supportBundle, (value) => asObject<SupportBundle>(value, 'Support bundle response'))
+  }
+
+  async getSupportLogs(): Promise<SupportLogEntry[]> {
+    return this.request(API_PATHS.supportLogs, (value) => asObjectArray<SupportLogEntry>(value, 'Support logs response'))
+  }
+
   async getJellyfinSetup(): Promise<JellyfinSetup> {
     return this.request(API_PATHS.jellyfinSetup, (value) => decodeJellyfinSetup(value))
   }
@@ -1372,6 +1384,32 @@ export class MockIptvApiClient implements IptvApiClient {
 
   async getSessions(): Promise<Session[]> {
     return mockSessions.map((session) => ({ ...session }))
+  }
+
+  async getSupportBundle(): Promise<SupportBundle> {
+    return {
+      schemaVersion: '1',
+      generatedAt: '2026-08-20T12:00:00Z',
+      redaction: 'Secrets, tokens, credentials, URLs, and sensitive diagnostic fields are redacted.',
+      system: {
+        ...mockOverview,
+        uptimeSeconds: 3600,
+        versions: { gateway: 'mock' },
+      },
+      jobs: [],
+      sessions: mockSessions.map((session) => ({ ...session })),
+      streamHealth: { alive: 1, dead: 0, unknown: 0, checking: 0 },
+      logs: [{
+        timestamp: '2026-08-20T11:59:00Z',
+        level: 'info',
+        message: 'support bundle is ready',
+        context: { source: 'mock' },
+      }],
+    }
+  }
+
+  async getSupportLogs(): Promise<SupportLogEntry[]> {
+    return (await this.getSupportBundle()).logs
   }
 
   async getJellyfinSetup(): Promise<JellyfinSetup> {

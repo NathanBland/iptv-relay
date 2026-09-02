@@ -501,6 +501,24 @@ export interface Session {
   providerAvailableSlots: number
 }
 
+export interface SupportLogEntry {
+  timestamp: string
+  level: 'info' | 'error' | string
+  message: string
+  context: Record<string, unknown>
+}
+
+export interface SupportBundle {
+  schemaVersion: string
+  generatedAt: string
+  redaction: string
+  system: Overview & { uptimeSeconds: number; versions: Record<string, unknown> }
+  jobs: Array<Record<string, unknown>>
+  sessions: Session[]
+  streamHealth: StreamHealthStats
+  logs: SupportLogEntry[]
+}
+
 export type JellyfinSetupStatus = 'available' | 'regeneration-required'
 
 export interface JellyfinSetup {
@@ -682,6 +700,8 @@ export interface IptvApiClient {
   deleteLineupTemplate(id: string): Promise<void>
   applyLineupTemplate(id: string): Promise<SaveResult>
   getSessions(): Promise<Session[]>
+  getSupportBundle(): Promise<SupportBundle>
+  getSupportLogs(): Promise<SupportLogEntry[]>
   getJellyfinSetup(): Promise<JellyfinSetup>
   rotateJellyfinToken(input?: RotateJellyfinTokenInput): Promise<JellyfinSetup>
   getStreamHealth(status?: string, group?: string, limit?: number, offset?: number): Promise<StreamHealthPage>

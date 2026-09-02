@@ -1405,6 +1405,49 @@ pub struct JobRepository {
     pool: PgPool,
 }
 
+/// A durable operator activity record for support diagnostics.
+///
+/// The details value can contain operational data. Callers must redact it
+/// before they serialize it outside the persistence boundary.
+#[derive(Clone, Debug, Deserialize, Serialize, FromRow, PartialEq)]
+pub struct AuditEventRecord {
+    pub id: Uuid,
+    pub actor: String,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+    pub correlation_id: Uuid,
+    pub details: Value,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Database {
+    /// Lists recent operator activity for redacted support diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    pub async fn list_recent_audit_events(
+        &self,
+        limit: u16,
+    ) -> Result<Vec<AuditEventRecord>, PersistenceError> {
+        let limit = i64::from(limit.clamp(1, 500));
+        let records = sqlx::query_as::<_, AuditEventRecord>(
+            r"
+            SELECT id, actor, action, resource_type, resource_id,
+                   correlation_id, details, created_at
+            FROM audit_events
+            ORDER BY created_at DESC, id DESC
+            LIMIT $1
+            ",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(records)
+    }
+}
+
 impl JobRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
