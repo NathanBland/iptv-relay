@@ -7,9 +7,11 @@ import { resolve } from 'node:path'
 const webRoot = fileURLToPath(new URL('.', import.meta.url))
 const workspaceRoot = resolve(webRoot, '../..')
 const environmentFile = resolve(workspaceRoot, '.env')
+const testEnvironmentFile = resolve(workspaceRoot, '.env.test')
 
-if (!existsSync(environmentFile)) throw new Error('The root .env file is required for the real-source browser test.')
-loadEnvFile(environmentFile)
+if (existsSync(environmentFile)) loadEnvFile(environmentFile)
+else if (existsSync(testEnvironmentFile)) loadEnvFile(testEnvironmentFile)
+else throw new Error('The root .env or .env.test file is required for browser tests.')
 
 const baseURL = (process.env.IPTV_E2E_BASE_URL ?? process.env.IPTV_PUBLIC_BASE_URL ?? 'http://127.0.0.1:8080').replace(/\/$/, '')
 

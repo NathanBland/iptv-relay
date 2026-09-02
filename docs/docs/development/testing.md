@@ -144,7 +144,19 @@ Run the full pipeline:
 make ci
 ```
 
-The `ci` target runs formatting, lint, audit, coverage, and Compose config validation.
+The `ci` target runs every non-credentialed gate.
+
+The gate runs formatting, lint, audit, Rust and web coverage, and changed-line coverage.
+
+The gate also runs fuzz smoke tests, media acceptance, fault acceptance, Compose health checks, strict documentation build, and Playwright tests.
+
+The gate stops after a required command fails.
+
+Run the live-provider gate separately because it needs provider credentials:
+
+```bash
+make live-acceptance
+```
 
 ## Acceptance tests
 
