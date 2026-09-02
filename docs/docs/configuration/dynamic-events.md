@@ -18,6 +18,8 @@ The scan does not create a canonical channel.
 | `eventDurationHours` | Stored duration value. |
 | `pastDateGraceHours` | Stored retention value. |
 | `futureDateDays` | Stored search-window value. |
+| `timezone` | IANA timezone for event timestamps without an offset. Defaults to `UTC`. |
+| `fillerTitle` | Title for filler programmes around events. Defaults to `No programs available`. |
 
 The scan uses the regular expression, group name, and supported guide fields.
 It extracts event data from matching stream names.
@@ -55,7 +57,10 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
   }'
 ```
 
-The `name`, `displayName`, `matchRegex`, `channelNameFormat`, and `groupName` fields are required. The duration, grace, and future-window fields use default values when you omit them.
+The `name`, `displayName`, `matchRegex`, `channelNameFormat`, and `groupName` fields are required. The duration, grace, future-window, timezone, and filler-title fields use defaults when you omit them.
+
+Set `timezone` to a valid IANA timezone, such as `America/Denver`, when event dates omit an offset.
+Set `fillerTitle` to the title that the guide must use for contiguous filler programmes.
 
 ## Suggest a template record
 
@@ -98,4 +103,5 @@ curl "http://localhost:8080/api/v1/event-channels?templateId={template_id}" \
 ## User interface
 
 The `/events` page manages template and event-channel records.
-The page does not yet configure stored `event_rule_sets` or per-template filler and category settings.
+Use **Configure templates** to create a template with timezone and filler-title settings.
+Use **Edit** on an existing template to update those settings and the matching rule.

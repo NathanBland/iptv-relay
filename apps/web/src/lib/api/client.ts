@@ -1326,8 +1326,10 @@ export class MockIptvApiClient implements IptvApiClient {
       channelNameFormat: input.channelNameFormat,
       groupName: input.groupName,
       eventDurationHours: input.eventDurationHours ?? 3,
-      pastDateGraceHours: input.pastDateGraceHours ?? 6,
-      futureDateDays: input.futureDateDays ?? 7,
+      pastDateGraceHours: input.pastDateGraceHours ?? 4,
+      futureDateDays: input.futureDateDays ?? 2,
+      timezone: input.timezone ?? 'UTC',
+      fillerTitle: input.fillerTitle ?? 'No programs available',
       enabled: true,
     }
   }
@@ -1341,8 +1343,10 @@ export class MockIptvApiClient implements IptvApiClient {
       channelNameFormat: input.channelNameFormat ?? '{event}',
       groupName: input.groupName ?? 'Sports',
       eventDurationHours: input.eventDurationHours ?? 3,
-      pastDateGraceHours: input.pastDateGraceHours ?? 6,
-      futureDateDays: input.futureDateDays ?? 7,
+      pastDateGraceHours: input.pastDateGraceHours ?? 4,
+      futureDateDays: input.futureDateDays ?? 2,
+      timezone: input.timezone ?? 'UTC',
+      fillerTitle: input.fillerTitle ?? 'No programs available',
       enabled: input.enabled ?? true,
     }
   }

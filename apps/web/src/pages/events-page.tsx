@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Braces, CalendarClock, Eye, Power, Radio, ScanLine, Sparkles, Trash2, X } from 'lucide-react'
+import { Braces, CalendarClock, Eye, Pencil, Power, Radio, ScanLine, Sparkles, Trash2, X } from 'lucide-react'
 import { PageHeader } from '@/components/page-header'
 import { LoadingPage } from '@/components/loading-page'
 import { Badge } from '@/components/ui/badge'
@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
 import type { CreateEventTemplateInput, EventChannel, EventTemplate, EventTemplateSuggestion, IptvApiClient, UpdateEventTemplateInput } from '@/lib/api/types'
+import { eventTemplateDefaults, eventTemplateSchema } from '@/lib/validation'
 
 const channelTones: Record<EventChannel['state'], 'success' | 'info' | 'warning' | 'neutral'> = {
   live: 'success',
@@ -74,6 +75,7 @@ function TemplateCard({
   template,
   channels,
   onScan,
+  onEdit,
   scanning,
   onDelete,
   confirmDelete,
@@ -86,6 +88,7 @@ function TemplateCard({
   template: EventTemplate
   channels: EventChannel[]
   onScan: () => void
+  onEdit: () => void
   scanning: boolean
   onDelete: () => void
   confirmDelete: boolean
@@ -121,6 +124,9 @@ function TemplateCard({
           </p>
         </div>
         <div className="flex items-center gap-1">
+          <Button variant="ghost" size="sm" onClick={onEdit} aria-label={`Edit ${template.displayName}`}>
+            <Pencil aria-hidden="true" className="size-4" />
+          </Button>
           <Button
             variant="secondary"
             size="sm"
@@ -180,6 +186,8 @@ function TemplateCard({
           <span>Duration: {template.eventDurationHours}h</span>
           <span>Past grace: {template.pastDateGraceHours}h</span>
           <span>Future window: {template.futureDateDays}d</span>
+          <span>Timezone: {template.timezone}</span>
+          <span className="sm:col-span-2">Filler: {template.fillerTitle}</span>
         </div>
         {showPreview ? (
           <EventRulePreviewPanel
@@ -357,6 +365,7 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
   const queryClient = useQueryClient()
   const [scanningId, setScanningId] = useState<string | null>(null)
   const [showTemplateForm, setShowTemplateForm] = useState(false)
+  const [editingTemplate, setEditingTemplate] = useState<EventTemplate | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [showSuggestions, setShowSuggestions] = useState(false)
   const [suggestions, setSuggestions] = useState<EventTemplateSuggestion[] | null>(null)
@@ -380,6 +389,18 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
     mutationFn: (input: CreateEventTemplateInput) => client.createEventTemplate(input),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['event-templates'] })
+      setShowTemplateForm(false)
+    },
+  })
+
+  const updateMutation = useMutation({
+    mutationFn: ({ id, input }: { id: string; input: CreateEventTemplateInput }) =>
+      client.updateEventTemplate(id, input),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['event-templates'] })
+      void queryClient.invalidateQueries({ queryKey: ['event-channels'] })
+      void queryClient.invalidateQueries({ queryKey: ['events'] })
+      setEditingTemplate(null)
       setShowTemplateForm(false)
     },
   })
@@ -464,7 +485,7 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
               <Sparkles aria-hidden="true" className="size-4" />
               {suggestMutation.isPending ? 'Analyzing…' : 'Analyze streams'}
             </Button>
-            <Button variant="secondary" onClick={() => setShowTemplateForm(true)}>
+            <Button variant="secondary" onClick={() => { setEditingTemplate(null); setShowTemplateForm(true) }}>
               <Braces aria-hidden="true" className="size-4" /> Configure templates
             </Button>
           </>
@@ -472,10 +493,16 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
       />
       {showTemplateForm ? (
         <EventTemplateForm
-          pending={createMutation.isPending}
-          error={createMutation.error instanceof Error ? createMutation.error.message : null}
-          onSubmit={(input) => createMutation.mutate(input)}
-          onCancel={() => setShowTemplateForm(false)}
+          initialTemplate={editingTemplate}
+          pending={editingTemplate ? updateMutation.isPending : createMutation.isPending}
+          error={editingTemplate
+            ? updateMutation.error instanceof Error ? updateMutation.error.message : null
+            : createMutation.error instanceof Error ? createMutation.error.message : null}
+          onSubmit={(input) => {
+            if (editingTemplate) updateMutation.mutate({ id: editingTemplate.id, input })
+            else createMutation.mutate(input)
+          }}
+          onCancel={() => { setEditingTemplate(null); setShowTemplateForm(false) }}
         />
       ) : null}
       {showSuggestions ? (
@@ -526,6 +553,7 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
               template={template}
               channels={channels.filter((channel) => channel.templateId === template.id)}
               onScan={() => scanMutation.mutate(template.id)}
+              onEdit={() => { setEditingTemplate(template); setShowTemplateForm(true) }}
               scanning={scanningId === template.id || scanMutation.isPending}
               onDelete={() => setConfirmDelete(template.id)}
               confirmDelete={confirmDelete === template.id}
@@ -545,25 +573,30 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
 }
 
 function EventTemplateForm({
+  initialTemplate,
   pending,
   error,
   onSubmit,
   onCancel,
 }: {
+  initialTemplate: EventTemplate | null
   pending: boolean
   error: string | null
   onSubmit: (input: CreateEventTemplateInput) => void
   onCancel: () => void
 }) {
-  const [name, setName] = useState('')
-  const [displayName, setDisplayName] = useState('')
-  const [matchRegex, setMatchRegex] = useState('')
-  const [channelNameFormat, setChannelNameFormat] = useState('{event}')
-  const [groupName, setGroupName] = useState('Sports')
-  const [eventDurationHours, setEventDurationHours] = useState('3')
-  const [pastDateGraceHours, setPastDateGraceHours] = useState('4')
-  const [futureDateDays, setFutureDateDays] = useState('2')
+  const [name, setName] = useState(initialTemplate?.name ?? '')
+  const [displayName, setDisplayName] = useState(initialTemplate?.displayName ?? '')
+  const [matchRegex, setMatchRegex] = useState(initialTemplate?.matchRegex ?? '')
+  const [channelNameFormat, setChannelNameFormat] = useState(initialTemplate?.channelNameFormat ?? '{event}')
+  const [groupName, setGroupName] = useState(initialTemplate?.groupName ?? 'Sports')
+  const [eventDurationHours, setEventDurationHours] = useState(String(initialTemplate?.eventDurationHours ?? eventTemplateDefaults.eventDurationHours))
+  const [pastDateGraceHours, setPastDateGraceHours] = useState(String(initialTemplate?.pastDateGraceHours ?? eventTemplateDefaults.pastDateGraceHours))
+  const [futureDateDays, setFutureDateDays] = useState(String(initialTemplate?.futureDateDays ?? eventTemplateDefaults.futureDateDays))
+  const [timezone, setTimezone] = useState(initialTemplate?.timezone ?? eventTemplateDefaults.timezone)
+  const [fillerTitle, setFillerTitle] = useState(initialTemplate?.fillerTitle ?? eventTemplateDefaults.fillerTitle)
   const [previewSample, setPreviewSample] = useState('')
+  const [validationError, setValidationError] = useState<string | null>(null)
 
   const previewMatches = useMemo(
     () => (previewSample.trim() ? previewEventRule(matchRegex, channelNameFormat, [previewSample]) : []),
@@ -573,7 +606,7 @@ function EventTemplateForm({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    onSubmit({
+    const input: CreateEventTemplateInput = {
       name,
       displayName,
       matchRegex,
@@ -582,14 +615,23 @@ function EventTemplateForm({
       eventDurationHours: Number(eventDurationHours),
       pastDateGraceHours: Number(pastDateGraceHours),
       futureDateDays: Number(futureDateDays),
-    })
+      timezone,
+      fillerTitle,
+    }
+    const result = eventTemplateSchema.safeParse(input)
+    if (!result.success) {
+      setValidationError(result.error.issues[0]?.message ?? 'Enter valid event template settings.')
+      return
+    }
+    setValidationError(null)
+    onSubmit(input)
   }
 
   return (
     <Card>
       <CardHeader>
         <div className="flex items-center justify-between">
-          <h2 className="font-semibold text-white">New event template</h2>
+          <h2 className="font-semibold text-white">{initialTemplate ? `Edit ${initialTemplate.displayName}` : 'New event template'}</h2>
           <Button variant="ghost" size="sm" onClick={onCancel}><X aria-hidden="true" className="size-4" /></Button>
         </div>
       </CardHeader>
@@ -656,6 +698,18 @@ function EventTemplateForm({
               />
             </label>
           </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="block text-xs font-medium text-slate-300">
+              Timezone
+              <Input className="mt-1" value={timezone} onChange={(e) => setTimezone(e.target.value)} placeholder="UTC" required />
+              <span className="mt-1 block text-[0.68rem] text-slate-500">Use an IANA timezone for event dates without an offset.</span>
+            </label>
+            <label className="block text-xs font-medium text-slate-300">
+              Filler title
+              <Input className="mt-1" value={fillerTitle} onChange={(e) => setFillerTitle(e.target.value)} placeholder={eventTemplateDefaults.fillerTitle} required />
+              <span className="mt-1 block text-[0.68rem] text-slate-500">Use this title for filler programmes around events.</span>
+            </label>
+          </div>
           <div className="rounded-lg border border-white/8 bg-ink-950/50 p-4">
             <p className="text-xs font-medium text-slate-300">Rule preview</p>
             <p className="mt-1 text-[0.68rem] text-slate-500">
@@ -686,10 +740,11 @@ function EventTemplateForm({
               </div>
             ) : null}
           </div>
+          {validationError ? <p role="alert" className="text-sm text-red-300">{validationError}</p> : null}
           {error ? <p role="alert" className="text-sm text-red-300">{error}</p> : null}
           <div className="flex justify-end gap-2">
             <Button variant="ghost" size="sm" onClick={onCancel}>Cancel</Button>
-            <Button type="submit" size="sm" disabled={pending}>{pending ? 'Saving…' : 'Create template'}</Button>
+            <Button type="submit" size="sm" disabled={pending}>{pending ? 'Saving…' : initialTemplate ? 'Save changes' : 'Create template'}</Button>
           </div>
         </form>
       </CardContent>

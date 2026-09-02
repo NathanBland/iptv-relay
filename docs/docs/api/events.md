@@ -37,11 +37,13 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
     "channelNameFormat": "NFL: {1} vs {2}",
     "eventDurationHours": 4,
     "pastDateGraceHours": 6,
-    "futureDateDays": 7
+    "futureDateDays": 7,
+    "timezone": "America/Denver",
+    "fillerTitle": "No programs available"
   }'
 ```
 
-The `name`, `displayName`, `matchRegex`, `channelNameFormat`, and `groupName` fields are required. The duration, grace, and future-window fields use default values when you omit them.
+The `name`, `displayName`, `matchRegex`, `channelNameFormat`, and `groupName` fields are required. The duration, grace, future-window, timezone, and filler-title fields use defaults when you omit them.
 
 ## Update an event template
 
@@ -51,8 +53,10 @@ Send a partial update. Omitted fields keep their stored values. Set `enabled` to
 curl -X PATCH http://localhost:8080/api/v1/event-templates/{template_id} \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"enabled": false, "eventDurationHours": 5}'
+  -d '{"enabled": false, "eventDurationHours": 5, "timezone": "America/Denver", "fillerTitle": "Off air"}'
 ```
+
+Set `timezone` to a valid IANA timezone for event dates without an offset. Set `fillerTitle` to the title for generated filler programmes. The server rejects blank or invalid values.
 
 ## Delete an event template
 

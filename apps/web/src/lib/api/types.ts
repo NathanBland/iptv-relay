@@ -394,6 +394,8 @@ export interface EventTemplate {
   eventDurationHours: number
   pastDateGraceHours: number
   futureDateDays: number
+  timezone: string
+  fillerTitle: string
   enabled: boolean
 }
 
@@ -440,6 +442,8 @@ export interface CreateEventTemplateInput {
   eventDurationHours?: number
   pastDateGraceHours?: number
   futureDateDays?: number
+  timezone?: string
+  fillerTitle?: string
 }
 
 export interface UpdateEventTemplateInput {
@@ -451,6 +455,8 @@ export interface UpdateEventTemplateInput {
   eventDurationHours?: number
   pastDateGraceHours?: number
   futureDateDays?: number
+  timezone?: string
+  fillerTitle?: string
   enabled?: boolean
 }
 

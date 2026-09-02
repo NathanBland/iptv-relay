@@ -30,6 +30,28 @@ export const sourceUpdateSchema = z.object({
   enabled: z.boolean(),
 })
 
+export const eventTemplateSchema = z.object({
+  name: nonBlank('Enter a template name.'),
+  displayName: nonBlank('Enter a display name.'),
+  matchRegex: nonBlank('Enter a match pattern.'),
+  channelNameFormat: nonBlank('Enter a channel name format.'),
+  groupName: nonBlank('Enter a group name.'),
+  eventDurationHours: z.number().int('Use a whole number.').min(1, 'Use at least one hour.'),
+  pastDateGraceHours: z.number().int('Use a whole number.').min(0, 'Use zero or more hours.'),
+  futureDateDays: z.number().int('Use a whole number.').min(0, 'Use zero or more days.'),
+  timezone: nonBlank('Enter an IANA timezone.'),
+  fillerTitle: nonBlank('Enter a filler title.'),
+})
+
+export const eventTemplateDefaults = {
+  eventDurationHours: 3,
+  pastDateGraceHours: 4,
+  futureDateDays: 2,
+  timezone: 'UTC',
+  fillerTitle: 'No programs available',
+} as const
+
 export type LoginFormValues = z.input<typeof loginSchema>
 export type SourceFormValues = z.input<typeof sourceSchema>
 export type SourceUpdateFormValues = z.input<typeof sourceUpdateSchema>
+export type EventTemplateFormValues = z.input<typeof eventTemplateSchema>
