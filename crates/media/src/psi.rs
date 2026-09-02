@@ -381,58 +381,43 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn pmt_section(video_pid: u16) -> Vec<u8> {
-        let mut section = vec![
-            PMT_TABLE_ID,
-            0xb0,
-            0x12,
-            0x00,
-            0x01,
-            0xc1,
-            0x00,
-            0x00,
-            0xe0 | u8::try_from((video_pid >> 8) & 0x1f).unwrap(),
-            u8::try_from(video_pid & 0xff).unwrap(),
-            0xf0,
-            0x00,
-            0x1b,
-            0xe0 | u8::try_from((video_pid >> 8) & 0x1f).unwrap(),
-            u8::try_from(video_pid & 0xff).unwrap(),
-            0xf0,
-            0x00,
-        ];
-        append_crc(&mut section);
-        section
+        pmt_section_with_streams(video_pid, &[(0x1b, video_pid)])
     }
 
     /// Builds a PMT section that declares one video and one audio elementary
     /// stream. The audio PID is distinct from the video PID.
     pub(crate) fn pmt_section_with_audio(video_pid: u16, audio_pid: u16) -> Vec<u8> {
+        pmt_section_with_streams(video_pid, &[(0x1b, video_pid), (0x04, audio_pid)])
+    }
+
+    /// Builds a PMT section with a custom set of elementary streams. The first
+    /// PID is used as the PCR PID. Each entry is `(stream_type, pid)`.
+    pub(crate) fn pmt_section_with_streams(pcr_pid: u16, streams: &[(u8, u16)]) -> Vec<u8> {
         let mut section = vec![
             PMT_TABLE_ID,
-            0xb0,
-            0x17,
-            0x00,
-            0x01,
-            0xc1,
-            0x00,
-            0x00,
-            0xe0 | u8::try_from((video_pid >> 8) & 0x1f).unwrap(),
-            u8::try_from(video_pid & 0xff).unwrap(),
-            0xf0,
-            0x00,
-            // Video elementary stream: H.264 (stream_type 0x1b).
-            0x1b,
-            0xe0 | u8::try_from((video_pid >> 8) & 0x1f).unwrap(),
-            u8::try_from(video_pid & 0xff).unwrap(),
-            0xf0,
-            0x00,
-            // Audio elementary stream: MPEG-2 audio (stream_type 0x04).
-            0x04,
-            0xe0 | u8::try_from((audio_pid >> 8) & 0x1f).unwrap(),
-            u8::try_from(audio_pid & 0xff).unwrap(),
-            0xf0,
-            0x00,
+            0xb0, // section_syntax_indicator + reserved + section_length[11:8]
+            0x00, // section_length[7:0] (filled below)
+            0x00, // program_number high
+            0x01, // program_number low
+            0xc1, // reserved + version + current_next
+            0x00, // section_number
+            0x00, // last_section_number
+            0xe0 | u8::try_from((pcr_pid >> 8) & 0x1f).unwrap(),
+            u8::try_from(pcr_pid & 0xff).unwrap(),
+            0xf0, // reserved + program_info_length high
+            0x00, // program_info_length low
         ];
+        for (stream_type, pid) in streams {
+            section.push(*stream_type);
+            section.push(0xe0 | u8::try_from((pid >> 8) & 0x1f).unwrap());
+            section.push(u8::try_from(pid & 0xff).unwrap());
+            section.push(0xf0); // reserved + ES info length high
+            section.push(0x00); // ES info length low
+        }
+        // Compute and set the section_length (bytes after this field, including CRC).
+        let section_length = u16::try_from(section.len() - 3 + 4).unwrap();
+        section[1] |= u8::try_from((section_length >> 8) & 0x0f).unwrap();
+        section[2] = u8::try_from(section_length & 0xff).unwrap();
         append_crc(&mut section);
         section
     }
@@ -563,5 +548,42 @@ mod tests {
         assert!(parse_pmt_elementary_streams(&pmt_section(TEST_VIDEO_PID), 999).is_none());
         assert!(parse_pmt_elementary_streams(&[], 1).is_none());
         assert!(parse_pmt_elementary_streams(&pat_section(TEST_PMT_PID), 1).is_none());
+    }
+
+    #[test]
+    fn parse_pmt_elementary_streams_rejects_truncated_stream_loop() {
+        // Build a PMT section where the program_info_length pushes the offset
+        // past the streams end, so the stream loop cannot start.
+        let mut section = pmt_section_with_streams(TEST_VIDEO_PID, &[(0x1b, TEST_VIDEO_PID)]);
+        // Set program_info_length to a value larger than the remaining bytes.
+        section[10] = 0xf0;
+        section[11] = 0x80; // program_info_length = 128, far past the section end
+        assert!(parse_pmt_elementary_streams(&section, 1).is_none());
+    }
+
+    #[test]
+    fn parse_pmt_elementary_streams_rejects_oversized_es_info_length() {
+        // Build a PMT section where one elementary stream declares an
+        // ES info length that extends past the streams end.
+        let mut section = pmt_section_with_streams(TEST_VIDEO_PID, &[(0x1b, TEST_VIDEO_PID)]);
+        // Overwrite the ES info length of the first (and only) stream entry
+        // to push `next` past `streams_end`. The stream entry starts at offset
+        // 12 (after program_info_length of 0). Bytes 12..17 are the 5-byte
+        // stream header. Byte 16 is ES info length high, byte 17 is low.
+        section[16] = 0x0f;
+        section[17] = 0xff; // ES info length = 4095, far past the section end
+        assert!(parse_pmt_elementary_streams(&section, 1).is_none());
+    }
+
+    #[test]
+    fn parse_pmt_elementary_streams_rejects_trailing_bytes_after_stream_loop() {
+        // Build a PMT section with an extra byte after the stream loop so the
+        // final offset != streams_end check fails.
+        let mut section = pmt_section_with_streams(TEST_VIDEO_PID, &[(0x1b, TEST_VIDEO_PID)]);
+        // Insert one extra byte before the CRC to misalign the stream loop end.
+        let crc = section.split_off(section.len() - 4);
+        section.push(0x00); // extra byte
+        section.extend_from_slice(&crc);
+        assert!(parse_pmt_elementary_streams(&section, 1).is_none());
     }
 }

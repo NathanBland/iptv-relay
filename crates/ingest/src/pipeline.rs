@@ -767,8 +767,13 @@ fn streaming_parse<P: EndpointProtector>(
     Ok((snapshot, records_seen))
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn prepare_streaming_snapshot<P: EndpointProtector>(
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc
+)]
+pub fn prepare_streaming_snapshot<P: EndpointProtector>(
     owner: SnapshotOwner,
     format: IngestFormat,
     source_timezone: String,

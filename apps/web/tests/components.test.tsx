@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -15,7 +15,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Combobox } from '@/components/ui/combobox'
 import { FieldMessage, Input, Select } from '@/components/ui/input'
-import { IptvApiError, MockIptvApiClient } from '@/lib/api/client'
+import { IptvApiError, MockIptvApiClient, apiClient } from '@/lib/api/client'
 import { renderWithQuery } from './test-utils'
 
 vi.mock('@/lib/api/client', async () => {
@@ -87,6 +87,32 @@ describe('owned management components', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Session could not be cleared.')
   })
 
+  it('uses the default redirect after a successful sign out', async () => {
+    const assign = vi.fn()
+    Object.defineProperty(window, 'location', { configurable: true, value: { assign } })
+    const success = new MockIptvApiClient()
+    vi.spyOn(success, 'logout').mockResolvedValue({ ok: true, message: '' })
+    render(<LogoutButton client={success} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }))
+    await waitFor(() => expect(assign).toHaveBeenCalledWith('/login'))
+  })
+
+  it('shows a generic refusal when logout returns no message', async () => {
+    const refused = new MockIptvApiClient()
+    vi.spyOn(refused, 'logout').mockResolvedValue({ ok: false, message: '' })
+    render(<LogoutButton client={refused} onLoggedOut={vi.fn()} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Unable to sign out.')
+  })
+
+  it('shows a generic fallback for non-API sign-out errors', async () => {
+    const crashed = new MockIptvApiClient()
+    vi.spyOn(crashed, 'logout').mockRejectedValue(new Error('Network down.'))
+    render(<LogoutButton client={crashed} onLoggedOut={vi.fn()} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Sign out' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Unable to sign out.')
+  })
+
   it('filters combobox items by search query and selects on click', async () => {
     const onChange = vi.fn()
     const items = [
@@ -127,5 +153,33 @@ describe('owned management components', () => {
     expect(screen.getByRole('listbox')).toBeVisible()
     await userEvent.keyboard('{Escape}')
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
+  })
+
+  it('renders the shell overview and provider budget states', async () => {
+    const success = vi.spyOn(apiClient, 'getOverview').mockResolvedValue({
+      channels: 100, healthyStreams: 80, activeSessions: 1, guideCoverage: 90, providerConnections: 2, providerLimit: 4,
+    })
+    renderWithQuery(<AppShell><h1>Overview</h1></AppShell>)
+    expect(await screen.findByText('100 channels · 80 healthy streams')).toBeInTheDocument()
+    expect(screen.getByText('One downstream session shares upstream connections.')).toBeInTheDocument()
+    expect(screen.getByText('2 / 4')).toBeInTheDocument()
+    success.mockRestore()
+  })
+
+  it('renders the shell service-unavailable state', async () => {
+    const error = vi.spyOn(apiClient, 'getOverview').mockRejectedValue(new Error('Offline.'))
+    renderWithQuery(<AppShell><h1>Error shell</h1></AppShell>)
+    expect(await screen.findByText('Service unavailable')).toBeInTheDocument()
+    error.mockRestore()
+  })
+
+  it('renders the shell zero provider-budget state', async () => {
+    const zero = vi.spyOn(apiClient, 'getOverview').mockResolvedValue({
+      channels: 0, healthyStreams: 0, activeSessions: 0, guideCoverage: 0, providerConnections: 0, providerLimit: 0,
+    })
+    renderWithQuery(<AppShell><h1>Zero budget</h1></AppShell>)
+    expect(await screen.findByText('0 downstream sessions share upstream connections.')).toBeInTheDocument()
+    expect(screen.getByText('0 / 0')).toBeInTheDocument()
+    zero.mockRestore()
   })
 })

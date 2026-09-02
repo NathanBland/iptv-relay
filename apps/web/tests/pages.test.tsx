@@ -138,6 +138,22 @@ describe('management pages', () => {
     expect(await screen.findByText('1 slots')).toBeInTheDocument()
   })
 
+  it('shows the empty EPG state and pages across multiple pages', async () => {
+    const empty = new MockIptvApiClient()
+    vi.spyOn(empty, 'getProgrammes').mockResolvedValue({ total: 0, limit: 100, offset: 0, items: [] })
+    renderWithQuery(<EpgPage client={empty} />)
+    expect(await screen.findByText('No programme data available.')).toBeInTheDocument()
+
+    const paged = new MockIptvApiClient()
+    vi.spyOn(paged, 'getProgrammes').mockResolvedValue({
+      total: 150, limit: 100, offset: 0,
+      items: [{ id: 'p-1', channel: 'KWGN', title: 'Late news', start: '2026-08-20T12:00:00Z', end: '2026-08-20T13:00:00Z', source: 'XMLTV', confidence: 100 }],
+    })
+    renderWithQuery(<EpgPage client={paged} />)
+    expect(await screen.findByText('Page 1 of 2')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Next/ })).toBeEnabled()
+  })
+
   it('shows event parsing decisions and templates', async () => {
     renderWithQuery(<EventsPage client={new MockIptvApiClient()} />)
     expect(await screen.findByText('No event templates configured. Create a template to start detecting events from provider streams.')).toBeInTheDocument()
@@ -200,6 +216,36 @@ describe('management pages', () => {
     // The unmount cleanup removes the token-bearing setup data from the
     // TanStack Query cache so the URLs do not persist after navigation.
     expect(queryClient.getQueryData(['jellyfin-setup'])).toBeUndefined()
+  })
+
+  it('reports a token rotation failure and a published endpoints load failure', async () => {
+    const rotateFail = new MockIptvApiClient()
+    vi.spyOn(rotateFail, 'rotateJellyfinToken').mockRejectedValue(new Error('Token service offline.'))
+    renderWithQuery(<JellyfinPage client={rotateFail} />)
+    await screen.findByTestId('endpoint-M3U tuner URL')
+    await userEvent.click(screen.getByRole('button', { name: 'Rotate publish token' }))
+    expect(await screen.findByText('Token rotation failed.')).toBeInTheDocument()
+
+    const loadFail = new MockIptvApiClient()
+    vi.spyOn(loadFail, 'getJellyfinSetup').mockRejectedValue(new Error('Setup endpoint unavailable.'))
+    renderWithQuery(<JellyfinPage client={loadFail} />)
+    expect(await screen.findByText('The published endpoints could not load.')).toBeInTheDocument()
+  })
+
+  it('skips the copy action when a published endpoint value is missing', async () => {
+    const mock = new MockIptvApiClient()
+    vi.spyOn(mock, 'getJellyfinSetup').mockResolvedValue({
+      status: 'available',
+      playlistUrl: 'http://iptv-web:3000/out/mock-token/playlist.m3u',
+      xmltvUrl: undefined,
+      hdhrDeviceUrl: 'http://iptv-web:3000/out/mock-token/hdhr.xml',
+      guideDaysMax: 30,
+    })
+    renderWithQuery(<JellyfinPage client={mock} />)
+    await screen.findByTestId('endpoint-M3U tuner URL')
+    await userEvent.click(screen.getByRole('button', { name: 'Copy XMLTV guide URL' }))
+    // The missing value short-circuits the copy action and writes nothing.
+    expect(navigator.clipboard.writeText).not.toHaveBeenCalledWith(undefined)
   })
 
   it('shows EPG mappings with confidence and method badges', async () => {

@@ -1483,6 +1483,23 @@ mod tests {
     const BOOTSTRAP_TOKEN: &str =
         "2222222222222222222222222222222222222222222222222222222222222222";
 
+    /// Computes the MPEG-2 CRC32 used by PSI sections. The polynomial is
+    /// 0x04c11db7, which differs from the standard CRC32.
+    fn mpeg_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for &byte in bytes {
+            crc ^= u32::from(byte) << 24;
+            for _ in 0..8 {
+                crc = if crc & 0x8000_0000 != 0 {
+                    (crc << 1) ^ 0x04c1_1db7
+                } else {
+                    crc << 1
+                };
+            }
+        }
+        crc
+    }
+
     #[derive(Default)]
     struct TestPostRefreshCatalog {
         calls: Mutex<Vec<&'static str>>,
@@ -2769,6 +2786,671 @@ mod tests {
             .expect("error was persisted");
         assert!(error.contains("source configuration could not be loaded"));
         delete_job(&pool, job.id).await;
+    }
+
+    #[test]
+    fn decrypt_probe_url_returns_template_without_ciphertext() {
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let target = StreamProbeTargetRow {
+            provider_stream_id: Uuid::now_v7(),
+            provider_account_id: Uuid::now_v7(),
+            provider_pool_id: Uuid::now_v7(),
+            max_connections: 2,
+            input_adapter: "auto".to_owned(),
+            url_template: "https://provider.test/stream".to_owned(),
+            url_secret_ciphertext: None,
+        };
+        let url = decrypt_probe_url(&master_key, &target).expect("template fallback succeeds");
+        assert_eq!(url, "https://provider.test/stream");
+    }
+
+    #[test]
+    fn decrypt_probe_url_decrypts_ciphertext_when_present() {
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let account_id = Uuid::now_v7();
+        let plaintext = b"https://secret.provider.test/stream";
+        let associated_data = format!("iptv-provider-stream:v1:{account_id}");
+        let ciphertext = master_key
+            .encrypt_secret(plaintext, associated_data.as_bytes())
+            .expect("encrypt URL");
+        let target = StreamProbeTargetRow {
+            provider_stream_id: Uuid::now_v7(),
+            provider_account_id: account_id,
+            provider_pool_id: Uuid::now_v7(),
+            max_connections: 2,
+            input_adapter: "auto".to_owned(),
+            url_template: "https://provider.test/[encrypted]".to_owned(),
+            url_secret_ciphertext: Some(ciphertext),
+        };
+        let url = decrypt_probe_url(&master_key, &target).expect("decrypt URL");
+        assert_eq!(url, "https://secret.provider.test/stream");
+    }
+
+    #[test]
+    fn decrypt_probe_url_rejects_invalid_ciphertext() {
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let target = StreamProbeTargetRow {
+            provider_stream_id: Uuid::now_v7(),
+            provider_account_id: Uuid::now_v7(),
+            provider_pool_id: Uuid::now_v7(),
+            max_connections: 2,
+            input_adapter: "auto".to_owned(),
+            url_template: "https://provider.test/[encrypted]".to_owned(),
+            url_secret_ciphertext: Some(vec![0_u8, 1, 2, 3]),
+        };
+        assert!(decrypt_probe_url(&master_key, &target).is_err());
+    }
+
+    #[tokio::test]
+    async fn process_job_fails_health_probe_with_invalid_payload() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let jobs = JobRepository::new(pool.clone());
+        let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([1_u8; 32]));
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let worker_id = "test-worker-health-probe-invalid";
+        let mut new_job = iptv_persistence::NewJob::immediate(
+            "health-probe",
+            serde_json::json!({"notProviderStreamId": true}),
+        );
+        new_job.max_attempts = 1;
+        let job = jobs
+            .enqueue(&new_job)
+            .await
+            .expect("enqueue health-probe with bad payload");
+        force_running(&pool, job.id, worker_id).await;
+        let record = fetch_job(&pool, job.id).await;
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            record,
+        )
+        .await
+        .expect("process health-probe with bad payload");
+        assert_eq!(job_status(&pool, job.id).await, "failed");
+        delete_job(&pool, job.id).await;
+    }
+
+    #[tokio::test]
+    async fn process_job_succeeds_health_probe_for_missing_stream() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let jobs = JobRepository::new(pool.clone());
+        let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([1_u8; 32]));
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let worker_id = "test-worker-health-probe-missing";
+        let stream_id = Uuid::now_v7();
+        let mut new_job = iptv_persistence::NewJob::immediate(
+            "health-probe",
+            serde_json::json!({"providerStreamId": stream_id}),
+        );
+        new_job.max_attempts = 1;
+        let job = jobs
+            .enqueue(&new_job)
+            .await
+            .expect("enqueue health-probe for missing stream");
+        force_running(&pool, job.id, worker_id).await;
+        let record = fetch_job(&pool, job.id).await;
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            record,
+        )
+        .await
+        .expect("process health-probe for missing stream");
+        assert_eq!(job_status(&pool, job.id).await, "succeeded");
+        delete_job(&pool, job.id).await;
+    }
+
+    #[tokio::test]
+    async fn run_health_probe_returns_skipped_for_already_checking_stream() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let catalog = CatalogRepository::new(pool.clone());
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let suffix = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let snapshot_id = Uuid::now_v7();
+        let stream_id = Uuid::now_v7();
+
+        let mut transaction = pool.begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, name, source_type, base_url_template, max_connections) \
+             VALUES ($1, $2, 'm3u', 'https://provider.test/', 2)",
+        )
+        .bind(account_id)
+        .bind(format!("Health probe test {suffix}"))
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider account");
+        sqlx::query(
+            "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) \
+             VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+        )
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert snapshot");
+        sqlx::query(
+            "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, group_name, url_template, supported) \
+             VALUES ($1, $2, $3, $4, $5, 'news', 'https://provider.test/stream', true)",
+        )
+        .bind(stream_id)
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(format!("probe-skip-{suffix}"))
+        .bind("Probe Skip Stream")
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider stream");
+        transaction.commit().await.expect("commit");
+
+        // Mark the stream as `checking` so the probe must skip it.
+        sqlx::query("UPDATE provider_streams SET health_status = 'checking' WHERE id = $1")
+            .bind(stream_id)
+            .execute(&pool)
+            .await
+            .expect("mark stream as checking");
+
+        let result = run_health_probe(&catalog, &master_key, stream_id)
+            .await
+            .expect("probe call succeeds");
+        assert_eq!(result, HealthProbeResult::Skipped);
+
+        // Cleanup.
+        let mut transaction = pool.begin().await.expect("begin cleanup");
+        sqlx::query("DELETE FROM stream_health_checks WHERE provider_stream_id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete health checks");
+        sqlx::query("DELETE FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider stream");
+        sqlx::query("DELETE FROM source_snapshots WHERE id = $1")
+            .bind(snapshot_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete snapshot");
+        sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider account");
+        transaction.commit().await.expect("commit cleanup");
+    }
+
+    #[tokio::test]
+    async fn process_job_succeeds_health_probe_for_already_checking_stream() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let jobs = JobRepository::new(pool.clone());
+        let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([1_u8; 32]));
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let worker_id = "test-worker-health-probe-checking";
+        let suffix = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let snapshot_id = Uuid::now_v7();
+        let stream_id = Uuid::now_v7();
+
+        let mut transaction = pool.begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, name, source_type, base_url_template, max_connections) \
+             VALUES ($1, $2, 'm3u', 'https://provider.test/', 2)",
+        )
+        .bind(account_id)
+        .bind(format!("Checking probe test {suffix}"))
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider account");
+        sqlx::query(
+            "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) \
+             VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+        )
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert snapshot");
+        sqlx::query(
+            "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, group_name, url_template, supported) \
+             VALUES ($1, $2, $3, $4, $5, 'news', 'https://provider.test/stream', true)",
+        )
+        .bind(stream_id)
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(format!("checking-{suffix}"))
+        .bind("Checking Probe Stream")
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider stream");
+        transaction.commit().await.expect("commit");
+
+        // Mark the stream as `checking` so the probe must skip it.
+        sqlx::query("UPDATE provider_streams SET health_status = 'checking' WHERE id = $1")
+            .bind(stream_id)
+            .execute(&pool)
+            .await
+            .expect("mark stream as checking");
+
+        let mut new_job = iptv_persistence::NewJob::immediate(
+            "health-probe",
+            serde_json::json!({"providerStreamId": stream_id}),
+        );
+        new_job.max_attempts = 1;
+        let job = jobs
+            .enqueue(&new_job)
+            .await
+            .expect("enqueue health-probe for checking stream");
+        force_running(&pool, job.id, worker_id).await;
+        let record = fetch_job(&pool, job.id).await;
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            record,
+        )
+        .await
+        .expect("process health-probe for checking stream");
+        assert_eq!(job_status(&pool, job.id).await, "succeeded");
+
+        // Cleanup.
+        delete_job(&pool, job.id).await;
+        let mut transaction = pool.begin().await.expect("begin cleanup");
+        sqlx::query("DELETE FROM stream_health_checks WHERE provider_stream_id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete health checks");
+        sqlx::query("DELETE FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider stream");
+        sqlx::query("DELETE FROM source_snapshots WHERE id = $1")
+            .bind(snapshot_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete snapshot");
+        sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider account");
+        transaction.commit().await.expect("commit cleanup");
+    }
+
+    const PROBE_PAT_PID: u16 = 0x0000;
+    const PROBE_PMT_PID: u16 = 0x100;
+    const PROBE_VIDEO_PID: u16 = 0x101;
+    const PROBE_AUDIO_PID: u16 = 0x102;
+    const PROBE_PKT_SIZE: usize = iptv_media::MPEG_TS_PACKET_SIZE;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn run_health_probe_persists_alive_status_for_a_live_stream() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let catalog = CatalogRepository::new(pool.clone());
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let suffix = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let snapshot_id = Uuid::now_v7();
+        let stream_id = Uuid::now_v7();
+
+        // Build a valid TS chunk with PAT, PMT, and payload packets. The
+        // packet structure mirrors the media crate test helpers but is
+        // self-contained because `psi::test_support` is `pub(crate)`.
+        // PAT section: table_id=0x00, section_length=0x0d, tsid=1,
+        // program_number=1, PMT PID=0x100.
+        let mut association_section: Vec<u8> = vec![
+            0x00,
+            0xb0,
+            0x0d,
+            0x00,
+            0x01,
+            0xc1,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0xe0 | 0x01,
+            0x00,
+        ];
+        // PMT section: table_id=0x02, program_number=1, PCR_PID=VIDEO_PID,
+        // one H.264 video stream and one MP2 audio stream.
+        let mut program_map_section: Vec<u8> = vec![
+            0x02,
+            0xb0,
+            0x17,
+            0x00,
+            0x01,
+            0xc1,
+            0x00,
+            0x00,
+            0xe0 | 0x01,
+            0x01,
+            0xf0,
+            0x00,
+            0x1b,
+            0xe0 | 0x01,
+            0x01,
+            0xf0,
+            0x00, // Video: H.264 (stream_type 0x1b).
+            0x04,
+            0xe0 | 0x01,
+            0x02,
+            0xf0,
+            0x00, // Audio: MP2 (stream_type 0x04).
+        ];
+
+        // Compute and append MPEG CRC32 for each section.
+        let association_crc = mpeg_crc32(&association_section);
+        association_section.extend_from_slice(&association_crc.to_be_bytes());
+        let program_map_crc = mpeg_crc32(&program_map_section);
+        program_map_section.extend_from_slice(&program_map_crc.to_be_bytes());
+
+        let mut ts_bytes = Vec::new();
+
+        // PAT packet.
+        let mut association_packet = [0xff_u8; PROBE_PKT_SIZE];
+        association_packet[0] = 0x47;
+        association_packet[1] = 0x40 | u8::try_from((PROBE_PAT_PID >> 8) & 0x1f).unwrap();
+        association_packet[2] = u8::try_from(PROBE_PAT_PID & 0xff).unwrap();
+        association_packet[3] = 0x10;
+        association_packet[4] = 0x00; // pointer field
+        association_packet[5..5 + association_section.len()].copy_from_slice(&association_section);
+        ts_bytes.extend_from_slice(&association_packet);
+
+        // PMT packet.
+        let mut program_map_packet = [0xff_u8; PROBE_PKT_SIZE];
+        program_map_packet[0] = 0x47;
+        program_map_packet[1] = 0x40 | u8::try_from((PROBE_PMT_PID >> 8) & 0x1f).unwrap();
+        program_map_packet[2] = u8::try_from(PROBE_PMT_PID & 0xff).unwrap();
+        program_map_packet[3] = 0x10;
+        program_map_packet[4] = 0x00; // pointer field
+        program_map_packet[5..5 + program_map_section.len()].copy_from_slice(&program_map_section);
+        ts_bytes.extend_from_slice(&program_map_packet);
+
+        // Payload packets on video and audio PIDs.
+        for index in 0u8..40 {
+            let pid = if index.is_multiple_of(2) {
+                PROBE_VIDEO_PID
+            } else {
+                PROBE_AUDIO_PID
+            };
+            let mut packet = [0xff_u8; PROBE_PKT_SIZE];
+            packet[0] = 0x47;
+            packet[1] = u8::try_from((pid >> 8) & 0x1f).unwrap();
+            packet[2] = u8::try_from(pid & 0xff).unwrap();
+            packet[3] = 0x10 | (index & 0x0f);
+            ts_bytes.extend_from_slice(&packet);
+        }
+
+        // Start a local HTTP server that serves the TS data.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local address");
+        let ts_data = ts_bytes.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = [0_u8; 1024];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                tokio::io::AsyncReadExt::read(&mut socket, &mut buf),
+            )
+            .await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\n\r\n",
+                ts_data.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .expect("write headers");
+            tokio::io::AsyncWriteExt::write_all(&mut socket, &ts_data)
+                .await
+                .expect("write body");
+        });
+
+        let url = format!("http://{addr}/stream.ts");
+
+        let mut transaction = pool.begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, name, source_type, base_url_template, max_connections) \
+             VALUES ($1, $2, 'm3u', 'https://provider.test/', 2)",
+        )
+        .bind(account_id)
+        .bind(format!("Live probe test {suffix}"))
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider account");
+        sqlx::query(
+            "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) \
+             VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+        )
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert snapshot");
+        sqlx::query(
+            "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, group_name, url_template, supported) \
+             VALUES ($1, $2, $3, $4, $5, 'news', $6, true)",
+        )
+        .bind(stream_id)
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(format!("live-probe-{suffix}"))
+        .bind("Live Probe Stream")
+        .bind(&url)
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider stream");
+        transaction.commit().await.expect("commit");
+
+        let result = run_health_probe(&catalog, &master_key, stream_id)
+            .await
+            .expect("probe call succeeds");
+        assert_eq!(result, HealthProbeResult::Applied);
+
+        // The stream health status must be `alive`.
+        let status: String =
+            sqlx::query_scalar("SELECT health_status FROM provider_streams WHERE id = $1")
+                .bind(stream_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch status");
+        assert_eq!(status, "alive");
+
+        let _ = server.await;
+
+        // Cleanup.
+        let mut transaction = pool.begin().await.expect("begin cleanup");
+        sqlx::query("DELETE FROM stream_health_checks WHERE provider_stream_id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete health checks");
+        sqlx::query("DELETE FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider stream");
+        sqlx::query("DELETE FROM source_snapshots WHERE id = $1")
+            .bind(snapshot_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete snapshot");
+        sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider account");
+        transaction.commit().await.expect("commit cleanup");
+    }
+
+    #[tokio::test]
+    async fn health_probe_scheduler_starts_and_stops_on_timeout() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let catalog = CatalogRepository::new(pool.clone());
+        let jobs = JobRepository::new(pool.clone());
+
+        // The scheduler loops forever. A short timeout covers the startup
+        // lines and the first `tokio::select!` before the scheduler interval
+        // sleep completes.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            health_probe_scheduler(&catalog, &jobs),
+        )
+        .await;
+        assert!(result.is_err(), "scheduler must not return on its own");
+    }
+
+    #[tokio::test]
+    async fn process_job_fails_health_probe_when_decryption_fails() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let jobs = JobRepository::new(pool.clone());
+        let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([1_u8; 32]));
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let master_key = MasterKey::from_bytes([1_u8; 32]);
+        let worker_id = "test-worker-health-probe-decrypt-fail";
+        let suffix = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let snapshot_id = Uuid::now_v7();
+        let stream_id = Uuid::now_v7();
+
+        let mut transaction = pool.begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, name, source_type, base_url_template, max_connections) \
+             VALUES ($1, $2, 'm3u', 'https://provider.test/', 2)",
+        )
+        .bind(account_id)
+        .bind(format!("Decrypt fail test {suffix}"))
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider account");
+        sqlx::query(
+            "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) \
+             VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+        )
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert snapshot");
+        // Insert a stream with invalid ciphertext so `decrypt_probe_url` fails.
+        sqlx::query(
+            "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, group_name, url_template, url_secret_ciphertext, supported) \
+             VALUES ($1, $2, $3, $4, $5, 'news', 'https://provider.test/[encrypted]', $6, true)",
+        )
+        .bind(stream_id)
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(format!("decrypt-fail-{suffix}"))
+        .bind("Decrypt Fail Stream")
+        .bind(vec![0_u8, 1, 2, 3])
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider stream");
+        transaction.commit().await.expect("commit");
+
+        let mut new_job = iptv_persistence::NewJob::immediate(
+            "health-probe",
+            serde_json::json!({"providerStreamId": stream_id}),
+        );
+        new_job.max_attempts = 1;
+        let job = jobs
+            .enqueue(&new_job)
+            .await
+            .expect("enqueue health-probe for decrypt fail");
+        force_running(&pool, job.id, worker_id).await;
+        let record = fetch_job(&pool, job.id).await;
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            record,
+        )
+        .await
+        .expect("process health-probe for decrypt fail");
+        assert_eq!(job_status(&pool, job.id).await, "failed");
+
+        // Cleanup.
+        delete_job(&pool, job.id).await;
+        let mut transaction = pool.begin().await.expect("begin cleanup");
+        sqlx::query("DELETE FROM stream_health_checks WHERE provider_stream_id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete health checks");
+        sqlx::query("DELETE FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider stream");
+        sqlx::query("DELETE FROM source_snapshots WHERE id = $1")
+            .bind(snapshot_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete snapshot");
+        sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider account");
+        transaction.commit().await.expect("commit cleanup");
     }
 
     #[tokio::test]

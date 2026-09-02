@@ -303,7 +303,8 @@ mod tests {
 
     use super::*;
     use crate::psi::test_support::{
-        TEST_PMT_PID, TEST_VIDEO_PID, pat_packet, pmt_section_with_audio, psi_packet,
+        TEST_PMT_PID, TEST_VIDEO_PID, pat_packet, pmt_section_with_audio, pmt_section_with_streams,
+        psi_packet,
     };
 
     const TEST_AUDIO_PID: u16 = 0x102;
@@ -428,5 +429,305 @@ mod tests {
             min_packets: 1,
         };
         assert_eq!(probe.run(&spec).await, StreamProbeOutcome::Skipped);
+    }
+
+    #[test]
+    fn codec_name_for_stream_type_maps_all_known_types() {
+        let cases: &[(u8, &str)] = &[
+            (0x01, "mpeg1-video"),
+            (0x02, "mpeg2-video"),
+            (0x10, "mpeg4-video"),
+            (0x1b, "h264"),
+            (0x24, "h265"),
+            (0x03, "mpeg1-audio"),
+            (0x04, "mp2"),
+            (0x0f, "aac"),
+            (0x11, "aac-latm"),
+            (0x80, "ac3"),
+            (0x81, "ac3"),
+            (0x82, "dts"),
+            (0x83, "eac3"),
+            (0x84, "eac3"),
+            (0x87, "eac3"),
+        ];
+        for (stream_type, expected) in cases {
+            assert_eq!(
+                codec_name_for_stream_type(*stream_type),
+                Some(*expected),
+                "stream_type 0x{stream_type:02x}"
+            );
+        }
+        assert_eq!(codec_name_for_stream_type(0xff), None);
+    }
+
+    #[test]
+    fn classify_streams_picks_first_video_and_first_audio() {
+        let streams = vec![
+            ElementaryStreamInfo {
+                stream_type: 0x1b,
+                pid: 0x101,
+            },
+            ElementaryStreamInfo {
+                stream_type: 0x02,
+                pid: 0x102,
+            },
+            ElementaryStreamInfo {
+                stream_type: 0x04,
+                pid: 0x103,
+            },
+            ElementaryStreamInfo {
+                stream_type: 0x0f,
+                pid: 0x104,
+            },
+            ElementaryStreamInfo {
+                stream_type: 0xff,
+                pid: 0x105,
+            },
+        ];
+        let quality = classify_streams(&streams);
+        assert_eq!(quality.video_codec.as_deref(), Some("h264"));
+        assert_eq!(quality.audio_codec.as_deref(), Some("mp2"));
+    }
+
+    #[test]
+    fn classify_streams_reports_none_for_unknown_stream_types() {
+        let streams = vec![ElementaryStreamInfo {
+            stream_type: 0xfe,
+            pid: 0x101,
+        }];
+        let quality = classify_streams(&streams);
+        assert!(quality.video_codec.is_none());
+        assert!(quality.audio_codec.is_none());
+    }
+
+    #[tokio::test]
+    async fn analyze_reports_http_error_when_stream_yields_error() {
+        let chunks = stream::iter(vec![Err::<Bytes, std::io::Error>(std::io::Error::other(
+            "boom",
+        ))]);
+        let outcome = analyze_transport_stream(chunks, 1, Duration::from_millis(50)).await;
+        assert_eq!(outcome, StreamProbeOutcome::Dead(StreamProbeFailure::Http));
+    }
+
+    #[tokio::test]
+    async fn analyze_reports_no_video_when_pmt_has_only_audio() {
+        let pat = pat_packet();
+        let pmt = psi_packet(
+            TEST_PMT_PID,
+            &pmt_section_with_streams(TEST_VIDEO_PID, &[(0x04, TEST_AUDIO_PID)]),
+            0,
+            0,
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&pat);
+        bytes.extend_from_slice(&pmt);
+        // Add payload packets to exceed the minimum.
+        for index in 0..8 {
+            let mut packet = [0xff; MPEG_TS_PACKET_SIZE];
+            packet[0] = 0x47;
+            packet[1] = u8::try_from((TEST_AUDIO_PID >> 8) & 0x1f).unwrap();
+            packet[2] = u8::try_from(TEST_AUDIO_PID & 0xff).unwrap();
+            packet[3] = 0x10 | u8::try_from(index & 0x0f).unwrap();
+            bytes.extend_from_slice(&packet);
+        }
+        let chunks = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+        let outcome = analyze_transport_stream(chunks, 4, Duration::from_millis(50)).await;
+        assert_eq!(
+            outcome,
+            StreamProbeOutcome::Dead(StreamProbeFailure::NoVideo)
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_reports_no_audio_when_pmt_has_only_video() {
+        let pat = pat_packet();
+        let pmt = psi_packet(
+            TEST_PMT_PID,
+            &pmt_section_with_streams(TEST_VIDEO_PID, &[(0x1b, TEST_VIDEO_PID)]),
+            0,
+            0,
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&pat);
+        bytes.extend_from_slice(&pmt);
+        for index in 0..8 {
+            let mut packet = [0xff; MPEG_TS_PACKET_SIZE];
+            packet[0] = 0x47;
+            packet[1] = u8::try_from((TEST_VIDEO_PID >> 8) & 0x1f).unwrap();
+            packet[2] = u8::try_from(TEST_VIDEO_PID & 0xff).unwrap();
+            packet[3] = 0x10 | u8::try_from(index & 0x0f).unwrap();
+            bytes.extend_from_slice(&packet);
+        }
+        let chunks = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+        let outcome = analyze_transport_stream(chunks, 4, Duration::from_millis(50)).await;
+        assert_eq!(
+            outcome,
+            StreamProbeOutcome::Dead(StreamProbeFailure::NoAudio)
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_accepts_truncated_tail_at_end_of_window() {
+        // A chunk that ends with a partial packet triggers the
+        // IncompleteTail branch, which is acceptable and must not report
+        // MalformedTransport.
+        let pat = pat_packet();
+        let pmt = psi_packet(
+            TEST_PMT_PID,
+            &pmt_section_with_audio(TEST_VIDEO_PID, TEST_AUDIO_PID),
+            0,
+            0,
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&pat);
+        bytes.extend_from_slice(&pmt);
+        // Add a few payload packets.
+        for index in 0u8..4 {
+            let pid = if index.is_multiple_of(2) {
+                TEST_VIDEO_PID
+            } else {
+                TEST_AUDIO_PID
+            };
+            let mut packet = [0xff; MPEG_TS_PACKET_SIZE];
+            packet[0] = 0x47;
+            packet[1] = u8::try_from((pid >> 8) & 0x1f).unwrap();
+            packet[2] = u8::try_from(pid & 0xff).unwrap();
+            packet[3] = 0x10 | (index & 0x0f);
+            bytes.extend_from_slice(&packet);
+        }
+        // Append a truncated tail (3 bytes, less than one full packet).
+        bytes.extend_from_slice(&[0x47, 0x00, 0x00]);
+        let chunks = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
+        let outcome = analyze_transport_stream(chunks, 4, Duration::from_millis(50)).await;
+        // The probe must declare the stream alive because PAT, PMT, video,
+        // audio, and sufficient packets were all observed before the tail.
+        assert!(matches!(outcome, StreamProbeOutcome::Alive { .. }));
+    }
+
+    #[tokio::test]
+    async fn run_reports_http_error_when_connection_is_refused() {
+        let broker = ProviderSlotBroker::new("probe-http", 1);
+        let probe = StreamProbe::new(broker, Client::new());
+        let spec = StreamProbeSpec {
+            url: "http://127.0.0.1:1/stream.ts".into(),
+            headers: HeaderMap::new(),
+            pool_id: "probe-http".into(),
+            session_key: "probe-http-conn".into(),
+            max_connections: 1,
+            startup_timeout: Duration::from_secs(1),
+            max_duration: Duration::from_millis(50),
+            min_packets: 1,
+        };
+        let outcome = probe.run(&spec).await;
+        assert_eq!(outcome, StreamProbeOutcome::Dead(StreamProbeFailure::Http));
+    }
+
+    #[tokio::test]
+    async fn run_reports_http_status_when_upstream_returns_error_code() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Read and discard the HTTP request line.
+            let mut buf = [0_u8; 1024];
+            let _ = tokio::time::timeout(
+                Duration::from_millis(100),
+                tokio::io::AsyncReadExt::read(&mut socket, &mut buf),
+            )
+            .await;
+            let response = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response)
+                .await
+                .unwrap();
+        });
+        let broker = ProviderSlotBroker::new("probe-status", 1);
+        let probe = StreamProbe::new(broker, Client::new());
+        let spec = StreamProbeSpec {
+            url: format!("http://{addr}/stream.ts").into(),
+            headers: HeaderMap::new(),
+            pool_id: "probe-status".into(),
+            session_key: "probe-status-conn".into(),
+            max_connections: 1,
+            startup_timeout: Duration::from_secs(2),
+            max_duration: Duration::from_millis(50),
+            min_packets: 1,
+        };
+        let outcome = probe.run(&spec).await;
+        assert_eq!(
+            outcome,
+            StreamProbeOutcome::Dead(StreamProbeFailure::HttpStatus)
+        );
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn run_reports_startup_timeout_when_upstream_never_responds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Accept the connection but never send an HTTP response.
+            let (_socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let broker = ProviderSlotBroker::new("probe-timeout", 1);
+        let probe = StreamProbe::new(broker, Client::new());
+        let spec = StreamProbeSpec {
+            url: format!("http://{addr}/stream.ts").into(),
+            headers: HeaderMap::new(),
+            pool_id: "probe-timeout".into(),
+            session_key: "probe-timeout-conn".into(),
+            max_connections: 1,
+            startup_timeout: Duration::from_millis(50),
+            max_duration: Duration::from_millis(50),
+            min_packets: 1,
+        };
+        let outcome = probe.run(&spec).await;
+        assert_eq!(
+            outcome,
+            StreamProbeOutcome::Dead(StreamProbeFailure::StartupTimeout)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn run_reports_alive_when_upstream_serves_valid_transport_stream() {
+        let chunk = ts_chunk_with_pat_pmt_and_payload(8);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = tokio::time::timeout(
+                Duration::from_millis(100),
+                tokio::io::AsyncReadExt::read(&mut socket, &mut buf),
+            )
+            .await;
+            let body = chunk.as_ref();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut socket, body)
+                .await
+                .unwrap();
+        });
+        let broker = ProviderSlotBroker::new("probe-alive", 1);
+        let probe = StreamProbe::new(broker, Client::new());
+        let spec = StreamProbeSpec {
+            url: format!("http://{addr}/stream.ts").into(),
+            headers: HeaderMap::new(),
+            pool_id: "probe-alive".into(),
+            session_key: "probe-alive-conn".into(),
+            max_connections: 1,
+            startup_timeout: Duration::from_secs(2),
+            max_duration: Duration::from_secs(1),
+            min_packets: 4,
+        };
+        let outcome = probe.run(&spec).await;
+        assert!(matches!(outcome, StreamProbeOutcome::Alive { .. }));
+        let _ = server.await;
     }
 }

@@ -37,10 +37,10 @@ use anyhow::{Context, Result, bail};
 use iptv_ingest::{
     ArtifactLimits, DownloadRequest, DownloadedArtifact, EndpointProtector, IngestError,
     IngestFormat, IngestRequest, PgSnapshotStore, ProtectedEndpoint, SnapshotOwner,
-    parse_artifact_with_source_timezone, prepare_snapshot, unpack_artifact,
+    prepare_streaming_snapshot, unpack_artifact,
 };
 use iptv_parsers::{
-    ParseLimits, parse_m3u, parse_xmltv,
+    ParseLimits, parse_m3u_visit, parse_xmltv_visit,
     scale::{
         REGRESSION_TOLERANCE, ScaleBudgets, ScaleM3uConfig, ScaleXmltvConfig, exceeds_budget,
         generate_m3u, generate_xmltv, m3u_sha256, regresses, xmltv_sha256,
@@ -376,11 +376,16 @@ fn measure_parse_m3u(path: &Path) -> Result<Measurement> {
     let limits = scale_limits(metadata.len());
     let reader = BufReader::new(file);
     let start = Instant::now();
-    let playlist = parse_m3u(reader, limits).context("parse m3u")?;
+    let mut records = 0_usize;
+    let playlist = parse_m3u_visit(reader, limits, |_entry| {
+        records += 1;
+        Ok(())
+    })
+    .context("parse m3u")?;
     let elapsed = start.elapsed().as_secs_f64();
     Ok(Measurement {
         elapsed_seconds: elapsed,
-        records: playlist.entries.len(),
+        records,
         diagnostics: playlist.diagnostics.len(),
     })
 }
@@ -391,11 +396,25 @@ fn measure_parse_xmltv(path: &Path) -> Result<Measurement> {
     let limits = scale_limits(metadata.len());
     let reader = BufReader::new(file);
     let start = Instant::now();
-    let document = parse_xmltv(reader, limits).context("parse xmltv")?;
+    let mut channels = 0_usize;
+    let mut programmes = 0_usize;
+    let document = parse_xmltv_visit(
+        reader,
+        limits,
+        |_channel| {
+            channels += 1;
+            Ok(())
+        },
+        |_programme| {
+            programmes += 1;
+            Ok(())
+        },
+    )
+    .context("parse xmltv")?;
     let elapsed = start.elapsed().as_secs_f64();
     Ok(Measurement {
         elapsed_seconds: elapsed,
-        records: document.channels.len() + document.programmes.len(),
+        records: channels + programmes,
         diagnostics: document.diagnostics.len(),
     })
 }
@@ -405,17 +424,19 @@ fn measure_staging(path: &Path, format: IngestFormat, timezone: &str) -> Result<
     let downloaded = DownloadedArtifact::from_file(file, None).context("artifact")?;
     let decoded = unpack_artifact(downloaded, ArtifactLimits::default()).context("unpack")?;
     let limits = scale_limits(decoded.decoded_byte_count);
+    let request = staging_request(format);
     let start = Instant::now();
-    let parsed = parse_artifact_with_source_timezone(&decoded, format, limits, timezone)
-        .context("parse artifact")?;
-    let snapshot = prepare_snapshot(
-        &staging_request(format),
-        parsed,
+    let (snapshot, _records_seen) = prepare_streaming_snapshot(
+        request.owner,
+        format,
+        timezone.to_owned(),
+        &decoded,
         decoded.sha256.clone(),
         decoded.decoded_byte_count,
         &GateProtector,
+        limits,
     )
-    .context("prepare snapshot")?;
+    .context("prepare streaming snapshot")?;
     let elapsed = start.elapsed().as_secs_f64();
     let records = usize::try_from(snapshot.record_count).unwrap_or(0);
     Ok(Measurement {
@@ -484,16 +505,18 @@ async fn activate_snapshot(
     let downloaded = DownloadedArtifact::from_file(file, None).context("artifact")?;
     let decoded = unpack_artifact(downloaded, ArtifactLimits::default()).context("unpack")?;
     let limits = scale_limits(decoded.decoded_byte_count);
-    let parsed = parse_artifact_with_source_timezone(&decoded, format, limits, "UTC")
-        .context("parse artifact")?;
-    let snapshot = prepare_snapshot(
-        &staging_request(format),
-        parsed,
+    let request = staging_request(format);
+    let (snapshot, _records_seen) = prepare_streaming_snapshot(
+        request.owner,
+        format,
+        request.source_timezone,
+        &decoded,
         decoded.sha256.clone(),
         decoded.decoded_byte_count,
         &GateProtector,
+        limits,
     )
-    .context("prepare snapshot")?;
+    .context("prepare streaming snapshot")?;
     let start = Instant::now();
     store
         .activate(&snapshot)

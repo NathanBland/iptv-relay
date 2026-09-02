@@ -99,6 +99,14 @@ describe('stream preview', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Resume' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Failed to resume playback.')
   })
+
+  it('reports a generic message for non-Error preview failures', async () => {
+    mpegts.supported = true
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getChannelPreview').mockRejectedValue('unexpected failure')
+    render(<StreamPreview channelId="four" channelName="Four" client={client} onClose={vi.fn()} />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('Failed to load stream preview.')
+  })
 })
 
 describe('catalog event subscription', () => {
@@ -141,5 +149,31 @@ describe('catalog event subscription', () => {
     const queryClient = new QueryClient()
     render(<EventSubscriber />, { wrapper: ({ children }) => <QueryWrapper client={queryClient}>{children}</QueryWrapper> })
     expect(screen.getByText('subscribed')).toBeInTheDocument()
+  })
+
+  it('writes terminal sync status and defaults missing optional progress fields', async () => {
+    EventSourceStub.instances = []
+    Object.defineProperty(window, 'EventSource', { configurable: true, value: EventSourceStub })
+    const queryClient = new QueryClient()
+    const setData = vi.spyOn(queryClient, 'setQueryData')
+    const removeQueries = vi.spyOn(queryClient, 'removeQueries')
+    render(<EventSubscriber />, { wrapper: ({ children }) => <QueryWrapper client={queryClient}>{children}</QueryWrapper> })
+    const catalog = EventSourceStub.instances[0]!
+
+    // A terminal status writes the final state and schedules cache removal.
+    catalog.emit('source-sync-progress', JSON.stringify({
+      sourceId: 'source-2', jobId: 'job-2', status: 'succeeded', stage: 'completed', percent: 100,
+      message: 'Done.', bytesDownloaded: 500, recordsProcessed: 10, updatedAt: '2026-08-20T12:00:00Z',
+    }))
+    await waitFor(() => expect(setData).toHaveBeenCalledWith(['source-sync-status', 'source-2'], expect.objectContaining({ status: 'succeeded' })))
+
+    // An active status with only required fields defaults the optional fields.
+    catalog.emit('source-sync-progress', JSON.stringify({
+      sourceId: 'source-3', jobId: 'job-3', status: 'running', stage: 'downloading',
+    }))
+    await waitFor(() => expect(setData).toHaveBeenCalledWith(['source-sync-status', 'source-3'], expect.objectContaining({
+      percent: 0, message: '', bytesDownloaded: 0, recordsProcessed: 0,
+    })))
+    expect(removeQueries).not.toHaveBeenCalled()
   })
 })

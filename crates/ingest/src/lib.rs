@@ -18,6 +18,7 @@ pub use model::{
 pub use parse::{ParsedArtifact, parse_artifact_with_source_timezone};
 pub use pipeline::{
     EndpointProtector, IngestRequest, IngestResult, Ingestor, JobControl, prepare_snapshot,
+    prepare_streaming_snapshot,
 };
 pub use store::PgSnapshotStore;
 pub use xtream_endpoints::{XtreamEndpoints, XtreamPublicEndpoints, XtreamStreamEndpointTemplate};

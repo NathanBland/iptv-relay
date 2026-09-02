@@ -1,13 +1,23 @@
 import { screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
+import { ChannelAliasesPage } from '@/pages/channel-aliases-page'
+import { ChannelsPage } from '@/pages/channels-page'
 import { EpgMappingsPage } from '@/pages/epg-mappings-page'
+import { EpgPage } from '@/pages/epg-page'
 import { EventsPage } from '@/pages/events-page'
+import { GroupsPage } from '@/pages/groups-page'
+import { JellyfinPage } from '@/pages/jellyfin-page'
+import { LoginPage } from '@/pages/login-page'
 import { OperatorSettingsPage } from '@/pages/operator-settings-page'
+import { OverviewPage } from '@/pages/overview-page'
+import { RecordingsPage } from '@/pages/recordings-page'
 import { SessionsPage } from '@/pages/sessions-page'
 import { SourcesPage } from '@/pages/sources-page'
 import { StreamHealthPage } from '@/pages/stream-health-page'
 import { StreamProfilesPage } from '@/pages/stream-profiles-page'
+import { TvGuidePage } from '@/pages/tv-guide-page'
+import { UsersPage } from '@/pages/users-page'
 import { MockIptvApiClient } from '@/lib/api/client'
 import { mockSources } from '@/lib/api/mock-data'
 import { renderWithQuery } from './test-utils'
@@ -203,6 +213,137 @@ describe('management workflow accessibility', () => {
     await userEvent.selectOptions(screen.getByRole('combobox'), 'ffmpeg')
     await userEvent.click(screen.getByRole('button', { name: 'Create profile' }))
     await expect.poll(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ name: 'FFmpeg copy', profileType: 'ffmpeg' })))
+    expectNoAlert()
+  })
+
+  it('login form exposes a level-1 heading, labeled fields, and an operable submit control', async () => {
+    const onAuthenticated = vi.fn()
+    renderWithQuery(<LoginPage client={new MockIptvApiClient()} next="/channels" onAuthenticated={onAuthenticated} />)
+    expect(screen.getByRole('heading', { name: 'Sign in', level: 1 })).toBeInTheDocument()
+    const username = screen.getByLabelText('Username')
+    expect(username).toHaveAttribute('autocomplete', 'username')
+    const password = screen.getByLabelText('Password')
+    expect(password).toHaveAttribute('autocomplete', 'current-password')
+    const submit = screen.getByRole('button', { name: 'Sign in' })
+    expect(submit).toBeInTheDocument()
+    await userEvent.type(username, 'operator')
+    await userEvent.type(password, 'secret')
+    await userEvent.click(submit)
+    await expect.poll(() => expect(onAuthenticated).toHaveBeenCalledWith('/channels'))
+    expectNoAlert()
+  })
+
+  it('overview exposes a summary region, level-1 heading, and stat headings without alerts', async () => {
+    renderWithQuery(<OverviewPage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'Overview', level: 1 })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'System summary' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Provider connection budget' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Guide coverage' })).toBeInTheDocument()
+    expect(screen.getByText('Published channels')).toBeInTheDocument()
+    expectNoAlert()
+  })
+
+  it('channels page exposes a captioned table, labeled search, and group filter controls', async () => {
+    renderWithQuery(<ChannelsPage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'Channels', level: 1 })).toBeInTheDocument()
+    expect(screen.getByLabelText('Search channels')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Filter by group' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Filter by enabled state' })).toBeInTheDocument()
+    const table = screen.getByRole('table')
+    expect(table).toHaveAccessibleName('Published channel lineup')
+    // The channel count is announced through a live status region.
+    expect(screen.getByRole('status')).toBeInTheDocument()
+    // Per-row enable/disable controls expose accessible names tied to the channel.
+    expect(screen.getByRole('button', { name: 'Disable KWGN Denver' })).toBeInTheDocument()
+    expectNoAlert()
+  })
+
+  it('groups page exposes a level-1 heading, labeled search, and bulk toggle controls', async () => {
+    renderWithQuery(<GroupsPage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'Groups', level: 1 })).toBeInTheDocument()
+    expect(screen.getByLabelText('Search groups')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Enable all groups/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Disable all groups/ })).toBeInTheDocument()
+    // Per-group toggle controls expose accessible names.
+    expect(screen.getAllByRole('button', { name: 'Enable all' }).length).toBeGreaterThan(0)
+    expect(screen.getAllByRole('button', { name: 'Disable all' }).length).toBeGreaterThan(0)
+    expectNoAlert()
+  })
+
+  it('tv guide page exposes a level-1 heading, labeled search, and section headings', async () => {
+    renderWithQuery(<TvGuidePage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'TV Guide', level: 1 })).toBeInTheDocument()
+    expect(screen.getByLabelText('Search TV guide')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'On now' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Up next' })).toBeInTheDocument()
+    expectNoAlert()
+  })
+
+  it('epg page exposes a level-1 heading, labeled search, and a named scrollable schedule', async () => {
+    renderWithQuery(<EpgPage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'EPG', level: 1 })).toBeInTheDocument()
+    expect(screen.getByLabelText('Search programme guide')).toBeInTheDocument()
+    // The scrollable schedule container exposes an accessible name through
+    // aria-label and is focusable through tabindex. It does not declare an
+    // explicit role="region", so the test asserts the accessible name rather
+    // than the region role.
+    expect(screen.getByLabelText('Scrollable programme schedule')).toBeInTheDocument()
+    expectNoAlert()
+  })
+
+  it('recordings page exposes a level-1 heading and an operable add-rule toggle', async () => {
+    renderWithQuery(<RecordingsPage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'Recordings', level: 1 })).toBeInTheDocument()
+    const addToggle = screen.getByRole('button', { name: 'Add rule' })
+    expect(addToggle).toBeInTheDocument()
+    await userEvent.click(addToggle)
+    // The rule form opens. The form field labels are visual text and are not
+    // programmatically associated with their inputs through htmlFor/id. The
+    // test uses placeholder text to confirm the form is operable.
+    expect(screen.getByPlaceholderText('Daily news')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Create rule' })).toBeInTheDocument()
+    expectNoAlert()
+  })
+
+  it('users page exposes a level-1 heading and an operable add-user toggle', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getUsers').mockResolvedValue([
+      { id: 'user-1', username: 'operator', displayName: 'Demo operator', role: 'operator', enabled: true, lastLoginAt: null, createdAt: timestamp, updatedAt: timestamp },
+      { id: 'user-2', username: 'viewer', displayName: 'Read-only viewer', role: 'viewer', enabled: false, lastLoginAt: null, createdAt: timestamp, updatedAt: timestamp },
+    ])
+    renderWithQuery(<UsersPage client={client} />)
+    expect(await screen.findByRole('heading', { name: 'Users', level: 1 })).toBeInTheDocument()
+    const addToggle = screen.getByRole('button', { name: 'Add user' })
+    expect(addToggle).toBeInTheDocument()
+    await userEvent.click(addToggle)
+    expect(screen.getByRole('button', { name: 'Create user' })).toBeInTheDocument()
+    // Per-user enable/disable controls expose text labels tied to the user state.
+    expect(screen.getByRole('button', { name: 'Disable' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Enable' })).toBeInTheDocument()
+    expectNoAlert()
+  })
+
+  it('channel aliases page exposes a level-1 heading, a resolve control, and an add-alias toggle', async () => {
+    renderWithQuery(<ChannelAliasesPage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'Channel aliases', level: 1 })).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('Enter a channel name to resolve')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Resolve' })).toBeInTheDocument()
+    const addToggle = screen.getByRole('button', { name: 'Add alias' })
+    await userEvent.click(addToggle)
+    expect(screen.getByRole('button', { name: 'Create alias' })).toBeInTheDocument()
+    expectNoAlert()
+  })
+
+  it('jellyfin setup page exposes a level-1 heading, a labeled rotate control, and copy controls', async () => {
+    renderWithQuery(<JellyfinPage client={new MockIptvApiClient()} />)
+    expect(await screen.findByRole('heading', { name: 'Jellyfin setup', level: 1 })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Rotate publish token' })).toBeInTheDocument()
+    // The published endpoints load asynchronously. Wait for the copy controls
+    // to appear before asserting their accessible names.
+    expect(await screen.findByRole('button', { name: 'Copy M3U tuner URL' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy XMLTV guide URL' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy HDHomeRun device URL' })).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /Jellyfin docs/ })).toBeInTheDocument()
     expectNoAlert()
   })
 })

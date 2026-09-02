@@ -70,6 +70,36 @@ describe('typed API boundary', () => {
     expect(apiQueries().authStatus.queryKey).toEqual(['auth', 'status'])
     expect(apiQueries().authStatus.retry).toBe(false)
     expect(apiQueries(apiClient).sessions.queryKey).toEqual(['sessions'])
+    expect(apiQueries().channels().queryKey).toEqual(['channels', null])
+    expect(apiQueries().programmes().queryKey).toEqual(['programmes', null])
+    expect(apiQueries().streamHealth().queryKey).toEqual(['stream-health', null, null, null])
+  })
+
+  it('round-trips operator scope overrides, rejects stale revisions, and rolls back', async () => {
+    const client = new MockIptvApiClient()
+    const initial = await client.getOperatorScope('provider', 'provider-a')
+    expect(initial.revision).toBe(1)
+
+    const saved = await client.replaceOperatorScope('provider', 'provider-a', {
+      overrides: { 'media.ring.duration_seconds': 20 },
+      ifMatch: '"1"',
+    })
+    expect(saved.revision).toBe(2)
+    expect(await client.listOperatorRevisions('provider', 'provider-a')).toHaveLength(1)
+
+    // A stale If-Match triggers the revision conflict path.
+    await expect(client.replaceOperatorScope('provider', 'provider-a', {
+      overrides: { 'media.ring.duration_seconds': 30 },
+      ifMatch: '"1"',
+    })).rejects.toMatchObject({ problem: { status: 412 } })
+
+    // Roll back to the recorded revision restores that override set.
+    const restored = await client.rollbackOperatorScope('provider', 'provider-a', { revision: 2 })
+    expect(restored.revision).toBe(3)
+    expect(restored.overrides).toEqual({ 'media.ring.duration_seconds': 20 })
+
+    // Rolling back to a missing revision surfaces the not-found error.
+    await expect(client.rollbackOperatorScope('provider', 'provider-a', { revision: 99 })).rejects.toMatchObject({ problem: { status: 404 } })
   })
 })
 

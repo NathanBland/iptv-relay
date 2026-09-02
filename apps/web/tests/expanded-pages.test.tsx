@@ -613,4 +613,212 @@ describe('expanded management pages', () => {
     await userEvent.click(screen.getAllByRole('button', { name: /Roll back/ })[0]!)
     await waitFor(() => expect(rollback).toHaveBeenCalledWith('global', '', { revision: 2 }))
   })
+
+  it('switches to provider and group scopes and filters effective settings by id', async () => {
+    const client = new MockIptvApiClient()
+    const effective = vi.spyOn(client, 'getEffectiveSettings').mockResolvedValue({
+      providerId: 'provider-a',
+      groupId: 'sports',
+      etag: 'etag-1',
+      applyRequirements: ['restart'],
+      settings: [
+        {
+          definition: { key: 'media.ring.duration_seconds', label: 'Live ring duration', description: '', valueKind: 'integer', defaultValue: 8, minimum: 1, maximum: 120, choices: [], unit: 'seconds', operationalEffect: '', risk: 'low', providerOverridable: true, groupOverridable: true, applyRequirement: 'immediate' },
+          value: 16,
+          inheritedFrom: { scope: 'provider', id: 'provider-a' },
+        },
+      ],
+    })
+    renderWithQuery(<OperatorSettingsPage client={client} />)
+    await screen.findByRole('heading', { name: 'Operator settings' })
+    // Filter the effective settings by provider and group ids.
+    await userEvent.type(screen.getByLabelText('Provider id'), 'provider-a')
+    await userEvent.type(screen.getByLabelText('Channel group id'), 'sports')
+    await waitFor(() => expect(effective).toHaveBeenCalledWith('provider-a', 'sports'))
+    expect(screen.getByText('Provider: provider-a')).toBeInTheDocument()
+    expect(screen.getByText('Restart')).toBeInTheDocument()
+
+    // Switch to the provider scope panel and enter its identifier.
+    await userEvent.click(screen.getByRole('button', { name: 'Provider' }))
+    const providerScopeInput = document.getElementById('scope-id-provider') as HTMLInputElement
+    expect(providerScopeInput).toBeInTheDocument()
+    await userEvent.type(providerScopeInput, 'provider-a')
+    expect(await screen.findByRole('button', { name: 'Save overrides' })).toBeInTheDocument()
+
+    // Switch to the group scope panel.
+    await userEvent.click(screen.getByRole('button', { name: 'Channel group' }))
+    const groupScopeInput = document.getElementById('scope-id-group') as HTMLInputElement
+    await userEvent.type(groupScopeInput, 'sports')
+    expect(await screen.findByRole('button', { name: 'Save overrides' })).toBeInTheDocument()
+  })
+
+  it('edits a choice override and surfaces non-conflict save and rollback errors', async () => {
+    const client = new MockIptvApiClient()
+    const replace = vi.spyOn(client, 'replaceOperatorScope').mockRejectedValueOnce(new IptvApiError({
+      type: 'urn:iptv:error:setting-invalid',
+      title: 'Setting validation failed',
+      status: 422,
+      detail: 'The adapter value is not permitted.',
+    }))
+    const rollback = vi.spyOn(client, 'rollbackOperatorScope').mockRejectedValueOnce(new IptvApiError({
+      type: 'urn:iptv:error:setting-revision-not-found',
+      title: 'Setting revision not found',
+      status: 404,
+      detail: 'The target revision does not exist for this scope.',
+    }))
+    renderWithQuery(<OperatorSettingsPage client={client} />)
+    await screen.findByRole('heading', { name: 'Operator settings' })
+    // Change the choice field and save to trigger the non-412 error path.
+    const adapterSelect = await screen.findByRole('combobox', { name: 'Input adapter' })
+    await userEvent.selectOptions(adapterSelect, 'ffmpeg')
+    await userEvent.click(screen.getByRole('button', { name: 'Save overrides' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('The adapter value is not permitted.')
+    expect(replace).toHaveBeenCalled()
+    // Roll back to trigger the rollback error path.
+    await userEvent.click(screen.getAllByRole('button', { name: /Roll back/ })[0]!)
+    expect(await screen.findByRole('alert')).toHaveTextContent('target revision does not exist')
+    expect(rollback).toHaveBeenCalled()
+  })
+
+  it('analyzes streams, creates a template from a suggestion, and reports empty and error states', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getEventTemplates').mockResolvedValue([])
+    vi.spyOn(client, 'getEventChannels').mockResolvedValue([])
+    const suggest = vi.spyOn(client, 'suggestEventTemplates')
+      .mockResolvedValueOnce([
+        {
+          name: 'nba',
+          displayName: 'NBA Games',
+          matchRegex: 'NBA.*vs.*',
+          channelNameFormat: '{event}',
+          groupName: 'Sports',
+          eventDurationHours: 3,
+          pastDateGraceHours: 2,
+          futureDateDays: 5,
+          sampleStreams: ['NBA Lakers vs Celtics', 'NBA Bulls vs Heat'],
+          streamCount: 2,
+        },
+      ])
+      .mockResolvedValueOnce([])
+    const create = vi.spyOn(client, 'createEventTemplate').mockResolvedValue({
+      id: 'nba', name: 'nba', displayName: 'NBA Games', matchRegex: 'NBA.*vs.*', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 2, futureDateDays: 5, enabled: true,
+    })
+    renderWithQuery(<EventsPage client={client} />)
+    await screen.findByText(/No event templates configured/)
+    await userEvent.click(screen.getByRole('button', { name: 'Analyze streams' }))
+    expect(await screen.findByText('NBA Games')).toBeInTheDocument()
+    expect(screen.getByText('2 streams')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Create template' }))
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ name: 'nba' })))
+    await waitFor(() => expect(screen.queryByText('NBA Games')).not.toBeInTheDocument())
+
+    // A second analysis returns no suggestions.
+    await userEvent.click(screen.getByRole('button', { name: 'Analyze streams' }))
+    expect(await screen.findByText('No template suggestions found.')).toBeInTheDocument()
+    expect(suggest).toHaveBeenCalledTimes(2)
+
+    // A failed analysis surfaces the error path and clears prior suggestions.
+    suggest.mockRejectedValueOnce(new Error('Stream analysis unavailable.'))
+    await userEvent.click(screen.getByRole('button', { name: 'Analyze streams' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Stream analysis unavailable.')
+
+    // Close the suggestions section.
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByText('Suggested templates')).not.toBeInTheDocument())
+  })
+
+  it('confirms and cancels event template deletion', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
+      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+    ])
+    vi.spyOn(client, 'getEventChannels').mockResolvedValue([])
+    const remove = vi.spyOn(client, 'deleteEventTemplate').mockResolvedValue()
+    renderWithQuery(<EventsPage client={client} />)
+    await screen.findByText('NFL events')
+    await userEvent.click(screen.getByRole('button', { name: 'Delete NFL events' }))
+    expect(screen.getByRole('button', { name: 'Yes' })).toBeInTheDocument()
+    // Cancel the confirmation and keep the template.
+    await userEvent.click(screen.getByRole('button', { name: 'No' }))
+    expect(screen.queryByRole('button', { name: 'Yes' })).not.toBeInTheDocument()
+    // Reopen and confirm deletion.
+    await userEvent.click(screen.getByRole('button', { name: 'Delete NFL events' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Yes' }))
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('enabled'))
+  })
+
+  it('surfaces invalid regex in the event rule preview and edits the group name field', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
+      { id: 'bad', name: 'bad', displayName: 'Bad regex', matchRegex: '(unclosed', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+    ])
+    vi.spyOn(client, 'getEventChannels').mockResolvedValue([
+      { id: 'event-1', templateId: 'bad', channelId: null, slotNumber: 1, eventTitle: 'Title', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
+    ])
+    renderWithQuery(<EventsPage client={client} />)
+    await screen.findByText('Bad regex')
+    await userEvent.click(screen.getByRole('button', { name: 'Preview rule for Bad regex' }))
+    expect(await screen.findByText('The match pattern is not valid regex.')).toBeInTheDocument()
+
+    // The manual template form records a custom group name.
+    await userEvent.click(screen.getByRole('button', { name: 'Configure templates' }))
+    const groupNameInput = screen.getByLabelText('Group name')
+    await userEvent.clear(groupNameInput)
+    await userEvent.type(groupNameInput, 'Events')
+    expect(groupNameInput).toHaveValue('Events')
+  })
+
+  it('renders matched, unmatched, and empty-sample rule preview states', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
+      { id: 'match', name: 'match', displayName: 'Matched', matchRegex: '(?<home>.+) vs (?<away>.+)', channelNameFormat: '{home} vs {away}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+      { id: 'nomatch', name: 'nomatch', displayName: 'No match', matchRegex: 'zzz', channelNameFormat: '{x}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+      { id: 'empty', name: 'empty', displayName: 'Empty regex', matchRegex: '', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+    ])
+    vi.spyOn(client, 'getEventChannels').mockResolvedValue([
+      { id: 'm1', templateId: 'match', channelId: null, slotNumber: 1, eventTitle: 'Game', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos vs Chiefs', state: 'scheduled' },
+      { id: 'm2', templateId: 'match', channelId: null, slotNumber: 2, eventTitle: 'Skip', eventStart: timestamp, eventEnd: null, rawStreamName: 'Lakers Heat', state: 'scheduled' },
+      { id: 'n1', templateId: 'nomatch', channelId: null, slotNumber: 1, eventTitle: 'Miss', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
+      { id: 'e1', templateId: 'empty', channelId: null, slotNumber: 1, eventTitle: 'Empty regex', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
+    ])
+    renderWithQuery(<EventsPage client={client} />)
+    await screen.findByText('Matched')
+
+    // Matched template: a sample matches and the channel name renders.
+    await userEvent.click(screen.getByRole('button', { name: 'Preview rule for Matched' }))
+    expect(await screen.findByText(/1 of 2 scanned stream names match/)).toBeInTheDocument()
+    expect(screen.getByText('channel:')).toBeInTheDocument()
+
+    // No-match template: the empty message reports no matches.
+    await userEvent.click(screen.getByRole('button', { name: 'Preview rule for No match' }))
+    expect((await screen.findAllByText('The match pattern did not match any scanned stream names.')).length).toBeGreaterThan(0)
+
+    // Empty regex template: the preview reports no matches.
+    await userEvent.click(screen.getByRole('button', { name: 'Preview rule for Empty regex' }))
+    expect((await screen.findAllByText('The match pattern did not match any scanned stream names.')).length).toBeGreaterThan(1)
+  })
+
+  it('renders the queued sync status and surfaces a cancel failure', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getSources').mockResolvedValue([
+      { ...mockSources[0]!, id: 'source-queued', name: 'Queued tuner', refreshIntervalSeconds: 60 },
+    ])
+    vi.spyOn(client, 'getSourceSyncStatus').mockResolvedValue({
+      jobId: 'job-queued',
+      status: 'queued',
+      stage: 'completed',
+      percent: 0,
+      message: '',
+      bytesDownloaded: 0,
+      recordsProcessed: 0,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+    })
+    const cancel = vi.spyOn(client, 'cancelSourceSync').mockRejectedValue(new Error('Cancel endpoint offline.'))
+    renderWithQuery(<SourcesPage client={client} />)
+    expect(await screen.findByText('Queued')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel sync' }))
+    expect(await screen.findByText('Cancel endpoint offline.')).toBeInTheDocument()
+    expect(cancel).toHaveBeenCalledWith('source-queued')
+  })
 })
