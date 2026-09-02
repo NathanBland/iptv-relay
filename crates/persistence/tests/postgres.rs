@@ -2895,7 +2895,10 @@ async fn event_scan_persists_idempotent_non_overlapping_generated_guides() {
         })
         .await
         .unwrap();
-    assert_eq!(api_programmes.total, first.len() as i64);
+    assert_eq!(
+        api_programmes.total,
+        i64::try_from(first.len()).expect("programme count fits in i64")
+    );
     assert!(
         api_programmes
             .items

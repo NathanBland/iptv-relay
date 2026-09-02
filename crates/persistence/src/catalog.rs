@@ -793,6 +793,7 @@ impl CatalogRepository {
     ///
     /// Returns [`PersistenceError::Database`] when the query fails.
     #[allow(clippy::missing_errors_doc)]
+    #[allow(clippy::too_many_lines)]
     pub async fn list_programmes(
         &self,
         query: ProgrammeQuery,

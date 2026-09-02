@@ -12,9 +12,7 @@ use std::{
 use axum::http::HeaderMap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
-use jsonwebtoken::{
-    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
-};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -754,6 +752,7 @@ fn secure_attribute(secure: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use serde::Serialize;
 
     fn config() -> OidcConfig {
@@ -979,6 +978,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires loopback socket access for the provider fixture"]
+    #[allow(clippy::too_many_lines)]
     async fn callback_validates_signed_id_token_against_jwks() {
         let token_slot = Arc::new(tokio::sync::RwLock::new(String::new()));
         let token_slot_for_handler = Arc::clone(&token_slot);
@@ -1048,7 +1048,9 @@ mod tests {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() as i64;
+            .as_secs()
+            .try_into()
+            .expect("system time fits in i64");
         let claims = SignedClaims {
             iss: issuer,
             sub: "subject-1".to_owned(),

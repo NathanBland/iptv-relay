@@ -2173,7 +2173,7 @@ async fn support_log_entries(state: &AppState) -> Result<Vec<SupportLogEntry>, P
                 .filter_map(support_log_from_job),
         );
     }
-    entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.timestamp));
     entries.truncate(100);
     Ok(entries)
 }
@@ -2206,7 +2206,7 @@ async fn support_bundle(State(state): State<AppState>, headers: HeaderMap) -> Re
     };
     let stream_health = match &state.catalog_repository {
         Some(repository) => match repository.stream_health_stats().await {
-            Ok(stats) => StreamHealthStatsResponse::from(stats),
+            Ok(health_stats) => StreamHealthStatsResponse::from(health_stats),
             Err(error) => return persistence_error_response(error),
         },
         None => StreamHealthStatsResponse {
