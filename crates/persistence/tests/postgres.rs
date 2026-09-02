@@ -2870,6 +2870,26 @@ async fn event_scan_persists_idempotent_non_overlapping_generated_guides() {
         .list_programmes_for_channels(&[channel_id])
         .await
         .unwrap();
+    let api_programmes = catalog
+        .list_programmes(ProgrammeQuery {
+            channel_id: Some(channel_id),
+            limit: Some(100),
+            now: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-09-13T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            ..ProgrammeQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(api_programmes.total, first.len() as i64);
+    assert!(
+        api_programmes
+            .items
+            .iter()
+            .any(|programme| programme.title == "Broncos vs Chiefs")
+    );
     assert_eq!(first.len(), 5);
     assert_eq!(
         first

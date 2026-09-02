@@ -816,17 +816,27 @@ impl CatalogRepository {
 
         let total: i64 = sqlx::query_scalar(
             r"
-            SELECT count(*)
-            FROM programmes p
-            JOIN epg_channels ec ON ec.id = p.epg_channel_id
-            JOIN channel_epg_mappings m ON m.epg_channel_id = ec.id
-            JOIN channels c ON c.id = m.channel_id
-            WHERE c.enabled = true
-              AND ($1::uuid IS NULL OR m.channel_id = $1)
-              AND ($2::timestamptz IS NULL OR p.starts_at >= $2)
+            WITH programme_rows AS (
+                SELECT m.channel_id, c.name AS channel_name, p.title,
+                       p.starts_at, coalesce(p.stops_at, 'infinity'::timestamptz) AS stops_at
+                FROM programmes p
+                JOIN epg_channels ec ON ec.id = p.epg_channel_id
+                JOIN channel_epg_mappings m ON m.epg_channel_id = ec.id
+                JOIN channels c ON c.id = m.channel_id
+                WHERE c.enabled
+                UNION ALL
+                SELECT gp.channel_id, c.name, gp.title, gp.starts_at, gp.stops_at
+                FROM generated_programmes gp
+                JOIN event_channels ec ON ec.id = gp.event_channel_id
+                JOIN channels c ON c.id = gp.channel_id
+                WHERE c.enabled AND ec.state = 'scheduled'
+            )
+            SELECT count(*) FROM programme_rows
+            WHERE ($1::uuid IS NULL OR channel_id = $1)
+              AND ($2::timestamptz IS NULL OR starts_at >= $2)
               AND ($3::text IS NULL
-                   OR lower(p.title) LIKE lower($3) ESCAPE '\'
-                   OR lower(c.name) LIKE lower($3) ESCAPE '\')
+                   OR lower(title) LIKE lower($3) ESCAPE '\'
+                   OR lower(channel_name) LIKE lower($3) ESCAPE '\')
             ",
         )
         .bind(query.channel_id)
@@ -837,38 +847,43 @@ impl CatalogRepository {
 
         let rows = sqlx::query_as::<_, ProgrammeRow>(
             r"
-            SELECT
-                concat(m.channel_id::text, ':', p.id::text) AS id,
-                m.channel_id,
-                c.name AS channel_name,
-                p.title,
-                p.subtitle,
-                p.description,
-                p.categories,
-                p.starts_at,
-                coalesce(p.stops_at, 'infinity'::timestamptz) AS stops_at,
-                es.name AS source_name
-            FROM programmes p
-            JOIN epg_channels ec ON ec.id = p.epg_channel_id
-            JOIN channel_epg_mappings m ON m.epg_channel_id = ec.id
-            JOIN channels c ON c.id = m.channel_id
-            LEFT JOIN epg_sources es ON es.id = ec.epg_source_id
-            WHERE c.enabled = true
-              AND ($1::uuid IS NULL OR m.channel_id = $1)
-              AND ($2::timestamptz IS NULL OR p.starts_at >= $2)
+            WITH programme_rows AS (
+                SELECT concat(m.channel_id::text, ':', p.id::text) AS id,
+                       m.channel_id, c.name AS channel_name, p.title,
+                       p.subtitle, p.description, p.categories, p.starts_at,
+                       coalesce(p.stops_at, 'infinity'::timestamptz) AS stops_at,
+                       es.name AS source_name
+                FROM programmes p
+                JOIN epg_channels ec ON ec.id = p.epg_channel_id
+                JOIN channel_epg_mappings m ON m.epg_channel_id = ec.id
+                JOIN channels c ON c.id = m.channel_id
+                LEFT JOIN epg_sources es ON es.id = ec.epg_source_id
+                WHERE c.enabled
+                UNION ALL
+                SELECT concat(gp.channel_id::text, ':generated:', gp.id::text),
+                       gp.channel_id, c.name, gp.title, NULL::text,
+                       gp.source_title, gp.categories, gp.starts_at, gp.stops_at,
+                       gp.rule_name
+                FROM generated_programmes gp
+                JOIN event_channels ec ON ec.id = gp.event_channel_id
+                JOIN channels c ON c.id = gp.channel_id
+                WHERE c.enabled AND ec.state = 'scheduled'
+            )
+            SELECT * FROM programme_rows
+            WHERE ($1::uuid IS NULL OR channel_id = $1)
+              AND ($2::timestamptz IS NULL OR starts_at >= $2)
               AND ($3::text IS NULL
-                   OR lower(p.title) LIKE lower($3) ESCAPE '\'
-                   OR lower(c.name) LIKE lower($3) ESCAPE '\')
+                   OR lower(title) LIKE lower($3) ESCAPE '\'
+                   OR lower(channel_name) LIKE lower($3) ESCAPE '\')
             ORDER BY
                 CASE
-                    WHEN p.starts_at <= $4
-                     AND coalesce(p.stops_at, 'infinity'::timestamptz) > $4 THEN 0
-                    WHEN p.starts_at > $4 THEN 1
+                    WHEN starts_at <= $4 AND stops_at > $4 THEN 0
+                    WHEN starts_at > $4 THEN 1
                     ELSE 2
                 END,
-                CASE WHEN p.starts_at > $4 THEN p.starts_at END ASC NULLS LAST,
-                p.starts_at DESC,
-                p.id DESC
+                CASE WHEN starts_at > $4 THEN starts_at END ASC NULLS LAST,
+                starts_at DESC,
+                id DESC
             LIMIT $5 OFFSET $6
             ",
         )
