@@ -384,15 +384,14 @@ impl CatalogRepository {
             INSERT INTO channel_epg_mappings
                 (channel_id, epg_channel_id, method, confidence, evidence,
                  review_status, revision)
-            SELECT rc.channel_id, rc.epg_channel_id, rc.method, rc.confidence,
+            SELECT DISTINCT ON (rc.channel_id)
+                   rc.channel_id, rc.epg_channel_id, rc.method, rc.confidence,
                    rc.evidence, 'review', 1
             FROM review_candidates rc
             WHERE NOT EXISTS (
                 SELECT 1 FROM channel_epg_mappings cem WHERE cem.channel_id = rc.channel_id
             )
-            AND rc.confidence = (
-                SELECT max(rc2.confidence) FROM review_candidates rc2 WHERE rc2.channel_id = rc.channel_id
-            )
+            ORDER BY rc.channel_id, rc.confidence DESC, rc.epg_channel_id ASC
             ON CONFLICT (channel_id) DO NOTHING
             ",
         )
@@ -2515,7 +2514,7 @@ impl CatalogRepository {
             FROM review_candidates rc
             LEFT JOIN epg_channels ec ON ec.id = rc.epg_channel_id
             WHERE rc.channel_id = $1
-            ORDER BY rc.confidence DESC
+            ORDER BY rc.confidence DESC, rc.epg_channel_id ASC
             ",
         )
         .bind(channel_id)
