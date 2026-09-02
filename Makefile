@@ -1,4 +1,4 @@
-.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-coverage-script test-openapi-drift-check postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
+.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-openapi-drift-check postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
 
 DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
 
@@ -87,7 +87,23 @@ fuzz-smoke:
 	cargo +nightly fuzz run xtream -- -max_total_time=60
 	cargo +nightly fuzz run events -- -max_total_time=60
 
-ci: fmt lint audit coverage test-coverage-script test-openapi-drift-check coverage-changed test-e2e-ci compose-config
+docs-build:
+	if [ -x docs/.venv/bin/mkdocs ]; then docs/.venv/bin/mkdocs build --config-file docs/mkdocs.yml --strict --clean; else mkdocs build --config-file docs/mkdocs.yml --strict --clean; fi
+
+# Start the production-shaped stack and wait for each required health check.
+# Always remove the temporary containers after the check.
+compose-health:
+	trap 'docker-compose --env-file .env.test down' EXIT; \
+	docker-compose --env-file .env.test up --build -d --wait postgres core web gateway
+
+# Run Playwright against the same temporary stack used by the health check.
+# Keep this target separate so developers can run Playwright against a stack.
+compose-e2e-ci:
+	trap 'docker-compose --env-file .env.test down' EXIT; \
+	docker-compose --env-file .env.test up --build -d --wait postgres core web gateway; \
+	(cd apps/web && IPTV_ADMIN_PASSWORD=test-administrator-password CI=true pnpm exec playwright test --grep-invert="@live|real-source-flow")
+
+ci: fmt lint audit coverage test-coverage-script test-openapi-drift-check coverage-changed fuzz-smoke media-acceptance fault-acceptance compose-health docs-build compose-e2e-ci compose-config
 
 build:
 	cargo build --workspace --release
