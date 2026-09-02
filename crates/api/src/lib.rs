@@ -51,7 +51,10 @@ use tower_http::{catch_panic::CatchPanicLayer, compression::CompressionLayer};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
-use crate::auth::{AuthManager, LoginError};
+use crate::auth::{
+    AuthManager, LoginError, OPERATOR_TOKEN_ADMIN_SCOPE, OPERATOR_TOKEN_CONTROL_SCOPE,
+    OPERATOR_TOKEN_OUTPUT_SCOPE, OPERATOR_TOKEN_READ_SCOPE, OperatorTokenRecord,
+};
 use crate::oidc::OidcError;
 
 #[derive(Clone)]
@@ -133,7 +136,8 @@ impl fmt::Debug for AppState {
 
 impl AppState {
     pub fn new(database: Option<Database>, config: AppConfig) -> Self {
-        let secure_cookies = config.public_base_url.starts_with("https://");
+        let secure_cookies = url::Url::parse(config.public_base_url.trim())
+            .is_ok_and(|url| url.scheme().eq_ignore_ascii_case("https"));
         let source_repository = database.as_ref().map(|database| {
             SourceRepository::new(database.pool().clone(), config.master_key.clone())
         });
@@ -222,6 +226,20 @@ impl AppState {
         if !database.bootstrap_bearer_enabled().await? {
             self.auth.disable_bootstrap_bearer();
         }
+        let records = database
+            .list_operator_api_tokens()
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                let token_hash: [u8; 32] = row.token_hash.try_into().ok()?;
+                row.revoked_at.is_none().then_some(OperatorTokenRecord {
+                    id: row.id,
+                    token_hash,
+                    scopes: row.scopes,
+                    expires_at: row.expires_at,
+                })
+            });
+        self.auth.load_operator_tokens(records);
         Ok(())
     }
 
@@ -704,6 +722,50 @@ struct AuthStatus {
     user: Option<AuthUser>,
 }
 
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct OperatorApiTokenResponse {
+    id: String,
+    name: String,
+    scopes: Vec<String>,
+    expires_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+    created_by: String,
+    created_at: DateTime<Utc>,
+    last_used_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct IssuedOperatorApiTokenResponse {
+    #[serde(flatten)]
+    metadata: OperatorApiTokenResponse,
+    /// The plaintext token is returned only by create and rotate responses.
+    token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateOperatorApiTokenRequest {
+    name: String,
+    scopes: Vec<String>,
+    #[serde(alias = "expires_at")]
+    expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RotateOperatorApiTokenRequest {
+    name: Option<String>,
+    scopes: Option<Vec<String>>,
+    #[serde(alias = "expires_at")]
+    expires_at: Option<OperatorTokenExpiration>,
+}
+
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(transparent)]
+struct OperatorTokenExpiration(Option<DateTime<Utc>>);
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProblemDetails {
     #[serde(rename = "type")]
@@ -738,8 +800,8 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, oidc_start, oidc_callback, system_info, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
-    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
+    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -770,6 +832,18 @@ fn source_control_routes() -> Router<AppState> {
         .route("/api/v1/auth/logout", axum::routing::post(logout))
         .route("/api/v1/auth/oidc/start", get(oidc_start))
         .route("/api/v1/auth/oidc/callback", get(oidc_callback))
+        .route(
+            "/api/v1/auth/tokens",
+            get(list_operator_api_tokens).post(create_operator_api_token),
+        )
+        .route(
+            "/api/v1/auth/tokens/{token_id}/rotate",
+            post(rotate_operator_api_token),
+        )
+        .route(
+            "/api/v1/auth/tokens/{token_id}/revoke",
+            post(revoke_operator_api_token),
+        )
         .route("/api/v1/system", get(system_info))
         .route("/api/v1/settings/schema", get(settings_schema))
         .route("/api/v1/settings/effective", get(get_effective_settings))
@@ -1536,6 +1610,301 @@ async fn logout(
     response
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/auth/tokens",
+    tag = "authentication",
+    responses(
+        (status = 200, description = "Operator API token metadata", body = Vec<OperatorApiTokenResponse>),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn list_operator_api_tokens(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_operator_token_admin(&state, &headers, false) {
+        return response;
+    }
+    let Some(database) = &state.database else {
+        return persistence_unavailable();
+    };
+    match database.list_operator_api_tokens().await {
+        Ok(rows) => no_store_response(
+            Json(
+                rows.into_iter()
+                    .map(OperatorApiTokenResponse::from)
+                    .collect::<Vec<_>>(),
+            )
+            .into_response(),
+        ),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/tokens",
+    tag = "authentication",
+    request_body = CreateOperatorApiTokenRequest,
+    responses(
+        (status = 201, description = "Operator API token created; plaintext is shown once", body = IssuedOperatorApiTokenResponse),
+        (status = 400, body = ProblemDetails),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn create_operator_api_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Result<Json<CreateOperatorApiTokenRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_operator_token_admin(&state, &headers, true) {
+        return response;
+    }
+    let Ok(Json(request)) = request else {
+        return invalid_operator_token_request();
+    };
+    let (name, scopes) = match validate_operator_token_input(&request.name, request.scopes) {
+        Ok(values) => values,
+        Err(detail) => return invalid_operator_token_detail(detail),
+    };
+    let Some(database) = &state.database else {
+        return persistence_unavailable();
+    };
+    let Ok(plaintext) = AuthManager::generate_operator_token() else {
+        return persistence_unavailable();
+    };
+    let token_hash = token_hash(&plaintext);
+    let id = Uuid::now_v7();
+    let actor = state.auth.operator_token_actor(&headers);
+    let row = match database
+        .create_operator_api_token(id, &name, &token_hash, &scopes, request.expires_at, &actor)
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => return persistence_error_response(error),
+    };
+    state.auth.add_operator_token(OperatorTokenRecord {
+        id,
+        token_hash,
+        scopes: row.scopes.clone(),
+        expires_at: row.expires_at,
+    });
+    no_store_response(
+        (
+            StatusCode::CREATED,
+            Json(IssuedOperatorApiTokenResponse {
+                metadata: OperatorApiTokenResponse::from(row),
+                token: plaintext,
+            }),
+        )
+            .into_response(),
+    )
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/tokens/{token_id}/rotate",
+    tag = "authentication",
+    params(("token_id" = Uuid, Path, description = "Token ID")),
+    request_body = RotateOperatorApiTokenRequest,
+    responses(
+        (status = 200, description = "Operator API token rotated; plaintext is shown once", body = IssuedOperatorApiTokenResponse),
+        (status = 400, body = ProblemDetails),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn rotate_operator_api_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token_id): Path<Uuid>,
+    request: Result<Json<RotateOperatorApiTokenRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_operator_token_admin(&state, &headers, true) {
+        return response;
+    }
+    let Ok(Json(request)) = request else {
+        return invalid_operator_token_request();
+    };
+    let Some(database) = &state.database else {
+        return persistence_unavailable();
+    };
+    let rows = match database.list_operator_api_tokens().await {
+        Ok(rows) => rows,
+        Err(error) => return persistence_error_response(error),
+    };
+    let Some(existing) = rows
+        .into_iter()
+        .find(|row| row.id == token_id && row.revoked_at.is_none())
+    else {
+        return operator_token_not_found();
+    };
+    let name = request.name.unwrap_or(existing.name);
+    let scopes = request.scopes.unwrap_or(existing.scopes);
+    let (name, scopes) = match validate_operator_token_input(&name, scopes) {
+        Ok(values) => values,
+        Err(detail) => return invalid_operator_token_detail(detail),
+    };
+    let expires_at = request
+        .expires_at
+        .map_or(existing.expires_at, |value| value.0);
+    let Ok(plaintext) = AuthManager::generate_operator_token() else {
+        return persistence_unavailable();
+    };
+    let token_hash = token_hash(&plaintext);
+    let new_id = Uuid::now_v7();
+    let actor = state.auth.operator_token_actor(&headers);
+    let Some(row) = (match database
+        .rotate_operator_api_token(
+            token_id,
+            new_id,
+            &name,
+            &token_hash,
+            &scopes,
+            expires_at,
+            &actor,
+        )
+        .await
+    {
+        Ok(row) => row,
+        Err(error) => return persistence_error_response(error),
+    }) else {
+        return operator_token_not_found();
+    };
+    state.auth.revoke_operator_token(token_id);
+    state.auth.add_operator_token(OperatorTokenRecord {
+        id: new_id,
+        token_hash,
+        scopes: row.scopes.clone(),
+        expires_at: row.expires_at,
+    });
+    no_store_response(
+        Json(IssuedOperatorApiTokenResponse {
+            metadata: OperatorApiTokenResponse::from(row),
+            token: plaintext,
+        })
+        .into_response(),
+    )
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/tokens/{token_id}/revoke",
+    tag = "authentication",
+    params(("token_id" = Uuid, Path, description = "Token ID")),
+    responses(
+        (status = 204, description = "Operator API token revoked"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn revoke_operator_api_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(token_id): Path<Uuid>,
+) -> Response {
+    if let Some(response) = require_operator_token_admin(&state, &headers, true) {
+        return response;
+    }
+    let Some(database) = &state.database else {
+        return persistence_unavailable();
+    };
+    let actor = state.auth.operator_token_actor(&headers);
+    match database.revoke_operator_api_token(token_id, &actor).await {
+        Ok(true) => {
+            state.auth.revoke_operator_token(token_id);
+            no_store_response(StatusCode::NO_CONTENT.into_response())
+        }
+        Ok(false) => operator_token_not_found(),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+impl From<iptv_persistence::OperatorApiTokenRow> for OperatorApiTokenResponse {
+    fn from(row: iptv_persistence::OperatorApiTokenRow) -> Self {
+        Self {
+            id: row.id.to_string(),
+            name: row.name,
+            scopes: row.scopes,
+            expires_at: row.expires_at,
+            revoked_at: row.revoked_at,
+            created_by: row.created_by,
+            created_at: row.created_at,
+            last_used_at: row.last_used_at,
+        }
+    }
+}
+
+fn validate_operator_token_input(
+    name: &str,
+    scopes: Vec<String>,
+) -> Result<(String, Vec<String>), String> {
+    let name = name.trim().to_owned();
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return Err("name must contain 1-128 non-control characters".to_owned());
+    }
+    let mut normalized = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let scope = scope.trim().to_ascii_lowercase();
+        if !matches!(
+            scope.as_str(),
+            OPERATOR_TOKEN_READ_SCOPE
+                | OPERATOR_TOKEN_CONTROL_SCOPE
+                | OPERATOR_TOKEN_OUTPUT_SCOPE
+                | OPERATOR_TOKEN_ADMIN_SCOPE
+        ) {
+            return Err("scopes must contain only read, control, output, or admin".to_owned());
+        }
+        if !normalized.contains(&scope) {
+            normalized.push(scope);
+        }
+    }
+    if normalized.is_empty() {
+        return Err("at least one scope is required".to_owned());
+    }
+    Ok((name, normalized))
+}
+
+fn require_operator_token_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+    require_csrf: bool,
+) -> Option<Response> {
+    require_scope(state, headers, OPERATOR_TOKEN_ADMIN_SCOPE, require_csrf)
+}
+
+fn invalid_operator_token_request() -> Response {
+    invalid_operator_token_detail(
+        "send a JSON request that matches the documented operator token schema".to_owned(),
+    )
+}
+
+fn invalid_operator_token_detail(detail: String) -> Response {
+    ProblemDetails::new(
+        StatusCode::BAD_REQUEST,
+        "invalid-operator-api-token",
+        "Invalid operator API token",
+        detail,
+    )
+    .response()
+}
+
+fn operator_token_not_found() -> Response {
+    ProblemDetails::new(
+        StatusCode::NOT_FOUND,
+        "operator-api-token-not-found",
+        "Operator API token not found",
+        "no active operator API token with that ID exists",
+    )
+    .response()
+}
+
 fn auth_status_body(authenticated: bool) -> AuthStatus {
     AuthStatus {
         authenticated,
@@ -1631,6 +2000,7 @@ fn persistence_error_response(error: PersistenceError) -> Response {
         | PersistenceError::Database(_)
         | PersistenceError::Migration(_)
         | PersistenceError::JobOwnership { .. } => persistence_unavailable(),
+        PersistenceError::OperatorApiTokenNotFound(_) => operator_token_not_found(),
     }
 }
 
@@ -4815,7 +5185,7 @@ const fn session_failure_name(failure: SessionFailureKind) -> &'static str {
     responses((status = 200, body = JellyfinSetup), (status = 401, body = ProblemDetails))
 )]
 async fn jellyfin_setup(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(response) = require_admin(&state, &headers) {
+    if let Some(response) = require_scope(&state, &headers, OPERATOR_TOKEN_OUTPUT_SCOPE, false) {
         return response;
     }
     let setup = state.jellyfin_setup.read().await.clone();
@@ -4856,7 +5226,7 @@ async fn rotate_jellyfin_token(
     headers: HeaderMap,
     request: Result<Json<RotateJellyfinTokenRequest>, JsonRejection>,
 ) -> Response {
-    if let Some(response) = require_admin_mutation(&state, &headers) {
+    if let Some(response) = require_scope(&state, &headers, OPERATOR_TOKEN_OUTPUT_SCOPE, true) {
         return response;
     }
     let Ok(Json(request)) = request else {
@@ -7624,37 +7994,56 @@ async fn remove_stream_profile(
 }
 
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    state.auth.authorize(headers, false).is_none().then(|| {
-        ProblemDetails::new(
-            StatusCode::UNAUTHORIZED,
-            "authentication-required",
-            "Authentication required",
-            "sign in as the local administrator or provide the bootstrap bearer token",
-        )
-        .response()
-    })
+    require_scope(state, headers, OPERATOR_TOKEN_READ_SCOPE, false)
 }
 
 fn require_admin_mutation(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    if state.auth.authorize(headers, true).is_some() {
+    require_scope(state, headers, OPERATOR_TOKEN_CONTROL_SCOPE, true)
+}
+
+fn require_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: &str,
+    require_csrf: bool,
+) -> Option<Response> {
+    if state
+        .auth
+        .authorize_scope(headers, require_csrf, scope)
+        .is_some()
+    {
         return None;
     }
-    Some(if state.auth.authorize(headers, false).is_some() {
-        ProblemDetails::new(
+    let any_authorization = state.auth.authorize(headers, false);
+    Some(match any_authorization {
+        Some(crate::auth::Authorization::OperatorToken) => ProblemDetails::new(
+            StatusCode::FORBIDDEN,
+            "insufficient-scope",
+            "Insufficient token scope",
+            format!("the operator API token does not grant the {scope} scope"),
+        )
+        .response(),
+        Some(crate::auth::Authorization::Session) if require_csrf => ProblemDetails::new(
             StatusCode::FORBIDDEN,
             "csrf-validation-failed",
             "CSRF validation failed",
             "provide the CSRF token associated with the administrator session",
         )
-        .response()
-    } else {
-        ProblemDetails::new(
+        .response(),
+        Some(_) => ProblemDetails::new(
+            StatusCode::FORBIDDEN,
+            "insufficient-scope",
+            "Insufficient token scope",
+            format!("the authorization does not grant the {scope} scope"),
+        )
+        .response(),
+        None => ProblemDetails::new(
             StatusCode::UNAUTHORIZED,
             "authentication-required",
             "Authentication required",
             "sign in as the local administrator or provide the bootstrap bearer token",
         )
-        .response()
+        .response(),
     })
 }
 

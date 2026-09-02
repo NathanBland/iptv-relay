@@ -72,6 +72,8 @@ pub enum PersistenceError {
     },
     #[error("reconciliation revision {target} was not found for account {account_id}")]
     ReconciliationRevisionNotFound { account_id: Uuid, target: i64 },
+    #[error("operator API token {0} was not found")]
+    OperatorApiTokenNotFound(Uuid),
 }
 
 const ENCRYPTED_VALUE_VERSION: u8 = 1;
@@ -281,6 +283,245 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Lists operator API tokens without exposing their plaintext values.
+    ///
+    /// The returned rows contain only the stored hash and token metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn list_operator_api_tokens(
+        &self,
+    ) -> Result<Vec<OperatorApiTokenRow>, PersistenceError> {
+        let rows = sqlx::query_as::<_, OperatorApiTokenRow>(
+            r"
+            SELECT id, name, token_hash, scopes, expires_at, revoked_at,
+                   created_by, created_at, last_used_at
+            FROM operator_api_tokens
+            ORDER BY created_at DESC, id DESC
+            ",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Creates an operator API token and records its audit event atomically.
+    ///
+    /// Only the hash is stored. The caller must retain the generated plaintext
+    /// token and display it once to the operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the insert or audit event fails.
+    #[allow(clippy::too_many_arguments, clippy::missing_errors_doc)]
+    pub async fn create_operator_api_token(
+        &self,
+        id: Uuid,
+        name: &str,
+        token_hash: &[u8; 32],
+        scopes: &[String],
+        expires_at: Option<DateTime<Utc>>,
+        actor: &str,
+    ) -> Result<OperatorApiTokenRow, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, OperatorApiTokenRow>(
+            r"
+            INSERT INTO operator_api_tokens
+                (id, name, token_hash, scopes, expires_at, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, name, token_hash, scopes, expires_at, revoked_at,
+                      created_by, created_at, last_used_at
+            ",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(token_hash.as_slice())
+        .bind(scopes)
+        .bind(expires_at)
+        .bind(actor)
+        .fetch_one(&mut *transaction)
+        .await?;
+        self.insert_operator_token_audit(
+            &mut transaction,
+            actor,
+            "operator_token.create",
+            id,
+            serde_json::json!({
+                "name": name,
+                "scopes": scopes,
+                "expiresAt": expires_at,
+            }),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(row)
+    }
+
+    /// Rotates an active operator API token and records both lifecycle events.
+    ///
+    /// Rotation revokes the old token before it inserts the replacement. Only
+    /// the replacement hash is stored and its plaintext is returned to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the transaction fails.
+    #[allow(clippy::too_many_arguments, clippy::missing_errors_doc)]
+    pub async fn rotate_operator_api_token(
+        &self,
+        old_id: Uuid,
+        new_id: Uuid,
+        name: &str,
+        token_hash: &[u8; 32],
+        scopes: &[String],
+        expires_at: Option<DateTime<Utc>>,
+        actor: &str,
+    ) -> Result<Option<OperatorApiTokenRow>, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let old_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM operator_api_tokens WHERE id = $1 AND revoked_at IS NULL)",
+        )
+        .bind(old_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if !old_exists {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        sqlx::query(
+            "UPDATE operator_api_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(old_id)
+        .execute(&mut *transaction)
+        .await?;
+        let row = sqlx::query_as::<_, OperatorApiTokenRow>(
+            r"
+            INSERT INTO operator_api_tokens
+                (id, name, token_hash, scopes, expires_at, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, name, token_hash, scopes, expires_at, revoked_at,
+                      created_by, created_at, last_used_at
+            ",
+        )
+        .bind(new_id)
+        .bind(name)
+        .bind(token_hash.as_slice())
+        .bind(scopes)
+        .bind(expires_at)
+        .bind(actor)
+        .fetch_one(&mut *transaction)
+        .await?;
+        self.insert_operator_token_audit(
+            &mut transaction,
+            actor,
+            "operator_token.rotate",
+            old_id,
+            serde_json::json!({
+                "newTokenId": new_id,
+                "name": name,
+                "scopes": scopes,
+                "expiresAt": expires_at,
+            }),
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(Some(row))
+    }
+
+    /// Revokes an operator API token and records the lifecycle audit event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the update or audit event fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn revoke_operator_api_token(
+        &self,
+        id: Uuid,
+        actor: &str,
+    ) -> Result<bool, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE operator_api_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            > 0;
+        if changed {
+            self.insert_operator_token_audit(
+                &mut transaction,
+                actor,
+                "operator_token.revoke",
+                id,
+                serde_json::json!({}),
+            )
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(changed)
+    }
+
+    async fn insert_operator_token_audit(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        actor: &str,
+        action: &str,
+        resource_id: Uuid,
+        details: serde_json::Value,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            r"
+            INSERT INTO audit_events
+                (id, actor, action, resource_type, resource_id, correlation_id, details)
+            VALUES ($1, $2, $3, 'operator_api_token', $4, $5, $6)
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(actor)
+        .bind(action)
+        .bind(resource_id)
+        .bind(Uuid::now_v7())
+        .bind(details)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
+    }
+}
+
+/// Durable operator API token metadata and its one-way hash.
+///
+/// The hash is never serialized or included in the debug representation.
+#[derive(Clone, FromRow)]
+pub struct OperatorApiTokenRow {
+    pub id: Uuid,
+    pub name: String,
+    pub token_hash: Vec<u8>,
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
+impl fmt::Debug for OperatorApiTokenRow {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OperatorApiTokenRow")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("token_hash", &"<redacted>")
+            .field("scopes", &self.scopes)
+            .field("expires_at", &self.expires_at)
+            .field("revoked_at", &self.revoked_at)
+            .field("created_by", &self.created_by)
+            .field("created_at", &self.created_at)
+            .field("last_used_at", &self.last_used_at)
+            .finish()
     }
 }
 

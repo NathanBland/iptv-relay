@@ -14,7 +14,9 @@ use argon2::{
 };
 use axum::http::{HeaderMap, header};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::oidc::{OidcAuthorization, OidcClient, OidcConfig, OidcError};
 
@@ -25,6 +27,10 @@ const SESSION_TTL: Duration = Duration::from_hours(12);
 const LOGIN_CSRF_TTL: Duration = Duration::from_mins(30);
 const MAX_LOGIN_CSRF_TOKENS: usize = 4_096;
 const ADMIN_USERNAME: &str = "operator";
+pub(crate) const OPERATOR_TOKEN_READ_SCOPE: &str = "read";
+pub(crate) const OPERATOR_TOKEN_CONTROL_SCOPE: &str = "control";
+pub(crate) const OPERATOR_TOKEN_OUTPUT_SCOPE: &str = "output";
+pub(crate) const OPERATOR_TOKEN_ADMIN_SCOPE: &str = "admin";
 
 #[derive(Clone)]
 pub(crate) struct AuthManager {
@@ -38,6 +44,7 @@ struct AuthInner {
     secure_cookies: bool,
     sessions: Mutex<HashMap<[u8; 32], SessionRecord>>,
     login_csrf_tokens: Mutex<HashMap<[u8; 32], Instant>>,
+    operator_tokens: Mutex<HashMap<[u8; 32], OperatorTokenRecord>>,
     oidc: Option<OidcClient>,
 }
 
@@ -52,6 +59,7 @@ impl fmt::Debug for AuthManager {
                 &self.inner.bootstrap_bearer_enabled.load(Ordering::Acquire),
             )
             .field("secure_cookies", &self.inner.secure_cookies)
+            .field("operator_token_count", &self.operator_token_count())
             .field("active_sessions", &self.session_count())
             .finish()
     }
@@ -73,6 +81,15 @@ pub(crate) struct IssuedSession {
 pub(crate) enum Authorization {
     Bearer,
     Session,
+    OperatorToken,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OperatorTokenRecord {
+    pub id: Uuid,
+    pub token_hash: [u8; 32],
+    pub scopes: Vec<String>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl AuthManager {
@@ -101,6 +118,7 @@ impl AuthManager {
                 secure_cookies,
                 sessions: Mutex::new(HashMap::new()),
                 login_csrf_tokens: Mutex::new(HashMap::new()),
+                operator_tokens: Mutex::new(HashMap::new()),
                 oidc: oidc_config.map(OidcClient::new),
             }),
         }
@@ -252,11 +270,42 @@ impl AuthManager {
         headers: &HeaderMap,
         require_csrf: bool,
     ) -> Option<Authorization> {
+        self.authorize_with_scope(headers, require_csrf, None)
+    }
+
+    pub(crate) fn authorize_scope(
+        &self,
+        headers: &HeaderMap,
+        require_csrf: bool,
+        scope: &str,
+    ) -> Option<Authorization> {
+        self.authorize_with_scope(headers, require_csrf, Some(scope))
+    }
+
+    fn authorize_with_scope(
+        &self,
+        headers: &HeaderMap,
+        require_csrf: bool,
+        required_scope: Option<&str>,
+    ) -> Option<Authorization> {
         if self.inner.bootstrap_bearer_enabled.load(Ordering::Acquire)
             && bearer_token(headers)
                 .is_some_and(|token| constant_time_eq(&digest(token), &self.inner.bearer_hash))
         {
             return Some(Authorization::Bearer);
+        }
+        if let Some(token) = bearer_token(headers) {
+            let token_hash = digest(token);
+            let now = Utc::now();
+            let mut operator_tokens = self.lock_operator_tokens();
+            operator_tokens
+                .retain(|_, record| record.expires_at.is_none_or(|expires_at| expires_at > now));
+            if let Some(record) = operator_tokens.get(&token_hash)
+                && constant_time_eq(&token_hash, &record.token_hash)
+                && required_scope.is_none_or(|scope| scope_satisfied(&record.scopes, scope))
+            {
+                return Some(Authorization::OperatorToken);
+            }
         }
         let token = cookie(headers, SESSION_COOKIE)?;
         let token_hash = digest(token);
@@ -277,6 +326,41 @@ impl AuthManager {
             }
         }
         Some(Authorization::Session)
+    }
+
+    pub(crate) fn load_operator_tokens(
+        &self,
+        records: impl IntoIterator<Item = OperatorTokenRecord>,
+    ) {
+        let mut operator_tokens = self.lock_operator_tokens();
+        operator_tokens.clear();
+        for record in records {
+            operator_tokens.insert(record.token_hash, record);
+        }
+    }
+
+    pub(crate) fn add_operator_token(&self, record: OperatorTokenRecord) {
+        self.lock_operator_tokens()
+            .insert(record.token_hash, record);
+    }
+
+    pub(crate) fn revoke_operator_token(&self, id: Uuid) {
+        self.lock_operator_tokens()
+            .retain(|_, record| record.id != id);
+    }
+
+    pub(crate) fn operator_token_actor(&self, headers: &HeaderMap) -> String {
+        if let Some(token) = bearer_token(headers) {
+            let token_hash = digest(token);
+            if let Some(record) = self.lock_operator_tokens().get(&token_hash) {
+                return format!("operator-api-token:{}", record.id);
+            }
+        }
+        ADMIN_USERNAME.to_owned()
+    }
+
+    pub(crate) fn generate_operator_token() -> Result<String, getrandom::Error> {
+        random_token()
     }
 
     pub(crate) fn logout(&self, headers: &HeaderMap) {
@@ -305,6 +389,10 @@ impl AuthManager {
 
     fn session_count(&self) -> usize {
         self.lock_sessions().len()
+    }
+
+    fn operator_token_count(&self) -> usize {
+        self.lock_operator_tokens().len()
     }
 
     fn csrf_binding(&self, headers: &HeaderMap) -> Option<CsrfBinding> {
@@ -368,6 +456,15 @@ impl AuthManager {
     fn lock_login_csrf_tokens(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], Instant>> {
         self.inner
             .login_csrf_tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_operator_tokens(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<[u8; 32], OperatorTokenRecord>> {
+        self.inner
+            .operator_tokens
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -444,6 +541,14 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
         == 0
 }
 
+fn scope_satisfied(scopes: &[String], required: &str) -> bool {
+    scopes.iter().any(|scope| {
+        scope == OPERATOR_TOKEN_ADMIN_SCOPE
+            || scope == required
+            || (required == OPERATOR_TOKEN_READ_SCOPE && scope == OPERATOR_TOKEN_CONTROL_SCOPE)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +600,47 @@ mod tests {
 
         manager.disable_bootstrap_bearer();
 
+        assert_eq!(manager.authorize(&headers, false), None);
+    }
+
+    #[test]
+    fn operator_tokens_enforce_scopes_and_expiration() {
+        let manager = AuthManager::new(
+            hash_admin_password("admin-password").unwrap(),
+            "bootstrap-token",
+            false,
+        );
+        let token = "operator-api-secret";
+        manager.add_operator_token(OperatorTokenRecord {
+            id: Uuid::now_v7(),
+            token_hash: digest(token),
+            scopes: vec![OPERATOR_TOKEN_READ_SCOPE.to_owned()],
+            expires_at: None,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer operator-api-secret".parse().unwrap(),
+        );
+        assert_eq!(
+            manager.authorize(&headers, false),
+            Some(Authorization::OperatorToken)
+        );
+        assert_eq!(
+            manager.authorize_scope(&headers, false, OPERATOR_TOKEN_READ_SCOPE),
+            Some(Authorization::OperatorToken)
+        );
+        assert_eq!(
+            manager.authorize_scope(&headers, false, OPERATOR_TOKEN_CONTROL_SCOPE),
+            None
+        );
+
+        manager.add_operator_token(OperatorTokenRecord {
+            id: Uuid::now_v7(),
+            token_hash: digest(token),
+            scopes: vec![OPERATOR_TOKEN_ADMIN_SCOPE.to_owned()],
+            expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+        });
         assert_eq!(manager.authorize(&headers, false), None);
     }
 

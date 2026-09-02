@@ -135,6 +135,101 @@ async fn bootstrap_bearer_state_is_durable_and_idempotent() {
 }
 
 #[tokio::test]
+async fn operator_api_tokens_are_hash_only_and_have_audited_lifecycle() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let first_plaintext = "first-operator-token";
+    let first_hash = [7_u8; 32];
+    let scopes = vec!["read".to_owned(), "control".to_owned()];
+    let first_id = uuid::Uuid::now_v7();
+    let created = database
+        .create_operator_api_token(
+            first_id,
+            "integration token",
+            &first_hash,
+            &scopes,
+            Some(Utc::now() + Duration::hours(1)),
+            "integration-test",
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.id, first_id);
+    assert_eq!(created.token_hash, first_hash);
+    let stored_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT token_hash FROM operator_api_tokens WHERE id = $1")
+            .bind(first_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_hash, first_hash);
+    assert!(
+        !stored_hash
+            .windows(first_plaintext.len())
+            .any(|window| window == first_plaintext.as_bytes())
+    );
+    let debug = format!("{created:?}");
+    assert!(!debug.contains(first_plaintext));
+    assert_eq!(database.list_operator_api_tokens().await.unwrap().len(), 1);
+
+    let second_hash = [8_u8; 32];
+    let second_id = uuid::Uuid::now_v7();
+    let rotated = database
+        .rotate_operator_api_token(
+            first_id,
+            second_id,
+            "rotated token",
+            &second_hash,
+            &["admin".to_owned()],
+            None,
+            "integration-test",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rotated.id, second_id);
+    assert_eq!(rotated.token_hash, second_hash);
+    let old_revoked: Option<chrono::DateTime<Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM operator_api_tokens WHERE id = $1")
+            .bind(first_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(old_revoked.is_some());
+    assert!(
+        database
+            .revoke_operator_api_token(second_id, "integration-test")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !database
+            .revoke_operator_api_token(second_id, "integration-test")
+            .await
+            .unwrap()
+    );
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_events WHERE resource_type = 'operator_api_token' ORDER BY created_at, id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        actions,
+        [
+            "operator_token.create",
+            "operator_token.rotate",
+            "operator_token.revoke"
+        ]
+    );
+
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
 async fn encrypted_source_creation_enqueues_and_audits_atomically() {
     let Some(database_url) = database_url() else {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");

@@ -6,11 +6,12 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, PoisonError},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::http::HeaderMap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::StreamExt;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use reqwest::Client;
 use serde::Deserialize;
@@ -24,6 +25,11 @@ const OIDC_STATE_TTL: Duration = Duration::from_mins(10);
 const MAX_PENDING_LOGINS: usize = 4_096;
 const MAX_STATE_BYTES: usize = 128;
 const MAX_CODE_BYTES: usize = 8_192;
+const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const OIDC_CLOCK_SKEW_SECS: i64 = 60;
+const MAX_DISCOVERY_BODY_BYTES: usize = 64 * 1024;
+const MAX_TOKEN_BODY_BYTES: usize = 64 * 1024;
+const MAX_JWKS_BODY_BYTES: usize = 256 * 1024;
 
 /// OIDC settings supplied by the operator.
 ///
@@ -209,6 +215,8 @@ struct DiscoveryDocument {
     authorization_endpoint: String,
     token_endpoint: String,
     jwks_uri: String,
+    #[serde(default)]
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +230,10 @@ struct JsonWebKey {
     kid: Option<String>,
     n: Option<String>,
     e: Option<String>,
+    #[serde(default)]
+    alg: Option<String>,
+    #[serde(rename = "use", default)]
+    use_: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +247,7 @@ struct IdTokenClaims {
     sub: String,
     aud: serde_json::Value,
     exp: i64,
+    iat: i64,
     nonce: String,
     email: Option<String>,
     email_verified: Option<bool>,
@@ -246,7 +259,11 @@ impl OidcClient {
         Self {
             inner: Arc::new(OidcInner {
                 config,
-                http: Client::new(),
+                http: Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(OIDC_HTTP_TIMEOUT)
+                    .build()
+                    .expect("OIDC HTTP client configuration is valid"),
                 provider: Mutex::new(None),
                 pending: Mutex::new(HashMap::new()),
             }),
@@ -313,30 +330,29 @@ impl OidcClient {
             .filter(|value| !value.is_empty() && value.len() <= MAX_CODE_BYTES)
             .ok_or(OidcError::InvalidCallback)?;
         let provider = self.provider().await?;
-        let response = self
-            .inner
-            .http
-            .post(provider.token_endpoint.clone())
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", self.inner.config.redirect_url.as_str()),
-                ("client_id", self.inner.config.client_id.as_str()),
-                ("code_verifier", pending.verifier.as_str()),
-            ])
-            .basic_auth(
-                &self.inner.config.client_id,
-                self.inner.config.client_secret.as_deref(),
-            )
+        let mut request = self.inner.http.post(provider.token_endpoint.clone());
+        let form = [
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", self.inner.config.redirect_url.as_str()),
+            ("client_id", self.inner.config.client_id.as_str()),
+            ("code_verifier", pending.verifier.as_str()),
+        ];
+        request = request.form(&form);
+        if let Some(secret) = self.inner.config.client_secret.as_deref() {
+            request = request.basic_auth(&self.inner.config.client_id, Some(secret));
+        }
+        let response = request
             .send()
             .await
             .map_err(|_| OidcError::ProviderUnavailable)?;
         if !response.status().is_success() {
             return Err(OidcError::ProviderUnavailable);
         }
-        let token = response
-            .json::<TokenResponse>()
+        let body = read_limited_body(response, MAX_TOKEN_BODY_BYTES)
             .await
+            .map_err(|_| OidcError::InvalidCallback)?;
+        let token = serde_json::from_slice::<TokenResponse>(&body)
             .map_err(|_| OidcError::InvalidCallback)?;
         let id_token = token
             .id_token
@@ -408,12 +424,23 @@ impl OidcClient {
         if !response.status().is_success() {
             return Err(OidcError::ProviderUnavailable);
         }
-        let document = response
-            .json::<DiscoveryDocument>()
+        let body = read_limited_body(response, MAX_DISCOVERY_BODY_BYTES)
             .await
+            .map_err(|_| OidcError::InvalidProvider)?;
+        let document = serde_json::from_slice::<DiscoveryDocument>(&body)
             .map_err(|_| OidcError::InvalidProvider)?;
         if document.issuer != self.inner.config.issuer_url {
             return Err(OidcError::InvalidProvider);
+        }
+        if let Some(methods) = document.token_endpoint_auth_methods_supported.as_ref() {
+            let expected = if self.inner.config.client_secret.is_some() {
+                "client_secret_basic"
+            } else {
+                "none"
+            };
+            if !methods.iter().any(|method| method == expected) {
+                return Err(OidcError::InvalidProvider);
+            }
         }
         let provider = OidcProvider {
             issuer: document.issuer,
@@ -447,6 +474,7 @@ impl OidcClient {
         ) {
             return Err(OidcError::InvalidIdentityToken);
         }
+        let algorithm_name = algorithm_name(algorithm);
         let response = self
             .inner
             .http
@@ -457,14 +485,23 @@ impl OidcClient {
         if !response.status().is_success() {
             return Err(OidcError::ProviderUnavailable);
         }
-        let keys = response
-            .json::<JsonWebKeySet>()
+        let body = read_limited_body(response, MAX_JWKS_BODY_BYTES)
             .await
+            .map_err(|_| OidcError::InvalidProvider)?;
+        let keys = serde_json::from_slice::<JsonWebKeySet>(&body)
             .map_err(|_| OidcError::InvalidProvider)?;
         let key = keys
             .keys
             .into_iter()
-            .find(|key| key.kty == "RSA" && key.kid.as_deref() == Some(kid))
+            .find(|key| {
+                key.kty == "RSA"
+                    && key.kid.as_deref() == Some(kid)
+                    && key
+                        .alg
+                        .as_deref()
+                        .is_none_or(|value| value == algorithm_name)
+                    && key.use_.as_deref().is_none_or(|value| value == "sig")
+            })
             .ok_or(OidcError::InvalidIdentityToken)?;
         let n = key.n.ok_or(OidcError::InvalidIdentityToken)?;
         let e = key.e.ok_or(OidcError::InvalidIdentityToken)?;
@@ -475,6 +512,13 @@ impl OidcClient {
         validation.set_audience(&[self.inner.config.client_id.as_str()]);
         let token = decode::<IdTokenClaims>(id_token, &decoding_key, &validation)
             .map_err(|_| OidcError::InvalidIdentityToken)?;
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| OidcError::InvalidIdentityToken)?
+                .as_secs(),
+        )
+        .map_err(|_| OidcError::InvalidIdentityToken)?;
         if token.claims.iss != provider.issuer
             || !audience_contains(&token.claims.aud, &self.inner.config.client_id)
             || !audience_party_is_valid(
@@ -483,6 +527,7 @@ impl OidcClient {
                 &self.inner.config.client_id,
             )
             || token.claims.exp <= 0
+            || !issued_at_is_valid(token.claims.iat, now)
         {
             return Err(OidcError::InvalidIdentityToken);
         }
@@ -512,6 +557,27 @@ fn audience_contains(value: &serde_json::Value, client_id: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn algorithm_name(algorithm: Algorithm) -> &'static str {
+    match algorithm {
+        Algorithm::HS256 => "HS256",
+        Algorithm::HS384 => "HS384",
+        Algorithm::HS512 => "HS512",
+        Algorithm::ES256 => "ES256",
+        Algorithm::ES384 => "ES384",
+        Algorithm::RS256 => "RS256",
+        Algorithm::RS384 => "RS384",
+        Algorithm::RS512 => "RS512",
+        Algorithm::PS256 => "PS256",
+        Algorithm::PS384 => "PS384",
+        Algorithm::PS512 => "PS512",
+        Algorithm::EdDSA => "EdDSA",
+    }
+}
+
+fn issued_at_is_valid(iat: i64, now: i64) -> bool {
+    iat > 0 && iat <= now.saturating_add(OIDC_CLOCK_SKEW_SECS)
 }
 
 fn audience_party_is_valid(
@@ -566,10 +632,11 @@ fn validate_endpoint_url(value: &str, name: &str) -> Result<(), String> {
         || url.host_str().is_none()
         || url.username() != ""
         || url.password().is_some()
+        || url.query().is_some()
         || url.fragment().is_some()
     {
         return Err(format!(
-            "OIDC {name} URL must use HTTPS and have no credentials or fragment"
+            "OIDC {name} URL must use HTTPS and have no credentials, query, or fragment"
         ));
     }
     if url.scheme() == "http" && !is_loopback_host(url.host_str().unwrap_or_default()) {
@@ -586,6 +653,7 @@ fn parse_provider_endpoint(value: &str) -> Result<Url, OidcError> {
         || url.host_str().is_none()
         || url.username() != ""
         || url.password().is_some()
+        || url.query().is_some()
         || url.fragment().is_some()
         || (url.scheme() == "http" && !is_loopback_host(url.host_str().unwrap_or_default()))
     {
@@ -609,6 +677,47 @@ fn is_loopback_host(host: &str) -> bool {
 
 fn contains_control(value: &str) -> bool {
     value.chars().any(char::is_control)
+}
+
+#[derive(Debug)]
+enum LimitedBodyError {
+    TooLarge,
+    Request,
+}
+
+async fn read_limited_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, LimitedBodyError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(LimitedBodyError::TooLarge);
+    }
+
+    let capacity = response.content_length().map_or(0, |length| {
+        usize::try_from(length).unwrap_or(limit).min(limit)
+    });
+    let mut body = Vec::with_capacity(capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| LimitedBodyError::Request)?;
+        append_limited_chunk(&mut body, &chunk, limit)?;
+    }
+    Ok(body)
+}
+
+fn append_limited_chunk(
+    body: &mut Vec<u8>,
+    chunk: &[u8],
+    limit: usize,
+) -> Result<(), LimitedBodyError> {
+    if chunk.len() > limit.saturating_sub(body.len()) {
+        return Err(LimitedBodyError::TooLarge);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn random_token() -> Option<String> {
@@ -682,6 +791,38 @@ mod tests {
                 vec![],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn config_and_provider_endpoints_reject_queries() {
+        assert!(
+            OidcConfig::new(
+                "https://idp.example.test/issuer?tenant=one",
+                "client",
+                None,
+                "https://gateway.example.test/callback",
+                vec!["subject".to_owned()],
+                vec![],
+                vec![],
+            )
+            .is_err()
+        );
+        assert!(
+            OidcConfig::new(
+                "https://idp.example.test/issuer",
+                "client",
+                None,
+                "https://gateway.example.test/callback?next=home",
+                vec!["subject".to_owned()],
+                vec![],
+                vec![],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            parse_provider_endpoint("https://idp.example.test/keys?version=1"),
+            Err(OidcError::InvalidProvider)
         );
     }
 
@@ -857,6 +998,36 @@ mod tests {
             &serde_json::json!("gateway-client"),
             None,
             "gateway-client"
+        ));
+    }
+
+    #[test]
+    fn issued_at_must_be_positive_and_not_far_in_the_future() {
+        let now = 1_000_i64;
+        assert!(issued_at_is_valid(now, now));
+        assert!(issued_at_is_valid(now + OIDC_CLOCK_SKEW_SECS, now));
+        assert!(!issued_at_is_valid(0, now));
+        assert!(!issued_at_is_valid(-1, now));
+        assert!(!issued_at_is_valid(now + OIDC_CLOCK_SKEW_SECS + 1, now));
+    }
+
+    #[test]
+    fn jwk_use_field_uses_the_standard_json_name() {
+        let key: JsonWebKey =
+            serde_json::from_str(r#"{"kty":"RSA","kid":"key-1","alg":"RS256","use":"sig"}"#)
+                .expect("JWK");
+        assert_eq!(key.use_.as_deref(), Some("sig"));
+    }
+
+    #[test]
+    fn limited_body_rejects_streamed_chunks_after_the_limit() {
+        let mut body = Vec::new();
+        append_limited_chunk(&mut body, b"123", 5).expect("first chunk");
+        append_limited_chunk(&mut body, b"45", 5).expect("second chunk");
+        assert_eq!(body, b"12345");
+        assert!(matches!(
+            append_limited_chunk(&mut body, b"6", 5),
+            Err(LimitedBodyError::TooLarge)
         ));
     }
 }
