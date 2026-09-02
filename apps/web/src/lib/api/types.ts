@@ -551,8 +551,8 @@ export interface AuthUser {
 }
 
 export type AuthStatus =
-  | { authenticated: false }
-  | { authenticated: true; user: AuthUser }
+  | { authenticated: false; oidcEnabled?: boolean }
+  | { authenticated: true; user: AuthUser; oidcEnabled?: boolean }
 
 export interface LoginInput {
   username: string

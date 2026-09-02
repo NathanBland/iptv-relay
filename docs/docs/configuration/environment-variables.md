@@ -19,6 +19,26 @@ The gateway reads configuration from environment variables. The Compose file pas
 | `IPTV_TUNER_COUNT` | `1` | HDHomeRun tuner count for the environment output profile. |
 | `RUST_LOG` | `info` | Log level filter. |
 
+### Optional OIDC sign-in
+
+The gateway enables OIDC when the issuer and client ID are set. Set at least one approved subject or verified email.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `IPTV_OIDC_ISSUER_URL` | _empty_ | HTTPS issuer URL. HTTP is valid only for a loopback development issuer. |
+| `IPTV_OIDC_CLIENT_ID` | _empty_ | OIDC client identifier. |
+| `IPTV_OIDC_CLIENT_SECRET` | _empty_ | Confidential-client secret. Leave empty for a public PKCE client. |
+| `IPTV_OIDC_REDIRECT_URL` | Derived | Callback URL. The default uses `IPTV_PUBLIC_BASE_URL`. |
+| `IPTV_OIDC_ALLOWED_SUBJECTS` | _empty_ | Comma or space separated approved subject values. |
+| `IPTV_OIDC_ALLOWED_EMAILS` | _empty_ | Comma or space separated approved verified email values. |
+| `IPTV_OIDC_SCOPES` | `openid profile email` | Space separated scopes. The `openid` scope is required. |
+
+The login page shows the OIDC option only when the gateway reports OIDC as enabled.
+
+The callback uses authorization code flow with PKCE, state, and nonce. The gateway validates the issuer, audience, signature, and JWKS key.
+
+Keep the local `operator` password configured for break-glass access.
+
 ## Worker service
 
 | Variable | Default | Description |

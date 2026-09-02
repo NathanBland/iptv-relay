@@ -12,7 +12,9 @@ use std::{
 use axum::http::HeaderMap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+};
 use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -752,6 +754,7 @@ fn secure_attribute(secure: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Serialize;
 
     fn config() -> OidcConfig {
         OidcConfig::new(
@@ -957,6 +960,131 @@ mod tests {
             client.callback(&headers, state, Some("code")).await,
             Err(OidcError::InvalidState)
         ));
+    }
+
+    #[derive(Debug, Serialize)]
+    struct SignedClaims {
+        iss: String,
+        sub: String,
+        aud: String,
+        exp: i64,
+        iat: i64,
+        nonce: String,
+        email: String,
+        email_verified: bool,
+    }
+
+    // Test-only key. The matching public modulus appears in the JWKS fixture below.
+    const TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC4G5PzhDelj2Kf\nVqoPaCmjULd403IqRHKhLl0MsG2lhOZB19c7X+fVymtE2P3ar4SHTpufZY+YrjHY\nq17xSPd+3kzBHnMH6XOQUH13Tg8+6xh1xjtJOItYan80dIBlWkyEyiIGMhKDI00j\nNUv+euRY+nTIwYrlm0oBhlTSVr7eDWHsiTpM4FxqvbYi0nfU/K2CmvHP7t1sTEUM\n6Kq02tBgpLgsabaup0/1CLQ26gAwDCSabAUyVtcZMXBi9cMe4V3dAhdzq+HJjb6Y\n6WbuyZbxuCp3tqXmPbAoxuwdxUh7rJGgwzcdweKQhDgWd7xW3XSf7AXGxiEKm35J\nNQtQwXE3AgMBAAECggEATIb+GU+At/thcb0a5FuWTzHqiblOr74S7eexOuiNMyuK\ncJ0Q9Le5TNcefpg58PBbRMkKjBexuDPUOW2GggIkCmLKAc4v336NEFQ8yt4yHSOo\n36++DgIIfgCKjpnMkxSVUO8adHvU0RjX5AYv6ABaMZgt+hLlMuq5OOgHEwWGwhKW\ncPHN3rNAeyURmEa5paBLJ/YjRTkfBkOmLIDtMcFyTDk/7aIFDigd99Hvx35c4ivJ\n5aPgFddI7KHB9LAUnfBvAlTZbkyLAAUEUK3lKm08kf/sKQiWgLP9iVWWIlnxXbuR\nBLXqslVIl/sJOSGA+0OfHUbr8Jys7YN6cNfwCBP6UQKBgQDe+/QMKzO/YKqFLnuK\nvuhjpykxCJ/h43F+x5MDBhMA2S+jNcOoufpcpGzRTT67F8PJWbow9YO/6e5x8YGf\nZ+MURYJxyxugIt0Mhnm8Rj5Wgk5vPGgzn0paAHsB0Q3pcoX45xqZ4R7ikiFsuthl\nBXset9xU7W96Jf7v20ip34T00QKBgQDTXgqp87XXCo73mUVSHVutmCpYMiYdkrm\ni2kGpFuBO51u2diVLHY3+k79sjMKVk3VotWITx4tnytTX3iqjIVrEoRX5eaXreXb\nv20/jYli5xp40z3fqkgJutMjyfzrZ0kRlTrqCiiby7y9a4GzVvXlJdDuyX9/WgAZ\nWmzCkvCnhwKBgA6nekNud2klXi+AfYgBwd4Ct1dMnM1ImEXfsc6qEIemvlW4i9JD\n3qtF9wzOScgb6LcL2YusJutu4UfFumISfr7vToJR+c/NWr+e+tMfvqsKx0LSMnrq\nBgXiMDNPXN2xtBJGhd4FCHWVavLtWJlTAeNj6+v86q2ZX6a9v4nCccdxAoGAKatI\nfujE2HgEZ1uYBvAyuq5c6rY4PWxHmh4xvlV4lKmkB856nC3/wFlgaTNQTKFnBs7r\nOcwfLu9KI02XBEhfpRQpcwqnww9NWV0LtJO6mfzlgxxh/k4blY93QH75lY7vIMBC\ntRD7oHsx4kXnc+uY3mvuHKUstXaQvm7NMi61stECgYBF+BydGz589gSfkzBzRrd/\n/RLlJ//jU51293CMdrtW24x/J8c6/C9OFp9L8Hxr98JpgVu2Lh2NTeMFNis2Oqxl\nxofYGvpGV/dIClWFzEbUdXIC/Zbs30WcW8ryzFJkkvyprIdBx0VJu6klczPevITK\n+Q24I1fjx8H5entR6bN3PQ==\n-----END PRIVATE KEY-----\n";
+
+    #[tokio::test]
+    #[ignore = "requires loopback socket access for the provider fixture"]
+    async fn callback_validates_signed_id_token_against_jwks() {
+        let token_slot = Arc::new(tokio::sync::RwLock::new(String::new()));
+        let token_slot_for_handler = Arc::clone(&token_slot);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let issuer = format!("http://127.0.0.1:{}/issuer", address.port());
+        let provider_app = axum::Router::new()
+            .route(
+                "/issuer/.well-known/openid-configuration",
+                axum::routing::get({
+                    let issuer = issuer.clone();
+                    move || {
+                        let issuer = issuer.clone();
+                        async move {
+                            axum::Json(serde_json::json!({
+                                "issuer": issuer,
+                                "authorization_endpoint": format!("{issuer}/authorize"),
+                                "token_endpoint": format!("{issuer}/token"),
+                                "jwks_uri": format!("{issuer}/keys")
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/issuer/token",
+                axum::routing::post(move || {
+                    let token_slot = Arc::clone(&token_slot_for_handler);
+                    async move { axum::Json(serde_json::json!({"id_token": *token_slot.read().await})) }
+                }),
+            )
+            .route(
+                "/issuer/keys",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"keys": [{
+                        "kty": "RSA",
+                        "kid": "test-key",
+                        "alg": "RS256",
+                        "use": "sig",
+                        "n": "uBuT84Q3pY9in1aqD2gpo1C3eNNyKkRyoS5dDLBtpYTmQdfXO1_n1cprRNj92q-Eh06bn2WPmK4x2Kte8Uj3ft5MwR5zB-lzkFB9d04PPusYdcY7STiLWGp_NHSAZVpMhMoiBjISgyNNIzVL_nrkWPp0yMGK5ZtKAYZU0la-3g1h7Ik6TOBcar22ItJ31Pytgprxz-7dbExFDOiqtNrQYKS4LGm2rqdP9Qi0NuoAMAwkmmwFMlbXGTFwYvXDHuFd3QIXc6vhyY2-mOlm7smW8bgqd7al5j2wKMbsHcVIe6yRoMM3HcHikIQ4Fne8Vt10n-wFxsYhCpt-STULUMFxNw",
+                        "e": "AQAB"
+                    }]}))
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, provider_app).await.unwrap();
+        });
+
+        let config = OidcConfig::new(
+            &issuer,
+            "gateway-client",
+            None,
+            "http://localhost:8080/api/v1/auth/oidc/callback",
+            vec!["subject-1".to_owned()],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let client = OidcClient::new(config);
+        let authorization = client.start(false).await.unwrap();
+        let location = Url::parse(&authorization.location).unwrap();
+        let state = location
+            .query_pairs()
+            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+            .unwrap();
+        let pending = client.lock_pending().get(&digest(&state)).cloned().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = SignedClaims {
+            iss: issuer,
+            sub: "subject-1".to_owned(),
+            aud: "gateway-client".to_owned(),
+            exp: now + 600,
+            iat: now,
+            nonce: pending.nonce,
+            email: "unused@example.test".to_owned(),
+            email_verified: true,
+        };
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key".to_owned());
+        let token = encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        *token_slot.write().await = token;
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            format!("{OIDC_STATE_COOKIE}={state}").parse().unwrap(),
+        );
+        client
+            .callback(&headers, &state, Some("provider-code"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            client
+                .callback(&headers, &state, Some("provider-code"))
+                .await,
+            Err(OidcError::InvalidState)
+        ));
+        server.abort();
     }
 
     #[test]

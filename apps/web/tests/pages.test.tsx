@@ -35,6 +35,13 @@ describe('management pages', () => {
     await waitFor(() => expect(onAuthenticated).toHaveBeenCalledWith('/channels?filter=local'))
   })
 
+  it('offers the configured OIDC sign-in option', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getAuthStatus').mockResolvedValue({ authenticated: false, oidcEnabled: true })
+    renderWithQuery(<LoginPage client={client} />)
+    expect(await screen.findByRole('link', { name: 'Continue with SSO' })).toHaveAttribute('href', '/api/v1/auth/oidc/start')
+  })
+
   it('shows validation and bounded authentication failures', async () => {
     const client = new MockIptvApiClient()
     vi.spyOn(client, 'login').mockRejectedValue(new IptvApiError({

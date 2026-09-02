@@ -758,6 +758,8 @@ struct AuthStatus {
     authenticated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<AuthUser>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oidc_enabled: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -1364,7 +1366,8 @@ fn write_prometheus_counter(output: &mut String, name: &str, help: &str, value: 
 #[utoipa::path(get, path = "/api/v1/auth/status", tag = "authentication", responses((status = 200, body = AuthStatus)))]
 async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let authenticated = state.auth.authorize(&headers, false).is_some();
-    let mut response = Json(auth_status_body(authenticated)).into_response();
+    let mut response =
+        Json(auth_status_body(authenticated, state.auth.oidc_enabled())).into_response();
     if let Some(cookie) = state.auth.ensure_csrf_cookie(&headers) {
         response.headers_mut().append(
             header::SET_COOKIE,
@@ -1605,7 +1608,7 @@ async fn login(
             .response();
         }
     };
-    let mut response = Json(auth_status_body(true)).into_response();
+    let mut response = Json(auth_status_body(true, state.auth.oidc_enabled())).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
         HeaderValue::from_str(&session.session_cookie).expect("generated session cookie is valid"),
@@ -1945,7 +1948,7 @@ fn operator_token_not_found() -> Response {
     .response()
 }
 
-fn auth_status_body(authenticated: bool) -> AuthStatus {
+fn auth_status_body(authenticated: bool, oidc_enabled: bool) -> AuthStatus {
     AuthStatus {
         authenticated,
         user: authenticated.then(|| AuthUser {
@@ -1953,6 +1956,7 @@ fn auth_status_body(authenticated: bool) -> AuthStatus {
             username: "operator".to_owned(),
             display_name: "Relay operator".to_owned(),
         }),
+        oidc_enabled: oidc_enabled.then_some(true),
     }
 }
 
@@ -11700,6 +11704,7 @@ mod tests {
                 username: "operator".to_owned(),
                 display_name: "Operator".to_owned(),
             }),
+            oidc_enabled: None,
         });
         assert_serializes(ProblemDetails::new(
             StatusCode::BAD_REQUEST,

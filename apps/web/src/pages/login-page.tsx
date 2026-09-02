@@ -154,6 +154,18 @@ export function LoginPage({
                 </form.Subscribe>
               </form>
             )}
+
+            {!authenticatedUser && authQuery.data?.oidcEnabled ? (
+              <div className="mt-5 border-t border-white/10 pt-5">
+                <p className="mb-3 text-center text-xs text-slate-500">Or use your approved identity provider.</p>
+                <a
+                  className="inline-flex min-h-10 w-full items-center justify-center rounded-lg border border-ocean-400/40 px-3 text-sm font-semibold text-ocean-200 hover:border-mint-400 hover:text-mint-200"
+                  href="/api/v1/auth/oidc/start"
+                >
+                  Continue with SSO
+                </a>
+              </div>
+            ) : null}
           </CardContent>
         </Card>
         <p className="mt-4 text-center text-xs leading-5 text-slate-600">The server stores your session in a secure, HTTP-only cookie. The page does not receive the cookie value.</p>

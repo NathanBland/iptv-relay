@@ -224,6 +224,10 @@ impl AuthManager {
         client.start(self.inner.secure_cookies).await
     }
 
+    pub(crate) fn oidc_enabled(&self) -> bool {
+        self.inner.oidc.is_some()
+    }
+
     pub(crate) async fn complete_oidc_login(
         &self,
         headers: &HeaderMap,

@@ -2,6 +2,16 @@
 
 The control API requires authentication for all endpoints under `/api/v1`. The gateway supports session cookies, a bootstrap bearer, and CSRF protection.
 
+## OIDC sign-in
+
+When OIDC is configured, select **Continue with SSO** on the login page. The gateway redirects the browser to the configured provider.
+
+The gateway uses authorization code flow with PKCE. It validates state, nonce, issuer, audience, token signature, and the provider JWKS.
+
+The gateway accepts an OIDC identity only when its subject or verified email matches the configured allowlist.
+
+Use the local `operator` password when the provider is unavailable or during recovery.
+
 ## Session cookie
 
 First, request the login CSRF cookie:
@@ -85,3 +95,5 @@ When `IPTV_ADMIN_PASSWORD_HASH` is set, the core service ignores the plaintext p
 | GET | `/api/v1/auth/status` | Return the current session status. |
 | POST | `/api/v1/auth/login` | Start an admin session. |
 | POST | `/api/v1/auth/logout` | End the current session. |
+| GET | `/api/v1/auth/oidc/start` | Start OIDC sign-in and redirect to the provider. |
+| GET | `/api/v1/auth/oidc/callback` | Validate the provider response and create a session. |
