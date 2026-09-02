@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Deterministic scale-test fixtures and budget gates for the pinned-runner
+# scale gate. Adds no new dependencies. Disabled in production builds.
+scale = []
+
 [dependencies]
 base64.workspace = true
 chrono.workspace = true

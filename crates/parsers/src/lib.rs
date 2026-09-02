@@ -23,3 +23,6 @@ pub use xtream::{
     parse_xtream_auth, parse_xtream_live_categories, parse_xtream_live_streams,
     parse_xtream_short_epg, parse_xtream_short_epg_in_timezone,
 };
+
+#[cfg(feature = "scale")]
+pub mod scale;

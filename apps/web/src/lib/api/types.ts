@@ -171,6 +171,26 @@ export interface EpgReconcileResult {
   reviewQueued: number
 }
 
+export interface ReconciliationRevision {
+  revision: number
+  actor: string
+  createdAt: string
+  beforeValue: unknown | null
+  afterValue: unknown
+}
+
+export interface ReconciliationRollbackInput {
+  revision: number
+}
+
+export interface ReconciliationRollbackResult {
+  targetRevision: number
+  channelsRemoved: number
+  channelsRestored: number
+  streamLinksRestored: number
+  epgMappingsRestored: number
+}
+
 export interface StreamHealthItem {
   providerStreamId: string
   streamName: string
@@ -422,6 +442,18 @@ export interface CreateEventTemplateInput {
   futureDateDays?: number
 }
 
+export interface UpdateEventTemplateInput {
+  name?: string
+  displayName?: string
+  matchRegex?: string
+  channelNameFormat?: string
+  groupName?: string
+  eventDurationHours?: number
+  pastDateGraceHours?: number
+  futureDateDays?: number
+  enabled?: boolean
+}
+
 export interface CreateLineupTemplateInput {
   name: string
   packageName: string
@@ -530,6 +562,80 @@ export interface RegionSettingsResponse {
   prefixes: RegionPrefixInfo[]
 }
 
+export type SettingValueKind = 'boolean' | 'integer' | 'string' | 'choice'
+export type SettingRisk = 'low' | 'capacity' | 'compatibility' | 'service_disruption' | 'security'
+export type ApplyRequirement = 'immediate' | 'restart' | 'reimport'
+export type OperatorSettingScope = 'global' | 'provider' | 'group'
+
+export interface SettingDefinition {
+  key: string
+  label: string
+  description: string
+  valueKind: SettingValueKind
+  defaultValue: unknown
+  minimum?: number
+  maximum?: number
+  choices: string[]
+  unit?: string
+  operationalEffect: string
+  risk: SettingRisk
+  applyRequirement: ApplyRequirement
+  providerOverridable: boolean
+  groupOverridable: boolean
+}
+
+export type InheritanceSource =
+  | { scope: 'system_default' }
+  | { scope: 'global' }
+  | { scope: 'provider'; id: string }
+  | { scope: 'channel_group'; id: string }
+
+export interface EffectiveSetting {
+  definition: SettingDefinition
+  value: unknown
+  inheritedFrom: InheritanceSource
+}
+
+export interface EffectiveSettingsResponse {
+  providerId: string
+  groupId: string
+  settings: EffectiveSetting[]
+  applyRequirements: ApplyRequirement[]
+  etag: string
+}
+
+export type OperatorOverrideMap = Record<string, unknown>
+
+export interface OperatorOverridesResponse {
+  global: OperatorOverrideMap
+  providers: Record<string, OperatorOverrideMap>
+  groups: Record<string, OperatorOverrideMap>
+}
+
+export interface OperatorScopeResponse {
+  scope: OperatorSettingScope
+  scopeId: string
+  overrides: OperatorOverrideMap
+  revision: number
+}
+
+export interface OperatorRevisionResponse {
+  revision: number
+  actor: string
+  createdAt: string
+  beforeValue: unknown | null
+  afterValue: unknown
+}
+
+export interface ReplaceOperatorScopeInput {
+  overrides: OperatorOverrideMap
+  ifMatch?: string
+}
+
+export interface RollbackOperatorScopeInput {
+  revision: number
+}
+
 export interface IptvApiClient {
   getAuthStatus(): Promise<AuthStatus>
   login(input: LoginInput): Promise<AuthStatus>
@@ -554,6 +660,8 @@ export interface IptvApiClient {
   setAllGroupsEnabled(enabled: boolean): Promise<SaveResult>
   getProgrammes(query?: ProgrammeQuery): Promise<ProgrammePage>
   reconcileEpg(): Promise<EpgReconcileResult>
+  listReconciliationRevisions(sourceId: string): Promise<ReconciliationRevision[]>
+  rollbackReconciliation(sourceId: string, input: ReconciliationRollbackInput): Promise<ReconciliationRollbackResult>
   getEpgMappings(reviewStatus?: string, limit?: number, offset?: number): Promise<EpgMappingPage>
   getUnmappedChannels(search?: string, limit?: number, offset?: number): Promise<UnmappedChannelPage>
   getReviewCandidates(channelId: string): Promise<ReviewCandidate[]>
@@ -564,6 +672,7 @@ export interface IptvApiClient {
   getEvents(): Promise<EventChannel[]>
   getEventTemplates(): Promise<EventTemplate[]>
   createEventTemplate(input: CreateEventTemplateInput): Promise<EventTemplate>
+  updateEventTemplate(id: string, input: UpdateEventTemplateInput): Promise<EventTemplate>
   deleteEventTemplate(id: string): Promise<void>
   getEventChannels(templateId?: string): Promise<EventChannel[]>
   scanEventTemplate(id: string): Promise<SaveResult>
@@ -600,4 +709,11 @@ export interface IptvApiClient {
   deleteStreamProfile(id: string): Promise<void>
   assignStreamProfile(channelId: string, profileId: string): Promise<void>
   removeStreamProfile(channelId: string): Promise<void>
+  getSettingSchema(): Promise<SettingDefinition[]>
+  getEffectiveSettings(providerId?: string, groupId?: string): Promise<EffectiveSettingsResponse>
+  getOperatorOverrides(): Promise<OperatorOverridesResponse>
+  getOperatorScope(scope: OperatorSettingScope, scopeId: string): Promise<OperatorScopeResponse>
+  replaceOperatorScope(scope: OperatorSettingScope, scopeId: string, input: ReplaceOperatorScopeInput): Promise<OperatorScopeResponse>
+  listOperatorRevisions(scope: OperatorSettingScope, scopeId: string): Promise<OperatorRevisionResponse[]>
+  rollbackOperatorScope(scope: OperatorSettingScope, scopeId: string, input: RollbackOperatorScopeInput): Promise<OperatorScopeResponse>
 }

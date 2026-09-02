@@ -21,16 +21,14 @@ interface CreatedSource {
 
 const workspaceRoot = resolve(fileURLToPath(new URL('.', import.meta.url)), '../../..')
 const adminUsername = process.env.IPTV_ADMIN_USERNAME ?? 'operator'
-const adminPassword = requiredEnvironment('IPTV_ADMIN_PASSWORD')
-const m3uUrl = requiredEnvironment('IPTV_TEST_M3U_URL')
-const xmltvUrl = requiredEnvironment('IPTV_TEST_XMLTV_URL')
-const secrets = [adminPassword, m3uUrl, xmltvUrl]
-
-function requiredEnvironment(name: string) {
-  const value = process.env[name]?.trim()
-  if (!value) throw new Error(`${name} must be set in the root .env file.`)
-  return value
-}
+// Read the credentials lazily so the spec file loads without credentials.
+// The test skips when the credentialed flag is off or when credentials are
+// missing. This keeps the credentialed live-source run explicit and prevents
+// the file load from crashing the non-credentialed Playwright suite.
+const adminPassword = process.env.IPTV_ADMIN_PASSWORD ?? ''
+const m3uUrl = process.env.IPTV_TEST_M3U_URL ?? ''
+const xmltvUrl = process.env.IPTV_TEST_XMLTV_URL ?? ''
+const secrets = [adminPassword, m3uUrl, xmltvUrl].filter(Boolean)
 
 function safeUrl(value: string) {
   try {
@@ -212,6 +210,10 @@ async function expectManagementPage(page: Page, path: string, heading: string) {
 
 test('operator can add and activate real M3U and XMLTV sources', async ({ context, page }, testInfo) => {
   test.skip(process.env.IPTV_E2E_REAL_SOURCES !== 'true', 'Set IPTV_E2E_REAL_SOURCES=true to run this long real-source test.')
+  if (!adminPassword || !m3uUrl || !xmltvUrl) {
+    test.skip(true, 'Set IPTV_ADMIN_PASSWORD, IPTV_TEST_M3U_URL, and IPTV_TEST_XMLTV_URL to run this credentialed test.')
+    return
+  }
   const runId = `${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
   const requestedSources = [
     { endpoint: m3uUrl, kind: 'M3U' as const, name: `E2E M3U ${runId}` },

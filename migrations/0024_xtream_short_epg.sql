@@ -18,6 +18,10 @@ ALTER TABLE epg_channels
     ADD COLUMN IF NOT EXISTS provider_account_id uuid
     REFERENCES provider_accounts(id) ON DELETE CASCADE;
 
+-- Xtream short EPG channels are owned by the provider account, so the
+-- original epg_source_id column must accept NULL for those rows.
+ALTER TABLE epg_channels ALTER COLUMN epg_source_id DROP NOT NULL;
+
 DO $$
 BEGIN
     IF NOT EXISTS (

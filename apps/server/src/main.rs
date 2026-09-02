@@ -1203,6 +1203,7 @@ mod tests {
         authentication_requests: AtomicUsize,
         category_requests: AtomicUsize,
         stream_requests: AtomicUsize,
+        short_epg_requests: AtomicUsize,
     }
 
     impl XtreamFixtureState {
@@ -1220,6 +1221,10 @@ mod tests {
                 self.category_requests.load(Ordering::SeqCst),
                 self.stream_requests.load(Ordering::SeqCst),
             )
+        }
+
+        fn short_epg_requests(&self) -> usize {
+            self.short_epg_requests.load(Ordering::SeqCst)
         }
     }
 
@@ -1281,12 +1286,36 @@ mod tests {
                 ]))
                 .into_response()
             }
+            Some("get_short_epg") => {
+                state.short_epg_requests.fetch_add(1, Ordering::SeqCst);
+                // The live-stream fixture exposes stream_id 7 with
+                // epg_channel_id "worker-epg-7". Return one programme whose
+                // channel_id matches that tvg-id so the catalog tvg-id
+                // reconciliation pass links the short EPG channel to the
+                // canonical channel that the live-stream snapshot produced.
+                Json(serde_json::json!({
+                    "epg_listings": [
+                        {
+                            "id": "short-epg-1",
+                            "epg_id": "worker-epg-7",
+                            "title": "QnJvbmNvcyB2cyBDaGllZnM=",
+                            "description": "TGl2ZSBmcm9tIERlbnZlcg==",
+                            "lang": "en",
+                            "start": "2026-09-14T00:20:00Z",
+                            "end": "2026-09-14T03:30:00Z",
+                            "channel_id": "worker-epg-7",
+                            "event_id": "short-epg-game-1"
+                        }
+                    ]
+                }))
+                .into_response()
+            }
             Some(_) => StatusCode::BAD_REQUEST.into_response(),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn process_source_refresh_job(
+    async fn process_refresh_job(
         pool: &sqlx::PgPool,
         jobs: &JobRepository,
         sources: &SourceRepository,
@@ -1300,14 +1329,14 @@ mod tests {
             .bind(job_id)
             .execute(pool)
             .await
-            .expect("set source job max attempts");
+            .expect("set job max attempts");
         force_running(pool, job_id, worker_id).await;
         let job = fetch_job(pool, job_id).await;
         process_job(
             jobs, sources, snapshots, catalog, master_key, worker_id, job,
         )
         .await
-        .expect("process source refresh job");
+        .expect("process refresh job");
     }
 
     #[tokio::test]
@@ -2415,7 +2444,7 @@ mod tests {
             .await
             .expect("create Xtream source");
         let source_id = source.source.id;
-        process_source_refresh_job(
+        process_refresh_job(
             &pool,
             &jobs,
             &sources,
@@ -2502,7 +2531,7 @@ mod tests {
             ))
             .await
             .expect("enqueue renamed Xtream refresh");
-        process_source_refresh_job(
+        process_refresh_job(
             &pool,
             &jobs,
             &sources,
@@ -2544,7 +2573,7 @@ mod tests {
             ))
             .await
             .expect("enqueue Xtream authentication failure");
-        process_source_refresh_job(
+        process_refresh_job(
             &pool,
             &jobs,
             &sources,
@@ -2574,7 +2603,7 @@ mod tests {
             ))
             .await
             .expect("enqueue Xtream empty stream refresh");
-        process_source_refresh_job(
+        process_refresh_job(
             &pool,
             &jobs,
             &sources,
@@ -2973,5 +3002,222 @@ mod tests {
             .expect_err("checkpoint reports cancellation");
         assert!(matches!(error, IngestError::Cancelled));
         delete_job(&pool, job.id).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn process_job_refreshes_xtream_short_epg_and_reconciles_catalog() {
+        let Some((admin, database, schema)) = isolated_integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind Xtream short EPG fixture");
+        let address = listener
+            .local_addr()
+            .expect("Xtream short EPG fixture address");
+        let fixture = Arc::new(XtreamFixtureState::default());
+        fixture.set_phase(XTREAM_PHASE_INITIAL);
+        let fixture_server = tokio::spawn({
+            let fixture = Arc::clone(&fixture);
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/player_api.php", get(xtream_fixture_response))
+                        .with_state(fixture),
+                )
+                .await
+                .expect("serve Xtream short EPG fixture");
+            }
+        });
+
+        let pool = database.pool().clone();
+        let master_key = MasterKey::from_bytes([11_u8; 32]);
+        let jobs = JobRepository::new(pool.clone());
+        let sources = SourceRepository::new(pool.clone(), master_key.clone());
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let worker_id = "test-worker-xtream-short-epg";
+        let created = sources
+            .create(
+                &iptv_persistence::NewSource {
+                    name: format!("Xtream short EPG test {}", Uuid::now_v7()),
+                    kind: SourceKind::Xtream,
+                    endpoint: format!(
+                        "http://{address}/player_api.php?username=worker-user-canary&password=worker-password-canary&access_token=source-access-token-canary"
+                    ),
+                },
+                "coverage-test",
+            )
+            .await
+            .expect("create Xtream source for short EPG test");
+        let source_id = created.source.id;
+
+        // Process the initial refresh-source job. A successful Xtream refresh
+        // must enqueue one refresh-xtream-short-epg job for the same source.
+        process_refresh_job(
+            &pool,
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            created.refresh_job.id,
+        )
+        .await;
+        assert_eq!(
+            job_status(&pool, created.refresh_job.id).await,
+            "succeeded",
+            "Xtream refresh failed: {:?}",
+            job_last_error(&pool, created.refresh_job.id).await
+        );
+        assert_eq!(fixture.request_counts(), (1, 1, 1));
+
+        // The successful Xtream refresh must queue exactly one short EPG job.
+        let short_epg_job: JobRecord = sqlx::query_as::<_, JobRecord>(
+            "SELECT * FROM jobs \
+             WHERE kind = 'refresh-xtream-short-epg' \
+               AND payload->>'sourceId' = $1 \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1",
+        )
+        .bind(source_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("short EPG job was enqueued after Xtream refresh");
+        assert_eq!(short_epg_job.status, "queued");
+        let short_epg_job_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs \
+             WHERE kind = 'refresh-xtream-short-epg' \
+               AND payload->>'sourceId' = $1",
+        )
+        .bind(source_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("count short EPG jobs");
+        assert_eq!(short_epg_job_count, 1);
+
+        // Process the queued short EPG job. This exercises the full
+        // refresh-xtream-short-epg handler end to end against the database.
+        sqlx::query("UPDATE jobs SET max_attempts = 1 WHERE id = $1")
+            .bind(short_epg_job.id)
+            .execute(&pool)
+            .await
+            .expect("set short EPG job max attempts");
+        force_running(&pool, short_epg_job.id, worker_id).await;
+        let short_epg_record = fetch_job(&pool, short_epg_job.id).await;
+        if let Err(error) = process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &master_key,
+            worker_id,
+            short_epg_record,
+        )
+        .await
+        {
+            panic!("process_job failed for short EPG: {error:?}");
+        }
+        assert_eq!(
+            job_status(&pool, short_epg_job.id).await,
+            "succeeded",
+            "short EPG refresh failed: {:?}",
+            job_last_error(&pool, short_epg_job.id).await
+        );
+        assert!(
+            fixture.short_epg_requests() >= 1,
+            "short EPG fixture received no requests"
+        );
+
+        // The short EPG snapshot must be active and owned by the provider
+        // account that the live-stream snapshot also owns.
+        let short_epg_snapshot: (Uuid, String, String, Option<Uuid>) = sqlx::query_as(
+            "SELECT id, kind, status, provider_account_id \
+             FROM source_snapshots \
+             WHERE provider_account_id = $1 AND kind = 'xtream-epg' AND status = 'active'",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch active short EPG snapshot");
+        assert_eq!(short_epg_snapshot.1, "xtream-epg");
+        assert_eq!(short_epg_snapshot.2, "active");
+        assert_eq!(short_epg_snapshot.3, Some(source_id));
+        let short_epg_snapshot_id = short_epg_snapshot.0;
+        let active_short_epg_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM source_snapshots \
+             WHERE provider_account_id = $1 AND kind = 'xtream-epg' AND status = 'active'",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count active short EPG snapshots");
+        assert_eq!(active_short_epg_count, 1);
+
+        // The short EPG snapshot must stage one EPG channel and one programme.
+        let epg_channel_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM epg_channels WHERE source_snapshot_id = $1")
+                .bind(short_epg_snapshot_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count short EPG channels");
+        assert_eq!(epg_channel_count, 1);
+        let programme_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM programmes WHERE source_snapshot_id = $1")
+                .bind(short_epg_snapshot_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count short EPG programmes");
+        assert_eq!(programme_count, 1);
+        let programme_title: String =
+            sqlx::query_scalar("SELECT title FROM programmes WHERE source_snapshot_id = $1")
+                .bind(short_epg_snapshot_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch short EPG programme title");
+        assert_eq!(programme_title, "Broncos vs Chiefs");
+
+        // The EPG reconciliation must link the short EPG channel to the
+        // canonical channel that the live-stream snapshot produced. The
+        // live-stream fixture exposes epg_channel_id "worker-epg-7", which
+        // becomes the canonical key. The short EPG fixture reuses that
+        // channel_id so the tvg-id pass applies the mapping.
+        let channel_id: Uuid = sqlx::query_scalar(
+            "SELECT c.id FROM channels c \
+             WHERE c.provider_account_id = $1 AND c.canonical_key = 'worker-epg-7'",
+        )
+        .bind(source_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch canonical Xtream channel");
+        let mapping_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM channel_epg_mappings WHERE channel_id = $1")
+                .bind(channel_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count EPG mappings for canonical channel");
+        assert!(
+            mapping_count >= 1,
+            "short EPG reconciliation did not map the canonical channel"
+        );
+        let mapped_programmes = catalog
+            .list_programmes_for_channels(&[channel_id])
+            .await
+            .expect("list programmes for mapped channel");
+        assert!(
+            mapped_programmes
+                .iter()
+                .any(|programme| programme.title == "Broncos vs Chiefs"),
+            "mapped channel did not expose the short EPG programme"
+        );
+
+        delete_source(&pool, source_id).await;
+        fixture_server.abort();
+        drop(database);
+        drop_isolated_schema(&admin, &schema).await;
     }
 }

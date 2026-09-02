@@ -18,6 +18,7 @@ import { Route as EventsRouteImport } from './routes/events'
 import { Route as GroupsRouteImport } from './routes/groups'
 import { Route as JellyfinRouteImport } from './routes/jellyfin'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as OperatorSettingsRouteImport } from './routes/operator-settings'
 import { Route as RecordingsRouteImport } from './routes/recordings'
 import { Route as SessionsRouteImport } from './routes/sessions'
 import { Route as SourcesRouteImport } from './routes/sources'
@@ -71,6 +72,11 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
+const OperatorSettingsRoute = OperatorSettingsRouteImport.update({
+  id: '/operator-settings',
+  path: '/operator-settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const RecordingsRoute = RecordingsRouteImport.update({
   id: '/recordings',
   path: '/recordings',
@@ -117,6 +123,7 @@ export interface FileRoutesByFullPath {
   '/groups': typeof GroupsRoute
   '/jellyfin': typeof JellyfinRoute
   '/login': typeof LoginRoute
+  '/operator-settings': typeof OperatorSettingsRoute
   '/recordings': typeof RecordingsRoute
   '/sessions': typeof SessionsRoute
   '/sources': typeof SourcesRoute
@@ -135,6 +142,7 @@ export interface FileRoutesByTo {
   '/groups': typeof GroupsRoute
   '/jellyfin': typeof JellyfinRoute
   '/login': typeof LoginRoute
+  '/operator-settings': typeof OperatorSettingsRoute
   '/recordings': typeof RecordingsRoute
   '/sessions': typeof SessionsRoute
   '/sources': typeof SourcesRoute
@@ -154,6 +162,7 @@ export interface FileRoutesById {
   '/groups': typeof GroupsRoute
   '/jellyfin': typeof JellyfinRoute
   '/login': typeof LoginRoute
+  '/operator-settings': typeof OperatorSettingsRoute
   '/recordings': typeof RecordingsRoute
   '/sessions': typeof SessionsRoute
   '/sources': typeof SourcesRoute
@@ -174,6 +183,7 @@ export interface FileRouteTypes {
     | '/groups'
     | '/jellyfin'
     | '/login'
+    | '/operator-settings'
     | '/recordings'
     | '/sessions'
     | '/sources'
@@ -192,6 +202,7 @@ export interface FileRouteTypes {
     | '/groups'
     | '/jellyfin'
     | '/login'
+    | '/operator-settings'
     | '/recordings'
     | '/sessions'
     | '/sources'
@@ -210,6 +221,7 @@ export interface FileRouteTypes {
     | '/groups'
     | '/jellyfin'
     | '/login'
+    | '/operator-settings'
     | '/recordings'
     | '/sessions'
     | '/sources'
@@ -229,6 +241,7 @@ export interface RootRouteChildren {
   GroupsRoute: typeof GroupsRoute
   JellyfinRoute: typeof JellyfinRoute
   LoginRoute: typeof LoginRoute
+  OperatorSettingsRoute: typeof OperatorSettingsRoute
   RecordingsRoute: typeof RecordingsRoute
   SessionsRoute: typeof SessionsRoute
   SourcesRoute: typeof SourcesRoute
@@ -303,6 +316,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/operator-settings': {
+      id: '/operator-settings'
+      path: '/operator-settings'
+      fullPath: '/operator-settings'
+      preLoaderRoute: typeof OperatorSettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/recordings': {
       id: '/recordings'
       path: '/recordings'
@@ -365,6 +385,7 @@ const rootRouteChildren: RootRouteChildren = {
   GroupsRoute: GroupsRoute,
   JellyfinRoute: JellyfinRoute,
   LoginRoute: LoginRoute,
+  OperatorSettingsRoute: OperatorSettingsRoute,
   RecordingsRoute: RecordingsRoute,
   SessionsRoute: SessionsRoute,
   SourcesRoute: SourcesRoute,

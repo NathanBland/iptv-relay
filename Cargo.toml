@@ -58,7 +58,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2.5", features = ["serde"] }
 utoipa = { version = "5.4", features = ["axum_extras", "chrono", "uuid"] }
-uuid = { version = "1.18", features = ["serde", "v4", "v7"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5", "v7"] }
 xz2 = "0.1"
 zip = { version = "4.6", default-features = false, features = ["deflate"] }
 

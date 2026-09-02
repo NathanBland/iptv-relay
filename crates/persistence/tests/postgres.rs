@@ -3,11 +3,11 @@ use iptv_persistence::{
     CatalogRepository, CreateChannelAliasInput, CreateEventTemplate, CreateRecordingInput,
     CreateRecordingRuleInput, CreateStreamProfileInput, CreateUserInput, Database,
     ENVIRONMENT_OUTPUT_PROFILE_ID, ENVIRONMENT_OUTPUT_PROFILE_NAME, EventTemplateQuery,
-    JobRepository, MasterKey, NewJob, NewSource, OutputProfileTokenHash, PersistenceError,
-    ProgrammeQuery, SourceKind, SourceRepository, SourceUpdate, StreamHealthUpdate,
-    UpdateUserInput,
+    EventTemplateUpdate, JobRepository, MasterKey, NewJob, NewSource, OperatorSettingOverrides,
+    OutputProfileTokenHash, PersistenceError, ProgrammeQuery, SourceKind, SourceRepository,
+    SourceUpdate, StreamHealthUpdate, UpdateUserInput,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn database_url() -> Option<String> {
     std::env::var("IPTV_TEST_DATABASE_URL").ok()
@@ -2391,6 +2391,101 @@ async fn event_template_and_channel_lifecycle_work() {
 }
 
 #[tokio::test]
+async fn event_template_partial_update_persists_enabled_and_optional_fields() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let catalog = CatalogRepository::new(database.pool().clone());
+    let suffix = uuid::Uuid::now_v7();
+    let template = catalog
+        .create_event_template(CreateEventTemplate {
+            name: format!("partial-{suffix}"),
+            display_name: "Partial league".to_owned(),
+            match_regex: format!("Partial {suffix}"),
+            channel_name_format: "{home} vs {away}".to_owned(),
+            group_name: format!("Partial group {suffix}"),
+            event_duration_hours: 3,
+            past_date_grace_hours: 4,
+            future_date_days: 2,
+        })
+        .await
+        .unwrap();
+    assert!(template.enabled);
+
+    // Disable the template and change only the duration.
+    let disabled = catalog
+        .update_event_template_partial(
+            template.id,
+            &EventTemplateUpdate {
+                enabled: Some(false),
+                event_duration_hours: Some(6),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.event_duration_hours, 6);
+    // Omitted fields keep their stored values.
+    assert_eq!(disabled.display_name, "Partial league");
+    assert_eq!(disabled.past_date_grace_hours, 4);
+    assert_eq!(disabled.future_date_days, 2);
+
+    // The disabled template no longer appears in the enabled-only listing.
+    let enabled_list = catalog
+        .list_event_templates(EventTemplateQuery { enabled_only: true })
+        .await
+        .unwrap();
+    assert!(enabled_list.iter().all(|row| row.id != template.id));
+
+    // Empty update leaves all fields unchanged.
+    let unchanged = catalog
+        .update_event_template_partial(template.id, &EventTemplateUpdate::default())
+        .await
+        .unwrap();
+    assert!(!unchanged.enabled);
+    assert_eq!(unchanged.event_duration_hours, 6);
+
+    // Re-enable and rename in one partial update.
+    let reenabled = catalog
+        .update_event_template_partial(
+            template.id,
+            &EventTemplateUpdate {
+                enabled: Some(true),
+                display_name: Some("Renamed league".to_owned()),
+                future_date_days: Some(9),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(reenabled.enabled);
+    assert_eq!(reenabled.display_name, "Renamed league");
+    assert_eq!(reenabled.future_date_days, 9);
+
+    // Unknown ID returns SourceNotFound.
+    assert!(matches!(
+        catalog
+            .update_event_template_partial(
+                uuid::Uuid::now_v7(),
+                &EventTemplateUpdate {
+                    enabled: Some(false),
+                    ..Default::default()
+                }
+            )
+            .await,
+        Err(PersistenceError::SourceNotFound(_))
+    ));
+
+    assert_eq!(catalog.delete_event_template(template.id).await.unwrap(), 1);
+    drop(catalog);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn event_scan_persists_idempotent_non_overlapping_generated_guides() {
     let Some(database_url) = database_url() else {
@@ -3090,4 +3185,1005 @@ async fn catalog_lineup_and_remaining_read_queries_work() {
     drop(pool);
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn operator_settings_persist_precedence_revisions_and_rollback() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let catalog = CatalogRepository::new(database.pool().clone());
+
+    // Global override.
+    let mut global = std::collections::BTreeMap::new();
+    global.insert("media.ring.duration_seconds".to_owned(), json!(12));
+    let stored = catalog
+        .replace_operator_setting_scope("global", "", &global, None, "operator")
+        .await
+        .unwrap();
+    assert_eq!(stored.revision, 1);
+    assert_eq!(stored.values["media.ring.duration_seconds"], json!(12));
+
+    // Provider override (provider wins over global for the same key).
+    let mut provider = std::collections::BTreeMap::new();
+    provider.insert("media.ring.duration_seconds".to_owned(), json!(16));
+    let stored = catalog
+        .replace_operator_setting_scope("provider", "provider-a", &provider, None, "operator")
+        .await
+        .unwrap();
+    assert_eq!(stored.revision, 1);
+
+    // Group override (group wins over provider and global).
+    let mut group = std::collections::BTreeMap::new();
+    group.insert("events.inferred_duration_seconds".to_owned(), json!(9000));
+    catalog
+        .replace_operator_setting_scope("group", "sports", &group, None, "operator")
+        .await
+        .unwrap();
+
+    // Load all overrides and verify the domain precedence map.
+    let overrides: OperatorSettingOverrides =
+        catalog.load_operator_setting_overrides().await.unwrap();
+    assert_eq!(overrides.global["media.ring.duration_seconds"], json!(12));
+    assert_eq!(
+        overrides.providers["provider-a"]["media.ring.duration_seconds"],
+        json!(16)
+    );
+    assert_eq!(
+        overrides.groups["sports"]["events.inferred_duration_seconds"],
+        json!(9000)
+    );
+    let domain = overrides.to_domain("provider-a", "sports");
+    assert_eq!(domain.global["media.ring.duration_seconds"], json!(12));
+    assert_eq!(domain.provider["media.ring.duration_seconds"], json!(16));
+    assert_eq!(
+        domain.group["events.inferred_duration_seconds"],
+        json!(9000)
+    );
+
+    // Stale expected revision returns a conflict and leaves data unchanged.
+    let mut next = std::collections::BTreeMap::new();
+    next.insert("media.ring.duration_seconds".to_owned(), json!(20));
+    let conflict = catalog
+        .replace_operator_setting_scope("global", "", &next, Some(99), "operator")
+        .await;
+    assert!(matches!(
+        conflict,
+        Err(PersistenceError::SettingRevisionConflict {
+            expected: 99,
+            actual: 1
+        })
+    ));
+    let still = catalog
+        .load_operator_setting_scope("global", "")
+        .await
+        .unwrap();
+    assert_eq!(still.revision, 1);
+    assert_eq!(still.values["media.ring.duration_seconds"], json!(12));
+
+    // Fresh expected revision succeeds and bumps to 2.
+    let stored = catalog
+        .replace_operator_setting_scope("global", "", &next, Some(1), "operator")
+        .await
+        .unwrap();
+    assert_eq!(stored.revision, 2);
+    assert_eq!(stored.values["media.ring.duration_seconds"], json!(20));
+
+    // Revision history is recorded newest first.
+    let revisions = catalog
+        .list_operator_setting_revisions("global", "")
+        .await
+        .unwrap();
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(revisions[0].revision, 2);
+    assert_eq!(revisions[1].revision, 1);
+    let before: Value = revisions[0].before_value.clone().unwrap();
+    assert_eq!(
+        before["overrides"]["media.ring.duration_seconds"],
+        json!(12)
+    );
+    assert_eq!(
+        revisions[0].after_value["media.ring.duration_seconds"],
+        json!(20)
+    );
+
+    // Rollback to revision 1 restores the earlier value and bumps to 3.
+    let restored = catalog
+        .rollback_operator_setting_scope("global", "", 1, "operator")
+        .await
+        .unwrap();
+    assert_eq!(restored.revision, 3);
+    assert_eq!(restored.values["media.ring.duration_seconds"], json!(12));
+
+    // Rollback to a missing revision returns not found.
+    let missing = catalog
+        .rollback_operator_setting_scope("global", "", 99, "operator")
+        .await;
+    assert!(matches!(
+        missing,
+        Err(PersistenceError::SettingRevisionNotFound { target: 99, .. })
+    ));
+
+    drop(catalog);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn operator_settings_scope_revision_survives_empty_override_set() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let catalog = CatalogRepository::new(database.pool().clone());
+
+    // Seed one override so the scope has a recorded revision.
+    let mut first = std::collections::BTreeMap::new();
+    first.insert("media.ring.duration_seconds".to_owned(), json!(12));
+    let stored = catalog
+        .replace_operator_setting_scope("global", "", &first, None, "operator")
+        .await
+        .unwrap();
+    assert_eq!(stored.revision, 1);
+
+    // Clear the scope. The revisions table keeps revision 2 even though the
+    // override rows are deleted.
+    let cleared = catalog
+        .replace_operator_setting_scope(
+            "global",
+            "",
+            &std::collections::BTreeMap::new(),
+            Some(1),
+            "operator",
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.revision, 2);
+    assert!(cleared.values.is_empty());
+
+    // The load path must read revision 2 from revisions, not 0 from the empty
+    // override set. The returned ETag must match the write.
+    let loaded = catalog
+        .load_operator_setting_scope("global", "")
+        .await
+        .unwrap();
+    assert_eq!(loaded.revision, 2);
+    assert!(loaded.values.is_empty());
+
+    // A fresh If-Match write with the loaded revision must succeed and bump
+    // the revision to 3.
+    let mut next = std::collections::BTreeMap::new();
+    next.insert("media.ring.duration_seconds".to_owned(), json!(30));
+    let stored = catalog
+        .replace_operator_setting_scope("global", "", &next, Some(2), "operator")
+        .await
+        .unwrap();
+    assert_eq!(stored.revision, 3);
+    assert_eq!(stored.values["media.ring.duration_seconds"], json!(30));
+
+    drop(catalog);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn reconcile_epg_mappings_are_stable_across_input_permutations() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+
+    // Seed one provider account with one channel whose normalized name matches
+    // two EPG channels. The ambiguous match must populate review_candidates
+    // deterministically regardless of the EPG channel insertion order.
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("Permutation account {suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, channel_number, url_template, attributes, directives, supported) VALUES ($1, $2, $3, 'sports', 'Denver Sports Network', NULL, '4.1', 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(snapshot_id)
+    .bind(account_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+
+    // Seed an active XMLTV snapshot with two EPG channels that share the same
+    // normalized display name. Insert them in one order and capture the
+    // review candidate set.
+    let epg_source_id = uuid::Uuid::now_v7();
+    let epg_snapshot_id = uuid::Uuid::now_v7();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO epg_sources (id, name, url_template, enabled) VALUES ($1, $2, 'https://guide.test/g.xml', true)")
+        .bind(epg_source_id)
+        .bind(format!("Permutation guide {suffix}"))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO source_snapshots (id, epg_source_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'xmltv', 'active', $3, 1, 2)")
+        .bind(epg_snapshot_id)
+        .bind(epg_source_id)
+        .bind(epg_snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let epg_a = uuid::Uuid::now_v7();
+    let epg_b = uuid::Uuid::now_v7();
+    for (id, xmltv) in [(epg_a, "denver-sports-a"), (epg_b, "denver-sports-b")] {
+        sqlx::query("INSERT INTO epg_channels (id, source_snapshot_id, epg_source_id, xmltv_id, display_names) VALUES ($1, $2, $3, $4, '[{\"value\":\"Denver Sports Network\"}]'::jsonb)")
+            .bind(id)
+            .bind(epg_snapshot_id)
+            .bind(epg_source_id)
+            .bind(xmltv)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+
+    catalog.reconcile_epg_mappings().await.unwrap();
+    let first_ids: Vec<uuid::Uuid> =
+        sqlx::query_scalar("SELECT epg_channel_id FROM review_candidates ORDER BY epg_channel_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+    // Clear the review candidates and EPG channels, then re-insert the same
+    // two EPG channels in the reverse order. The review candidate set must be
+    // identical because the SQL aggregation orders by epg_channel_id.
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM review_candidates")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM channel_epg_mappings USING channels WHERE channel_epg_mappings.channel_id = channels.id AND channels.provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM epg_channels WHERE source_snapshot_id = $1")
+        .bind(epg_snapshot_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    for (id, xmltv) in [(epg_b, "denver-sports-b"), (epg_a, "denver-sports-a")] {
+        sqlx::query("INSERT INTO epg_channels (id, source_snapshot_id, epg_source_id, xmltv_id, display_names) VALUES ($1, $2, $3, $4, '[{\"value\":\"Denver Sports Network\"}]'::jsonb)")
+            .bind(id)
+            .bind(epg_snapshot_id)
+            .bind(epg_source_id)
+            .bind(xmltv)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+
+    catalog.reconcile_epg_mappings().await.unwrap();
+    let second_ids: Vec<uuid::Uuid> =
+        sqlx::query_scalar("SELECT epg_channel_id FROM review_candidates ORDER BY epg_channel_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        first_ids, second_ids,
+        "review candidates must be stable across input permutations"
+    );
+    assert_eq!(first_ids.len(), 2);
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM channel_epg_mappings USING channels WHERE channel_epg_mappings.channel_id = channels.id AND channels.provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM channels WHERE provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM epg_sources WHERE id = $1")
+        .bind(epg_source_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn reconcile_epg_mappings_preserve_manual_bindings() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+
+    // Seed one provider account with one stream that has no tvg-id so the
+    // automatic EPG reconcile cannot match it by tvg-id.
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("Manual binding account {suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, channel_number, url_template, attributes, directives, supported) VALUES ($1, $2, $3, 'manual', 'Manual Channel', NULL, '8.1', 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(snapshot_id)
+    .bind(account_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+
+    // Seed an active XMLTV snapshot with one EPG channel that does not match
+    // the channel name, so the automatic reconcile leaves the channel unmapped.
+    let epg_source_id = uuid::Uuid::now_v7();
+    let epg_snapshot_id = uuid::Uuid::now_v7();
+    let epg_channel_id = uuid::Uuid::now_v7();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO epg_sources (id, name, url_template, enabled) VALUES ($1, $2, 'https://guide.test/g.xml', true)")
+        .bind(epg_source_id)
+        .bind(format!("Manual binding guide {suffix}"))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO source_snapshots (id, epg_source_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'xmltv', 'active', $3, 1, 1)")
+        .bind(epg_snapshot_id)
+        .bind(epg_source_id)
+        .bind(epg_snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO epg_channels (id, source_snapshot_id, epg_source_id, xmltv_id, display_names) VALUES ($1, $2, $3, 'manual.target', '[{\"value\":\"Target EPG Channel\"}]'::jsonb)")
+        .bind(epg_channel_id)
+        .bind(epg_snapshot_id)
+        .bind(epg_source_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    // Resolve the canonical channel id and set a manual binding.
+    let channel_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM channels WHERE provider_account_id = $1 AND managed_by = 'automatic' LIMIT 1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    catalog
+        .set_manual_epg_mapping(channel_id, epg_channel_id, "integration-test")
+        .await
+        .unwrap();
+
+    // Run the automatic EPG reconcile. The manual binding must survive.
+    let stats = catalog.reconcile_epg_mappings().await.unwrap();
+    let mappings = catalog
+        .list_epg_mappings(Some("manual"), 100, 0)
+        .await
+        .unwrap();
+    let manual = mappings
+        .items
+        .iter()
+        .find(|row| row.channel_id == channel_id)
+        .expect("manual mapping must survive reconciliation");
+    assert_eq!(manual.review_status, "manual");
+    assert_eq!(manual.epg_channel_id, epg_channel_id);
+    // The automatic reconcile must not have applied a competing mapping.
+    assert_eq!(stats.mappings_applied, 0);
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM channel_epg_mappings USING channels WHERE channel_epg_mappings.channel_id = channels.id AND channels.provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM channels WHERE provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM epg_sources WHERE id = $1")
+        .bind(epg_source_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn reconciliation_rollback_restores_channels_streams_and_epg_mappings() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+
+    // Seed one provider account with one supported stream.
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    let stream_id = uuid::Uuid::now_v7();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("Rollback account {suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, channel_number, url_template, attributes, directives, supported) VALUES ($1, $2, $3, 'news', 'News HD', 'news.tvg', '7.1', 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(stream_id)
+    .bind(snapshot_id)
+    .bind(account_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+
+    // First reconciliation records revision 1 and creates one channel with
+    // one stream link.
+    catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+    let channel_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM channels WHERE provider_account_id = $1 AND managed_by = 'automatic' LIMIT 1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Seed an EPG channel that matches by tvg-id and run the global EPG
+    // reconcile so the channel gets an automatic EPG mapping.
+    let epg_source_id = uuid::Uuid::now_v7();
+    let epg_snapshot_id = uuid::Uuid::now_v7();
+    let epg_channel_id = uuid::Uuid::now_v7();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO epg_sources (id, name, url_template, enabled) VALUES ($1, $2, 'https://guide.test/g.xml', true)")
+        .bind(epg_source_id)
+        .bind(format!("Rollback guide {suffix}"))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO source_snapshots (id, epg_source_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'xmltv', 'active', $3, 1, 1)")
+        .bind(epg_snapshot_id)
+        .bind(epg_source_id)
+        .bind(epg_snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO epg_channels (id, source_snapshot_id, epg_source_id, xmltv_id) VALUES ($1, $2, $3, 'news.tvg')")
+        .bind(epg_channel_id)
+        .bind(epg_snapshot_id)
+        .bind(epg_source_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    catalog.reconcile_epg_mappings().await.unwrap();
+
+    // Run a second per-account reconciliation so the EPG mapping is captured
+    // in a revision snapshot. Revision 1 held only the channel and stream
+    // link because the global EPG reconcile ran after it. Revision 2 captures
+    // the channel, stream link, and EPG mapping together.
+    catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+
+    let link_count_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM channel_streams cs JOIN channels c ON c.id = cs.channel_id WHERE c.provider_account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(link_count_before, 1);
+    let mapping_count_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM channel_epg_mappings cem JOIN channels c ON c.id = cem.channel_id WHERE c.provider_account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(mapping_count_before, 1);
+
+    // Revision 2 holds the full state. Roll back to it after a destructive
+    // third reconciliation removes the channel.
+    let revisions_before = catalog
+        .list_reconciliation_revisions(account_id)
+        .await
+        .unwrap();
+    assert_eq!(revisions_before.len(), 2);
+    let target_revision = revisions_before[0].revision;
+    assert_eq!(target_revision, 2);
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("UPDATE provider_streams SET supported = false WHERE id = $1")
+        .bind(stream_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+
+    // The third reconciliation removed the channel, stream link, and EPG
+    // mapping.
+    let channel_count_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM channels WHERE provider_account_id = $1 AND managed_by = 'automatic'",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(channel_count_after, 0);
+
+    // Rollback to revision 2 restores the channel, stream link, and EPG
+    // mapping captured at that revision.
+    let stats = catalog
+        .rollback_reconciliation(account_id, target_revision, "integration-test")
+        .await
+        .unwrap();
+    assert_eq!(stats.target_revision, target_revision);
+    assert_eq!(stats.channels_restored, 1);
+    assert_eq!(stats.stream_links_restored, 1);
+    assert_eq!(stats.epg_mappings_restored, 1);
+
+    let restored_channel_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM channels WHERE provider_account_id = $1 AND managed_by = 'automatic'",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(restored_channel_count, 1);
+    let restored_channel_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM channels WHERE provider_account_id = $1 AND managed_by = 'automatic' LIMIT 1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(restored_channel_id, channel_id, "channel id must be stable");
+
+    let restored_link_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM channel_streams cs JOIN channels c ON c.id = cs.channel_id WHERE c.provider_account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(restored_link_count, 1);
+
+    let restored_mapping_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM channel_epg_mappings cem JOIN channels c ON c.id = cem.channel_id WHERE c.provider_account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(restored_mapping_count, 1);
+
+    // Rollback to a missing revision returns the not-found error.
+    let missing = catalog
+        .rollback_reconciliation(account_id, 99, "integration-test")
+        .await;
+    assert!(matches!(
+        missing,
+        Err(PersistenceError::ReconciliationRevisionNotFound { target: 99, .. })
+    ));
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM channel_epg_mappings USING channels WHERE channel_epg_mappings.channel_id = channels.id AND channels.provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM channels WHERE provider_account_id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM epg_sources WHERE id = $1")
+        .bind(epg_source_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+/// Inserts one active Xtream live snapshot with two supported numeric streams.
+async fn seed_xtream_short_epg_streams(
+    pool: &sqlx::PgPool,
+    account_id: uuid::Uuid,
+    max_connections: i32,
+) -> uuid::Uuid {
+    sqlx::query("UPDATE provider_accounts SET max_connections = $2 WHERE id = $1")
+        .bind(account_id)
+        .bind(max_connections)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // Supersede any prior active xtream snapshot so the new active row does
+    // not violate the one-active-snapshot-per-kind index.
+    sqlx::query(
+        "UPDATE source_snapshots SET status = 'superseded', activated_at = coalesce(activated_at, now()) \
+         WHERE provider_account_id = $1 AND kind = 'xtream' AND status = 'active'",
+    )
+    .bind(account_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let snapshot_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO source_snapshots \
+         (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) \
+         VALUES ($1, $2, 'xtream', 'active', $3, 1, 2)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    for (stable_key, stream_id, tvg_id, channel_number) in [
+        ("sports-7", "7", "worker-epg-7", "7"),
+        ("sports-8", "8", "worker-epg-8", "8"),
+    ] {
+        sqlx::query(
+            "INSERT INTO provider_streams \
+             (id, snapshot_id, provider_account_id, stable_key, provider_stream_id, \
+              name, tvg_id, channel_number, url_template, attributes, directives, supported) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+                     'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(stable_key)
+        .bind(stream_id)
+        .bind(format!("Worker Sports {stream_id}"))
+        .bind(tvg_id)
+        .bind(channel_number)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    snapshot_id
+}
+
+#[tokio::test]
+async fn enqueue_xtream_short_epg_deduplicates_active_jobs() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([41_u8; 32]));
+    let jobs = JobRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+
+    let created = sources
+        .create(
+            &NewSource {
+                name: format!("Xtream short EPG dedup {suffix}"),
+                kind: SourceKind::Xtream,
+                endpoint: "https://provider.test/player_api.php?username=user&password=secret"
+                    .to_owned(),
+            },
+            "integration-test",
+        )
+        .await
+        .unwrap();
+    let source_id = created.source.id;
+    jobs.cancel(created.refresh_job.id).await.unwrap();
+
+    // The first enqueue creates one queued job.
+    let first = jobs
+        .enqueue_xtream_short_epg(source_id)
+        .await
+        .unwrap()
+        .expect("first enqueue creates a job");
+    assert_eq!(first.kind, "refresh-xtream-short-epg");
+    assert_eq!(first.status, "queued");
+
+    // A second enqueue while the first job is queued returns None and does
+    // not insert a duplicate row.
+    let second = jobs.enqueue_xtream_short_epg(source_id).await.unwrap();
+    assert!(second.is_none(), "duplicate enqueue must be suppressed");
+    let queued_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs \
+         WHERE kind = 'refresh-xtream-short-epg' \
+           AND payload->>'sourceId' = $1 \
+           AND status = 'queued'",
+    )
+    .bind(source_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued_count, 1, "only one queued short EPG job may exist");
+
+    // When the queued job transitions to running, the dedup guard still
+    // suppresses a new enqueue because running jobs are also active.
+    sqlx::query(
+        "UPDATE jobs SET status = 'running', locked_by = 'worker', locked_at = now() \
+         WHERE id = $1",
+    )
+    .bind(first.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let while_running = jobs.enqueue_xtream_short_epg(source_id).await.unwrap();
+    assert!(
+        while_running.is_none(),
+        "enqueue while running must be suppressed"
+    );
+
+    // When the running job completes, the dedup guard releases and a new
+    // enqueue creates a fresh queued job.
+    sqlx::query("UPDATE jobs SET status = 'succeeded', completed_at = now() WHERE id = $1")
+        .bind(first.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next = jobs
+        .enqueue_xtream_short_epg(source_id)
+        .await
+        .unwrap()
+        .expect("enqueue after completion creates a job");
+    assert_ne!(next.id, first.id);
+    let queued_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs \
+         WHERE kind = 'refresh-xtream-short-epg' \
+           AND payload->>'sourceId' = $1 \
+           AND status = 'queued'",
+    )
+    .bind(source_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        queued_count, 1,
+        "a fresh queued job replaces the completed one"
+    );
+
+    sources.delete(source_id, "integration-test").await.unwrap();
+    drop(jobs);
+    drop(sources);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn list_xtream_short_epg_streams_applies_bounded_capacity() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([42_u8; 32]));
+    let suffix = uuid::Uuid::now_v7();
+
+    let created = sources
+        .create(
+            &NewSource {
+                name: format!("Xtream short EPG bounds {suffix}"),
+                kind: SourceKind::Xtream,
+                endpoint: "https://provider.test/player_api.php?username=user&password=secret"
+                    .to_owned(),
+            },
+            "integration-test",
+        )
+        .await
+        .unwrap();
+    let source_id = created.source.id;
+    // Cancel the auto-enqueued refresh job so it does not interfere.
+    let auto_jobs: Vec<uuid::Uuid> = sqlx::query_as(
+        "SELECT id FROM jobs \
+         WHERE kind = 'refresh-source' AND payload->>'sourceId' = $1",
+    )
+    .bind(source_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(id,): (uuid::Uuid,)| id)
+    .collect();
+    for id in auto_jobs {
+        let _ = jobs_cancel(&pool, id).await;
+    }
+
+    // Seed two supported numeric streams under an account capacity of one.
+    seed_xtream_short_epg_streams(&pool, source_id, 1).await;
+
+    // The requested limit is clamped to the effective capacity of one, so
+    // only the first stream (ordered by channel number) is selected.
+    let selected = sources
+        .list_xtream_short_epg_streams(source_id, 16)
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.len(),
+        1,
+        "selection must obey the account capacity bound"
+    );
+    assert_eq!(selected[0].stream_id, 7);
+    assert_eq!(selected[0].channel_id, "worker-epg-7");
+
+    // A requested limit below the capacity is honored and clamped to the
+    // minimum of one, so the selection still returns one stream.
+    let small = sources
+        .list_xtream_short_epg_streams(source_id, 1)
+        .await
+        .unwrap();
+    assert_eq!(small.len(), 1);
+    assert_eq!(small[0].stream_id, 7);
+
+    // When the account capacity grows to two, both streams are selected up
+    // to the requested limit.
+    seed_xtream_short_epg_streams(&pool, source_id, 2).await;
+    let both = sources
+        .list_xtream_short_epg_streams(source_id, 16)
+        .await
+        .unwrap();
+    assert_eq!(
+        both.len(),
+        2,
+        "selection must return both streams when capacity allows"
+    );
+    assert_eq!(both[0].stream_id, 7);
+    assert_eq!(both[1].stream_id, 8);
+    // The channel_id falls back to the provider_stream_id when tvg_id is
+    // empty, so the helper must keep the tvg_id here.
+    assert_eq!(both[0].channel_id, "worker-epg-7");
+    assert_eq!(both[1].channel_id, "worker-epg-8");
+
+    // The selection excludes unsupported streams and non-numeric stream ids.
+    sqlx::query(
+        "UPDATE provider_streams SET supported = false \
+         WHERE provider_account_id = $1 AND provider_stream_id = '8'",
+    )
+    .bind(source_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let after_disable = sources
+        .list_xtream_short_epg_streams(source_id, 16)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_disable.len(),
+        1,
+        "unsupported streams must be excluded"
+    );
+    assert_eq!(after_disable[0].stream_id, 7);
+
+    sources.delete(source_id, "integration-test").await.unwrap();
+    drop(sources);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+async fn jobs_cancel(pool: &sqlx::PgPool, job_id: uuid::Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE jobs SET status = 'cancelled', completed_at = now() \
+         WHERE id = $1 AND status IN ('queued', 'running')",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
 }

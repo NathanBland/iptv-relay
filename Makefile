@@ -1,4 +1,4 @@
-.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-coverage-script postgres-test coverage coverage-rust coverage-web coverage-changed fuzz-smoke ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance dev
+.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-coverage-script postgres-test coverage coverage-rust coverage-web coverage-changed fuzz-smoke ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
 
 DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
 
@@ -35,6 +35,12 @@ test-web:
 test-e2e:
 	cd apps/web && CI=true pnpm run test:e2e
 
+# Run the non-credentialed Playwright suite. This excludes the @live data
+# acceptance tests and the credentialed real-source flow. The credentialed
+# live-source tests stay explicit through `test-e2e-real`.
+test-e2e-ci:
+	cd apps/web && CI=true pnpm exec playwright test --grep-invert="@live|real-source-flow"
+
 test-e2e-real:
 	cd apps/web && CI=true IPTV_E2E_REAL_SOURCES=true pnpm run test:e2e
 
@@ -68,7 +74,7 @@ fuzz-smoke:
 	cargo +nightly fuzz run xtream -- -max_total_time=60
 	cargo +nightly fuzz run events -- -max_total_time=60
 
-ci: fmt lint audit coverage test-coverage-script coverage-changed compose-config
+ci: fmt lint audit coverage test-coverage-script coverage-changed test-e2e-ci compose-config
 
 build:
 	cargo build --workspace --release
@@ -116,6 +122,25 @@ live-acceptance-gateway:
 	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from live-acceptance-gateway live-acceptance-gateway
 	docker-compose --env-file .env.test --profile test stop fake-provider
 	docker-compose --env-file .env.test --profile test rm -f live-acceptance-gateway
+
+scale-gate-build:
+	cargo build --release -p iptv-gateway --features scale-gate --bin scale-gate
+
+# Run the deterministic scale gate on the host. Activation is measured only
+# when IPTV_TEST_DATABASE_URL is set. Generated artifacts stay in a temp dir.
+scale-gate: scale-gate-build
+	./target/release/scale-gate
+
+# Quick deterministic smoke run with a tiny workload. Use it to verify the
+# gate runner logic without the full 1.16-million-entry fixture.
+scale-gate-smoke: scale-gate-build
+	SCALE_GATE_ENTRIES=1000 SCALE_GATE_CHANNELS=10 SCALE_GATE_PROGRAMMES=200 ./target/release/scale-gate
+
+# Run the deterministic scale gate on the pinned runner container. The
+# container activates each snapshot against the test PostgreSQL instance.
+scale-gate-pinned:
+	docker-compose --env-file .env.test build core
+	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from scale-gate scale-gate
 
 dev:
 	docker-compose up -d postgres web

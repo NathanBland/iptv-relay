@@ -7,13 +7,14 @@ import { EpgMappingsPage } from '@/pages/epg-mappings-page'
 import { EventsPage } from '@/pages/events-page'
 import { GroupsPage } from '@/pages/groups-page'
 import { OverviewPage } from '@/pages/overview-page'
+import { OperatorSettingsPage } from '@/pages/operator-settings-page'
 import { RecordingsPage } from '@/pages/recordings-page'
 import { SourcesPage } from '@/pages/sources-page'
 import { StreamHealthPage } from '@/pages/stream-health-page'
 import { StreamProfilesPage } from '@/pages/stream-profiles-page'
 import { TvGuidePage } from '@/pages/tv-guide-page'
 import { UsersPage } from '@/pages/users-page'
-import { MockIptvApiClient } from '@/lib/api/client'
+import { IptvApiError, MockIptvApiClient } from '@/lib/api/client'
 import { mockChannels, mockSources } from '@/lib/api/mock-data'
 import { renderWithQuery } from './test-utils'
 
@@ -45,6 +46,68 @@ describe('expanded management pages', () => {
     expect(screen.getByText('No event channels found. Scan provider streams to detect events.')).toBeInTheDocument()
     await userEvent.click(screen.getAllByRole('button', { name: 'Scan' })[0]!)
     await waitFor(() => expect(scan).toHaveBeenCalledWith('enabled'))
+  })
+
+  it('toggles event template enabled state through the partial PATCH control', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
+      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+    ])
+    vi.spyOn(client, 'getEventChannels').mockResolvedValue([])
+    const update = vi.spyOn(client, 'updateEventTemplate').mockResolvedValue({
+      id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: false,
+    })
+    renderWithQuery(<EventsPage client={client} />)
+    const disableButton = await screen.findByRole('button', { name: 'Disable NFL events' })
+    expect(disableButton).toHaveAttribute('aria-pressed', 'true')
+    await userEvent.click(disableButton)
+    await waitFor(() => expect(update).toHaveBeenCalledWith('enabled', { enabled: false }))
+  })
+
+  it('submits duration, grace, and future window fields from the manual event form', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getEventTemplates').mockResolvedValue([])
+    vi.spyOn(client, 'getEventChannels').mockResolvedValue([])
+    const create = vi.spyOn(client, 'createEventTemplate').mockResolvedValue({
+      id: 'new', name: 'nba', displayName: 'NBA Games', matchRegex: 'NBA.*vs.*', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 4, pastDateGraceHours: 2, futureDateDays: 5, enabled: true,
+    })
+    renderWithQuery(<EventsPage client={client} />)
+    await screen.findByText(/No event templates configured/)
+    await userEvent.click(screen.getByRole('button', { name: 'Configure templates' }))
+    await userEvent.type(screen.getByLabelText('Name'), 'nba')
+    await userEvent.type(screen.getByLabelText('Display name'), 'NBA Games')
+    await userEvent.type(screen.getByLabelText('Match regex'), 'NBA.*vs.*')
+    await userEvent.type(screen.getByLabelText('Channel name format'), '{event}')
+    await userEvent.clear(screen.getByLabelText('Duration (hours)'))
+    await userEvent.type(screen.getByLabelText('Duration (hours)'), '4')
+    await userEvent.clear(screen.getByLabelText('Past grace (hours)'))
+    await userEvent.type(screen.getByLabelText('Past grace (hours)'), '2')
+    await userEvent.clear(screen.getByLabelText('Future window (days)'))
+    await userEvent.type(screen.getByLabelText('Future window (days)'), '5')
+    await userEvent.click(screen.getByRole('button', { name: 'Create template' }))
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'nba', displayName: 'NBA Games', matchRegex: 'NBA.*vs.*', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 4, pastDateGraceHours: 2, futureDateDays: 5,
+    })))
+  })
+
+  it('renders event timestamps in the browser timezone instead of America/Denver', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getEventTemplates').mockResolvedValue([
+      { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, enabled: true },
+    ])
+    vi.spyOn(client, 'getEventChannels').mockResolvedValue([
+      { id: 'event-1', templateId: 'enabled', channelId: null, slotNumber: 1, eventTitle: 'Broncos game', eventStart: '2026-09-14T00:20:00Z', eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
+    ])
+    const toLocaleStringSpy = vi.spyOn(Date.prototype, 'toLocaleString')
+    renderWithQuery(<EventsPage client={client} />)
+    await screen.findByText('Broncos game')
+    const calls = toLocaleStringSpy.mock.calls
+    expect(calls.length).toBeGreaterThan(0)
+    // No call passes a hardcoded timeZone option. The browser timezone is used.
+    for (const [, options] of calls) {
+      expect(options).not.toEqual(expect.objectContaining({ timeZone: 'America/Denver' }))
+    }
+    toLocaleStringSpy.mockRestore()
   })
 
   it('filters and changes individual and bulk group states', async () => {
@@ -201,6 +264,43 @@ describe('expanded management pages', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Review' }))
     await userEvent.click(await screen.findByRole('button', { name: 'Reject all' }))
     await waitFor(() => expect(resolve).toHaveBeenCalledWith('review', false, undefined))
+  })
+
+  it('lists reconciliation revisions and rolls back a source', async () => {
+    const client = new MockIptvApiClient()
+    const listRevisions = vi.spyOn(client, 'listReconciliationRevisions').mockResolvedValue([
+      { revision: 2, actor: 'system', createdAt: '2026-08-20T12:02:00Z', beforeValue: null, afterValue: { channels: [] } },
+      { revision: 1, actor: 'system', createdAt: '2026-08-20T12:00:00Z', beforeValue: null, afterValue: { channels: [{ id: 'ch-1' }] } },
+    ])
+    const rollback = vi.spyOn(client, 'rollbackReconciliation').mockResolvedValue({
+      targetRevision: 1,
+      channelsRemoved: 1,
+      channelsRestored: 1,
+      streamLinksRestored: 1,
+      epgMappingsRestored: 1,
+    })
+
+    renderWithQuery(<EpgMappingsPage client={client} />)
+    await screen.findByRole('heading', { name: 'EPG Mappings' })
+
+    const sourceInput = screen.getByLabelText('Source id')
+    await userEvent.type(sourceInput, 'source-rollback')
+    await waitFor(() => expect(listRevisions).toHaveBeenCalledWith('source-rollback'))
+    expect(await screen.findByText('Revision 2')).toBeInTheDocument()
+
+    await userEvent.click(screen.getAllByRole('button', { name: /Roll back/ })[1]!)
+    await waitFor(() => expect(rollback).toHaveBeenCalledWith('source-rollback', { revision: 1 }))
+    expect(await screen.findByText(/Restored 1 channel/)).toBeInTheDocument()
+
+    // A missing revision surfaces the not-found error.
+    rollback.mockRejectedValueOnce(new IptvApiError({
+      type: 'urn:iptv:error:reconciliation-revision-not-found',
+      title: 'Reconciliation revision not found',
+      status: 404,
+      detail: 'The target revision does not exist for this source.',
+    }))
+    await userEvent.click(screen.getAllByRole('button', { name: /Roll back/ })[0]!)
+    expect(await screen.findByRole('alert')).toHaveTextContent('target revision does not exist')
   })
 
   it('searches and links unmapped channels to EPG channels', async () => {
@@ -472,5 +572,45 @@ describe('expanded management pages', () => {
     await waitFor(() => expect(update).toHaveBeenCalledWith('user-2', { enabled: true }))
     await userEvent.click(within(viewer).getAllByRole('button')[1]!)
     await waitFor(() => expect(remove).toHaveBeenCalledWith('user-2'))
+  })
+
+  it('renders effective settings with inheritance source and apply requirements', async () => {
+    const client = new MockIptvApiClient()
+    renderWithQuery(<OperatorSettingsPage client={client} />)
+    expect(await screen.findByRole('heading', { name: 'Operator settings' })).toBeInTheDocument()
+    expect(await screen.findByText('Live ring duration')).toBeInTheDocument()
+    expect(screen.getAllByText('System default').length).toBeGreaterThan(0)
+    expect(screen.getByText('Immediate')).toBeInTheDocument()
+    expect(screen.getByText('Reimport')).toBeInTheDocument()
+  })
+
+  it('saves global overrides, surfaces a stale ETag conflict, and rolls back', async () => {
+    const client = new MockIptvApiClient()
+    const replace = vi.spyOn(client, 'replaceOperatorScope')
+    const rollback = vi.spyOn(client, 'rollbackOperatorScope')
+    renderWithQuery(<OperatorSettingsPage client={client} />)
+    expect(await screen.findByRole('heading', { name: 'Operator settings' })).toBeInTheDocument()
+
+    // Wait for the global scope editor to load, then edit the ring duration.
+    const ringInput = await screen.findByLabelText('Live ring duration')
+    await userEvent.clear(ringInput)
+    await userEvent.type(ringInput, '14')
+    await userEvent.click(screen.getByRole('button', { name: 'Save overrides' }))
+    await waitFor(() => expect(replace).toHaveBeenCalledWith('global', '', expect.objectContaining({ overrides: expect.objectContaining({ 'media.ring.duration_seconds': 14 }) })))
+
+    // A stale If-Match (412) surfaces a conflict message.
+    replace.mockRejectedValueOnce(new IptvApiError({
+      type: 'urn:iptv:error:setting-revision-conflict',
+      title: 'Setting revision conflict',
+      status: 412,
+      detail: 'The stored revision does not match the supplied If-Match.',
+    }))
+    await userEvent.click(screen.getByRole('button', { name: 'Save overrides' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('stored revision changed')
+
+    // Roll back to revision 2 restores the earlier value.
+    rollback.mockResolvedValueOnce({ scope: 'global', scopeId: '', overrides: { 'media.ring.duration_seconds': 12 }, revision: 3 })
+    await userEvent.click(screen.getAllByRole('button', { name: /Roll back/ })[0]!)
+    await waitFor(() => expect(rollback).toHaveBeenCalledWith('global', '', { revision: 2 }))
   })
 })

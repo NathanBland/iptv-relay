@@ -1,0 +1,9 @@
+{
+  "measurements": {
+    "m3u_parse_seconds": 15.0,
+    "xmltv_parse_seconds": 10.0,
+    "m3u_activation_seconds": 90.0,
+    "xmltv_activation_seconds": 45.0,
+    "peak_rss_mib": 512.0
+  }
+}

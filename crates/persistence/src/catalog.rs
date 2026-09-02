@@ -10,7 +10,7 @@ use iptv_parsers::{
     CompiledEventRules, EventCandidate, EventGuideInput, GeneratedProgramme,
     GeneratedProgrammeKind, generate_event_schedule,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool};
 use std::{collections::BTreeMap, fmt};
@@ -89,9 +89,26 @@ impl CatalogRepository {
         sqlx::query("SET LOCAL statement_timeout = '300s'")
             .execute(&mut *transaction)
             .await?;
+        // Capture the automatic channel, stream link, and EPG mapping state
+        // for this account before reconciliation overwrites it. The snapshot
+        // is stored in the shared revisions table so a later rollback can
+        // restore channels, streams, and EPG mappings together.
+        let before_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
+        let current_revision =
+            current_reconciliation_revision(&mut transaction, account_id).await?;
         let channel_stats = upsert_canonical_channels(&mut transaction, account_id).await?;
         let link_count = relink_channel_streams(&mut transaction, account_id).await?;
         let orphans_removed = remove_orphaned_channels(&mut transaction, account_id).await?;
+        let after_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
+        record_reconciliation_revision(
+            &mut transaction,
+            account_id,
+            current_revision + 1,
+            "system",
+            before_snapshot,
+            after_snapshot,
+        )
+        .await?;
         transaction.commit().await?;
 
         Ok(ReconcileStats {
@@ -420,6 +437,224 @@ impl CatalogRepository {
             mappings_applied: tvg_applied + name_applied + alias_applied,
             mappings_removed: removed,
             review_queued,
+        })
+    }
+
+    /// Lists reconciliation revision history for one provider account, newest
+    /// first. Each revision records the automatic channel, stream link, and
+    /// EPG mapping snapshot captured before and after a reconciliation run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn list_reconciliation_revisions(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Vec<ReconciliationRevisionRow>, PersistenceError> {
+        let rows: Vec<ReconciliationRevisionRow> = sqlx::query_as(
+            r"
+            SELECT revision, actor, before_value, after_value, created_at
+            FROM revisions
+            WHERE resource_type = 'reconciliation' AND resource_id = $1
+            ORDER BY revision DESC
+            ",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Restores the automatic channels, stream links, and EPG mappings for
+    /// one provider account to the state captured at `target_revision`. A
+    /// new revision row records the restore so the rollback itself is
+    /// auditable and reversible.
+    ///
+    /// Manual channels and manual EPG mappings on channels outside the
+    /// account's automatic set are preserved. The snapshot captured by
+    /// [`CatalogRepository::reconcile_provider_account`] includes any manual
+    /// EPG mappings attached to the account's automatic channels, so those
+    /// are restored alongside the automatic mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::ReconciliationRevisionNotFound`] when the
+    /// target revision does not exist for the account.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn rollback_reconciliation(
+        &self,
+        account_id: Uuid,
+        target_revision: i64,
+        actor: &str,
+    ) -> Result<ReconciliationRollbackStats, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '300s'")
+            .execute(&mut *transaction)
+            .await?;
+
+        let target: Option<(Option<Value>, Value)> = sqlx::query_as(
+            r"
+            SELECT before_value, after_value
+            FROM revisions
+            WHERE resource_type = 'reconciliation' AND resource_id = $1 AND revision = $2
+            ",
+        )
+        .bind(account_id)
+        .bind(target_revision)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((_, after_value)) = target else {
+            transaction.rollback().await.ok();
+            return Err(PersistenceError::ReconciliationRevisionNotFound {
+                account_id,
+                target: target_revision,
+            });
+        };
+
+        let snapshot: ReconciliationSnapshot =
+            serde_json::from_value(after_value).map_err(|_| {
+                PersistenceError::Database(sqlx::Error::Protocol(
+                    "decode reconciliation snapshot".to_owned(),
+                ))
+            })?;
+
+        // Remove the account's current automatic channels. The cascade
+        // deletes their stream links and EPG mappings. Manual channels for
+        // the account and all channels for other accounts are untouched.
+        let channels_removed: i64 = sqlx::query(
+            r"
+            DELETE FROM channels
+            WHERE provider_account_id = $1 AND managed_by = 'automatic'
+            ",
+        )
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+        .try_into()
+        .unwrap_or(i64::MAX);
+
+        // Re-create the snapshot channels with their original ids. When the
+        // original channel number is now taken by a non-account channel, fall
+        // back to the canonical channel number sequence so the unique
+        // constraint stays satisfied.
+        let mut channels_restored: i64 = 0;
+        for channel in &snapshot.channels {
+            let channel_number =
+                if channel_number_available(&mut transaction, &channel.channel_number).await? {
+                    channel.channel_number.clone()
+                } else {
+                    next_channel_number(&mut transaction).await?
+                };
+            sqlx::query(
+                r"
+                INSERT INTO channels
+                    (id, channel_number, name, group_name, logo_url, enabled,
+                     managed_by, provider_account_id, canonical_key, revision)
+                VALUES ($1, $2, $3, $4, $5, $6, 'automatic', $7, $8, 1)
+                ON CONFLICT (id) DO UPDATE SET
+                    channel_number = EXCLUDED.channel_number,
+                    name = EXCLUDED.name,
+                    group_name = EXCLUDED.group_name,
+                    logo_url = EXCLUDED.logo_url,
+                    enabled = EXCLUDED.enabled,
+                    managed_by = EXCLUDED.managed_by,
+                    provider_account_id = EXCLUDED.provider_account_id,
+                    canonical_key = EXCLUDED.canonical_key,
+                    updated_at = now()
+                ",
+            )
+            .bind(channel.id)
+            .bind(&channel_number)
+            .bind(&channel.name)
+            .bind(&channel.group_name)
+            .bind(&channel.logo_url)
+            .bind(channel.enabled)
+            .bind(account_id)
+            .bind(&channel.canonical_key)
+            .execute(&mut *transaction)
+            .await?;
+            channels_restored += 1;
+        }
+
+        // Restore stream links for the re-created channels.
+        let mut stream_links_restored: i64 = 0;
+        for link in &snapshot.stream_links {
+            sqlx::query(
+                r"
+                INSERT INTO channel_streams (channel_id, provider_stream_id, priority, evidence)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (channel_id, provider_stream_id) DO UPDATE SET
+                    priority = EXCLUDED.priority,
+                    evidence = EXCLUDED.evidence
+                ",
+            )
+            .bind(link.channel_id)
+            .bind(link.provider_stream_id)
+            .bind(link.priority)
+            .bind(&link.evidence)
+            .execute(&mut *transaction)
+            .await?;
+            stream_links_restored += 1;
+        }
+
+        // Restore EPG mappings, including manual bindings that were attached
+        // to the account's automatic channels at the snapshot revision.
+        let mut epg_mappings_restored: i64 = 0;
+        for mapping in &snapshot.epg_mappings {
+            sqlx::query(
+                r"
+                INSERT INTO channel_epg_mappings
+                    (channel_id, epg_channel_id, method, confidence, evidence,
+                     review_status, reviewed_by, reviewed_at, revision)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+                ON CONFLICT (channel_id) DO UPDATE SET
+                    epg_channel_id = EXCLUDED.epg_channel_id,
+                    method = EXCLUDED.method,
+                    confidence = EXCLUDED.confidence,
+                    evidence = EXCLUDED.evidence,
+                    review_status = EXCLUDED.review_status,
+                    reviewed_by = EXCLUDED.reviewed_by,
+                    reviewed_at = EXCLUDED.reviewed_at,
+                    revision = channel_epg_mappings.revision + 1,
+                    updated_at = now()
+                ",
+            )
+            .bind(mapping.channel_id)
+            .bind(mapping.epg_channel_id)
+            .bind(&mapping.method)
+            .bind(mapping.confidence)
+            .bind(&mapping.evidence)
+            .bind(&mapping.review_status)
+            .bind(&mapping.reviewed_by)
+            .bind(mapping.reviewed_at)
+            .execute(&mut *transaction)
+            .await?;
+            epg_mappings_restored += 1;
+        }
+
+        let before_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
+        let current_revision =
+            current_reconciliation_revision(&mut transaction, account_id).await?;
+        let after_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
+        record_reconciliation_revision(
+            &mut transaction,
+            account_id,
+            current_revision + 1,
+            actor,
+            before_snapshot,
+            after_snapshot,
+        )
+        .await?;
+
+        transaction.commit().await?;
+        Ok(ReconciliationRollbackStats {
+            target_revision,
+            channels_removed,
+            channels_restored,
+            stream_links_restored,
+            epg_mappings_restored,
         })
     }
 
@@ -1372,6 +1607,54 @@ impl CatalogRepository {
         .bind(input.event_duration_hours)
         .bind(input.past_date_grace_hours)
         .bind(input.future_date_days)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.ok_or(PersistenceError::SourceNotFound(id))
+    }
+
+    /// Applies a partial update to an event template.
+    ///
+    /// Only the `Some` fields of `input` are written. `enabled` is persisted
+    /// when supplied. An empty update still refreshes `updated_at`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the update fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn update_event_template_partial(
+        &self,
+        id: Uuid,
+        input: &EventTemplateUpdate,
+    ) -> Result<EventTemplateRow, PersistenceError> {
+        let row = sqlx::query_as::<_, EventTemplateRow>(
+            r"
+            UPDATE event_templates SET
+                name = COALESCE($2, name),
+                display_name = COALESCE($3, display_name),
+                match_regex = COALESCE($4, match_regex),
+                channel_name_format = COALESCE($5, channel_name_format),
+                group_name = COALESCE($6, group_name),
+                event_duration_hours = COALESCE($7, event_duration_hours),
+                past_date_grace_hours = COALESCE($8, past_date_grace_hours),
+                future_date_days = COALESCE($9, future_date_days),
+                enabled = COALESCE($10, enabled),
+                updated_at = now()
+            WHERE id = $1
+            RETURNING id, name, display_name, match_regex, channel_name_format,
+                      group_name, event_duration_hours, past_date_grace_hours,
+                      future_date_days, enabled
+            ",
+        )
+        .bind(id)
+        .bind(input.name.as_deref())
+        .bind(input.display_name.as_deref())
+        .bind(input.match_regex.as_deref())
+        .bind(input.channel_name_format.as_deref())
+        .bind(input.group_name.as_deref())
+        .bind(input.event_duration_hours)
+        .bind(input.past_date_grace_hours)
+        .bind(input.future_date_days)
+        .bind(input.enabled)
         .fetch_optional(&self.pool)
         .await?;
         row.ok_or(PersistenceError::SourceNotFound(id))
@@ -2468,6 +2751,21 @@ pub struct CreateEventTemplate {
     pub event_duration_hours: i32,
     pub past_date_grace_hours: i32,
     pub future_date_days: i32,
+}
+
+/// Partial update for an event template. Only `Some` fields are applied.
+/// An empty update leaves the row unchanged and still refreshes `updated_at`.
+#[derive(Clone, Debug, Default)]
+pub struct EventTemplateUpdate {
+    pub name: Option<String>,
+    pub display_name: Option<String>,
+    pub match_regex: Option<String>,
+    pub channel_name_format: Option<String>,
+    pub group_name: Option<String>,
+    pub event_duration_hours: Option<i32>,
+    pub past_date_grace_hours: Option<i32>,
+    pub future_date_days: Option<i32>,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4442,6 +4740,625 @@ impl CatalogRepository {
         transaction.commit().await?;
         Ok(RegionFilterStats { enabled, disabled })
     }
+
+    // -- Operator setting overrides --
+
+    /// Loads every current operator override grouped by scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn load_operator_setting_overrides(
+        &self,
+    ) -> Result<OperatorSettingOverrides, PersistenceError> {
+        let rows: Vec<OperatorSettingOverrideRow> = sqlx::query_as(
+            r"
+            SELECT scope, scope_id, key, value, revision, updated_by, updated_at
+            FROM operator_setting_overrides
+            ORDER BY scope, scope_id, key
+            ",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut overrides = OperatorSettingOverrides::default();
+        for row in rows {
+            overrides.set(
+                &row.scope,
+                &row.scope_id,
+                row.key.clone(),
+                row.value.clone(),
+            );
+        }
+        Ok(overrides)
+    }
+
+    /// Loads the current overrides and revision for one scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn load_operator_setting_scope(
+        &self,
+        scope: &str,
+        scope_id: &str,
+    ) -> Result<OperatorSettingScopeState, PersistenceError> {
+        let resource_id = operator_setting_resource_id(scope, scope_id);
+        let revision: i64 = sqlx::query_scalar(
+            r"
+            SELECT COALESCE(MAX(revision), 0)
+            FROM revisions
+            WHERE resource_type = 'operator-settings' AND resource_id = $1
+            ",
+        )
+        .bind(resource_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows: Vec<OperatorSettingOverrideRow> = sqlx::query_as(
+            r"
+            SELECT scope, scope_id, key, value, revision, updated_by, updated_at
+            FROM operator_setting_overrides
+            WHERE scope = $1 AND scope_id = $2
+            ORDER BY key
+            ",
+        )
+        .bind(scope)
+        .bind(scope_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut values = BTreeMap::new();
+        for row in rows {
+            values.insert(row.key, row.value);
+        }
+        Ok(OperatorSettingScopeState { values, revision })
+    }
+
+    /// Replaces all overrides for one scope with optimistic concurrency.
+    ///
+    /// When `expected_revision` is `Some`, the call fails with
+    /// [`PersistenceError::SettingRevisionConflict`] when the stored revision
+    /// does not match. A new revision history row is recorded in the shared
+    /// `revisions` table before the overrides are written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when any query fails.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn replace_operator_setting_scope(
+        &self,
+        scope: &str,
+        scope_id: &str,
+        values: &BTreeMap<String, Value>,
+        expected_revision: Option<i64>,
+        actor: &str,
+    ) -> Result<OperatorSettingScopeState, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let resource_id = operator_setting_resource_id(scope, scope_id);
+
+        let current_revision: i64 = sqlx::query_scalar(
+            r"
+            SELECT COALESCE(MAX(revision), 0)
+            FROM revisions
+            WHERE resource_type = 'operator-settings' AND resource_id = $1
+            ",
+        )
+        .bind(resource_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        if let Some(expected) = expected_revision
+            && expected != current_revision
+        {
+            transaction.rollback().await.ok();
+            return Err(PersistenceError::SettingRevisionConflict {
+                expected,
+                actual: current_revision,
+            });
+        }
+
+        let before_value =
+            current_operator_scope_snapshot(&mut transaction, scope, scope_id, current_revision)
+                .await?;
+        let after_value = serde_json::to_value(values).map_err(|_| {
+            PersistenceError::Database(sqlx::Error::Protocol("encode overrides".to_owned()))
+        })?;
+        let next_revision = current_revision + 1;
+
+        sqlx::query(
+            r"
+            INSERT INTO revisions (id, resource_type, resource_id, revision, actor, before_value, after_value)
+            VALUES ($1, 'operator-settings', $2, $3, $4, $5, $6)
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(resource_id)
+        .bind(next_revision)
+        .bind(actor)
+        .bind(before_value)
+        .bind(&after_value)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r"
+            DELETE FROM operator_setting_overrides WHERE scope = $1 AND scope_id = $2
+            ",
+        )
+        .bind(scope)
+        .bind(scope_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        for (key, value) in values {
+            sqlx::query(
+                r"
+                INSERT INTO operator_setting_overrides
+                    (scope, scope_id, key, value, revision, updated_by)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ",
+            )
+            .bind(scope)
+            .bind(scope_id)
+            .bind(key)
+            .bind(value)
+            .bind(next_revision)
+            .bind(actor)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        Ok(OperatorSettingScopeState {
+            values: values.clone(),
+            revision: next_revision,
+        })
+    }
+
+    /// Lists revision history rows for one scope, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn list_operator_setting_revisions(
+        &self,
+        scope: &str,
+        scope_id: &str,
+    ) -> Result<Vec<OperatorSettingRevisionRow>, PersistenceError> {
+        let resource_id = operator_setting_resource_id(scope, scope_id);
+        let rows: Vec<OperatorSettingRevisionRow> = sqlx::query_as(
+            r"
+            SELECT revision, actor, before_value, after_value, created_at
+            FROM revisions
+            WHERE resource_type = 'operator-settings' AND resource_id = $1
+            ORDER BY revision DESC
+            ",
+        )
+        .bind(resource_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Restores the overrides captured at `target_revision` and records a new
+    /// revision that marks the restore.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::SettingRevisionNotFound`] when the target
+    /// revision does not exist for the scope.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn rollback_operator_setting_scope(
+        &self,
+        scope: &str,
+        scope_id: &str,
+        target_revision: i64,
+        actor: &str,
+    ) -> Result<OperatorSettingScopeState, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let resource_id = operator_setting_resource_id(scope, scope_id);
+
+        let target: Option<(Option<Value>, Value)> = sqlx::query_as(
+            r"
+            SELECT before_value, after_value
+            FROM revisions
+            WHERE resource_type = 'operator-settings' AND resource_id = $1 AND revision = $2
+            ",
+        )
+        .bind(resource_id)
+        .bind(target_revision)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((_, after_value)) = target else {
+            transaction.rollback().await.ok();
+            return Err(PersistenceError::SettingRevisionNotFound {
+                scope: scope.to_owned(),
+                scope_id: scope_id.to_owned(),
+                target: target_revision,
+            });
+        };
+
+        let restored: BTreeMap<String, Value> =
+            serde_json::from_value(after_value).map_err(|_| {
+                PersistenceError::Database(sqlx::Error::Protocol("decode overrides".to_owned()))
+            })?;
+
+        let current_revision: i64 = sqlx::query_scalar(
+            r"
+            SELECT COALESCE(MAX(revision), 0)
+            FROM revisions
+            WHERE resource_type = 'operator-settings' AND resource_id = $1
+            ",
+        )
+        .bind(resource_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        let before_value =
+            current_operator_scope_snapshot(&mut transaction, scope, scope_id, current_revision)
+                .await?;
+        let next_revision = current_revision + 1;
+        let after_value = serde_json::to_value(&restored).map_err(|_| {
+            PersistenceError::Database(sqlx::Error::Protocol("encode overrides".to_owned()))
+        })?;
+
+        sqlx::query(
+            r"
+            INSERT INTO revisions (id, resource_type, resource_id, revision, actor, before_value, after_value)
+            VALUES ($1, 'operator-settings', $2, $3, $4, $5, $6)
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(resource_id)
+        .bind(next_revision)
+        .bind(actor)
+        .bind(before_value)
+        .bind(&after_value)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r"
+            DELETE FROM operator_setting_overrides WHERE scope = $1 AND scope_id = $2
+            ",
+        )
+        .bind(scope)
+        .bind(scope_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        for (key, value) in &restored {
+            sqlx::query(
+                r"
+                INSERT INTO operator_setting_overrides
+                    (scope, scope_id, key, value, revision, updated_by)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ",
+            )
+            .bind(scope)
+            .bind(scope_id)
+            .bind(key)
+            .bind(value)
+            .bind(next_revision)
+            .bind(actor)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        transaction.commit().await?;
+        Ok(OperatorSettingScopeState {
+            values: restored,
+            revision: next_revision,
+        })
+    }
+}
+
+/// One reconciliation revision history row for a provider account.
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct ReconciliationRevisionRow {
+    pub revision: i64,
+    pub actor: String,
+    pub before_value: Option<Value>,
+    pub after_value: Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Counts produced by a reconciliation rollback.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ReconciliationRollbackStats {
+    pub target_revision: i64,
+    pub channels_removed: i64,
+    pub channels_restored: i64,
+    pub stream_links_restored: i64,
+    pub epg_mappings_restored: i64,
+}
+
+/// One automatic channel captured in a reconciliation snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, FromRow)]
+struct SnapshotChannel {
+    id: Uuid,
+    channel_number: String,
+    name: String,
+    group_name: Option<String>,
+    logo_url: Option<String>,
+    enabled: bool,
+    canonical_key: Option<String>,
+}
+
+/// One stream link captured in a reconciliation snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, FromRow)]
+struct SnapshotStreamLink {
+    channel_id: Uuid,
+    provider_stream_id: Uuid,
+    priority: i32,
+    evidence: Value,
+}
+
+/// One EPG mapping captured in a reconciliation snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, FromRow)]
+struct SnapshotEpgMapping {
+    channel_id: Uuid,
+    epg_channel_id: Uuid,
+    method: String,
+    confidence: f32,
+    evidence: Value,
+    review_status: String,
+    reviewed_by: Option<String>,
+    reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// The captured automatic channel, stream link, and EPG mapping state for
+/// one provider account. Stored as the `before_value` or `after_value` of a
+/// reconciliation revision row.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct ReconciliationSnapshot {
+    channels: Vec<SnapshotChannel>,
+    stream_links: Vec<SnapshotStreamLink>,
+    epg_mappings: Vec<SnapshotEpgMapping>,
+}
+
+/// Reads the automatic channels, their stream links, and their EPG mappings
+/// for one provider account as a JSON snapshot.
+async fn capture_reconciliation_snapshot(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+) -> Result<Option<Value>, PersistenceError> {
+    let channels: Vec<SnapshotChannel> = sqlx::query_as(
+        r"
+        SELECT id, channel_number, name, group_name, logo_url, enabled, canonical_key
+        FROM channels
+        WHERE provider_account_id = $1 AND managed_by = 'automatic'
+        ORDER BY id
+        ",
+    )
+    .bind(account_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let channel_ids: Vec<Uuid> = channels.iter().map(|channel| channel.id).collect();
+    let stream_links: Vec<SnapshotStreamLink> = if channel_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            r"
+            SELECT channel_id, provider_stream_id, priority, evidence
+            FROM channel_streams
+            WHERE channel_id = ANY($1)
+            ORDER BY channel_id, provider_stream_id
+            ",
+        )
+        .bind(&channel_ids)
+        .fetch_all(&mut **transaction)
+        .await?
+    };
+    let epg_mappings: Vec<SnapshotEpgMapping> = if channel_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            r"
+            SELECT channel_id, epg_channel_id, method, confidence, evidence,
+                   review_status, reviewed_by, reviewed_at
+            FROM channel_epg_mappings
+            WHERE channel_id = ANY($1)
+            ORDER BY channel_id
+            ",
+        )
+        .bind(&channel_ids)
+        .fetch_all(&mut **transaction)
+        .await?
+    };
+    let snapshot = ReconciliationSnapshot {
+        channels,
+        stream_links,
+        epg_mappings,
+    };
+    let payload = serde_json::to_value(&snapshot).map_err(|_| {
+        PersistenceError::Database(sqlx::Error::Protocol(
+            "encode reconciliation snapshot".to_owned(),
+        ))
+    })?;
+    Ok(Some(payload))
+}
+
+/// Returns the latest reconciliation revision number for one account, or 0
+/// when no reconciliation has been recorded yet.
+async fn current_reconciliation_revision(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+) -> Result<i64, PersistenceError> {
+    let revision: i64 = sqlx::query_scalar(
+        r"
+        SELECT COALESCE(MAX(revision), 0)
+        FROM revisions
+        WHERE resource_type = 'reconciliation' AND resource_id = $1
+        ",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(revision)
+}
+
+/// Writes one reconciliation revision row with before and after snapshots.
+async fn record_reconciliation_revision(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    revision: i64,
+    actor: &str,
+    before_value: Option<Value>,
+    after_value: Option<Value>,
+) -> Result<(), PersistenceError> {
+    sqlx::query(
+        r"
+        INSERT INTO revisions (id, resource_type, resource_id, revision, actor, before_value, after_value)
+        VALUES ($1, 'reconciliation', $2, $3, $4, $5, $6)
+        ",
+    )
+    .bind(Uuid::now_v7())
+    .bind(account_id)
+    .bind(revision)
+    .bind(actor)
+    .bind(before_value)
+    .bind(after_value)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// Returns true when no channel currently holds the given channel number.
+async fn channel_number_available(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    channel_number: &str,
+) -> Result<bool, PersistenceError> {
+    let taken: i64 = sqlx::query_scalar("SELECT count(*) FROM channels WHERE channel_number = $1")
+        .bind(channel_number)
+        .fetch_one(&mut **transaction)
+        .await?;
+    Ok(taken == 0)
+}
+
+/// Allocates the next channel number from the canonical sequence.
+async fn next_channel_number(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<String, PersistenceError> {
+    let number: String = sqlx::query_scalar("SELECT nextval('canonical_channel_number_seq')::text")
+        .fetch_one(&mut **transaction)
+        .await?;
+    Ok(number)
+}
+
+/// Deterministic namespace UUID for operator setting revision identity.
+const OPERATOR_SETTING_NAMESPACE: Uuid = Uuid::from_u128(0x9d4f_5e2a_1c6b_4d8a_9e7f_3a2c_1b5d_8f04);
+
+/// Builds a stable `UUIDv5` resource id for one operator setting scope.
+fn operator_setting_resource_id(scope: &str, scope_id: &str) -> Uuid {
+    let mut material = String::with_capacity(scope.len() + scope_id.len() + 1);
+    material.push_str(scope);
+    material.push(':');
+    material.push_str(scope_id);
+    Uuid::new_v5(&OPERATOR_SETTING_NAMESPACE, material.as_bytes())
+}
+
+/// Reads the current overrides for a scope as a JSON object snapshot.
+async fn current_operator_scope_snapshot(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &str,
+    scope_id: &str,
+    revision: i64,
+) -> Result<Option<Value>, PersistenceError> {
+    let rows: Vec<(String, Value)> = sqlx::query_as(
+        r"
+        SELECT key, value FROM operator_setting_overrides
+        WHERE scope = $1 AND scope_id = $2
+        ORDER BY key
+        ",
+    )
+    .bind(scope)
+    .bind(scope_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut object = serde_json::Map::new();
+    for (key, value) in rows {
+        object.insert(key, value);
+    }
+    let snapshot = Value::Object(object);
+    let payload = serde_json::json!({
+        "revision": revision,
+        "overrides": snapshot,
+    });
+    Ok(Some(payload))
+}
+
+/// Current overrides and revision for one operator setting scope.
+#[derive(Clone, Debug)]
+pub struct OperatorSettingScopeState {
+    pub values: BTreeMap<String, Value>,
+    pub revision: i64,
+}
+
+/// All current operator overrides grouped by scope.
+#[derive(Clone, Debug, Default)]
+pub struct OperatorSettingOverrides {
+    pub global: BTreeMap<String, Value>,
+    pub providers: BTreeMap<String, BTreeMap<String, Value>>,
+    pub groups: BTreeMap<String, BTreeMap<String, Value>>,
+}
+
+impl OperatorSettingOverrides {
+    fn set(&mut self, scope: &str, scope_id: &str, key: String, value: Value) {
+        match scope {
+            "global" => {
+                self.global.insert(key, value);
+            }
+            "provider" => {
+                self.providers
+                    .entry(scope_id.to_owned())
+                    .or_default()
+                    .insert(key, value);
+            }
+            "group" => {
+                self.groups
+                    .entry(scope_id.to_owned())
+                    .or_default()
+                    .insert(key, value);
+            }
+            _ => {}
+        }
+    }
+
+    /// Builds the domain override map for one provider and group.
+    #[must_use]
+    pub fn to_domain(&self, provider_id: &str, group_id: &str) -> iptv_domain::SettingOverrides {
+        let provider = self.providers.get(provider_id).cloned().unwrap_or_default();
+        let group = self.groups.get(group_id).cloned().unwrap_or_default();
+        iptv_domain::SettingOverrides {
+            global: self.global.clone(),
+            provider,
+            group,
+        }
+    }
+}
+
+/// One persisted operator override row.
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct OperatorSettingOverrideRow {
+    pub scope: String,
+    pub scope_id: String,
+    pub key: String,
+    pub value: Value,
+    pub revision: i64,
+    pub updated_by: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One revision history row for an operator setting scope.
+#[derive(Clone, Debug, FromRow, Serialize)]
+pub struct OperatorSettingRevisionRow {
+    pub revision: i64,
+    pub actor: String,
+    pub before_value: Option<Value>,
+    pub after_value: Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Region settings row stored in the `region_settings` table.

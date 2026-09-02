@@ -114,6 +114,7 @@ impl PgSnapshotStore {
             snapshot.id,
             provider_account_id,
             epg_source_id,
+            snapshot.format.snapshot_kind(),
             &snapshot.epg_channels,
         )
         .await?;
@@ -237,6 +238,7 @@ async fn insert_epg_channels(
     snapshot_id: Uuid,
     provider_account_id: Option<Uuid>,
     epg_source_id: Option<Uuid>,
+    snapshot_kind: &str,
     channels: &StagedRows<PreparedEpgChannel>,
 ) -> Result<(), IngestError> {
     if channels.is_empty() {
@@ -245,6 +247,14 @@ async fn insert_epg_channels(
     if provider_account_id.is_some() == epg_source_id.is_some() {
         return Err(IngestError::InvalidRequest(
             "EPG channels require exactly one source owner",
+        ));
+    }
+    // EPG channels are only valid on XMLTV and Xtream short EPG snapshots.
+    // Provider-owned live catalog snapshots (m3u, xtream) must not carry
+    // stray EPG channels.
+    if !matches!(snapshot_kind, "xmltv" | "xtream-epg") {
+        return Err(IngestError::InvalidRequest(
+            "EPG channels are not valid for this snapshot kind",
         ));
     }
     for chunk in channels.batches(EPG_CHANNEL_BATCH)? {

@@ -24,11 +24,20 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
-# Build dependencies — this layer is cached until Cargo.toml/lock changes.
-RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo chef cook --release -j 2 --recipe-path recipe.json
-# Build application binaries.
+# Cook dependencies in release mode. This layer stays cached until
+# Cargo.toml or Cargo.lock changes. Limit cook parallelism to one job so the
+# heaviest dependency (chrono-tz) compiles alone. This keeps peak memory below
+# the local 2 vCPU / 1.9 GiB Docker Desktop limit and prevents SIGKILL during
+# cold cache builds. The cached layer makes the slower one-job cook a one-time
+# cost that is paid only when the dependency set changes.
+RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo chef cook --release -j 1 --recipe-path recipe.json
+# Build application binaries. Limit parallelism to two jobs to match the cook
+# step and to avoid OOM kills on memory-constrained runners.
 COPY . .
-RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -p iptv-gateway
+RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 2 -p iptv-gateway
+# Build the deterministic scale gate binary. The `scale-gate` feature enables
+# the fixture generators in `iptv-parsers` and adds no new dependencies.
+RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 2 -p iptv-gateway --features scale-gate --bin scale-gate
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -42,6 +51,8 @@ COPY --from=builder /build/target/release/test-provider /usr/local/bin/test-prov
 COPY --from=builder /build/target/release/media-acceptance /usr/local/bin/media-acceptance
 COPY --from=builder /build/target/release/fault-acceptance /usr/local/bin/fault-acceptance
 COPY --from=builder /build/target/release/live-acceptance /usr/local/bin/live-acceptance
+COPY --from=builder /build/target/release/scale-gate /usr/local/bin/scale-gate
+COPY tests/fixtures/scale-gate-baseline.json /app/tests/fixtures/scale-gate-baseline.json
 COPY LICENSE THIRD_PARTY_NOTICES.md /app/
 USER iptv
 EXPOSE 8081

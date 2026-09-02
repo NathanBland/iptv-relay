@@ -24,13 +24,15 @@ pub use catalog::{
     CreateEventTemplate, CreateRecordingInput, CreateRecordingRuleInput, CreateStreamProfileInput,
     CreateUserInput, ENVIRONMENT_OUTPUT_PROFILE_ID, ENVIRONMENT_OUTPUT_PROFILE_NAME,
     EpgChannelSearchRow, EpgMappingPage, EpgMappingRow, EpgMappingStats, EventChannelRow,
-    EventTemplateQuery, EventTemplateRow, EventTemplateSuggestion, LineupApplyStats,
-    LineupCategoryRow, LineupChannelRow, LineupTemplateRow, OutputProfileRow,
-    OutputProfileTokenHash, ProgrammePage, ProgrammeQuery, ProgrammeRow, ReconcileStats,
-    RecordingRow, RecordingRuleRow, RecordingStats, RegionFilterStats, RegionPrefixRow,
-    RegionSettingsRow, ReviewCandidateRow, StreamHealthPage, StreamHealthRow, StreamHealthStats,
-    StreamHealthUpdate, StreamProfileRow, SystemCounts, UnmappedChannelPage, UnmappedChannelRow,
-    UpdateUserInput, UserRow,
+    EventTemplateQuery, EventTemplateRow, EventTemplateSuggestion, EventTemplateUpdate,
+    LineupApplyStats, LineupCategoryRow, LineupChannelRow, LineupTemplateRow,
+    OperatorSettingOverrideRow, OperatorSettingOverrides, OperatorSettingRevisionRow,
+    OperatorSettingScopeState, OutputProfileRow, OutputProfileTokenHash, ProgrammePage,
+    ProgrammeQuery, ProgrammeRow, ReconcileStats, ReconciliationRevisionRow,
+    ReconciliationRollbackStats, RecordingRow, RecordingRuleRow, RecordingStats, RegionFilterStats,
+    RegionPrefixRow, RegionSettingsRow, ReviewCandidateRow, StreamHealthPage, StreamHealthRow,
+    StreamHealthStats, StreamHealthUpdate, StreamProfileRow, SystemCounts, UnmappedChannelPage,
+    UnmappedChannelRow, UpdateUserInput, UserRow,
 };
 
 /// Embedded database migrations for the service schema.
@@ -60,6 +62,16 @@ pub enum PersistenceError {
     JobNotFound(Uuid),
     #[error("output profile tuner count must be at least one")]
     InvalidOutputProfileTunerCount,
+    #[error("operator setting revision conflict: expected {expected}, found {actual}")]
+    SettingRevisionConflict { expected: i64, actual: i64 },
+    #[error("operator setting revision {target} was not found for {scope}:{scope_id}")]
+    SettingRevisionNotFound {
+        scope: String,
+        scope_id: String,
+        target: i64,
+    },
+    #[error("reconciliation revision {target} was not found for account {account_id}")]
+    ReconciliationRevisionNotFound { account_id: Uuid, target: i64 },
 }
 
 const ENCRYPTED_VALUE_VERSION: u8 = 1;
@@ -852,12 +864,23 @@ impl SourceRepository {
         requested_limit: i64,
     ) -> Result<Vec<XtreamShortEpgStream>, PersistenceError> {
         let limit = requested_limit.clamp(1, 64);
+        // PostgreSQL rejects bind parameters inside a LIMIT expression that
+        // is wrapped in a function call. Compute the effective capacity in a
+        // CTE so the LIMIT clause references a materialized scalar value.
         let rows = sqlx::query_as::<_, XtreamShortEpgStream>(
             r"
+            WITH capacity AS (
+                SELECT least(
+                    $2::bigint,
+                    coalesce(cp.max_connections, pa.max_connections)::bigint
+                ) AS effective_limit
+                FROM provider_accounts pa
+                LEFT JOIN connection_pools cp ON cp.id = pa.connection_pool_id
+                WHERE pa.id = $1
+            )
             SELECT ps.provider_stream_id::bigint AS stream_id,
                    coalesce(nullif(ps.tvg_id, ''), ps.provider_stream_id) AS channel_id
             FROM provider_accounts pa
-            LEFT JOIN connection_pools cp ON cp.id = pa.connection_pool_id
             JOIN source_snapshots ss
               ON ss.provider_account_id = pa.id
              AND ss.kind = 'xtream'
@@ -865,13 +888,14 @@ impl SourceRepository {
             JOIN provider_streams ps
               ON ps.snapshot_id = ss.id
              AND ps.provider_account_id = pa.id
+            CROSS JOIN capacity
             WHERE pa.id = $1
               AND pa.source_type = 'xtream'
               AND pa.enabled
               AND ps.supported
               AND ps.provider_stream_id ~ '^[0-9]+$'
             ORDER BY ps.channel_number NULLS LAST, ps.provider_stream_id
-            LIMIT least($2::bigint, coalesce(cp.max_connections, pa.max_connections)::bigint)
+            LIMIT (SELECT effective_limit FROM capacity)
             ",
         )
         .bind(source_id)

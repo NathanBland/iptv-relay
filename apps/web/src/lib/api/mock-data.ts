@@ -1,11 +1,17 @@
 import type {
   Channel,
+  EffectiveSetting,
   EventChannel,
+  OperatorOverridesResponse,
+  OperatorRevisionResponse,
+  OperatorScopeResponse,
+  OperatorSettingScope,
   Overview,
   Programme,
   RegionPrefixInfo,
   RegionSettings,
   Session,
+  SettingDefinition,
   Source,
 } from './types'
 
@@ -238,4 +244,94 @@ export const mockRegionPrefixes: RegionPrefixInfo[] = [
   { prefix: 'DE', groupCount: 2, channelCount: 24, suggested: false },
   { prefix: 'AF', groupCount: 1, channelCount: 12, suggested: false },
   { prefix: 'ARA', groupCount: 1, channelCount: 16, suggested: false },
+]
+
+export const mockSettingSchema: SettingDefinition[] = [
+  {
+    key: 'media.ring.duration_seconds',
+    label: 'Live ring duration',
+    description: 'Keeps this many recent seconds for new or temporarily slow viewers.',
+    valueKind: 'integer',
+    defaultValue: 8,
+    minimum: 1,
+    maximum: 120,
+    choices: [],
+    unit: 'seconds',
+    operationalEffect: 'Higher values improve jitter tolerance and increase memory and tune latency.',
+    risk: 'capacity',
+    applyRequirement: 'immediate',
+    providerOverridable: true,
+    groupOverridable: false,
+  },
+  {
+    key: 'media.adapter',
+    label: 'Input adapter',
+    description: 'Selects native MPEG-TS ingestion or a fixed FFmpeg/VLC stream-copy adapter.',
+    valueKind: 'choice',
+    defaultValue: 'auto',
+    choices: ['auto', 'native-ts', 'ffmpeg', 'vlc'],
+    operationalEffect: 'Changing adapters can alter compatibility, startup time, and reconnect behavior.',
+    risk: 'compatibility',
+    applyRequirement: 'immediate',
+    providerOverridable: true,
+    groupOverridable: false,
+  },
+  {
+    key: 'events.inferred_duration_seconds',
+    label: 'Inferred event duration',
+    description: 'Sets the programme length when a dynamic channel title contains a start time but no end time.',
+    valueKind: 'integer',
+    defaultValue: 10800,
+    minimum: 300,
+    maximum: 86400,
+    choices: [],
+    unit: 'seconds',
+    operationalEffect: 'Generated filler is recalculated around the inferred programme interval.',
+    risk: 'low',
+    applyRequirement: 'reimport',
+    providerOverridable: true,
+    groupOverridable: true,
+  },
+]
+
+export const mockEffectiveSettings: EffectiveSetting[] = mockSettingSchema.map((definition) => ({
+  definition,
+  value: definition.defaultValue,
+  inheritedFrom: { scope: 'system_default' },
+}))
+
+export const mockOperatorOverrides: OperatorOverridesResponse = {
+  global: { 'media.ring.duration_seconds': 12 },
+  providers: { 'provider-a': { 'media.ring.duration_seconds': 16 } },
+  groups: { sports: { 'events.inferred_duration_seconds': 9000 } },
+}
+
+export function mockOperatorScope(scope: OperatorSettingScope, scopeId: string): OperatorScopeResponse {
+  if (scope === 'global') {
+    return { scope, scopeId: '', overrides: { ...mockOperatorOverrides.global }, revision: 1 }
+  }
+  const bucket = scope === 'provider' ? mockOperatorOverrides.providers : mockOperatorOverrides.groups
+  return {
+    scope,
+    scopeId,
+    overrides: { ...bucket[scopeId] },
+    revision: 1,
+  }
+}
+
+export const mockOperatorRevisions: OperatorRevisionResponse[] = [
+  {
+    revision: 2,
+    actor: 'operator',
+    createdAt: '2026-08-20T12:01:00Z',
+    beforeValue: { 'media.ring.duration_seconds': 12 },
+    afterValue: { 'media.ring.duration_seconds': 20 },
+  },
+  {
+    revision: 1,
+    actor: 'operator',
+    createdAt: '2026-08-20T12:00:00Z',
+    beforeValue: null,
+    afterValue: { 'media.ring.duration_seconds': 12 },
+  },
 ]

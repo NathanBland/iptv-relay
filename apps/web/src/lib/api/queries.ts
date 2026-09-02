@@ -1,6 +1,6 @@
 import { queryOptions } from '@tanstack/react-query'
 import { apiClient } from './client'
-import type { ChannelQuery, IptvApiClient, ProgrammeQuery } from './types'
+import type { ChannelQuery, IptvApiClient, OperatorSettingScope, ProgrammeQuery } from './types'
 
 export function apiQueries(client: IptvApiClient = apiClient) {
   return {
@@ -31,5 +31,23 @@ export function apiQueries(client: IptvApiClient = apiClient) {
     recordings: (status?: string) => queryOptions({ queryKey: ['recordings', status ?? null], queryFn: () => client.getRecordings(status) }),
     recordingStats: queryOptions({ queryKey: ['recording-stats'], queryFn: () => client.getRecordingStats() }),
     streamProfiles: queryOptions({ queryKey: ['stream-profiles'], queryFn: () => client.getStreamProfiles() }),
+    settingSchema: queryOptions({ queryKey: ['settings', 'schema'], queryFn: () => client.getSettingSchema() }),
+    effectiveSettings: (providerId?: string, groupId?: string) => queryOptions({
+      queryKey: ['settings', 'effective', providerId ?? null, groupId ?? null],
+      queryFn: () => client.getEffectiveSettings(providerId, groupId),
+    }),
+    operatorOverrides: queryOptions({ queryKey: ['settings', 'overrides'], queryFn: () => client.getOperatorOverrides() }),
+    operatorScope: (scope: OperatorSettingScope, scopeId: string) => queryOptions({
+      queryKey: ['settings', 'scope', scope, scopeId],
+      queryFn: () => client.getOperatorScope(scope, scopeId),
+    }),
+    operatorRevisions: (scope: OperatorSettingScope, scopeId: string) => queryOptions({
+      queryKey: ['settings', 'revisions', scope, scopeId],
+      queryFn: () => client.listOperatorRevisions(scope, scopeId),
+    }),
+    reconciliationRevisions: (sourceId: string) => queryOptions({
+      queryKey: ['reconciliation', 'revisions', sourceId],
+      queryFn: () => client.listReconciliationRevisions(sourceId),
+    }),
   }
 }

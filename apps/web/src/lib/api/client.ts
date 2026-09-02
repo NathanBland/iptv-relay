@@ -1,11 +1,16 @@
 import {
   mockChannels,
+  mockEffectiveSettings,
+  mockOperatorOverrides,
+  mockOperatorRevisions,
+  mockOperatorScope,
   mockOverview,
   mockProgrammes,
   mockRegionPrefixes,
   mockRegionSettings,
   mockSessions,
   mockSources,
+  mockSettingSchema,
 } from './mock-data'
 import type {
   Channel,
@@ -15,6 +20,7 @@ import type {
   AuthStatus,
   CreateEventTemplateInput,
   CreateLineupTemplateInput,
+  EffectiveSettingsResponse,
   EventChannel,
   EventTemplate,
   EventTemplateSuggestion,
@@ -22,6 +28,11 @@ import type {
   IptvApiClient,
   JellyfinSetup,
   LineupTemplate,
+  OperatorOverridesResponse,
+  OperatorOverrideMap,
+  OperatorRevisionResponse,
+  OperatorScopeResponse,
+  OperatorSettingScope,
   Overview,
   LoginInput,
   Page,
@@ -31,6 +42,9 @@ import type {
   EpgMapping,
   EpgMappingPage,
   EpgReconcileResult,
+  ReconciliationRevision,
+  ReconciliationRollbackInput,
+  ReconciliationRollbackResult,
   EpgChannelSearchResult,
   ReviewCandidate,
   UnmappedChannel,
@@ -38,6 +52,7 @@ import type {
   RotateJellyfinTokenInput,
   SaveResult,
   Session,
+  SettingDefinition,
   Source,
   SourceInput,
   SourceSyncStatus,
@@ -47,6 +62,7 @@ import type {
   StreamHealthPage,
   StreamHealthStats,
   BestStream,
+  UpdateEventTemplateInput,
   User,
   CreateUserInput,
   UpdateUserInput,
@@ -60,9 +76,10 @@ import type {
   RecordingPage,
   CreateRecordingInput,
   RecordingStats,
-  RegionPrefixInfo,
   RegionSettings,
   RegionSettingsResponse,
+  ReplaceOperatorScopeInput,
+  RollbackOperatorScopeInput,
   StreamProfile,
   CreateStreamProfileInput,
 } from './types'
@@ -77,6 +94,9 @@ const API_PATHS = {
   login: '/api/v1/auth/login',
   logout: '/api/v1/auth/logout',
   system: '/api/v1/system',
+  settingsSchema: '/api/v1/settings/schema',
+  settingsEffective: '/api/v1/settings/effective',
+  settingsOverrides: '/api/v1/settings/overrides',
   sources: '/api/v1/sources',
   channels: '/api/v1/channels',
   programmes: '/api/v1/programmes',
@@ -193,6 +213,14 @@ function asPage<T>(value: unknown, resource: string): Page<T> {
   const offset = typeof value.offset === 'number' ? value.offset : 0
   const items = asObjectArray<T>(value.items, `${resource} items`)
   return { total, limit, offset, items }
+}
+
+function operatorScopePath(scope: OperatorSettingScope, scopeId: string): string {
+  if (scope === 'global') return `${API_PATHS.settingsOverrides}/global`
+  const encoded = encodeURIComponent(scopeId)
+  return scope === 'provider'
+    ? `${API_PATHS.settingsOverrides}/providers/${encoded}`
+    : `${API_PATHS.settingsOverrides}/groups/${encoded}`
 }
 
 function decodeJellyfinSetup(value: unknown): JellyfinSetup {
@@ -603,6 +631,17 @@ export class FetchIptvApiClient implements IptvApiClient {
     })
   }
 
+  async listReconciliationRevisions(sourceId: string): Promise<ReconciliationRevision[]> {
+    return this.request(`/api/v1/sources/${encodeURIComponent(sourceId)}/reconcile/revisions`, (value) => asObjectArray<ReconciliationRevision>(value, 'Reconciliation revisions response'))
+  }
+
+  async rollbackReconciliation(sourceId: string, input: ReconciliationRollbackInput): Promise<ReconciliationRollbackResult> {
+    return this.request(`/api/v1/sources/${encodeURIComponent(sourceId)}/reconcile/rollback`, (value) => asObject<ReconciliationRollbackResult>(value, 'Reconciliation rollback response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
   async getEpgMappings(reviewStatus?: string, limit?: number, offset?: number): Promise<EpgMappingPage> {
     const qs = buildQueryString({ reviewStatus, limit, offset })
     return this.request(`/api/v1/epg/mappings${qs}`, (value) => asPage<EpgMapping>(value, 'EPG mappings response'))
@@ -715,6 +754,17 @@ export class FetchIptvApiClient implements IptvApiClient {
       method: 'POST',
       body: JSON.stringify(input),
     })
+  }
+
+  async updateEventTemplate(id: string, input: UpdateEventTemplateInput): Promise<EventTemplate> {
+    return this.request(
+      `${API_PATHS.eventTemplates}/${encodeURIComponent(id)}`,
+      (value) => asObject<EventTemplate>(value, 'Event template response'),
+      {
+        method: 'PATCH',
+        body: JSON.stringify(input),
+      },
+    )
   }
 
   async deleteEventTemplate(id: string): Promise<void> {
@@ -918,11 +968,52 @@ export class FetchIptvApiClient implements IptvApiClient {
   async removeStreamProfile(channelId: string): Promise<void> {
     await this.deleteResource(`${API_PATHS.channels}/${encodeURIComponent(channelId)}/stream-profile`, 'Stream profile assignment')
   }
+
+  async getSettingSchema(): Promise<SettingDefinition[]> {
+    return this.request(API_PATHS.settingsSchema, (value) => asObjectArray<SettingDefinition>(value, 'Setting schema response'))
+  }
+
+  async getEffectiveSettings(providerId?: string, groupId?: string): Promise<EffectiveSettingsResponse> {
+    const qs = buildQueryString({ providerId, groupId })
+    return this.request(`${API_PATHS.settingsEffective}${qs}`, (value) => asObject<EffectiveSettingsResponse>(value, 'Effective settings response'))
+  }
+
+  async getOperatorOverrides(): Promise<OperatorOverridesResponse> {
+    return this.request(API_PATHS.settingsOverrides, (value) => asObject<OperatorOverridesResponse>(value, 'Operator overrides response'))
+  }
+
+  async getOperatorScope(scope: OperatorSettingScope, scopeId: string): Promise<OperatorScopeResponse> {
+    return this.request(operatorScopePath(scope, scopeId), (value) => asObject<OperatorScopeResponse>(value, 'Operator scope response'))
+  }
+
+  async replaceOperatorScope(scope: OperatorSettingScope, scopeId: string, input: ReplaceOperatorScopeInput): Promise<OperatorScopeResponse> {
+    const headers = new Headers()
+    if (input.ifMatch) headers.set('If-Match', input.ifMatch)
+    return this.request(operatorScopePath(scope, scopeId), (value) => asObject<OperatorScopeResponse>(value, 'Operator scope replace response'), {
+      method: 'PUT',
+      body: JSON.stringify({ overrides: input.overrides }),
+      headers,
+    })
+  }
+
+  async listOperatorRevisions(scope: OperatorSettingScope, scopeId: string): Promise<OperatorRevisionResponse[]> {
+    return this.request(`${operatorScopePath(scope, scopeId)}/revisions`, (value) => asObjectArray<OperatorRevisionResponse>(value, 'Operator revisions response'))
+  }
+
+  async rollbackOperatorScope(scope: OperatorSettingScope, scopeId: string, input: RollbackOperatorScopeInput): Promise<OperatorScopeResponse> {
+    return this.request(`${operatorScopePath(scope, scopeId)}/rollback`, (value) => asObject<OperatorScopeResponse>(value, 'Operator rollback response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
 }
 
 export class MockIptvApiClient implements IptvApiClient {
   private readonly sources: Source[] = mockSources.map((source) => ({ ...source }))
   private readonly syncJobs = new Map<string, SourceSyncStatus>()
+  private readonly operatorScopes = new Map<string, OperatorScopeResponse>()
+  private readonly operatorRevisions = new Map<string, OperatorRevisionResponse[]>()
+  private readonly reconciliationRevisions = new Map<string, ReconciliationRevision[]>()
   private authenticated = false
 
   async getAuthStatus(): Promise<AuthStatus> {
@@ -1151,6 +1242,39 @@ export class MockIptvApiClient implements IptvApiClient {
     return { mappingsApplied: 0, mappingsRemoved: 0, reviewQueued: 0 }
   }
 
+  async listReconciliationRevisions(sourceId: string): Promise<ReconciliationRevision[]> {
+    return (this.reconciliationRevisions.get(sourceId) ?? []).map((row) => ({ ...row }))
+  }
+
+  async rollbackReconciliation(sourceId: string, input: ReconciliationRollbackInput): Promise<ReconciliationRollbackResult> {
+    const history = this.reconciliationRevisions.get(sourceId) ?? []
+    const target = history.find((row) => row.revision === input.revision)
+    if (!target) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:reconciliation-revision-not-found',
+        title: 'Reconciliation revision not found',
+        status: 404,
+        detail: 'The target revision does not exist for this source.',
+      })
+    }
+    const nextRevision = (history[0]?.revision ?? 0) + 1
+    history.unshift({
+      revision: nextRevision,
+      actor: 'operator',
+      createdAt: new Date().toISOString(),
+      beforeValue: target.beforeValue,
+      afterValue: target.afterValue,
+    })
+    this.reconciliationRevisions.set(sourceId, history)
+    return {
+      targetRevision: input.revision,
+      channelsRemoved: 0,
+      channelsRestored: 0,
+      streamLinksRestored: 0,
+      epgMappingsRestored: 0,
+    }
+  }
+
   async getEpgMappings(reviewStatus?: string, limit?: number, offset?: number): Promise<EpgMappingPage> {
     return { total: 0, limit: limit ?? 100, offset: offset ?? 0, items: [] }
   }
@@ -1193,6 +1317,21 @@ export class MockIptvApiClient implements IptvApiClient {
       pastDateGraceHours: input.pastDateGraceHours ?? 6,
       futureDateDays: input.futureDateDays ?? 7,
       enabled: true,
+    }
+  }
+
+  async updateEventTemplate(id: string, input: UpdateEventTemplateInput): Promise<EventTemplate> {
+    return {
+      id,
+      name: input.name ?? 'mock-template',
+      displayName: input.displayName ?? 'Mock template',
+      matchRegex: input.matchRegex ?? '.*',
+      channelNameFormat: input.channelNameFormat ?? '{event}',
+      groupName: input.groupName ?? 'Sports',
+      eventDurationHours: input.eventDurationHours ?? 3,
+      pastDateGraceHours: input.pastDateGraceHours ?? 6,
+      futureDateDays: input.futureDateDays ?? 7,
+      enabled: input.enabled ?? true,
     }
   }
 
@@ -1354,6 +1493,108 @@ export class MockIptvApiClient implements IptvApiClient {
   async removeStreamProfile(): Promise<void> {
     return
   }
+
+  async getSettingSchema(): Promise<SettingDefinition[]> {
+    return mockSettingSchema.map((definition) => ({ ...definition }))
+  }
+
+  async getEffectiveSettings(providerId?: string, groupId?: string): Promise<EffectiveSettingsResponse> {
+    return {
+      providerId: providerId ?? '',
+      groupId: groupId ?? '',
+      settings: mockEffectiveSettings,
+      applyRequirements: ['immediate', 'reimport'],
+      etag: 'mock-effective-etag',
+    }
+  }
+
+  async getOperatorOverrides(): Promise<OperatorOverridesResponse> {
+    return {
+      global: { ...mockOperatorOverrides.global },
+      providers: Object.fromEntries(Object.entries(mockOperatorOverrides.providers).map(([key, value]) => [key, { ...value }])),
+      groups: Object.fromEntries(Object.entries(mockOperatorOverrides.groups).map(([key, value]) => [key, { ...value }])),
+    }
+  }
+
+  async getOperatorScope(scope: OperatorSettingScope, scopeId: string): Promise<OperatorScopeResponse> {
+    const key = operatorScopeKey(scope, scopeId)
+    const existing = this.operatorScopes.get(key)
+    if (existing) return { ...existing, overrides: { ...existing.overrides } }
+    return { ...mockOperatorScope(scope, scopeId) }
+  }
+
+  async replaceOperatorScope(scope: OperatorSettingScope, scopeId: string, input: ReplaceOperatorScopeInput): Promise<OperatorScopeResponse> {
+    const key = operatorScopeKey(scope, scopeId)
+    const current = this.operatorScopes.get(key) ?? mockOperatorScope(scope, scopeId)
+    if (input.ifMatch && input.ifMatch !== `"${current.revision}"`) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:setting-revision-conflict',
+        title: 'Setting revision conflict',
+        status: 412,
+        detail: 'The stored revision does not match the supplied If-Match.',
+      })
+    }
+    const nextRevision = current.revision + 1
+    const updated: OperatorScopeResponse = {
+      scope,
+      scopeId,
+      overrides: { ...input.overrides },
+      revision: nextRevision,
+    }
+    this.operatorScopes.set(key, updated)
+    const history = this.operatorRevisions.get(key) ?? []
+    history.unshift({
+      revision: nextRevision,
+      actor: 'operator',
+      createdAt: new Date().toISOString(),
+      beforeValue: current.overrides,
+      afterValue: { ...input.overrides },
+    })
+    this.operatorRevisions.set(key, history)
+    return { ...updated, overrides: { ...updated.overrides } }
+  }
+
+  async listOperatorRevisions(scope: OperatorSettingScope, scopeId: string): Promise<OperatorRevisionResponse[]> {
+    const key = operatorScopeKey(scope, scopeId)
+    return (this.operatorRevisions.get(key) ?? mockOperatorRevisions).map((row) => ({ ...row }))
+  }
+
+  async rollbackOperatorScope(scope: OperatorSettingScope, scopeId: string, input: RollbackOperatorScopeInput): Promise<OperatorScopeResponse> {
+    const key = operatorScopeKey(scope, scopeId)
+    const history = this.operatorRevisions.get(key) ?? mockOperatorRevisions
+    const target = history.find((row) => row.revision === input.revision)
+    if (!target) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:setting-revision-not-found',
+        title: 'Setting revision not found',
+        status: 404,
+        detail: 'The target revision does not exist for this scope.',
+      })
+    }
+    const current = this.operatorScopes.get(key) ?? mockOperatorScope(scope, scopeId)
+    const restored = (target.afterValue ?? {}) as OperatorOverrideMap
+    const nextRevision = current.revision + 1
+    const updated: OperatorScopeResponse = {
+      scope,
+      scopeId,
+      overrides: { ...restored },
+      revision: nextRevision,
+    }
+    this.operatorScopes.set(key, updated)
+    history.unshift({
+      revision: nextRevision,
+      actor: 'operator',
+      createdAt: new Date().toISOString(),
+      beforeValue: current.overrides,
+      afterValue: { ...restored },
+    })
+    this.operatorRevisions.set(key, history)
+    return { ...updated, overrides: { ...updated.overrides } }
+  }
+}
+
+function operatorScopeKey(scope: OperatorSettingScope, scopeId: string): string {
+  return `${scope}:${scopeId}`
 }
 
 export function createIptvApiClient({ useMock = import.meta.env.VITE_USE_MOCK_API === 'true', fetcher, onUnauthorized, readCsrfToken }: {

@@ -5,7 +5,7 @@ mod auth;
 pub use auth::hash_admin_password;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
     fmt::{self, Write as _},
     sync::Arc,
@@ -25,7 +25,10 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
-use iptv_domain::{SettingDefinition, setting_catalog};
+use iptv_domain::{
+    ApplyRequirement, EffectiveSetting, InheritanceSource, SettingDefinition,
+    SettingValidationError, resolve_settings, setting_catalog,
+};
 use iptv_media::{
     AcquireError, HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSessionSnapshot,
     HttpTsSourceSpec, InputAdapterPolicy, MpegTsRingConfig, PoolSnapshot, ProviderSpec,
@@ -33,10 +36,11 @@ use iptv_media::{
 };
 use iptv_persistence::{
     CatalogRepository, ChannelPlaybackCandidateRow, ChannelPlaybackPlan, ChannelQuery,
-    CreateEventTemplate, Database, EventTemplateQuery, JobRecord, JobRepository, LineupApplyStats,
-    LineupCategoryRow, LineupChannelRow, LineupTemplateRow, MasterKey, NewSource, OutputProfileRow,
-    OutputProfileTokenHash, PersistenceError, ProgrammeQuery, SourceKind, SourceRepository,
-    SourceSummary, redact_diagnostics, redact_error,
+    CreateEventTemplate, Database, EventTemplateQuery, EventTemplateUpdate, JobRecord,
+    JobRepository, LineupApplyStats, LineupCategoryRow, LineupChannelRow, LineupTemplateRow,
+    MasterKey, NewSource, OperatorSettingScopeState, OutputProfileRow, OutputProfileTokenHash,
+    PersistenceError, ProgrammeQuery, SourceKind, SourceRepository, SourceSummary,
+    redact_diagnostics, redact_error,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -507,6 +511,31 @@ struct CreateEventTemplateRequest {
     future_date_days: i32,
 }
 
+/// Partial update body for an event template. All fields are optional.
+/// Omitted fields keep their stored value. `enabled` toggles the template.
+#[derive(Clone, Debug, Default, serde::Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct UpdateEventTemplateRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    match_regex: Option<String>,
+    #[serde(default)]
+    channel_name_format: Option<String>,
+    #[serde(default)]
+    group_name: Option<String>,
+    #[serde(default)]
+    event_duration_hours: Option<i32>,
+    #[serde(default)]
+    past_date_grace_hours: Option<i32>,
+    #[serde(default)]
+    future_date_days: Option<i32>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
 fn default_duration() -> i32 {
     3
 }
@@ -684,8 +713,8 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, system_info, settings_schema, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
-    components(schemas(LoginRequest, LogoutRequest, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
+    paths(auth_status, login, logout, system_info, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    components(schemas(LoginRequest, LogoutRequest, AuthUser, AuthStatus, RuntimeVersions, SystemInfo, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -716,6 +745,44 @@ fn source_control_routes() -> Router<AppState> {
         .route("/api/v1/auth/logout", axum::routing::post(logout))
         .route("/api/v1/system", get(system_info))
         .route("/api/v1/settings/schema", get(settings_schema))
+        .route("/api/v1/settings/effective", get(get_effective_settings))
+        .route("/api/v1/settings/overrides", get(list_operator_overrides))
+        .route(
+            "/api/v1/settings/overrides/global",
+            get(get_operator_scope_global).put(replace_operator_scope_global),
+        )
+        .route(
+            "/api/v1/settings/overrides/global/revisions",
+            get(list_operator_revisions_global),
+        )
+        .route(
+            "/api/v1/settings/overrides/global/rollback",
+            axum::routing::post(rollback_operator_scope_global),
+        )
+        .route(
+            "/api/v1/settings/overrides/providers/{provider_id}",
+            get(get_operator_scope_provider).put(replace_operator_scope_provider),
+        )
+        .route(
+            "/api/v1/settings/overrides/providers/{provider_id}/revisions",
+            get(list_operator_revisions_provider),
+        )
+        .route(
+            "/api/v1/settings/overrides/providers/{provider_id}/rollback",
+            axum::routing::post(rollback_operator_scope_provider),
+        )
+        .route(
+            "/api/v1/settings/overrides/groups/{group_id}",
+            get(get_operator_scope_group).put(replace_operator_scope_group),
+        )
+        .route(
+            "/api/v1/settings/overrides/groups/{group_id}/revisions",
+            get(list_operator_revisions_group),
+        )
+        .route(
+            "/api/v1/settings/overrides/groups/{group_id}/rollback",
+            axum::routing::post(rollback_operator_scope_group),
+        )
         .route("/api/v1/sources", get(list_sources).post(create_source))
         .route(
             "/api/v1/sources/{source_id}",
@@ -769,6 +836,14 @@ fn guide_control_routes() -> Router<AppState> {
         .route(
             "/api/v1/epg/reconcile",
             axum::routing::post(reconcile_epg_mappings),
+        )
+        .route(
+            "/api/v1/sources/{source_id}/reconcile/revisions",
+            get(list_reconciliation_revisions),
+        )
+        .route(
+            "/api/v1/sources/{source_id}/reconcile/rollback",
+            axum::routing::post(rollback_reconciliation),
         )
         .route("/api/v1/epg/mappings", get(list_epg_mappings))
         .route("/api/v1/epg/unmapped", get(list_unmapped_channels))
@@ -1349,6 +1424,33 @@ fn persistence_error_response(error: PersistenceError) -> Response {
             format!("job {job_id} does not exist"),
         )
         .response(),
+        PersistenceError::SettingRevisionConflict { expected, actual } => ProblemDetails::new(
+            StatusCode::CONFLICT,
+            "setting-revision-conflict",
+            "Setting revision conflict",
+            format!("expected revision {expected} but found {actual}"),
+        )
+        .response(),
+        PersistenceError::SettingRevisionNotFound {
+            scope,
+            scope_id,
+            target,
+        } => ProblemDetails::new(
+            StatusCode::NOT_FOUND,
+            "setting-revision-not-found",
+            "Setting revision not found",
+            format!("revision {target} was not found for {scope}:{scope_id}"),
+        )
+        .response(),
+        PersistenceError::ReconciliationRevisionNotFound { account_id, target } => {
+            ProblemDetails::new(
+                StatusCode::NOT_FOUND,
+                "reconciliation-revision-not-found",
+                "Reconciliation revision not found",
+                format!("revision {target} was not found for account {account_id}"),
+            )
+            .response()
+        }
         PersistenceError::InvalidMasterKey
         | PersistenceError::InvalidOutputProfileTunerCount
         | PersistenceError::Encryption
@@ -1436,6 +1538,718 @@ async fn settings_schema(State(state): State<AppState>, headers: HeaderMap) -> R
         return response;
     }
     Json(setting_catalog()).into_response()
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum OperatorSettingScope {
+    Global,
+    Provider,
+    Group,
+}
+
+impl OperatorSettingScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Provider => "provider",
+            Self::Group => "group",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct EffectiveSettingsResponse {
+    provider_id: String,
+    group_id: String,
+    settings: Vec<EffectiveSetting>,
+    apply_requirements: Vec<ApplyRequirement>,
+    etag: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct OperatorOverridesResponse {
+    global: BTreeMap<String, serde_json::Value>,
+    providers: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+    groups: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct OperatorScopeResponse {
+    scope: OperatorSettingScope,
+    scope_id: String,
+    overrides: BTreeMap<String, serde_json::Value>,
+    revision: i64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ReplaceOperatorScopeRequest {
+    overrides: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct OperatorRevisionResponse {
+    revision: i64,
+    actor: String,
+    created_at: DateTime<Utc>,
+    before_value: Option<serde_json::Value>,
+    after_value: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RollbackOperatorScopeRequest {
+    revision: i64,
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_if_match(headers: &HeaderMap) -> Result<Option<i64>, Response> {
+    let Some(header_value) = headers.get(header::IF_MATCH) else {
+        return Ok(None);
+    };
+    parse_if_match_value(header_value)
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_if_match_value(header_value: &HeaderValue) -> Result<Option<i64>, Response> {
+    let text = header_value.to_str().map_err(|_| {
+        ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-if-match",
+            "Invalid If-Match header",
+            "send an opaque ETag from the previous scope response",
+        )
+        .response()
+    })?;
+    let trimmed = text.trim().trim_start_matches("W/").trim_matches('"');
+    let revision: i64 = trimmed.parse().map_err(|_| {
+        ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-if-match",
+            "Invalid If-Match header",
+            "send an opaque ETag from the previous scope response",
+        )
+        .response()
+    })?;
+    Ok(Some(revision))
+}
+
+fn scope_etag(revision: i64) -> HeaderValue {
+    HeaderValue::from_str(&format!("\"{revision}\"")).expect("valid ETag")
+}
+
+fn operator_scope_response(
+    scope: OperatorSettingScope,
+    scope_id: &str,
+    state: OperatorSettingScopeState,
+) -> Response {
+    let mut response = Json(OperatorScopeResponse {
+        scope,
+        scope_id: scope_id.to_owned(),
+        overrides: state.values,
+        revision: state.revision,
+    })
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::ETAG, scope_etag(state.revision));
+    response
+}
+
+fn setting_validation_response(error: &SettingValidationError) -> Response {
+    let status = match &error {
+        SettingValidationError::UnknownSetting(_)
+        | SettingValidationError::WrongType { .. }
+        | SettingValidationError::OutOfRange { .. }
+        | SettingValidationError::InvalidChoice { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        SettingValidationError::ProviderOverrideForbidden(_)
+        | SettingValidationError::GroupOverrideForbidden(_) => StatusCode::FORBIDDEN,
+    };
+    ProblemDetails::new(
+        status,
+        "invalid-operator-setting",
+        "Invalid operator setting",
+        error.to_string(),
+    )
+    .response()
+}
+
+fn operator_persistence_error_response(error: PersistenceError) -> Response {
+    match error {
+        PersistenceError::SettingRevisionConflict { expected, actual } => {
+            let mut response = ProblemDetails::new(
+                StatusCode::PRECONDITION_FAILED,
+                "setting-revision-conflict",
+                "Setting revision conflict",
+                format!(
+                    "the stored revision is {actual}; the supplied If-Match expected {expected}. Refresh the scope and retry."
+                ),
+            )
+            .response();
+            response
+                .headers_mut()
+                .insert(header::ETAG, scope_etag(actual));
+            response
+        }
+        PersistenceError::SettingRevisionNotFound {
+            scope,
+            scope_id,
+            target,
+        } => ProblemDetails::new(
+            StatusCode::NOT_FOUND,
+            "setting-revision-not-found",
+            "Setting revision not found",
+            format!("revision {target} does not exist for {scope}:{scope_id}"),
+        )
+        .response(),
+        other => persistence_error_response(other),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/settings/effective",
+    tag = "settings",
+    params(
+        ("providerId" = Option<String>, Query, description = "Provider identifier used for provider-scope inheritance"),
+        ("groupId" = Option<String>, Query, description = "Channel group identifier used for group-scope inheritance")
+    ),
+    responses(
+        (status = 200, body = EffectiveSettingsResponse, description = "Effective settings with inheritance source and apply requirements"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn get_effective_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    let provider_id = params.get("providerId").cloned().unwrap_or_default();
+    let group_id = params.get("groupId").cloned().unwrap_or_default();
+    let overrides = match catalog.load_operator_setting_overrides().await {
+        Ok(overrides) => overrides,
+        Err(error) => return persistence_error_response(error),
+    };
+    let domain_overrides = overrides.to_domain(&provider_id, &group_id);
+    let settings = match resolve_settings(&domain_overrides, &provider_id, &group_id) {
+        Ok(settings) => settings,
+        Err(error) => return setting_validation_response(&error),
+    };
+    let apply_requirements = distinct_apply_requirements(&settings);
+    let etag = effective_settings_etag(&settings);
+    Json(EffectiveSettingsResponse {
+        provider_id,
+        group_id,
+        settings,
+        apply_requirements,
+        etag,
+    })
+    .into_response()
+}
+
+fn distinct_apply_requirements(settings: &[EffectiveSetting]) -> Vec<ApplyRequirement> {
+    let mut seen = Vec::new();
+    for setting in settings {
+        if !seen.contains(&setting.definition.apply_requirement) {
+            seen.push(setting.definition.apply_requirement);
+        }
+    }
+    seen
+}
+
+fn effective_settings_etag(settings: &[EffectiveSetting]) -> String {
+    let mut digest = Sha256::new();
+    for setting in settings {
+        digest.update(setting.definition.key.as_bytes());
+        digest.update(setting.value.to_string().as_bytes());
+        digest.update(format!("{:?}", setting.inherited_from).as_bytes());
+    }
+    let hash = digest.finalize();
+    hash.iter().take(8).fold(String::new(), |mut output, byte| {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+        output
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/settings/overrides",
+    tag = "settings",
+    responses(
+        (status = 200, body = OperatorOverridesResponse, description = "All current operator overrides grouped by scope"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn list_operator_overrides(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    match catalog.load_operator_setting_overrides().await {
+        Ok(overrides) => Json(OperatorOverridesResponse {
+            global: overrides.global,
+            providers: overrides.providers,
+            groups: overrides.groups,
+        })
+        .into_response(),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+async fn get_operator_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: OperatorSettingScope,
+    scope_id: &str,
+) -> Response {
+    if let Some(response) = require_admin(state, headers) {
+        return response;
+    }
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    match catalog
+        .load_operator_setting_scope(scope.as_str(), scope_id)
+        .await
+    {
+        Ok(stored) => operator_scope_response(scope, scope_id, stored),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+async fn replace_operator_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: OperatorSettingScope,
+    scope_id: &str,
+    request: Result<Json<ReplaceOperatorScopeRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_mutation(state, headers) {
+        return response;
+    }
+    let Ok(Json(request)) = request else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-operator-setting-request",
+            "Invalid operator setting request",
+            "send a JSON request with an overrides object",
+        )
+        .response();
+    };
+    let expected_revision = match parse_if_match(headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(error) = validate_scope_overrides(scope, &request.overrides) {
+        return setting_validation_response(&error);
+    }
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    match catalog
+        .replace_operator_setting_scope(
+            scope.as_str(),
+            scope_id,
+            &request.overrides,
+            expected_revision,
+            "operator",
+        )
+        .await
+    {
+        Ok(stored) => operator_scope_response(scope, scope_id, stored),
+        Err(error) => operator_persistence_error_response(error),
+    }
+}
+
+fn validate_scope_overrides(
+    scope: OperatorSettingScope,
+    overrides: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), SettingValidationError> {
+    let catalog = setting_catalog();
+    let known: BTreeMap<&str, &SettingDefinition> = catalog
+        .iter()
+        .map(|definition| (definition.key.as_str(), definition))
+        .collect();
+    for (key, value) in overrides {
+        let Some(definition) = known.get(key.as_str()) else {
+            return Err(SettingValidationError::UnknownSetting(key.clone()));
+        };
+        match scope {
+            OperatorSettingScope::Provider if !definition.provider_overridable => {
+                return Err(SettingValidationError::ProviderOverrideForbidden(
+                    key.clone(),
+                ));
+            }
+            OperatorSettingScope::Group if !definition.group_overridable => {
+                return Err(SettingValidationError::GroupOverrideForbidden(key.clone()));
+            }
+            _ => {}
+        }
+        definition.validate(value)?;
+    }
+    Ok(())
+}
+
+async fn list_operator_revisions(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: OperatorSettingScope,
+    scope_id: &str,
+) -> Response {
+    if let Some(response) = require_admin(state, headers) {
+        return response;
+    }
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    match catalog
+        .list_operator_setting_revisions(scope.as_str(), scope_id)
+        .await
+    {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|row| OperatorRevisionResponse {
+                    revision: row.revision,
+                    actor: row.actor,
+                    created_at: row.created_at,
+                    before_value: row.before_value,
+                    after_value: row.after_value,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+async fn rollback_operator_scope(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: OperatorSettingScope,
+    scope_id: &str,
+    request: Result<Json<RollbackOperatorScopeRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_mutation(state, headers) {
+        return response;
+    }
+    let Ok(Json(request)) = request else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-operator-rollback-request",
+            "Invalid rollback request",
+            "send a JSON request with the target revision number",
+        )
+        .response();
+    };
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    match catalog
+        .rollback_operator_setting_scope(scope.as_str(), scope_id, request.revision, "operator")
+        .await
+    {
+        Ok(stored) => operator_scope_response(scope, scope_id, stored),
+        Err(error) => operator_persistence_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/settings/overrides/global",
+    tag = "settings",
+    responses(
+        (status = 200, body = OperatorScopeResponse, description = "Current global overrides and revision"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn get_operator_scope_global(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    get_operator_scope(&state, &headers, OperatorSettingScope::Global, "").await
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/settings/overrides/global",
+    tag = "settings",
+    request_body = ReplaceOperatorScopeRequest,
+    responses(
+        (status = 200, body = OperatorScopeResponse, description = "Replaced global overrides"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 412, body = ProblemDetails),
+        (status = 422, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn replace_operator_scope_global(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Result<Json<ReplaceOperatorScopeRequest>, JsonRejection>,
+) -> Response {
+    replace_operator_scope(&state, &headers, OperatorSettingScope::Global, "", request).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/settings/overrides/global/revisions",
+    tag = "settings",
+    responses(
+        (status = 200, body = [OperatorRevisionResponse], description = "Global override revision history, newest first"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn list_operator_revisions_global(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    list_operator_revisions(&state, &headers, OperatorSettingScope::Global, "").await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/settings/overrides/global/rollback",
+    tag = "settings",
+    request_body = RollbackOperatorScopeRequest,
+    responses(
+        (status = 200, body = OperatorScopeResponse, description = "Restored global overrides"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn rollback_operator_scope_global(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Result<Json<RollbackOperatorScopeRequest>, JsonRejection>,
+) -> Response {
+    rollback_operator_scope(&state, &headers, OperatorSettingScope::Global, "", request).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/settings/overrides/providers/{providerId}",
+    tag = "settings",
+    params(("providerId" = String, Path, description = "Provider identifier")),
+    responses(
+        (status = 200, body = OperatorScopeResponse, description = "Current provider overrides and revision"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn get_operator_scope_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(provider_id): Path<String>,
+) -> Response {
+    get_operator_scope(
+        &state,
+        &headers,
+        OperatorSettingScope::Provider,
+        &provider_id,
+    )
+    .await
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/settings/overrides/providers/{providerId}",
+    tag = "settings",
+    params(("providerId" = String, Path, description = "Provider identifier")),
+    request_body = ReplaceOperatorScopeRequest,
+    responses(
+        (status = 200, body = OperatorScopeResponse, description = "Replaced provider overrides"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 412, body = ProblemDetails),
+        (status = 422, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn replace_operator_scope_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(provider_id): Path<String>,
+    request: Result<Json<ReplaceOperatorScopeRequest>, JsonRejection>,
+) -> Response {
+    replace_operator_scope(
+        &state,
+        &headers,
+        OperatorSettingScope::Provider,
+        &provider_id,
+        request,
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/settings/overrides/providers/{providerId}/revisions",
+    tag = "settings",
+    params(("providerId" = String, Path, description = "Provider identifier")),
+    responses(
+        (status = 200, body = [OperatorRevisionResponse], description = "Provider override revision history, newest first"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn list_operator_revisions_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(provider_id): Path<String>,
+) -> Response {
+    list_operator_revisions(
+        &state,
+        &headers,
+        OperatorSettingScope::Provider,
+        &provider_id,
+    )
+    .await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/settings/overrides/providers/{providerId}/rollback",
+    tag = "settings",
+    params(("providerId" = String, Path, description = "Provider identifier")),
+    request_body = RollbackOperatorScopeRequest,
+    responses(
+        (status = 200, body = OperatorScopeResponse, description = "Restored provider overrides"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn rollback_operator_scope_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(provider_id): Path<String>,
+    request: Result<Json<RollbackOperatorScopeRequest>, JsonRejection>,
+) -> Response {
+    rollback_operator_scope(
+        &state,
+        &headers,
+        OperatorSettingScope::Provider,
+        &provider_id,
+        request,
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/settings/overrides/groups/{groupId}",
+    tag = "settings",
+    params(("groupId" = String, Path, description = "Channel group identifier")),
+    responses(
+        (status = 200, body = OperatorScopeResponse, description = "Current group overrides and revision"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn get_operator_scope_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<String>,
+) -> Response {
+    get_operator_scope(&state, &headers, OperatorSettingScope::Group, &group_id).await
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/settings/overrides/groups/{groupId}",
+    tag = "settings",
+    params(("groupId" = String, Path, description = "Channel group identifier")),
+    request_body = ReplaceOperatorScopeRequest,
+    responses(
+        (status = 200, body = OperatorScopeResponse, description = "Replaced group overrides"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 412, body = ProblemDetails),
+        (status = 422, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn replace_operator_scope_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<String>,
+    request: Result<Json<ReplaceOperatorScopeRequest>, JsonRejection>,
+) -> Response {
+    replace_operator_scope(
+        &state,
+        &headers,
+        OperatorSettingScope::Group,
+        &group_id,
+        request,
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/settings/overrides/groups/{groupId}/revisions",
+    tag = "settings",
+    params(("groupId" = String, Path, description = "Channel group identifier")),
+    responses(
+        (status = 200, body = [OperatorRevisionResponse], description = "Group override revision history, newest first"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn list_operator_revisions_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<String>,
+) -> Response {
+    list_operator_revisions(&state, &headers, OperatorSettingScope::Group, &group_id).await
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/settings/overrides/groups/{groupId}/rollback",
+    tag = "settings",
+    params(("groupId" = String, Path, description = "Channel group identifier")),
+    request_body = RollbackOperatorScopeRequest,
+    responses(
+        (status = 200, body = OperatorScopeResponse, description = "Restored group overrides"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn rollback_operator_scope_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(group_id): Path<String>,
+    request: Result<Json<RollbackOperatorScopeRequest>, JsonRejection>,
+) -> Response {
+    rollback_operator_scope(
+        &state,
+        &headers,
+        OperatorSettingScope::Group,
+        &group_id,
+        request,
+    )
+    .await
 }
 
 #[utoipa::path(get, path = "/api/v1/sources", tag = "sources", responses((status = 200, body = [SourceResponse])))]
@@ -2649,6 +3463,32 @@ struct EpgReconcileResponse {
     review_queued: i64,
 }
 
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ReconciliationRevisionResponse {
+    revision: i64,
+    actor: String,
+    created_at: DateTime<Utc>,
+    before_value: Option<serde_json::Value>,
+    after_value: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ReconciliationRollbackResponse {
+    target_revision: i64,
+    channels_removed: i64,
+    channels_restored: i64,
+    stream_links_restored: i64,
+    epg_mappings_restored: i64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct RollbackReconciliationRequest {
+    revision: i64,
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SetEpgMappingRequest {
@@ -2680,6 +3520,114 @@ async fn reconcile_epg_mappings(State(state): State<AppState>, headers: HeaderMa
             mappings_applied: result.mappings_applied,
             mappings_removed: result.mappings_removed,
             review_queued: result.review_queued,
+        })
+        .into_response(),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/sources/{sourceId}/reconcile/revisions",
+    tag = "guide",
+    params(("sourceId" = String, Path, description = "Provider source identifier")),
+    responses(
+        (status = 200, body = [ReconciliationRevisionResponse], description = "Reconciliation revision history, newest first"),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn list_reconciliation_revisions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(source_id): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    let Ok(account_id) = Uuid::parse_str(&source_id) else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-source-id",
+            "Invalid source id",
+            "send a valid provider account identifier",
+        )
+        .response();
+    };
+    match catalog.list_reconciliation_revisions(account_id).await {
+        Ok(rows) => Json(
+            rows.into_iter()
+                .map(|row| ReconciliationRevisionResponse {
+                    revision: row.revision,
+                    actor: row.actor,
+                    created_at: row.created_at,
+                    before_value: row.before_value,
+                    after_value: row.after_value,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/sources/{sourceId}/reconcile/rollback",
+    tag = "guide",
+    params(("sourceId" = String, Path, description = "Provider source identifier")),
+    request_body = RollbackReconciliationRequest,
+    responses(
+        (status = 200, body = ReconciliationRollbackResponse, description = "Restored channels, streams, and EPG mappings"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn rollback_reconciliation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(source_id): Path<String>,
+    request: Result<Json<RollbackReconciliationRequest>, JsonRejection>,
+) -> Response {
+    if let Some(response) = require_admin_mutation(&state, &headers) {
+        return response;
+    }
+    let Ok(Json(request)) = request else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-reconciliation-rollback-request",
+            "Invalid rollback request",
+            "send a JSON request with the target revision number",
+        )
+        .response();
+    };
+    let Some(catalog) = &state.catalog_repository else {
+        return persistence_unavailable();
+    };
+    let Ok(account_id) = Uuid::parse_str(&source_id) else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-source-id",
+            "Invalid source id",
+            "send a valid provider account identifier",
+        )
+        .response();
+    };
+    match catalog
+        .rollback_reconciliation(account_id, request.revision, "operator")
+        .await
+    {
+        Ok(stats) => Json(ReconciliationRollbackResponse {
+            target_revision: stats.target_revision,
+            channels_removed: stats.channels_removed,
+            channels_restored: stats.channels_restored,
+            stream_links_restored: stats.stream_links_restored,
+            epg_mappings_restored: stats.epg_mappings_restored,
         })
         .into_response(),
         Err(error) => persistence_error_response(error),
@@ -3137,14 +4085,14 @@ async fn create_event_template(
     path = "/api/v1/event-templates/{template_id}",
     tag = "guide",
     params(("template_id" = String, Path, description = "Event template UUID")),
-    request_body = CreateEventTemplateRequest,
+    request_body = UpdateEventTemplateRequest,
     responses((status = 200, body = EventTemplateResponse), (status = 401, body = ProblemDetails), (status = 404, body = ProblemDetails))
 )]
 async fn update_event_template(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(template_id): Path<String>,
-    request: Result<Json<CreateEventTemplateRequest>, JsonRejection>,
+    request: Result<Json<UpdateEventTemplateRequest>, JsonRejection>,
 ) -> Response {
     if let Some(response) = require_admin_mutation(&state, &headers) {
         return response;
@@ -3154,7 +4102,7 @@ async fn update_event_template(
             StatusCode::BAD_REQUEST,
             "invalid-event-template-request",
             "Invalid event template request",
-            "send a JSON request that matches the documented event template schema",
+            "send a JSON request that matches the documented event template patch schema",
         )
         .response();
     };
@@ -3170,7 +4118,7 @@ async fn update_event_template(
     let Some(catalog) = &state.catalog_repository else {
         return persistence_unavailable();
     };
-    let input = CreateEventTemplate {
+    let input = EventTemplateUpdate {
         name: request.name,
         display_name: request.display_name,
         match_regex: request.match_regex,
@@ -3179,8 +4127,9 @@ async fn update_event_template(
         event_duration_hours: request.event_duration_hours,
         past_date_grace_hours: request.past_date_grace_hours,
         future_date_days: request.future_date_days,
+        enabled: request.enabled,
     };
-    match catalog.update_event_template(id, input).await {
+    match catalog.update_event_template_partial(id, &input).await {
         Ok(row) => Json(event_template_response_from_row(&row)).into_response(),
         Err(PersistenceError::SourceNotFound(_)) => not_found(),
         Err(error) => persistence_error_response(error),
@@ -6801,6 +7750,455 @@ mod tests {
         assert!(openapi.paths.paths.contains_key("/api/v1/settings/schema"));
     }
 
+    #[tokio::test]
+    async fn operator_settings_routes_require_admin_and_register_in_openapi() {
+        let app = router(state());
+        let unauthorized = app
+            .oneshot(
+                Request::get("/api/v1/settings/effective")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let openapi = ApiDoc::openapi();
+        for path in [
+            "/api/v1/settings/effective",
+            "/api/v1/settings/overrides",
+            "/api/v1/settings/overrides/global",
+            "/api/v1/settings/overrides/global/revisions",
+            "/api/v1/settings/overrides/global/rollback",
+            "/api/v1/settings/overrides/providers/{providerId}",
+            "/api/v1/settings/overrides/groups/{groupId}",
+        ] {
+            assert!(
+                openapi.paths.paths.contains_key(path),
+                "OpenAPI must register {path}"
+            );
+        }
+        assert_schema::<EffectiveSettingsResponse>();
+        assert_schema::<OperatorOverridesResponse>();
+        assert_schema::<OperatorScopeResponse>();
+        assert_schema::<OperatorRevisionResponse>();
+        assert_serializes(OperatorSettingScope::Global);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn operator_settings_persist_precedence_etag_revisions_and_rollback() {
+        if std::env::var("IPTV_TEST_DATABASE_URL").is_err() {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL API integration test");
+            return;
+        }
+        let (admin, database, schema) = isolated_database().await;
+        let app = router(state_with_database(Some(database.clone())));
+
+        // Global override: ring duration seconds.
+        let global_put = app
+            .clone()
+            .oneshot(admin_request(
+                "PUT",
+                "/api/v1/settings/overrides/global",
+                Some(r#"{"overrides":{"media.ring.duration_seconds":12}}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(global_put.status(), StatusCode::OK);
+        assert_eq!(global_put.headers()[header::ETAG], "\"1\"");
+        let global_body: serde_json::Value =
+            serde_json::from_str(&response_text(global_put).await).unwrap();
+        assert_eq!(global_body["scope"], "global");
+        assert_eq!(global_body["revision"], 1);
+        assert_eq!(global_body["overrides"]["media.ring.duration_seconds"], 12);
+
+        // Provider override: ring duration seconds (provider wins over global).
+        let provider_put = app
+            .clone()
+            .oneshot(admin_request(
+                "PUT",
+                "/api/v1/settings/overrides/providers/provider-a",
+                Some(r#"{"overrides":{"media.ring.duration_seconds":16}}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(provider_put.status(), StatusCode::OK);
+        assert_eq!(provider_put.headers()[header::ETAG], "\"1\"");
+
+        // Group override: events inferred duration (group wins over provider/global).
+        let group_put = app
+            .clone()
+            .oneshot(admin_request(
+                "PUT",
+                "/api/v1/settings/overrides/groups/sports",
+                Some(r#"{"overrides":{"events.inferred_duration_seconds":9000}}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(group_put.status(), StatusCode::OK);
+
+        // Effective settings show group > provider > global > default precedence.
+        let effective = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                "/api/v1/settings/effective?providerId=provider-a&groupId=sports",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(effective.status(), StatusCode::OK);
+        let effective_body: serde_json::Value =
+            serde_json::from_str(&response_text(effective).await).unwrap();
+        let settings = effective_body["settings"].as_array().unwrap();
+        let ring = settings
+            .iter()
+            .find(|s| s["definition"]["key"] == "media.ring.duration_seconds")
+            .unwrap();
+        assert_eq!(ring["value"], 16);
+        assert_eq!(ring["inheritedFrom"]["scope"], "provider");
+        assert_eq!(ring["inheritedFrom"]["id"], "provider-a");
+        let duration = settings
+            .iter()
+            .find(|s| s["definition"]["key"] == "events.inferred_duration_seconds")
+            .unwrap();
+        assert_eq!(duration["value"], 9000);
+        assert_eq!(duration["inheritedFrom"]["scope"], "channel_group");
+        assert_eq!(duration["inheritedFrom"]["id"], "sports");
+        let apply = effective_body["applyRequirements"].as_array().unwrap();
+        assert!(apply.iter().any(|value| value == "immediate"));
+        assert_eq!(effective_body["etag"].as_str().unwrap().len(), 16);
+
+        // Stale If-Match returns 412 and the current ETag.
+        let mut stale_request = admin_request(
+            "PUT",
+            "/api/v1/settings/overrides/global",
+            Some(r#"{"overrides":{"media.ring.duration_seconds":20}}"#.to_owned()),
+        );
+        stale_request
+            .headers_mut()
+            .insert(header::IF_MATCH, HeaderValue::from_static("\"99\""));
+        let stale_response = app.clone().oneshot(stale_request).await.unwrap();
+        assert_eq!(stale_response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale_response.headers()[header::ETAG], "\"1\"");
+        let stale_body: serde_json::Value =
+            serde_json::from_str(&response_text(stale_response).await).unwrap();
+        assert_eq!(stale_body["code"], "setting-revision-conflict");
+
+        // Fresh If-Match succeeds and bumps the revision.
+        let mut fresh_request = admin_request(
+            "PUT",
+            "/api/v1/settings/overrides/global",
+            Some(r#"{"overrides":{"media.ring.duration_seconds":20}}"#.to_owned()),
+        );
+        fresh_request
+            .headers_mut()
+            .insert(header::IF_MATCH, HeaderValue::from_static("\"1\""));
+        let fresh_response = app.clone().oneshot(fresh_request).await.unwrap();
+        assert_eq!(fresh_response.status(), StatusCode::OK);
+        assert_eq!(fresh_response.headers()[header::ETAG], "\"2\"");
+
+        // Revision history records both writes, newest first.
+        let revisions = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                "/api/v1/settings/overrides/global/revisions",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revisions.status(), StatusCode::OK);
+        let revisions_body: serde_json::Value =
+            serde_json::from_str(&response_text(revisions).await).unwrap();
+        let revisions_array = revisions_body.as_array().unwrap();
+        assert_eq!(revisions_array[0]["revision"], 2);
+        assert_eq!(revisions_array[1]["revision"], 1);
+        assert_eq!(
+            revisions_array[0]["afterValue"]["media.ring.duration_seconds"],
+            20
+        );
+        assert_eq!(
+            revisions_array[1]["afterValue"]["media.ring.duration_seconds"],
+            12
+        );
+
+        // Rollback to revision 1 restores the earlier value and bumps to 3.
+        let rollback = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                "/api/v1/settings/overrides/global/rollback",
+                Some(r#"{"revision":1}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rollback.status(), StatusCode::OK);
+        assert_eq!(rollback.headers()[header::ETAG], "\"3\"");
+        let rollback_body: serde_json::Value =
+            serde_json::from_str(&response_text(rollback).await).unwrap();
+        assert_eq!(
+            rollback_body["overrides"]["media.ring.duration_seconds"],
+            12
+        );
+
+        // Rollback to a missing revision returns 404.
+        let missing = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                "/api/v1/settings/overrides/global/rollback",
+                Some(r#"{"revision":99}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        // Forbidden group override returns 403 before persistence.
+        let forbidden = app
+            .clone()
+            .oneshot(admin_request(
+                "PUT",
+                "/api/v1/settings/overrides/groups/sports",
+                Some(r#"{"overrides":{"media.ring.max_bytes":1048576}}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        drop_isolated_database(&admin, database, schema).await;
+    }
+
+    #[tokio::test]
+    async fn operator_settings_scope_etag_survives_empty_override_set() {
+        if std::env::var("IPTV_TEST_DATABASE_URL").is_err() {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL API integration test");
+            return;
+        }
+        let (admin, database, schema) = isolated_database().await;
+        let app = router(state_with_database(Some(database.clone())));
+
+        // Seed one global override so the scope has a recorded revision.
+        let seed = app
+            .clone()
+            .oneshot(admin_request(
+                "PUT",
+                "/api/v1/settings/overrides/global",
+                Some(r#"{"overrides":{"media.ring.duration_seconds":12}}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(seed.status(), StatusCode::OK);
+        assert_eq!(seed.headers()[header::ETAG], "\"1\"");
+
+        // Clear the scope with the seeded ETag. The revisions table keeps
+        // revision 2 even though the override rows are deleted.
+        let mut clear_request = admin_request(
+            "PUT",
+            "/api/v1/settings/overrides/global",
+            Some(r#"{"overrides":{}}"#.to_owned()),
+        );
+        clear_request
+            .headers_mut()
+            .insert(header::IF_MATCH, HeaderValue::from_static("\"1\""));
+        let cleared = app.clone().oneshot(clear_request).await.unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert_eq!(cleared.headers()[header::ETAG], "\"2\"");
+        let cleared_body: serde_json::Value =
+            serde_json::from_str(&response_text(cleared).await).unwrap();
+        assert_eq!(cleared_body["revision"], 2);
+        assert!(cleared_body["overrides"].as_object().unwrap().is_empty());
+
+        // The GET scope response must report revision 2 and an ETag that
+        // matches the write, not revision 0 from the empty override set.
+        let loaded = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                "/api/v1/settings/overrides/global",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(loaded.status(), StatusCode::OK);
+        assert_eq!(loaded.headers()[header::ETAG], "\"2\"");
+        let loaded_body: serde_json::Value =
+            serde_json::from_str(&response_text(loaded).await).unwrap();
+        assert_eq!(loaded_body["revision"], 2);
+        assert!(loaded_body["overrides"].as_object().unwrap().is_empty());
+
+        // A fresh If-Match write with the loaded ETag must succeed and bump
+        // the revision to 3.
+        let mut fresh_request = admin_request(
+            "PUT",
+            "/api/v1/settings/overrides/global",
+            Some(r#"{"overrides":{"media.ring.duration_seconds":30}}"#.to_owned()),
+        );
+        fresh_request
+            .headers_mut()
+            .insert(header::IF_MATCH, HeaderValue::from_static("\"2\""));
+        let fresh = app.clone().oneshot(fresh_request).await.unwrap();
+        assert_eq!(fresh.status(), StatusCode::OK);
+        assert_eq!(fresh.headers()[header::ETAG], "\"3\"");
+
+        drop_isolated_database(&admin, database, schema).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn reconciliation_records_revisions_and_rollback_restores_state() {
+        if std::env::var("IPTV_TEST_DATABASE_URL").is_err() {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL API integration test");
+            return;
+        }
+        let (admin, database, schema) = isolated_database().await;
+        let app = router(state_with_database(Some(database.clone())));
+        let pool = database.pool().clone();
+
+        // Seed one provider account with one active M3U snapshot and one
+        // supported stream so reconciliation produces one canonical channel.
+        let account_id = uuid::Uuid::now_v7();
+        let snapshot_id = uuid::Uuid::now_v7();
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+        )
+        .bind(account_id)
+        .bind(format!("Rollback account {}", uuid::Uuid::now_v7()))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+        )
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, channel_number, url_template, attributes, directives, supported) VALUES ($1, $2, $3, 'news', 'News HD', 'news.tvg', '7.1', 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(snapshot_id)
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        // First reconciliation records revision 1.
+        let first = app
+            .clone()
+            .oneshot(admin_request("POST", "/api/v1/epg/reconcile", None))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // The per-account reconcile is invoked through the persistence layer
+        // directly because the public API exposes only the global EPG
+        // reconcile. The rollback endpoint targets the account revisions.
+        let catalog = iptv_persistence::CatalogRepository::new(pool.clone());
+        catalog
+            .reconcile_provider_account(account_id)
+            .await
+            .unwrap();
+
+        // Revision history lists the recorded reconciliation revision.
+        let revisions = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                &format!("/api/v1/sources/{account_id}/reconcile/revisions"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revisions.status(), StatusCode::OK);
+        let revisions_body: serde_json::Value =
+            serde_json::from_str(&response_text(revisions).await).unwrap();
+        let revisions_array = revisions_body.as_array().unwrap();
+        assert_eq!(revisions_array[0]["revision"], 1);
+        assert!(revisions_array[0]["afterValue"]["channels"].is_array());
+
+        // Mutate the catalog so a second reconciliation removes the channel.
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query("UPDATE provider_streams SET supported = false WHERE snapshot_id = $1")
+            .bind(snapshot_id)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+        catalog
+            .reconcile_provider_account(account_id)
+            .await
+            .unwrap();
+
+        // The channel is gone after the second reconciliation.
+        let channel_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM channels WHERE provider_account_id = $1 AND managed_by = 'automatic'",
+        )
+        .bind(account_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(channel_count, 0);
+
+        // Rollback to revision 1 restores the channel, stream link, and EPG
+        // mapping snapshot captured before the second reconciliation.
+        let rollback = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                &format!("/api/v1/sources/{account_id}/reconcile/rollback"),
+                Some(r#"{"revision":1}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rollback.status(), StatusCode::OK);
+        let rollback_body: serde_json::Value =
+            serde_json::from_str(&response_text(rollback).await).unwrap();
+        assert_eq!(rollback_body["targetRevision"], 1);
+        assert_eq!(rollback_body["channelsRestored"], 1);
+
+        let restored_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM channels WHERE provider_account_id = $1 AND managed_by = 'automatic'",
+        )
+        .bind(account_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(restored_count, 1);
+
+        // Rollback to a missing revision returns 404.
+        let missing = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                &format!("/api/v1/sources/{account_id}/reconcile/rollback"),
+                Some(r#"{"revision":99}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        // An invalid source id returns 400.
+        let bad = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                "/api/v1/sources/not-a-uuid/reconcile/revisions",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        drop_isolated_database(&admin, database, schema).await;
+    }
+
     #[test]
     fn aggregate_session_contract_maps_every_typed_state_and_failure() {
         let pool = PoolSnapshot {
@@ -9010,6 +10408,127 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_event_template_patch_applies_partial_updates() {
+        let (admin, database, schema) = isolated_database().await;
+        let pool = database.pool().clone();
+        let app = router(state_with_database(Some(database.clone())));
+
+        let template_body = r#"{"name":"Patch events","displayName":"Patch Events","matchRegex":"Patch.*","channelNameFormat":"Patch {slot}","groupName":"Events","eventDurationHours":3,"pastDateGraceHours":4,"futureDateDays":2}"#;
+        let created = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                "/api/v1/event-templates",
+                Some(template_body.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let template: serde_json::Value =
+            serde_json::from_str(&response_text(created).await).unwrap();
+        let template_id = template["id"].as_str().unwrap();
+        assert_eq!(template["enabled"], serde_json::Value::Bool(true));
+        assert_eq!(template["eventDurationHours"], serde_json::json!(3));
+
+        // Partial patch: toggle enabled off and adjust duration only.
+        let disabled = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                format!("/api/v1/event-templates/{template_id}"),
+                Some(r#"{"enabled":false,"eventDurationHours":5}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::OK);
+        let disabled_body: serde_json::Value =
+            serde_json::from_str(&response_text(disabled).await).unwrap();
+        assert_eq!(disabled_body["enabled"], serde_json::Value::Bool(false));
+        assert_eq!(disabled_body["eventDurationHours"], serde_json::json!(5));
+        // Omitted fields keep their stored values.
+        assert_eq!(
+            disabled_body["displayName"],
+            serde_json::json!("Patch Events")
+        );
+        assert_eq!(disabled_body["futureDateDays"], serde_json::json!(2));
+
+        // Empty patch still succeeds and refreshes updated_at.
+        let empty = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                format!("/api/v1/event-templates/{template_id}"),
+                Some("{}".to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::OK);
+
+        // Re-enable and rename in one partial patch.
+        let reenabled = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                format!("/api/v1/event-templates/{template_id}"),
+                Some(r#"{"enabled":true,"displayName":"Renamed Events"}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reenabled.status(), StatusCode::OK);
+        let reenabled_body: serde_json::Value =
+            serde_json::from_str(&response_text(reenabled).await).unwrap();
+        assert_eq!(reenabled_body["enabled"], serde_json::Value::Bool(true));
+        assert_eq!(
+            reenabled_body["displayName"],
+            serde_json::json!("Renamed Events")
+        );
+
+        // Unknown template ID returns 404.
+        let missing = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                format!("/api/v1/event-templates/{}", Uuid::now_v7()),
+                Some(r#"{"enabled":false}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        // Invalid UUID returns 400.
+        let bad_id = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                "/api/v1/event-templates/not-a-uuid",
+                Some(r#"{"enabled":false}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad_id.status(), StatusCode::BAD_REQUEST);
+
+        // Verify persistence: the enabled flag and duration are stored.
+        let stored: iptv_persistence::EventTemplateRow =
+            sqlx::query_as::<_, iptv_persistence::EventTemplateRow>(
+                r"SELECT id, name, display_name, match_regex, channel_name_format,
+                          group_name, event_duration_hours, past_date_grace_hours,
+                          future_date_days, enabled FROM event_templates WHERE id = $1",
+            )
+            .bind(Uuid::parse_str(template_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(stored.enabled);
+        assert_eq!(stored.event_duration_hours, 5);
+        assert_eq!(stored.display_name, "Renamed Events");
+
+        drop(app);
+        drop(pool);
+        drop_isolated_database(&admin, database, schema).await;
+    }
+
+    #[tokio::test]
     async fn durable_route_errors_are_consistent_without_postgres() {
         let app = router(state());
         let source_id = Uuid::nil();
@@ -9037,6 +10556,16 @@ mod tests {
             ("GET", "/api/v1/jobs".to_owned(), None),
             ("POST", format!("/api/v1/jobs/{job_id}/cancel"), None),
             ("POST", "/api/v1/epg/reconcile".to_owned(), None),
+            (
+                "GET",
+                format!("/api/v1/sources/{source_id}/reconcile/revisions"),
+                None,
+            ),
+            (
+                "POST",
+                format!("/api/v1/sources/{source_id}/reconcile/rollback"),
+                Some(r#"{"revision":1}"#.to_owned()),
+            ),
             ("GET", "/api/v1/epg/unmapped".to_owned(), None),
             ("GET", "/api/v1/epg/channels/search?q=test".to_owned(), None),
             ("GET", "/api/v1/event-templates".to_owned(), None),
@@ -9085,6 +10614,7 @@ mod tests {
         assert_schema::<DynamicEventResponse>();
         assert_schema::<EventTemplateResponse>();
         assert_schema::<CreateEventTemplateRequest>();
+        assert_schema::<UpdateEventTemplateRequest>();
         assert_schema::<EventChannelResponse>();
         assert_schema::<EventChannelQuery>();
         assert_schema::<SessionResponse>();
@@ -9575,6 +11105,13 @@ mod tests {
             "channelNameFormat": "Event {slot}", "groupName": "Events",
             "eventDurationHours": 3, "pastDateGraceHours": 4, "futureDateDays": 2
         }));
+        assert_deserializes::<UpdateEventTemplateRequest>(serde_json::json!({
+            "enabled": false
+        }));
+        assert_deserializes::<UpdateEventTemplateRequest>(serde_json::json!({
+            "displayName": "Updated", "eventDurationHours": 4, "enabled": true
+        }));
+        assert_deserializes::<UpdateEventTemplateRequest>(serde_json::json!({}));
         assert_deserializes::<EventChannelQuery>(serde_json::json!({"templateId": id}));
         assert_deserializes::<LoginRequest>(serde_json::json!({
             "username": "operator", "password": "password"

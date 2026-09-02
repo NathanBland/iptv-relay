@@ -181,5 +181,24 @@ services:
         condition: service_healthy
     restart: "no"
 
+  scale-gate:
+    image: iptv-gateway-core:local
+    entrypoint: ["scale-gate"]
+    profiles: ["test"]
+    environment:
+      IPTV_TEST_DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/iptv
+      SCALE_GATE_LABEL: pinned-runner
+      SCALE_GATE_BASELINE: /app/tests/fixtures/scale-gate-baseline.json
+      SCALE_GATE_RESULTS: /tmp/scale-gate-results.json
+      SCALE_GATE_ENTRIES: ${SCALE_GATE_ENTRIES:-1160000}
+      SCALE_GATE_CHANNELS: ${SCALE_GATE_CHANNELS:-2750}
+      SCALE_GATE_PROGRAMMES: ${SCALE_GATE_PROGRAMMES:-275000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./target/scale-gate:/tmp
+    restart: "no"
+
 volumes:
   postgres-data:
