@@ -8081,6 +8081,12 @@ fn text_response(content_type: &'static str, body: String) -> Response {
 fn no_store_response(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(header::EXPIRES, HeaderValue::from_static("0"));
+    headers.insert(
+        HeaderName::from_static("surrogate-control"),
+        HeaderValue::from_static("no-store"),
+    );
     response
 }
 
@@ -8183,6 +8189,9 @@ mod tests {
 
     fn assert_no_store(response: &Response) {
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::PRAGMA], "no-cache");
+        assert_eq!(response.headers()[header::EXPIRES], "0");
+        assert_eq!(response.headers()["surrogate-control"], "no-store");
     }
 
     fn sample_session(
