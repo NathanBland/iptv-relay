@@ -1,7 +1,7 @@
 use crate::{DecodedArtifact, IngestError, IngestFormat, XtreamPayloadKind};
 use iptv_parsers::{
     M3uPlaylist, ParseLimits, ParseStats, XmltvDocument, XtreamAuth, XtreamCategory,
-    XtreamDocument, XtreamLiveStream, XtreamShortEpgEntry, parse_m3u, parse_xmltv,
+    XtreamDocument, XtreamLiveStream, XtreamShortEpgEntry, parse_m3u, parse_xmltv_with_options,
     parse_xtream_auth, parse_xtream_live_categories, parse_xtream_live_streams,
     parse_xtream_short_epg_in_timezone,
 };
@@ -68,7 +68,7 @@ pub fn parse_artifact(
 
 /// Parses one decoded artifact with the configured source timezone.
 ///
-/// The timezone applies only to Xtream local short EPG timestamps. Explicit
+/// The timezone applies to timestamps without an explicit offset. Explicit
 /// timestamp offsets remain authoritative.
 #[allow(clippy::missing_errors_doc)]
 pub fn parse_artifact_with_source_timezone(
@@ -88,7 +88,13 @@ pub fn parse_artifact_with_source_timezone(
                 format: "M3U",
                 source,
             })?,
-        IngestFormat::Xmltv => parse_xmltv(BufReader::new(file), limits)
+        IngestFormat::Xmltv => parse_xmltv_with_options(
+            BufReader::new(file),
+            limits,
+            &iptv_parsers::XmltvParseOptions {
+                default_timezone: source_timezone.to_owned(),
+            },
+        )
             .map(ParsedArtifact::Xmltv)
             .map_err(|source| IngestError::Parse {
                 format: "XMLTV",
@@ -188,6 +194,36 @@ mod tests {
             ),
             Err(IngestError::EmptySnapshot { format: "XMLTV" })
         ));
+    }
+
+    #[test]
+    fn xmltv_source_timezone_is_fallback_for_implicit_timestamps() {
+        let parsed = parse_artifact_with_source_timezone(
+            &decoded(
+                br#"<tv>
+                    <channel id="denver"/>
+                    <programme channel="denver" start="20260101120000" stop="20260101130000"><title>Winter local noon</title></programme>
+                    <programme channel="denver" start="20260101120000 +0000" stop="20260101130000 +0000"><title>Explicit UTC noon</title></programme>
+                </tv>"#,
+            ),
+            IngestFormat::Xmltv,
+            ParseLimits::default(),
+            "America/Denver",
+        )
+        .expect("XMLTV with source timezone");
+
+        let ParsedArtifact::Xmltv(document) = parsed else {
+            panic!("expected XMLTV document");
+        };
+        assert_eq!(document.programmes.len(), 2);
+        assert_eq!(
+            document.programmes[0].start.to_rfc3339(),
+            "2026-01-01T19:00:00+00:00"
+        );
+        assert_eq!(
+            document.programmes[1].start.to_rfc3339(),
+            "2026-01-01T12:00:00+00:00"
+        );
     }
 
     #[test]
