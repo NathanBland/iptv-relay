@@ -1713,6 +1713,8 @@ mod tests {
                 // channel_id matches that tvg-id so the catalog tvg-id
                 // reconciliation pass links the short EPG channel to the
                 // canonical channel that the live-stream snapshot produced.
+                let start = chrono::Utc::now() - chrono::Duration::minutes(5);
+                let end = chrono::Utc::now() + chrono::Duration::hours(3);
                 Json(serde_json::json!({
                     "epg_listings": [
                         {
@@ -1721,8 +1723,8 @@ mod tests {
                             "title": "QnJvbmNvcyB2cyBDaGllZnM=",
                             "description": "TGl2ZSBmcm9tIERlbnZlcg==",
                             "lang": "en",
-                            "start": "2026-09-14T00:20:00Z",
-                            "end": "2026-09-14T03:30:00Z",
+                            "start": start.to_rfc3339(),
+                            "end": end.to_rfc3339(),
                             "channel_id": "worker-epg-7",
                             "event_id": "short-epg-game-1"
                         }
