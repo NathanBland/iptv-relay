@@ -1862,7 +1862,21 @@ pub fn redact_error(error: &str) -> String {
             redacted.replace_range(start..end, "[REDACTED_URL]");
         }
     }
-    for key in ["username", "password", "token", "auth", "secret", "key"] {
+    for key in [
+        "username",
+        "password",
+        "token",
+        "auth",
+        "authorization",
+        "secret",
+        "credential",
+        "cookie",
+        "signature",
+        "session",
+        "api_key",
+        "access_key",
+        "key",
+    ] {
         let mut search_from = 0;
         while let Some(relative) = redacted[search_from..]
             .to_ascii_lowercase()
@@ -1876,7 +1890,68 @@ pub fn redact_error(error: &str) -> String {
             search_from = start + "[REDACTED]".len();
         }
     }
+
+    // Errors can include serialized request headers without query syntax.
+    // Remove the complete header value because cookies can contain several
+    // semicolon-separated credentials.
+    for label in [
+        "authorization:",
+        "proxy-authorization:",
+        "cookie:",
+        "set-cookie:",
+        "x-api-key:",
+        "x-auth-token:",
+        "api-key:",
+    ] {
+        let mut search_from = 0;
+        while let Some(relative) = redacted[search_from..].to_ascii_lowercase().find(label) {
+            let start = search_from + relative + label.len();
+            let value_start = start
+                + redacted[start..]
+                    .find(|character: char| !character.is_ascii_whitespace())
+                    .unwrap_or(redacted.len() - start);
+            let end = redacted[value_start..]
+                .find(['\r', '\n', '\'', '"'])
+                .map_or(redacted.len(), |offset| value_start + offset);
+            redacted.replace_range(value_start..end, "[REDACTED]");
+            search_from = value_start + "[REDACTED]".len();
+        }
+    }
     redacted
+}
+
+fn sensitive_diagnostic_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    [
+        "username",
+        "password",
+        "token",
+        "auth",
+        "secret",
+        "credential",
+        "cookie",
+        "header",
+        "url",
+        "uri",
+        "endpoint",
+        "processarg",
+        "argv",
+        "argument",
+        "args",
+        "command",
+        "environment",
+        "apikey",
+        "accesskey",
+        "signature",
+        "sessionid",
+        "key",
+    ]
+    .iter()
+    .any(|candidate| normalized.contains(candidate))
 }
 
 /// Recursively redacts job diagnostics before they cross the control API.
@@ -1886,15 +1961,9 @@ pub fn redact_diagnostics(value: &Value) -> Value {
             object
                 .iter()
                 .map(|(key, value)| {
-                    let normalized = key.to_ascii_lowercase();
-                    let sensitive = [
-                        "username", "password", "token", "auth", "secret", "key", "url", "endpoint",
-                    ]
-                    .iter()
-                    .any(|candidate| normalized.contains(candidate));
                     (
                         key.clone(),
-                        if sensitive {
+                        if sensitive_diagnostic_key(key) {
                             Value::String("[REDACTED]".to_owned())
                         } else {
                             redact_diagnostics(value)
@@ -2061,6 +2130,15 @@ mod tests {
     }
 
     #[test]
+    fn redacts_headers_cookies_and_credentials_in_plain_errors() {
+        let value = redact_error(
+            "request failed Authorization: Bearer provider-secret Cookie: session=output-secret",
+        );
+        assert!(!value.contains("provider-secret"));
+        assert!(!value.contains("output-secret"));
+    }
+
+    #[test]
     fn recursively_redacts_job_diagnostics() {
         let value = redact_diagnostics(&serde_json::json!({
             "processed": 4,
@@ -2073,6 +2151,29 @@ mod tests {
             assert!(!rendered.contains(secret));
         }
         assert_eq!(value["processed"], 4);
+    }
+
+    #[test]
+    fn recursively_redacts_request_metadata_and_arbitrary_credential_fields() {
+        let value = redact_diagnostics(&serde_json::json!({
+            "headers": {"authorization": "Bearer provider-secret"},
+            "cookies": ["session=output-secret"],
+            "processArgs": ["ffmpeg", "--http-header", "Cookie: session=hidden"],
+            "providerCredentials": {"username": "alice", "password": "secret"},
+            "safe": {"message": "Authorization: Bearer plain-secret"}
+        }));
+        let rendered = value.to_string();
+        for secret in [
+            "provider-secret",
+            "output-secret",
+            "hidden",
+            "alice",
+            "secret",
+            "plain-secret",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret} in {rendered}");
+        }
+        assert_eq!(value["safe"]["message"], "Authorization: [REDACTED]");
     }
 
     #[test]
