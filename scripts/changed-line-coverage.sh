@@ -91,6 +91,9 @@ is_production_file() {
     tests/*|*/tests/*|benches/*|*/benches/*|examples/*|*/examples/*|build.rs|*/build.rs|*/bin/*|*.test.*|*.spec.*|e2e/*|*/e2e/*|fuzz/*|*/fuzz/*|migrations/*|*/migrations/*|scripts/*|*/scripts/*|deploy/*|*/deploy/*)
       return 1
       ;;
+    */playwright.config.ts|*/vitest.config.ts|*/vite.config.ts)
+      return 1
+      ;;
   esac
 
   return 0

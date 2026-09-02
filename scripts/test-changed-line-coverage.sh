@@ -157,4 +157,17 @@ if ! (cd "$TEST_DIR" && \
   exit 1
 fi
 
+# Test-tool configuration must stay outside the production gate.
+printf '%s\n' 'export default {}' > "$TEST_DIR/apps/web/playwright.config.ts"
+CONFIG_OUTPUT=$(cd "$TEST_DIR" && \
+  FAKE_COVERAGE_JSON='{"data":[{"files":[{"filename":"src/lib.rs","lines":[{"line_number":2,"count":1}]}]}]}' \
+  PATH="$TEST_DIR/bin:$PATH" \
+  GITHUB_BASE_REF=base \
+  "$COVERAGE_SCRIPT" 95)
+if printf '%s\n' "$CONFIG_OUTPUT" | grep -q 'playwright.config.ts'; then
+  echo "Expected Playwright configuration to stay outside the production gate." >&2
+  printf '%s\n' "$CONFIG_OUTPUT" >&2
+  exit 1
+fi
+
 echo "Changed-line coverage script tests passed."
