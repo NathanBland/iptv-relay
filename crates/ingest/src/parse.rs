@@ -95,11 +95,11 @@ pub fn parse_artifact_with_source_timezone(
                 default_timezone: source_timezone.to_owned(),
             },
         )
-            .map(ParsedArtifact::Xmltv)
-            .map_err(|source| IngestError::Parse {
-                format: "XMLTV",
-                source,
-            })?,
+        .map(ParsedArtifact::Xmltv)
+        .map_err(|source| IngestError::Parse {
+            format: "XMLTV",
+            source,
+        })?,
         IngestFormat::Xtream(XtreamPayloadKind::Auth) => {
             parse_xtream_auth(BufReader::new(file), limits)
                 .map(ParsedArtifact::XtreamAuth)

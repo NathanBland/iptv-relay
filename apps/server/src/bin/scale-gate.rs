@@ -63,16 +63,13 @@ const DATABASE_URL_ENV: &str = "IPTV_TEST_DATABASE_URL";
 /// supplied. The row is isolated to this id and the runner removes only the
 /// snapshots it owns after each run. Real provider accounts use time-based ids,
 /// so this fixed value cannot collide with production data.
-const SCALE_GATE_PROVIDER_ACCOUNT_ID: Uuid = Uuid::from_u128(
-    0x5c41_3e2a_19a7_4f3e_8b1c_2d5e_6a7b_8c9d,
-);
+const SCALE_GATE_PROVIDER_ACCOUNT_ID: Uuid =
+    Uuid::from_u128(0x5c41_3e2a_19a7_4f3e_8b1c_2d5e_6a7b_8c9d);
 
 /// Deterministic test-only EPG source id used by the scale-gate runner for the
 /// XMLTV activation path. The runner inserts a matching `epg_sources` row and
 /// removes only the snapshots it owns after each run.
-const SCALE_GATE_EPG_SOURCE_ID: Uuid = Uuid::from_u128(
-    0x7d52_4f3b_2ab8_404e_9c2d_3e6f_7a8b_9c0e,
-);
+const SCALE_GATE_EPG_SOURCE_ID: Uuid = Uuid::from_u128(0x7d52_4f3b_2ab8_404e_9c2d_3e6f_7a8b_9c0e);
 
 /// Stable name shared by the runner-owned `provider_accounts` and `epg_sources`
 /// rows. The name makes the test-only rows easy to identify.
