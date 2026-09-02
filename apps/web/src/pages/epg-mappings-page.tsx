@@ -15,11 +15,21 @@ import type { EpgMapping, IptvApiClient, ReconciliationRevision } from '@/lib/ap
 const PAGE_SIZE = 50
 
 type Tab = 'mapped' | 'review' | 'unmapped'
+type BulkReviewAction = 'accept' | 'reject'
+
+interface BulkReviewResult {
+  action: BulkReviewAction
+  resolved: number
+}
 
 export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient }) {
   const [tab, setTab] = useState<Tab>('mapped')
   const [search, setSearch] = useState('')
   const [page, setPage] = useState(0)
+  const [selectedReviewIds, setSelectedReviewIds] = useState<Set<string>>(new Set())
+  const [bulkReviewAction, setBulkReviewAction] = useState<BulkReviewAction | null>(null)
+  const [bulkReviewError, setBulkReviewError] = useState<string | null>(null)
+  const [bulkReviewResult, setBulkReviewResult] = useState<BulkReviewResult | null>(null)
   const queryClient = useQueryClient()
 
   const reconcileMutation = useMutation({
@@ -54,6 +64,35 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['epg-mappings'] })
       queryClient.invalidateQueries({ queryKey: ['epg-unmapped'] })
+    },
+  })
+
+  const reviewMappings = tab === 'review' ? mappingsQuery.data?.items ?? [] : []
+  const selectedReviewMappings = reviewMappings.filter((mapping) => selectedReviewIds.has(mapping.channelId))
+  const allReviewMappingsSelected = reviewMappings.length > 0 && reviewMappings.every((mapping) => selectedReviewIds.has(mapping.channelId))
+
+  const bulkReviewMutation = useMutation<BulkReviewResult, unknown, { action: BulkReviewAction; mappings: EpgMapping[] }>({
+    mutationFn: async ({ action, mappings }) => {
+      // Resolve one mapping at a time in channel ID order. This keeps audit events
+      // reproducible and avoids sending an empty bulk request.
+      const orderedMappings = [...mappings].sort((left, right) => left.channelId.localeCompare(right.channelId))
+      for (const mapping of orderedMappings) {
+        await client.resolveReview(mapping.channelId, action === 'accept', action === 'accept' ? mapping.epgChannelId : undefined)
+      }
+      return { action, resolved: orderedMappings.length }
+    },
+    onSuccess: (result) => {
+      setSelectedReviewIds(new Set())
+      setBulkReviewAction(null)
+      setBulkReviewError(null)
+      setBulkReviewResult(result)
+      queryClient.invalidateQueries({ queryKey: ['epg-mappings'] })
+      queryClient.invalidateQueries({ queryKey: ['epg-review'] })
+      queryClient.invalidateQueries({ queryKey: ['epg-unmapped'] })
+    },
+    onError: (failure: unknown) => {
+      setBulkReviewError(failure instanceof IptvApiError ? failure.problem.detail ?? failure.problem.title : 'The bulk review failed. Try again.')
+      setBulkReviewAction(null)
     },
   })
 
@@ -98,7 +137,7 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
                 key={t}
                 variant={tab === t ? 'primary' : 'ghost'}
                 size="sm"
-                onClick={() => { setTab(t); setPage(0) }}
+                onClick={() => { setTab(t); setPage(0); setSelectedReviewIds(new Set()); setBulkReviewAction(null); setBulkReviewError(null); setBulkReviewResult(null) }}
               >
                 {t === 'mapped' ? 'Mapped' : t === 'review' ? 'Needs review' : 'Unmapped'}
               </Button>
@@ -116,10 +155,75 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
           </p>
         </div>
 
+        {tab === 'review' ? (
+          <div className="flex flex-wrap items-center gap-2 border-b border-white/8 px-4 py-3">
+            <p className="mr-auto text-xs text-slate-500">
+              {selectedReviewMappings.length > 0 ? `${selectedReviewMappings.length} selected` : 'Select mappings to review together.'}
+            </p>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={selectedReviewMappings.length === 0 || bulkReviewMutation.isPending}
+              onClick={() => { setBulkReviewError(null); setBulkReviewAction('accept') }}
+            >
+              <Check aria-hidden="true" className="size-4" /> Accept selected
+            </Button>
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={selectedReviewMappings.length === 0 || bulkReviewMutation.isPending}
+              onClick={() => { setBulkReviewError(null); setBulkReviewAction('reject') }}
+            >
+              <X aria-hidden="true" className="size-4" /> Reject selected
+            </Button>
+          </div>
+        ) : null}
+
+        {tab === 'review' && bulkReviewAction ? (
+          <div className="flex flex-wrap items-center gap-3 border-b border-amber-400/20 bg-amber-400/5 px-4 py-3 text-xs text-amber-100" role="alertdialog" aria-label="Confirm bulk review">
+            <p className="mr-auto">
+              {bulkReviewAction === 'accept'
+                ? `Apply the current best candidate to ${selectedReviewMappings.length} selected mapping(s)?`
+                : `Reject ${selectedReviewMappings.length} selected mapping(s)?`}
+            </p>
+            <Button
+              variant={bulkReviewAction === 'accept' ? 'primary' : 'danger'}
+              size="sm"
+              disabled={bulkReviewMutation.isPending || selectedReviewMappings.length === 0}
+              onClick={() => bulkReviewMutation.mutate({ action: bulkReviewAction, mappings: selectedReviewMappings })}
+            >
+              {bulkReviewMutation.isPending ? 'Applying…' : bulkReviewAction === 'accept' ? 'Confirm accept' : 'Confirm reject'}
+            </Button>
+            <Button variant="ghost" size="sm" disabled={bulkReviewMutation.isPending} onClick={() => setBulkReviewAction(null)}>Cancel</Button>
+          </div>
+        ) : null}
+
+        {bulkReviewResult ? (
+          <p role="status" className="border-b border-white/8 px-4 py-2 text-xs text-mint-400">
+            {bulkReviewResult.action === 'accept' ? 'Accepted' : 'Rejected'} {bulkReviewResult.resolved} mapping(s).
+          </p>
+        ) : null}
+        {bulkReviewError ? <p role="alert" className="border-b border-white/8 px-4 py-2 text-xs text-red-400">{bulkReviewError}</p> : null}
+
         <div className="overflow-x-auto">
           <Table>
             <TableHeader>
               <TableRow>
+                {tab === 'review' ? (
+                  <TableHead>
+                    <input
+                      type="checkbox"
+                      aria-label="Select all review mappings"
+                      checked={allReviewMappingsSelected}
+                      disabled={reviewMappings.length === 0 || bulkReviewMutation.isPending}
+                      onChange={(event) => {
+                        setSelectedReviewIds(event.target.checked
+                          ? new Set(reviewMappings.map((mapping) => mapping.channelId))
+                          : new Set())
+                      }}
+                    />
+                  </TableHead>
+                ) : null}
                 <TableHead>Channel</TableHead>
                 <TableHead>EPG match</TableHead>
                 <TableHead>Method</TableHead>
@@ -146,7 +250,7 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
                 )
               ) : (
                 mappingsQuery.data?.items.length === 0 ? (
-                  <TableRow><TableCell colSpan={5} className="py-8 text-center text-slate-500">
+                  <TableRow><TableCell colSpan={tab === 'review' ? 6 : 5} className="py-8 text-center text-slate-500">
                     {tab === 'review' ? 'No channels need review.' : 'No mappings found.'}
                   </TableCell></TableRow>
                 ) : (
@@ -155,9 +259,23 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
                       key={mapping.channelId}
                       mapping={mapping}
                       showReviewActions={tab === 'review'}
+                      selected={selectedReviewIds.has(mapping.channelId)}
+                      onSelect={(selected) => {
+                        setSelectedReviewIds((current) => {
+                          const next = new Set(current)
+                          if (selected) next.add(mapping.channelId)
+                          else next.delete(mapping.channelId)
+                          return next
+                        })
+                      }}
                       client={client}
                       onRemove={() => removeMapping.mutate(mapping.channelId)}
                       onResolved={() => {
+                        setSelectedReviewIds((current) => {
+                          const next = new Set(current)
+                          next.delete(mapping.channelId)
+                          return next
+                        })
                         queryClient.invalidateQueries({ queryKey: ['epg-mappings'] })
                         queryClient.invalidateQueries({ queryKey: ['epg-review'] })
                         queryClient.invalidateQueries({ queryKey: ['epg-unmapped'] })
@@ -174,10 +292,10 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
           <div className="flex items-center justify-between border-t border-white/8 p-3">
             <p className="text-xs text-slate-500">Page {page + 1} of {pageCount.toLocaleString()}</p>
             <div className="flex gap-2">
-              <Button variant="ghost" size="sm" disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
+              <Button variant="ghost" size="sm" disabled={page === 0} onClick={() => { setPage((p) => Math.max(0, p - 1)); setSelectedReviewIds(new Set()) }}>
                 <ChevronLeft aria-hidden="true" className="size-4" /> Prev
               </Button>
-              <Button variant="ghost" size="sm" disabled={page >= pageCount - 1} onClick={() => setPage((p) => p + 1)}>
+              <Button variant="ghost" size="sm" disabled={page >= pageCount - 1} onClick={() => { setPage((p) => p + 1); setSelectedReviewIds(new Set()) }}>
                 Next <ChevronRight aria-hidden="true" className="size-4" />
               </Button>
             </div>
@@ -207,12 +325,16 @@ function methodLabel(method: string): string {
 function MappingRow({
   mapping,
   showReviewActions,
+  selected,
+  onSelect,
   client,
   onRemove,
   onResolved,
 }: {
   mapping: EpgMapping
   showReviewActions: boolean
+  selected: boolean
+  onSelect: (selected: boolean) => void
   client: IptvApiClient
   onRemove: () => void
   onResolved: () => void
@@ -233,6 +355,16 @@ function MappingRow({
 
   return (
     <TableRow>
+      {showReviewActions ? (
+        <TableCell>
+          <input
+            type="checkbox"
+            aria-label={`Select review mapping for ${mapping.channelName}`}
+            checked={selected}
+            onChange={(event) => onSelect(event.target.checked)}
+          />
+        </TableCell>
+      ) : null}
       <TableCell>
         <p className="font-medium text-white">{mapping.channelName}</p>
         {mapping.canonicalKey ? <p className="mt-0.5 font-mono text-[0.68rem] text-slate-600">{mapping.canonicalKey}</p> : null}
@@ -384,11 +516,11 @@ function CandidateReviewRow({
     },
   })
 
-  if (!candidatesQuery.data) return <TableRow><TableCell colSpan={5} className="text-center text-slate-500">Loading candidates…</TableCell></TableRow>
+  if (!candidatesQuery.data) return <TableRow><TableCell colSpan={6} className="text-center text-slate-500">Loading candidates…</TableCell></TableRow>
 
   return (
     <TableRow>
-      <TableCell colSpan={5}>
+      <TableCell colSpan={6}>
         <div className="space-y-3">
           <div className="flex items-center justify-between">
             <p className="text-sm font-medium text-white">Review candidates for "{channelName}"</p>

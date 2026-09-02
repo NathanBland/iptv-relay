@@ -266,6 +266,56 @@ describe('expanded management pages', () => {
     await waitFor(() => expect(resolve).toHaveBeenCalledWith('review', false, undefined))
   })
 
+  it('bulk reviews selected mappings in stable order and does nothing for an empty queue', async () => {
+    const client = new MockIptvApiClient()
+    const mapping = (channelId: string) => ({
+      channelId,
+      epgChannelId: `epg-${channelId}`,
+      method: 'fuzzy',
+      confidence: 0.82,
+      evidence: {},
+      reviewStatus: 'review' as const,
+      reviewedBy: null,
+      reviewedAt: null,
+      revision: 1,
+      updatedAt: timestamp,
+      channelName: `Channel ${channelId}`,
+      canonicalKey: null,
+      epgXmltvId: null,
+      epgDisplayName: null,
+    })
+    let reviewItems = [mapping('channel-z'), mapping('channel-a'), mapping('channel-m')]
+    vi.spyOn(client, 'getEpgMappings').mockImplementation(async (status, limit = 50, offset = 0) => ({
+      total: status === 'review' ? reviewItems.length : 0,
+      limit,
+      offset,
+      items: status === 'review' ? reviewItems : [],
+    }))
+    const resolve = vi.spyOn(client, 'resolveReview').mockImplementation(async (channelId) => {
+      reviewItems = reviewItems.filter((mapping) => mapping.channelId !== channelId)
+    })
+
+    renderWithQuery(<EpgMappingsPage client={client} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Needs review' }))
+    expect(await screen.findByText('Channel channel-z')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Select all review mappings' }))
+    expect(screen.getByText('3 selected')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Accept selected' }))
+    expect(screen.getByRole('alertdialog', { name: 'Confirm bulk review' })).toHaveTextContent('3 selected mapping(s)')
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm accept' }))
+
+    await waitFor(() => expect(resolve).toHaveBeenCalledTimes(3))
+    expect(resolve.mock.calls.map(([channelId, accept, epgChannelId]) => [channelId, accept, epgChannelId])).toEqual([
+      ['channel-a', true, 'epg-channel-a'],
+      ['channel-m', true, 'epg-channel-m'],
+      ['channel-z', true, 'epg-channel-z'],
+    ])
+    expect(await screen.findByText('No channels need review.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Accept selected' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Reject selected' })).toBeDisabled()
+  })
+
   it('lists reconciliation revisions and rolls back a source', async () => {
     const client = new MockIptvApiClient()
     const listRevisions = vi.spyOn(client, 'listReconciliationRevisions').mockResolvedValue([
