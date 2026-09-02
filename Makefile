@@ -133,14 +133,14 @@ compose-dev-logs:
 	$(DEV_COMPOSE) logs -f core worker web
 
 media-acceptance:
-	docker-compose --env-file .env.test build core
+	trap 'docker-compose --env-file .env.test --profile test down --remove-orphans' EXIT; \
+	docker-compose --env-file .env.test build core; \
 	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from media-acceptance media-acceptance
-	docker-compose --env-file .env.test --profile test stop fake-provider
 
 fault-acceptance:
-	docker-compose --env-file .env.test build core
+	trap 'docker-compose --env-file .env.test --profile test down --remove-orphans' EXIT; \
+	docker-compose --env-file .env.test build core; \
 	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from fault-acceptance fault-acceptance
-	docker-compose --env-file .env.test --profile test stop fake-provider toxiproxy
 
 live-acceptance:
 	docker-compose --env-file .env.test build core
