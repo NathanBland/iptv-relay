@@ -4393,6 +4393,15 @@ mod tests {
                 .any(|programme| programme.title == "Broncos vs Chiefs"),
             "mapped channel did not expose the short EPG programme"
         );
+        let now = chrono::Utc::now();
+        assert!(
+            mapped_programmes.iter().any(|programme| {
+                programme.title == "Broncos vs Chiefs"
+                    && programme.starts_at <= now
+                    && now < programme.stops_at
+            }),
+            "mapped short EPG programme is not current"
+        );
 
         delete_source(&pool, source_id).await;
         fixture_server.abort();
