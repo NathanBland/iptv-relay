@@ -1,4 +1,4 @@
-.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-openapi-drift-check postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
+.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-openapi-drift-check postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
 
 DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
 
@@ -145,6 +145,11 @@ fault-acceptance:
 live-acceptance:
 	docker-compose --env-file .env.test build core
 	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from live-acceptance live-acceptance
+
+jellyfin-acceptance:
+	trap 'IPTV_PUBLIC_BASE_URL=http://gateway:8080 docker-compose --project-name iptv-jellyfin-acceptance --env-file .env.test --profile test down --volumes --remove-orphans' EXIT; \
+	IPTV_PUBLIC_BASE_URL=http://gateway:8080 docker-compose --project-name iptv-jellyfin-acceptance --env-file .env.test build core; \
+	IPTV_PUBLIC_BASE_URL=http://gateway:8080 docker-compose --project-name iptv-jellyfin-acceptance --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from jellyfin-acceptance jellyfin-acceptance
 
 live-acceptance-gateway:
 	docker-compose --env-file .env.test build core

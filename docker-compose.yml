@@ -181,6 +181,30 @@ services:
         condition: service_healthy
     restart: "no"
 
+  jellyfin-acceptance:
+    image: iptv-gateway-core:local
+    entrypoint: ["jellyfin-acceptance"]
+    profiles: ["test"]
+    environment:
+      IPTV_GATEWAY_URL: http://gateway:8080
+      IPTV_OUTPUT_TOKEN: ${IPTV_OUTPUT_TOKEN}
+      IPTV_ADMIN_BOOTSTRAP_TOKEN: ${IPTV_ADMIN_BOOTSTRAP_TOKEN}
+      IPTV_TEST_PROVIDER_URL: http://fake-provider:8090
+      IPTV_TUNER_COUNT: ${IPTV_TUNER_COUNT:-3}
+      JELLYFIN_ACCEPTANCE_CHANNELS: ${JELLYFIN_ACCEPTANCE_CHANNELS:-3}
+      JELLYFIN_ACCEPTANCE_SECONDS: ${JELLYFIN_ACCEPTANCE_SECONDS:-5}
+      JELLYFIN_ACCEPTANCE_SSDP: "0"
+    depends_on:
+      gateway:
+        condition: service_started
+      core:
+        condition: service_healthy
+      fake-provider:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+    restart: "no"
+
   scale-gate:
     image: iptv-gateway-core:local
     entrypoint: ["scale-gate"]

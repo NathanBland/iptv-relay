@@ -34,7 +34,7 @@ RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo 
 # Build application binaries. Limit parallelism to two jobs to match the cook
 # step and to avoid OOM kills on memory-constrained runners.
 COPY . .
-RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 2 -p iptv-gateway
+RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 1 -p iptv-gateway
 # Build the deterministic scale gate binary. The `scale-gate` feature enables
 # the fixture generators in `iptv-parsers` and adds no new dependencies. Limit
 # parallelism to one job because the scale-gate feature expands the fixture
@@ -56,6 +56,7 @@ COPY --from=builder /build/target/release/test-provider /usr/local/bin/test-prov
 COPY --from=builder /build/target/release/media-acceptance /usr/local/bin/media-acceptance
 COPY --from=builder /build/target/release/fault-acceptance /usr/local/bin/fault-acceptance
 COPY --from=builder /build/target/release/live-acceptance /usr/local/bin/live-acceptance
+COPY --from=builder /build/target/release/jellyfin-acceptance /usr/local/bin/jellyfin-acceptance
 COPY --from=builder /build/target/release/scale-gate /usr/local/bin/scale-gate
 COPY tests/fixtures/scale-gate-baseline.json /app/tests/fixtures/scale-gate-baseline.json
 COPY LICENSE THIRD_PARTY_NOTICES.md /app/
