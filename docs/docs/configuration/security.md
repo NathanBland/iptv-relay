@@ -58,6 +58,16 @@ The core and worker services must use the same `IPTV_MASTER_KEY`. The key encryp
 
 Store the key in a secret manager. Do not commit the key to the repository.
 
+### Protect proxy logs
+
+Configure the reverse proxy to redact the token segment in every `/out/{token}/...` request path.
+
+Do not send tokenized output paths to an external log service before redaction.
+
+The supplied Caddy files add a restrictive Content-Security-Policy header to the management interface.
+
+Keep this policy on the web route. Do not apply it to MPEG-TS or XMLTV output routes.
+
 ## Backup procedure
 
 ### Back up the database

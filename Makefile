@@ -1,4 +1,4 @@
-.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-openapi-drift-check postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
+.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-openapi-drift-check test-caddy-security postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
 
 DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
 
@@ -64,6 +64,9 @@ test-coverage-script:
 
 test-openapi-drift-check:
 	./scripts/test-openapi-drift-check.sh
+
+test-caddy-security:
+	./scripts/check-caddy-security.sh
 
 # Regenerate the checked-in OpenAPI reference snapshot from the ApiDoc.
 # This target needs no database and no secrets.
