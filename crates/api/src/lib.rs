@@ -5220,7 +5220,10 @@ async fn playlist(State(state): State<AppState>, Path(token): Path<String>) -> R
             )
             .expect("writing to a String cannot fail");
         }
-        return text_response("application/vnd.apple.mpegurl; charset=utf-8", body);
+        return no_store_response(text_response(
+            "application/vnd.apple.mpegurl; charset=utf-8",
+            body,
+        ));
     }
     let catalog = state.catalog.read().await;
     let mut body = format!(
@@ -5245,7 +5248,10 @@ async fn playlist(State(state): State<AppState>, Path(token): Path<String>) -> R
         )
         .expect("writing to a String cannot fail");
     }
-    text_response("application/vnd.apple.mpegurl; charset=utf-8", body)
+    no_store_response(text_response(
+        "application/vnd.apple.mpegurl; charset=utf-8",
+        body,
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5324,7 +5330,7 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
             body.push_str("</programme>\n");
         }
         body.push_str("</tv>\n");
-        return text_response("application/xml; charset=utf-8", body);
+        return no_store_response(text_response("application/xml; charset=utf-8", body));
     }
     let catalog = state.catalog.read().await;
     let enabled: HashSet<Uuid> = catalog
@@ -5377,7 +5383,7 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
         body.push_str("</programme>\n");
     }
     body.push_str("</tv>\n");
-    text_response("application/xml; charset=utf-8", body)
+    no_store_response(text_response("application/xml; charset=utf-8", body))
 }
 
 async fn stream_channel(
@@ -5727,7 +5733,7 @@ async fn hdhr_discover(State(state): State<AppState>, Path(token): Path<String>)
         Ok(access) => access,
         Err(response) => return response,
     };
-    Json(HdhrDiscover {
+    let response = Json(HdhrDiscover {
         friendly_name: "IPTV Gateway",
         manufacturer: "IPTV Gateway",
         model_number: "HDHR-IPTV",
@@ -5739,7 +5745,8 @@ async fn hdhr_discover(State(state): State<AppState>, Path(token): Path<String>)
         lineup_url: format!("{}/out/{}/hdhr/lineup.json", state.public_base_url, token),
         tuner_count: access.tuner_count,
     })
-    .into_response()
+    .into_response();
+    no_store_response(response)
 }
 
 #[derive(Serialize)]
@@ -5778,7 +5785,7 @@ async fn hdhr_lineup(State(state): State<AppState>, Path(token): Path<String>) -
                 ),
             })
             .collect::<Vec<_>>();
-        return Json(channels).into_response();
+        return no_store_response(Json(channels).into_response());
     }
     let catalog = state.catalog.read().await;
     let channels: Vec<_> = catalog
@@ -5794,20 +5801,21 @@ async fn hdhr_lineup(State(state): State<AppState>, Path(token): Path<String>) -
             ),
         })
         .collect();
-    Json(channels).into_response()
+    no_store_response(Json(channels).into_response())
 }
 
 async fn hdhr_lineup_status(State(state): State<AppState>, Path(token): Path<String>) -> Response {
     if let Err(response) = authorize_output(&state, &token).await {
         return response;
     }
-    Json(serde_json::json!({
+    let response = Json(serde_json::json!({
         "ScanInProgress": 0,
         "ScanPossible": 1,
         "Source": "Cable",
         "SourceList": ["Cable"]
     }))
-    .into_response()
+    .into_response();
+    no_store_response(response)
 }
 
 async fn hdhr_device(State(state): State<AppState>, Path(token): Path<String>) -> Response {
@@ -5818,7 +5826,7 @@ async fn hdhr_device(State(state): State<AppState>, Path(token): Path<String>) -
         "<?xml version=\"1.0\"?><root><device><deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType><friendlyName>IPTV Gateway</friendlyName><manufacturer>IPTV Gateway</manufacturer><modelName>HDHR-IPTV</modelName><UDN>uuid:{}</UDN></device></root>",
         Uuid::nil()
     );
-    text_response("application/xml; charset=utf-8", xml)
+    no_store_response(text_response("application/xml; charset=utf-8", xml))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -7514,6 +7522,12 @@ fn text_response(content_type: &'static str, body: String) -> Response {
     response
 }
 
+fn no_store_response(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 fn m3u_escape(value: &str) -> String {
     value.replace(['\r', '\n'], " ").replace('"', "'")
 }
@@ -7538,7 +7552,7 @@ fn natural_number_cmp(left: &str, right: &str) -> std::cmp::Ordering {
 mod tests {
     use std::sync::OnceLock;
 
-    use axum::{body::Body, http::Request};
+    use axum::{Router, body::Body, http::Request};
     use http_body_util::BodyExt;
     use iptv_media::RingSnapshot;
     use tower::ServiceExt;
@@ -7579,6 +7593,17 @@ mod tests {
                 .to_vec(),
         )
         .unwrap()
+    }
+
+    async fn output_response(app: &Router, path: &str) -> Response {
+        app.clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn assert_no_store(response: &Response) {
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     fn sample_session(
@@ -8532,6 +8557,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(playlist_response.status(), StatusCode::OK);
+        assert_no_store(&playlist_response);
         let playlist_body = response_text(playlist_response).await;
         assert!(playlist_body.contains("Included channel"));
         assert!(!playlist_body.contains("Excluded channel"));
@@ -8561,9 +8587,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(discover.status(), StatusCode::OK);
+        assert_no_store(&discover);
         let discover: serde_json::Value =
             serde_json::from_str(&response_text(discover).await).unwrap();
         assert_eq!(discover["TunerCount"], 3);
+
+        let xmltv = output_response(&app, "/out/output-secret/xmltv.xml").await;
+        assert_eq!(xmltv.status(), StatusCode::OK);
+        assert_no_store(&xmltv);
+        let lineup = output_response(&app, "/out/output-secret/hdhr/lineup.json").await;
+        assert_eq!(lineup.status(), StatusCode::OK);
+        assert_no_store(&lineup);
+        let lineup_status =
+            output_response(&app, "/out/output-secret/hdhr/lineup_status.json").await;
+        assert_eq!(lineup_status.status(), StatusCode::OK);
+        assert_no_store(&lineup_status);
+        let device = output_response(&app, "/out/output-secret/hdhr/device.xml").await;
+        assert_eq!(device.status(), StatusCode::OK);
+        assert_no_store(&device);
 
         // Update only the tuner count through the startup path. The persisted
         // current token hash stays as the environment hash so `output-secret`
@@ -8611,6 +8652,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            assert_no_store(&response);
             let body: serde_json::Value =
                 serde_json::from_str(&response_text(response).await).unwrap();
             assert_eq!(body["TunerCount"], 5);
@@ -11205,6 +11247,11 @@ mod tests {
             .unwrap();
         assert_eq!(openapi.status(), StatusCode::OK);
 
+        let playlist = output_response(&app, "/out/output-secret/playlist.m3u").await;
+        assert_eq!(playlist.status(), StatusCode::OK);
+        assert_no_store(&playlist);
+        assert!(response_text(playlist).await.contains("Discovery Channel"));
+
         let xmltv = app
             .clone()
             .oneshot(
@@ -11215,7 +11262,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(xmltv.status(), StatusCode::OK);
+        assert_no_store(&xmltv);
         assert!(response_text(xmltv).await.contains("Discovery programme"));
+        let discover = output_response(&app, "/out/output-secret/hdhr/discover.json").await;
+        assert_eq!(discover.status(), StatusCode::OK);
+        assert_no_store(&discover);
         let lineup = app
             .clone()
             .oneshot(
@@ -11226,6 +11277,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(lineup.status(), StatusCode::OK);
+        assert_no_store(&lineup);
         assert!(response_text(lineup).await.contains("Discovery Channel"));
         let status = app
             .clone()
@@ -11237,6 +11289,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status.status(), StatusCode::OK);
+        assert_no_store(&status);
         let device = app
             .clone()
             .oneshot(
@@ -11247,6 +11300,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(device.status(), StatusCode::OK);
+        assert_no_store(&device);
         assert!(response_text(device).await.contains("HDHR-IPTV"));
 
         let events = app
