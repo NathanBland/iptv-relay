@@ -66,6 +66,10 @@ Do not send tokenized output paths to an external log service before redaction.
 
 The supplied Caddy files add a restrictive Content-Security-Policy header to the management interface.
 
+The policy allows inline scripts because TanStack Start emits inline hydration scripts during server rendering.
+
+The policy blocks inline event-handler attributes with `script-src-attr 'none'`.
+
 Keep this policy on the web route. Do not apply it to MPEG-TS or XMLTV output routes.
 
 ## Backup procedure
