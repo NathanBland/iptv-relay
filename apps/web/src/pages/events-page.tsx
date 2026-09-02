@@ -699,16 +699,16 @@ function EventTemplateForm({
             </label>
           </div>
           <div className="grid gap-3 sm:grid-cols-2">
-            <label className="block text-xs font-medium text-slate-300">
-              Timezone
-              <Input className="mt-1" value={timezone} onChange={(e) => setTimezone(e.target.value)} placeholder="UTC" required />
+            <div className="block text-xs font-medium text-slate-300">
+              <label htmlFor="event-template-timezone">Timezone</label>
+              <Input id="event-template-timezone" className="mt-1" value={timezone} onChange={(e) => setTimezone(e.target.value)} placeholder="UTC" required />
               <span className="mt-1 block text-[0.68rem] text-slate-500">Use an IANA timezone for event dates without an offset.</span>
-            </label>
-            <label className="block text-xs font-medium text-slate-300">
-              Filler title
-              <Input className="mt-1" value={fillerTitle} onChange={(e) => setFillerTitle(e.target.value)} placeholder={eventTemplateDefaults.fillerTitle} required />
+            </div>
+            <div className="block text-xs font-medium text-slate-300">
+              <label htmlFor="event-template-filler-title">Filler title</label>
+              <Input id="event-template-filler-title" className="mt-1" value={fillerTitle} onChange={(e) => setFillerTitle(e.target.value)} placeholder={eventTemplateDefaults.fillerTitle} required />
               <span className="mt-1 block text-[0.68rem] text-slate-500">Use this title for filler programmes around events.</span>
-            </label>
+            </div>
           </div>
           <div className="rounded-lg border border-white/8 bg-ink-950/50 p-4">
             <p className="text-xs font-medium text-slate-300">Rule preview</p>

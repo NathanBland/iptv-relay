@@ -58,6 +58,7 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
 
   const total = mappingsQuery.data?.total ?? unmappedQuery.data?.total ?? 0
   const pageCount = Math.ceil(total / PAGE_SIZE)
+  const activeQueryLoading = tab === 'unmapped' ? unmappedQuery.isLoading : mappingsQuery.isLoading
 
   const removeMapping = useMutation({
     mutationFn: (channelId: string) => client.removeChannelEpgMapping(channelId),
@@ -95,10 +96,6 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
       setBulkReviewAction(null)
     },
   })
-
-  if (tab === 'mapped' && mappingsQuery.isLoading) return <LoadingPage label="EPG mappings" />
-  if (tab === 'review' && mappingsQuery.isLoading) return <LoadingPage label="review queue" />
-  if (tab === 'unmapped' && unmappedQuery.isLoading) return <LoadingPage label="unmapped channels" />
 
   return (
     <>
@@ -232,7 +229,9 @@ export function EpgMappingsPage({ client = apiClient }: { client?: IptvApiClient
               </TableRow>
             </TableHeader>
             <TableBody>
-              {tab === 'unmapped' ? (
+              {activeQueryLoading ? (
+                <TableRow><TableCell colSpan={tab === 'review' ? 6 : 5} className="py-8 text-center text-slate-500">Loading mappings…</TableCell></TableRow>
+              ) : tab === 'unmapped' ? (
                 unmappedQuery.data?.items.length === 0 ? (
                   <TableRow><TableCell colSpan={5} className="py-8 text-center text-slate-500">All channels have EPG mappings.</TableCell></TableRow>
                 ) : (

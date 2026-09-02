@@ -39,9 +39,11 @@ export function SupportPage({ client = apiClient }: { client?: IptvApiClient }) 
 
   if (!bundle) return <LoadingPage label="support diagnostics" />
 
+  const readyBundle = bundle
+
   function download() {
     try {
-      downloadBundle(bundle)
+      downloadBundle(readyBundle)
     } catch {
       // The API result remains available for manual copy if the browser blocks downloads.
     }
@@ -78,12 +80,12 @@ export function SupportPage({ client = apiClient }: { client?: IptvApiClient }) 
         <Card>
           <CardHeader><h2 className="text-lg font-semibold text-white">System snapshot</h2></CardHeader>
           <CardContent className="grid grid-cols-2 gap-3 text-sm">
-            <Snapshot label="Channels" value={bundle.system.channels} />
-            <Snapshot label="Healthy streams" value={bundle.system.healthyStreams} />
-            <Snapshot label="Active sessions" value={bundle.system.activeSessions} />
-            <Snapshot label="Guide coverage" value={`${bundle.system.guideCoverage.toFixed(1)}%`} />
-            <Snapshot label="Failed streams" value={bundle.streamHealth.dead} />
-            <Snapshot label="Uptime" value={`${Math.floor(bundle.system.uptimeSeconds / 3600)}h`} />
+            <Snapshot label="Channels" value={readyBundle.system.channels} />
+            <Snapshot label="Healthy streams" value={readyBundle.system.healthyStreams} />
+            <Snapshot label="Active sessions" value={readyBundle.system.activeSessions} />
+            <Snapshot label="Guide coverage" value={`${readyBundle.system.guideCoverage.toFixed(1)}%`} />
+            <Snapshot label="Failed streams" value={readyBundle.streamHealth.dead} />
+            <Snapshot label="Uptime" value={`${Math.floor(readyBundle.system.uptimeSeconds / 3600)}h`} />
           </CardContent>
         </Card>
       </div>
