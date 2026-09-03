@@ -39,6 +39,12 @@
           "authenticated": {
             "type": "boolean"
           },
+          "oidcEnabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "user": {
             "oneOf": [
               {
@@ -407,6 +413,9 @@
             "format": "int32",
             "type": "integer"
           },
+          "fillerTitle": {
+            "type": "string"
+          },
           "futureDateDays": {
             "format": "int32",
             "type": "integer"
@@ -423,6 +432,9 @@
           "pastDateGraceHours": {
             "format": "int32",
             "type": "integer"
+          },
+          "timezone": {
+            "type": "string"
           }
         },
         "required": [
@@ -461,6 +473,32 @@
         "required": [
           "name",
           "packageName"
+        ],
+        "type": "object"
+      },
+      "CreateOperatorApiTokenRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expiresAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "scopes"
         ],
         "type": "object"
       },
@@ -966,6 +1004,9 @@
             "format": "int32",
             "type": "integer"
           },
+          "fillerTitle": {
+            "type": "string"
+          },
           "futureDateDays": {
             "format": "int32",
             "type": "integer"
@@ -985,6 +1026,9 @@
           "pastDateGraceHours": {
             "format": "int32",
             "type": "integer"
+          },
+          "timezone": {
+            "type": "string"
           }
         },
         "required": [
@@ -997,6 +1041,8 @@
           "eventDurationHours",
           "pastDateGraceHours",
           "futureDateDays",
+          "timezone",
+          "fillerTitle",
           "enabled"
         ],
         "type": "object"
@@ -1152,6 +1198,25 @@
             "required": [
               "id",
               "scope"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "IssuedOperatorApiTokenResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OperatorApiTokenResponse"
+          },
+          {
+            "properties": {
+              "token": {
+                "description": "The plaintext token is returned only by create and rotate responses.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "token"
             ],
             "type": "object"
           }
@@ -1431,6 +1496,81 @@
         "additionalProperties": false,
         "type": "object"
       },
+      "OidcCallbackQuery": {
+        "properties": {
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "OperatorApiTokenResponse": {
+        "properties": {
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "createdBy": {
+            "type": "string"
+          },
+          "expiresAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "lastUsedAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "revokedAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "scopes",
+          "createdBy",
+          "createdAt"
+        ],
+        "type": "object"
+      },
       "OperatorOverridesResponse": {
         "properties": {
           "global": {
@@ -1533,6 +1673,13 @@
           "group"
         ],
         "type": "string"
+      },
+      "OperatorTokenExpiration": {
+        "format": "date-time",
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "PageQuery": {
         "properties": {
@@ -2151,6 +2298,37 @@
         },
         "type": "object"
       },
+      "RotateOperatorApiTokenRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expiresAt": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OperatorTokenExpiration"
+              }
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "RuntimeVersions": {
         "properties": {
           "ffmpeg": {
@@ -2752,6 +2930,77 @@
         ],
         "type": "object"
       },
+      "SupportBundleResponse": {
+        "properties": {
+          "generatedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "jobs": {
+            "items": {
+              "$ref": "#/components/schemas/JobResponse"
+            },
+            "type": "array"
+          },
+          "logs": {
+            "items": {
+              "$ref": "#/components/schemas/SupportLogEntry"
+            },
+            "type": "array"
+          },
+          "redaction": {
+            "type": "string"
+          },
+          "schemaVersion": {
+            "type": "string"
+          },
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/SessionResponse"
+            },
+            "type": "array"
+          },
+          "streamHealth": {
+            "$ref": "#/components/schemas/StreamHealthStatsResponse"
+          },
+          "system": {
+            "$ref": "#/components/schemas/SystemInfo"
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "generatedAt",
+          "redaction",
+          "system",
+          "jobs",
+          "sessions",
+          "streamHealth",
+          "logs"
+        ],
+        "type": "object"
+      },
+      "SupportLogEntry": {
+        "properties": {
+          "context": {},
+          "level": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "timestamp": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "timestamp",
+          "level",
+          "message",
+          "context"
+        ],
+        "type": "object"
+      },
       "SystemInfo": {
         "properties": {
           "activeSessions": {
@@ -2895,6 +3144,12 @@
               "null"
             ]
           },
+          "fillerTitle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "futureDateDays": {
             "format": "int32",
             "type": [
@@ -2924,6 +3179,12 @@
             "format": "int32",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "timezone": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -3197,6 +3458,117 @@
         ]
       }
     },
+    "/api/v1/auth/oidc/callback": {
+      "get": {
+        "operationId": "oidc_callback",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "307": {
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "authentication"
+        ]
+      }
+    },
+    "/api/v1/auth/oidc/start": {
+      "get": {
+        "operationId": "oidc_start",
+        "responses": {
+          "307": {
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "authentication"
+        ]
+      }
+    },
     "/api/v1/auth/status": {
       "get": {
         "operationId": "auth_status",
@@ -3206,6 +3578,284 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AuthStatus"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "authentication"
+        ]
+      }
+    },
+    "/api/v1/auth/tokens": {
+      "get": {
+        "operationId": "list_operator_api_tokens",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/OperatorApiTokenResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Operator API token metadata"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "authentication"
+        ]
+      },
+      "post": {
+        "operationId": "create_operator_api_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateOperatorApiTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedOperatorApiTokenResponse"
+                }
+              }
+            },
+            "description": "Operator API token created; plaintext is shown once"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "authentication"
+        ]
+      }
+    },
+    "/api/v1/auth/tokens/{token_id}/revoke": {
+      "post": {
+        "operationId": "revoke_operator_api_token",
+        "parameters": [
+          {
+            "description": "Token ID",
+            "in": "path",
+            "name": "token_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Operator API token revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "authentication"
+        ]
+      }
+    },
+    "/api/v1/auth/tokens/{token_id}/rotate": {
+      "post": {
+        "operationId": "rotate_operator_api_token",
+        "parameters": [
+          {
+            "description": "Token ID",
+            "in": "path",
+            "name": "token_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotateOperatorApiTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedOperatorApiTokenResponse"
+                }
+              }
+            },
+            "description": "Operator API token rotated; plaintext is shown once"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
                 }
               }
             },
@@ -7976,6 +8626,99 @@
         },
         "tags": [
           "streams"
+        ]
+      }
+    },
+    "/api/v1/support/bundle": {
+      "get": {
+        "operationId": "support_bundle",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SupportBundleResponse"
+                }
+              }
+            },
+            "description": "A redacted support bundle"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "system"
+        ]
+      }
+    },
+    "/api/v1/support/logs": {
+      "get": {
+        "operationId": "support_logs",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SupportLogEntry"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Recent redacted support log entries"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "system"
         ]
       }
     },
