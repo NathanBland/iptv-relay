@@ -218,7 +218,7 @@ docker compose -f docker-compose.appliance.yml up -d --wait
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `IPTV_VERSION` | Yes | Release tag, for example `v1.0.0`. |
+| `IPTV_VERSION` | No | Release tag, for example `v1.0.0`. Default `latest`. Pin a tag for reproducible upgrades. |
 | `POSTGRES_PASSWORD` | Yes | Strong database password. Do not change it after the first start. |
 | `IPTV_OUTPUT_TOKEN` | Yes | 64 random hex characters. Protects the output endpoints. |
 | `IPTV_ADMIN_BOOTSTRAP_TOKEN` | Yes | 64 random hex characters. Admin bearer, disabled after first sign-in. |
