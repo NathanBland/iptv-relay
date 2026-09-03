@@ -1,0 +1,9 @@
+# syntax=docker/dockerfile:1.7
+# Release gateway image. Packages the Caddy reverse-proxy configuration so
+# pull-only operators do not need deploy/Caddyfile on the host.
+FROM caddy:2.10-alpine
+LABEL org.opencontainers.image.title="iptv-relay-gateway"
+LABEL org.opencontainers.image.description="Caddy reverse proxy for IPTV Gateway with baked-in configuration"
+COPY deploy/Caddyfile /etc/caddy/Caddyfile
+EXPOSE 8080
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]

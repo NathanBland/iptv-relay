@@ -6,22 +6,20 @@ on:
       - 'v*'
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write
-
 concurrency:
   group: container-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
 
 jobs:
   v1-gates:
     name: Run v1 gates
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -30,9 +28,30 @@ jobs:
         run: ./scripts/run-test-suite.sh
 
   image:
-    name: Build and sign image
+    name: Build and sign ${{ matrix.target }} image
     needs: v1-gates
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: core
+            context: .
+            file: ./Dockerfile
+            suffix: ''
+          - target: web
+            context: ./apps/web
+            file: ./apps/web/Dockerfile
+            suffix: -web
+          - target: gateway
+            context: .
+            file: ./Dockerfile.gateway
+            suffix: -gateway
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -46,7 +65,7 @@ jobs:
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -54,17 +73,21 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ env.IMAGE_PREFIX }}${{ matrix.suffix }}
           tags: |
             type=ref,event=tag
-            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
 
       - name: Build and push image
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: ./Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -79,12 +102,13 @@ jobs:
 
       - name: Sign image digest
         env:
+          IMAGE_NAME: ${{ env.IMAGE_PREFIX }}${{ matrix.suffix }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}
         run: cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
 
       - name: Verify image signature
         env:
+          IMAGE_NAME: ${{ env.IMAGE_PREFIX }}${{ matrix.suffix }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}
         run: |

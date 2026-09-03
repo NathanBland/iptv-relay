@@ -1,0 +1,125 @@
+# Drop-in release distribution for IPTV Gateway.
+#
+# This pull-only Compose file uses the signed release images from GitHub
+# Container Registry. It does not build any image and it does not require a
+# source checkout.
+#
+# Set IPTV_VERSION to a release tag (default: latest) in a .env file next to
+# this Compose file. All application images use the same IPTV_VERSION value.
+#
+# Required variables (put these in a .env file next to this Compose file):
+#   POSTGRES_PASSWORD           Strong database password
+#   IPTV_OUTPUT_TOKEN           64 random hex characters
+#   IPTV_ADMIN_BOOTSTRAP_TOKEN  64 random hex characters
+#   IPTV_ADMIN_PASSWORD         12 or more characters (or set IPTV_ADMIN_PASSWORD_HASH)
+#   IPTV_MASTER_KEY             32-byte base64 key
+#
+# Start:   docker compose -f docker-compose.appliance.yml up -d --wait
+# Upgrade: set IPTV_VERSION to the new tag, then run:
+#          docker compose -f docker-compose.appliance.yml pull
+#          docker compose -f docker-compose.appliance.yml up -d --wait
+# Rollback: set IPTV_VERSION back to the previous tag, then run:
+#          docker compose -f docker-compose.appliance.yml up -d --wait
+
+name: iptv-gateway
+
+services:
+  gateway:
+    image: ghcr.io/nathanbland/iptv-relay-gateway:${IPTV_VERSION:-latest}
+    depends_on:
+      core:
+        condition: service_healthy
+      web:
+        condition: service_healthy
+    ports:
+      - "${IPTV_GATEWAY_BIND:-127.0.0.1}:${IPTV_GATEWAY_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  web:
+    image: ghcr.io/nathanbland/iptv-relay-web:${IPTV_VERSION:-latest}
+    environment:
+      CORE_INTERNAL_URL: http://core:8081
+      PORT: "3000"
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  core:
+    image: ghcr.io/nathanbland/iptv-relay:${IPTV_VERSION:-latest}
+    command: ["serve"]
+    environment:
+      DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/iptv
+      IPTV_BIND: 0.0.0.0:8081
+      IPTV_PUBLIC_BASE_URL: ${IPTV_PUBLIC_BASE_URL:-http://localhost:8080}
+      IPTV_OUTPUT_TOKEN: ${IPTV_OUTPUT_TOKEN:?Set IPTV_OUTPUT_TOKEN}
+      IPTV_ADMIN_BOOTSTRAP_TOKEN: ${IPTV_ADMIN_BOOTSTRAP_TOKEN:?Set IPTV_ADMIN_BOOTSTRAP_TOKEN}
+      IPTV_ADMIN_PASSWORD: ${IPTV_ADMIN_PASSWORD:-}
+      IPTV_ADMIN_PASSWORD_HASH: ${IPTV_ADMIN_PASSWORD_HASH:-}
+      IPTV_MASTER_KEY: ${IPTV_MASTER_KEY:?Set IPTV_MASTER_KEY}
+      IPTV_TUNER_COUNT: ${IPTV_TUNER_COUNT:-1}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:8081/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  worker:
+    image: ghcr.io/nathanbland/iptv-relay:${IPTV_VERSION:-latest}
+    command: ["worker"]
+    deploy:
+      replicas: ${IPTV_WORKER_COUNT:-4}
+    environment:
+      DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/iptv
+      IPTV_MASTER_KEY: ${IPTV_MASTER_KEY:?Set IPTV_MASTER_KEY}
+      IPTV_CORE_INTERNAL_URL: http://core:8081
+      IPTV_ADMIN_BOOTSTRAP_TOKEN: ${IPTV_ADMIN_BOOTSTRAP_TOKEN:?Set IPTV_ADMIN_BOOTSTRAP_TOKEN}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    stop_grace_period: 60s
+    stop_signal: SIGTERM
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h postgres -U iptv -d iptv || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: iptv
+      POSTGRES_USER: iptv
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iptv -d iptv"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

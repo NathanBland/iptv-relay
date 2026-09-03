@@ -1,4 +1,4 @@
-.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-runner test-openapi-drift-check test-caddy-security postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
+.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-runner test-openapi-drift-check test-caddy-security test-release-compose postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-release-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
 
 DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
 
@@ -71,6 +71,9 @@ test-openapi-drift-check:
 test-caddy-security:
 	./scripts/check-caddy-security.sh
 
+test-release-compose:
+	./scripts/test-release-compose.sh
+
 # Regenerate the checked-in OpenAPI reference snapshot from the ApiDoc.
 # This target needs no database and no secrets.
 openapi-snapshot:
@@ -109,7 +112,7 @@ compose-e2e-ci:
 	docker-compose --env-file .env.test up --build -d --wait postgres core web gateway; \
 	(cd apps/web && IPTV_ADMIN_PASSWORD=test-administrator-password CI=true pnpm exec playwright test --grep-invert="@live|real-source-flow")
 
-ci: fmt lint audit coverage test-coverage-script test-openapi-drift-check coverage-changed fuzz-smoke media-acceptance fault-acceptance compose-health docs-build compose-e2e-ci compose-config
+ci: fmt lint audit coverage test-coverage-script test-openapi-drift-check coverage-changed fuzz-smoke media-acceptance fault-acceptance compose-health docs-build compose-e2e-ci compose-config compose-release-config test-release-compose
 
 build:
 	cargo build --workspace --release
@@ -119,6 +122,9 @@ compose-config:
 	docker-compose --env-file .env.example config --quiet
 	docker-compose --env-file .env.test --profile test config --quiet
 	$(DEV_COMPOSE) --env-file .env.example config --quiet
+
+compose-release-config:
+	IPTV_VERSION=latest docker-compose -f docker-compose.appliance.yml --env-file .env.appliance.example config --quiet
 
 compose-up:
 	docker-compose up --build

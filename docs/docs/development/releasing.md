@@ -11,11 +11,28 @@ The workflow builds these platforms:
 - `linux/amd64`
 - `linux/arm64`
 
-The workflow publishes the image to GitHub Container Registry.
+The workflow publishes three application images to GitHub Container Registry:
 
-The workflow creates an SBOM and a provenance attestation.
+| Image | Purpose |
+|-------|---------|
+| `ghcr.io/nathanbland/iptv-relay` | `core` and `worker` services. |
+| `ghcr.io/nathanbland/iptv-relay-web` | Web management UI. |
+| `ghcr.io/nathanbland/iptv-relay-gateway` | Caddy reverse proxy with baked-in configuration. |
 
-The workflow signs the published image digest with Cosign keyless signing.
+The workflow tags each image with the release tag, the semantic version, the short SHA, and `latest`.
+The `latest` tag is generated only for stable tag pushes.
+A stable tag push uses a tag that starts with `v` and does not contain a hyphen.
+A prerelease tag push uses a tag that contains a hyphen, such as `v1.0.0-rc.1`.
+A manual run does not generate the `latest` tag.
+
+The workflow creates an SBOM and a provenance attestation for each image.
+
+The workflow signs each published image digest with Cosign keyless signing.
+The workflow verifies each signature before the job completes.
+
+The workflow uses least-privilege job permissions.
+The `v1-gates` job requests only `contents: read`.
+The image build job requests `contents: read`, `packages: write`, `id-token: write`, and `attestations: write`.
 
 ## Release steps
 

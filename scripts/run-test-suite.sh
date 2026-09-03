@@ -142,12 +142,14 @@ run_stage changed-line-coverage make coverage-changed
 run_stage coverage-script make test-coverage-script
 run_stage openapi-tests make test-openapi-drift-check
 run_stage caddy-security make test-caddy-security
+run_stage release-compose make test-release-compose
 run_stage fuzz-smoke make fuzz-smoke
 run_stage media-acceptance make media-acceptance
 run_stage fault-acceptance make fault-acceptance
 run_stage jellyfin-acceptance make jellyfin-acceptance
 run_stage Compose-health make compose-health
 run_stage Compose-config make compose-config
+run_stage Compose-release-config make compose-release-config
 run_stage documentation make docs-build
 run_stage browser-acceptance make compose-e2e-ci
 run_stage scale-database make postgres-test
