@@ -88,6 +88,9 @@ export IPTV_GATEWAY_PORT="${IPTV_GATEWAY_PORT:-$(pick_port 18080 18081 18082 180
 export IPTV_PUBLIC_BASE_URL="${IPTV_PUBLIC_BASE_URL:-http://127.0.0.1:${IPTV_GATEWAY_PORT}}"
 export IPTV_E2E_BASE_URL="${IPTV_E2E_BASE_URL:-$IPTV_PUBLIC_BASE_URL}"
 export IPTV_TEST_DATABASE_URL="${IPTV_TEST_DATABASE_URL:-postgres://iptv:iptv-development@127.0.0.1:${IPTV_POSTGRES_PORT}/iptv}"
+# Keep coverage memory use bounded on developer machines. Operators can override these values.
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 
 cleanup() {
   local exit_code=$?
