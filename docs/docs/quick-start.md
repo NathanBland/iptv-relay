@@ -2,6 +2,14 @@
 
 This guide starts IPTV Gateway with Docker Compose, adds a first source, and connects a client.
 
+## Legal notice
+
+You must use only streams that you have the legal right to access.
+This project does not provide streams, channels, provider accounts, playlists, programme data, or media content.
+You are responsible for the providers, URLs, credentials, and content that you configure.
+The maintainers do not control or endorse third-party content.
+The maintainers are not responsible for the use of third-party content.
+
 ## Prerequisites
 
 Install Docker Engine and Docker Compose before you start.

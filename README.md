@@ -8,6 +8,14 @@ The gateway exposes M3U, XMLTV, and HDHomeRun-compatible output endpoints.
 Provider credentials stay out of output URLs.
 Each output URL has an output token in its path.
 
+## Legal notice
+
+You must use only streams that you have the legal right to access.
+This project does not provide streams, channels, provider accounts, playlists, programme data, or media content.
+You are responsible for the providers, URLs, credentials, and content that you configure.
+The maintainers do not control or endorse third-party content.
+The maintainers are not responsible for the use of third-party content.
+
 ## Architecture
 
 The implementation is split into a control plane and a media plane.
