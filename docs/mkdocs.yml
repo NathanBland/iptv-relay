@@ -53,6 +53,7 @@ nav:
       - Testing: development/testing.md
       - OpenAPI Drift Check: development/openapi-drift-check.md
       - Architecture: development/architecture.md
+      - Release Images: development/releasing.md
 plugins:
   - search
 markdown_extensions:
