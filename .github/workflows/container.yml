@@ -24,8 +24,73 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Run noncredentialed v1 gates
-        run: ./scripts/run-test-suite.sh
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install mkdocs and jq
+        run: pip install mkdocs mkdocs-material && sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Install web dependencies
+        working-directory: apps/web
+        run: pnpm install --frozen-lockfile
+
+      - name: Run format check
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run cargo deny
+        run: cargo deny check
+
+      - name: Run web typecheck
+        working-directory: apps/web
+        run: CI=true pnpm run typecheck
+
+      - name: Run web lint
+        working-directory: apps/web
+        run: CI=true pnpm run lint
+
+      - name: Run web build
+        working-directory: apps/web
+        run: CI=true pnpm run build
+
+      - name: Run docs build
+        run: mkdocs build --config-file docs/mkdocs.yml --strict --clean
+
+      - name: Run Caddy security checks
+        run: ./scripts/check-caddy-security.sh
+
+      - name: Run release compose config check
+        run: IPTV_VERSION=latest docker-compose -f docker-compose.appliance.yml --env-file .env.appliance.example config --quiet
+
+      - name: Run release compose regression tests
+        run: ./scripts/test-release-compose.sh
 
   image:
     name: Build and sign ${{ matrix.target }} image
