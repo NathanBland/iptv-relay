@@ -14,7 +14,7 @@ The scan does not create a canonical channel.
 | `displayName` | The template display name. |
 | `groupName` | The source group name. |
 | `matchRegex` | The PostgreSQL regular expression. |
-| `channelNameFormat` | Stored text for a future formatter. |
+| `channelNameFormat` | The event title format. Named regex captures and `{source}` or `{title}` are supported. |
 | `eventDurationHours` | Stored duration value. |
 | `pastDateGraceHours` | Stored retention value. |
 | `futureDateDays` | Stored search-window value. |
@@ -30,10 +30,10 @@ The current scan can link a record to the first enabled channel in the configure
 Use this expression to match a possible NFL stream name.
 
 ```text
-(?i)^NFL\s+(.+?)\s+vs\.?\s+(.+?)\s+(\d{4}-\d{2}-\d{2})
+(?i)^NFL\s+(?P<home>.+?)\s+vs\.?\s+(?P<away>.+?)\s+(\d{4}-\d{2}-\d{2})
 ```
 
-The scan stores the matched source title as programme provenance. It applies the template timezone, duration, title, and filler settings to generated programmes. It does not apply capture groups to `channelNameFormat`.
+The scan stores the matched source title as programme provenance. It applies the template timezone, duration, title, and filler settings to generated programmes. The `channelNameFormat` field supplies the event title format. Named regex captures and `{source}` or `{title}` are supported. Numbered placeholders such as `{1}` or `{2}` are not supported.
 
 ## Create a template record
 
@@ -47,8 +47,8 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
     "name": "nfl",
     "displayName": "NFL",
     "groupName": "Sports",
-    "matchRegex": "(?i)^NFL\\s+(.+?)\\s+vs\\.?\\s+(.+?)\\s+(\\d{4}-\\d{2}-\\d{2})",
-    "channelNameFormat": "NFL: {1} vs {2}",
+    "matchRegex": "(?i)^NFL\\s+(?P<home>.+?)\\s+vs\\.?\\s+(?P<away>.+?)\\s+(\\d{4}-\\d{2}-\\d{2})",
+    "channelNameFormat": "NFL: {home} vs {away}",
     "eventDurationHours": 4,
     "pastDateGraceHours": 6,
     "futureDateDays": 7

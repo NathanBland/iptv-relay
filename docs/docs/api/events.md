@@ -33,8 +33,8 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
     "name": "nfl",
     "displayName": "NFL",
     "groupName": "Sports",
-    "matchRegex": "(?i)^NFL\\s+(.+?)\\s+vs\\.?\\s+(.+?)\\s+(\\d{4}-\\d{2}-\\d{2})",
-    "channelNameFormat": "NFL: {1} vs {2}",
+    "matchRegex": "(?i)^NFL\\s+(?P<home>.+?)\\s+vs\\.?\\s+(?P<away>.+?)\\s+(\\d{4}-\\d{2}-\\d{2})",
+    "channelNameFormat": "NFL: {home} vs {away}",
     "eventDurationHours": 4,
     "pastDateGraceHours": 6,
     "futureDateDays": 7,
@@ -44,6 +44,8 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
 ```
 
 The `name`, `displayName`, `matchRegex`, `channelNameFormat`, and `groupName` fields are required. The duration, grace, future-window, timezone, and filler-title fields use defaults when you omit them.
+
+The `channelNameFormat` field supplies the event title format. Named regex captures and `{source}` or `{title}` are supported. Numbered placeholders such as `{1}` or `{2}` are not supported.
 
 ## Update an event template
 

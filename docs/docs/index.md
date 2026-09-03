@@ -2,6 +2,14 @@
 
 IPTV Gateway is an MIT-licensed Rust appliance. It turns M3U and Xtream live-TV sources and XMLTV guide data into stable, token-protected endpoints for Jellyfin.
 
+## Legal notice
+
+You must use only streams that you have the legal right to access.
+This project does not provide streams, channels, provider accounts, playlists, programme data, or media content.
+You are responsible for the providers, URLs, credentials, and content that you configure.
+The maintainers do not control or endorse third-party content.
+The maintainers are not responsible for the use of third-party content.
+
 Documentation examples can use the bootstrap bearer. These examples work only before the first successful password sign-in.
 
 The gateway exposes M3U, XMLTV, and HDHomeRun-compatible output endpoints.

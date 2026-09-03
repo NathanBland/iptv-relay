@@ -101,7 +101,7 @@ Mutating requests require a CSRF token. The login response sets the `iptv_csrf` 
 curl -b cookies.txt -X POST http://localhost:8080/api/v1/sources \
   -H "Content-Type: application/json" \
   -H "x-csrf-token: <csrf-cookie-value>" \
-  -d '{"type": "m3u", "name": "test", "url": "https://example.com/playlist.m3u"}'
+  -d '{"kind": "M3U", "name": "test", "endpoint": "https://example.com/playlist.m3u"}'
 ```
 
 Bootstrap bearer requests do not require a CSRF header.
