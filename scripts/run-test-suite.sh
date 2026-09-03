@@ -147,6 +147,7 @@ run_stage Compose-health make compose-health
 run_stage Compose-config make compose-config
 run_stage documentation make docs-build
 run_stage browser-acceptance make compose-e2e-ci
+run_stage scale-database make postgres-test
 run_stage scale-smoke make scale-gate-smoke
 
 if ((RUN_LIVE == 1)); then
