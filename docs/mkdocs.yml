@@ -25,6 +25,8 @@ nav:
   - Quick Start: quick-start.md
   - Configuration:
       - Docker Compose: configuration/docker-compose.md
+      - Production Deployment: configuration/deployment.md
+      - Troubleshooting: configuration/troubleshooting.md
       - Environment Variables: configuration/environment-variables.md
       - Sources: configuration/sources.md
       - EPG: configuration/epg.md
