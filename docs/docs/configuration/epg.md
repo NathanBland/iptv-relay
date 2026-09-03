@@ -1,6 +1,6 @@
 # EPG
 
-The gateway maps canonical channels to EPG channels from XMLTV sources. The reconciliation runs in three passes.
+The gateway maps canonical channels to EPG channels from XMLTV sources. The reconciliation runs in four passes.
 
 ## Timezone handling
 
@@ -25,11 +25,18 @@ Leave the setting as `UTC` when the provider omits the offset from UTC values.
 |------|--------------|------------|---------------|
 | 1 | Exact case-insensitive `tvg-id` | 0.99 | `applied` |
 | 2 | Normalized name | 0.90 | `applied` |
-| 3 | Ambiguous normalized name | _varies_ | `review` |
+| 3 | Channel alias | 0.85 | `applied` |
+| 4 | Ambiguous normalized name | _varies_ | `review` |
 
 The `normalize_channel_name` SQL function strips country prefixes, quality tokens, resolution markers, and punctuation from channel names.
 
 The name match uses only the latest active XMLTV snapshot. The name match applies only when exactly one EPG channel shares the normalized name. The name match excludes VOD content.
+
+## Channel alias match
+
+Pass 3 reconciles channels that pass 1 and pass 2 did not map. The pass joins the channel name to the `channel_aliases` table on the normalized alias value. When the alias canonical name and an EPG display name share the same normalized form, the pass creates a mapping.
+
+The alias match uses confidence `0.85` and the `alias` method. The mapping receives the `applied` review status. The pass applies only when exactly one EPG channel shares the normalized canonical name. The pass skips channels that already have a mapping. The pass preserves manual mappings.
 
 ## Trigger reconciliation
 

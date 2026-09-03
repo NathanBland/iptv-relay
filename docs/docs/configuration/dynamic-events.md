@@ -13,8 +13,8 @@ The scan does not create a canonical channel.
 |---|---|
 | `displayName` | The template display name. |
 | `groupName` | The source group name. |
-| `matchRegex` | The PostgreSQL regular expression. |
-| `channelNameFormat` | The event title format. Named regex captures and `{source}` or `{title}` are supported. |
+| `matchRegex` | The PostgreSQL regular expression. The scan uses this expression only as a stream filter. |
+| `channelNameFormat` | The event title format. `{source}` or `{title}` render the provider stream name. Named captures from the built-in sports rules are supported when a built-in rule matches. |
 | `eventDurationHours` | Stored duration value. |
 | `pastDateGraceHours` | Stored retention value. |
 | `futureDateDays` | Stored search-window value. |
@@ -30,10 +30,12 @@ The current scan can link a record to the first enabled channel in the configure
 Use this expression to match a possible NFL stream name.
 
 ```text
-(?i)^NFL\s+(?P<home>.+?)\s+vs\.?\s+(?P<away>.+?)\s+(\d{4}-\d{2}-\d{2})
+(?i)^NFL\s+.+?\s+vs\.?\s+.+?\s+\d{4}-\d{2}-\d{2}
 ```
 
-The scan stores the matched source title as programme provenance. It applies the template timezone, duration, title, and filler settings to generated programmes. The `channelNameFormat` field supplies the event title format. Named regex captures and `{source}` or `{title}` are supported. Numbered placeholders such as `{1}` or `{2}` are not supported.
+The `matchRegex` value is a PostgreSQL advanced regular expression. PostgreSQL does not support Python or Rust named-capture syntax such as `(?P<home>...)`. Use plain capturing groups or non-capturing groups in this field.
+
+The scan stores the matched source title as programme provenance. It applies the template timezone, duration, title, and filler settings to generated programmes. The `channelNameFormat` field supplies the event title format. `{source}` and `{title}` render the provider stream name. Named captures such as `{home}` or `{away}` are available only when a built-in sports rule supplies those captures. The `matchRegex` captures do not feed the title renderer. Numbered placeholders such as `{1}` or `{2}` are not supported.
 
 ## Create a template record
 
@@ -47,8 +49,8 @@ curl -X POST http://localhost:8080/api/v1/event-templates \
     "name": "nfl",
     "displayName": "NFL",
     "groupName": "Sports",
-    "matchRegex": "(?i)^NFL\\s+(?P<home>.+?)\\s+vs\\.?\\s+(?P<away>.+?)\\s+(\\d{4}-\\d{2}-\\d{2})",
-    "channelNameFormat": "NFL: {home} vs {away}",
+    "matchRegex": "(?i)^NFL\\s+.+?\\s+vs\\.?\\s+.+?\\s+\\d{4}-\\d{2}-\\d{2}",
+    "channelNameFormat": "NFL: {source}",
     "eventDurationHours": 4,
     "pastDateGraceHours": 6,
     "futureDateDays": 7
