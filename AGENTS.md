@@ -44,6 +44,28 @@ Before substantial work:
 
 During work:
 
+### Kaneo stage claims
+
+Each agent that works on a Kaneo task must use a stage-specific identity.
+
+1. Generate a six-character lowercase hexadecimal suffix before work starts.
+2. Combine the model name and suffix as the agent identifier.
+3. Use the same identifier for the task and stage.
+4. Use a new identifier when another agent takes the next stage.
+5. Return the claim comment to the parent before task work starts.
+6. Return the completion comment to the parent after stage work ends.
+7. The parent posts both comments through Kaneo.
+
+Use this claim format:
+
+> Claimed for `<stage>` by agent `<model>-<suffix>`. Task `<task-id>` is reserved for this stage.
+
+Use this completion format:
+
+> `<stage>` complete by agent `<model>-<suffix>`. Result: `<pass, block, or findings>`. Evidence: `<short evidence>`.
+
+Do not put credentials, tokens, or secret URLs in either comment.
+
 - Add comments for discoveries, decisions, blockers, and scope changes.
 - Keep the task description and status aligned with the actual work.
 - Link related tasks when appropriate.

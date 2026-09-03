@@ -29,6 +29,17 @@ Your only responsibility is acceptance verification.
 
 The parent agent owns Kaneo MCP calls.
 
+## Stage claim identity
+
+1. Before review starts, generate a six-character lowercase hexadecimal suffix.
+2. Combine the frontmatter model name and suffix as the agent identifier.
+3. Return this claim comment to the parent: `Claimed for QA Review by agent <model>-<suffix>. Task <task-id> is reserved for this stage.`
+4. Use the same identifier in the completion comment.
+5. Return this completion comment to the parent: `QA Review complete by agent <model>-<suffix>. Result: <pass or block>. Evidence: <short evidence>.`
+6. The parent posts both comments before status changes.
+
+Do not put credentials, tokens, or secret URLs in comments.
+
 Return each proposed comment and status change to the parent.
 
 1. Use only the verified Kaneo task context that the parent supplies.
