@@ -17,12 +17,13 @@ Provide persistent storage for the postgres-data volume.
 5. Set IPTV_GATEWAY_BIND to the local host address.
 6. Restrict .env permissions.
 
-bash
+```bash
 cp .env.example .env
 chmod 600 .env
 openssl rand -hex 32
 openssl rand -hex 32
 openssl rand -base64 32
+```
 
 
 Use the values for IPTV_OUTPUT_TOKEN, IPTV_ADMIN_BOOTSTRAP_TOKEN, and IPTV_MASTER_KEY.
@@ -31,12 +32,13 @@ Use IPTV_ADMIN_PASSWORD_HASH with an Argon2id PHC value when possible.
 
 ## Start and validate
 
-bash
+```bash
 docker-compose config --quiet
 docker-compose up --build -d --wait
 docker-compose ps
 curl --fail https://gateway.example.com/health/live
 curl --fail https://gateway.example.com/health/ready
+```
 
 
 Expose the gateway through a TLS reverse proxy.
@@ -52,11 +54,12 @@ Keep the default gateway bind on loopback when the proxy runs on the same host.
 5. Rebuild and start the stack.
 6. Check health and one output stream.
 
-bash
+```bash
 docker-compose exec -T postgres pg_dump -U iptv -d iptv > iptv-backup.sql
 git fetch --tags
 git checkout <release-or-commit>
 docker-compose up --build -d --wait
+```
 
 
 ## Roll back
@@ -67,26 +70,29 @@ docker-compose up --build -d --wait
 4. Start the stack.
 5. Restore PostgreSQL only when the release requires it.
 
-bash
+```bash
 docker-compose down
 git checkout <previous-release-or-commit>
 docker-compose up --build -d --wait
+```
 
 
 ## Backup and restore
 
 Create a logical backup:
 
-bash
+```bash
 docker-compose exec -T postgres pg_dump -U iptv -d iptv > iptv-backup.sql
+```
 
 
 Stop application services before a restore:
 
-bash
+```bash
 docker-compose stop core worker
 cat iptv-backup.sql | docker-compose exec -T postgres psql -U iptv -d iptv
 docker-compose up -d --wait
+```
 
 
 Store backups outside the repository.
@@ -97,22 +103,25 @@ Test each restore on a separate PostgreSQL instance.
 
 Stop services and keep data:
 
-bash
+```bash
 docker-compose down
+```
 
 
 Delete services and all database data only when you no longer need the data:
 
-bash
+```bash
 docker-compose down --volumes
+```
 
 
 ## Repository checks
 
 Run the standard noncredentialed test command from the repository root:
 
-bash
+```bash
 ./scripts/run-test-suite.sh
+```
 
 
 Use --keep to retain Compose resources after a failure.

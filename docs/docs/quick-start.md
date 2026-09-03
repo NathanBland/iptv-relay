@@ -101,10 +101,12 @@ Do not paste provider credentials into Jellyfin.
 
 ### Use the HDHomeRun path
 
-Use the HDHomeRun URL when a client needs an HDHomeRun tuner:
+Use the tokenized HDHomeRun discovery URL when a client needs an HDHomeRun tuner.
+Copy the HDHomeRun device URL from the Jellyfin setup page.
+The URL has this form:
 
 ```text
-http://localhost:8080/hdhomerun
+http://localhost:8080/out/{token}/hdhr/device.xml
 ```
 
 Set `IPTV_TUNER_COUNT` to the number of concurrent tuners that the output profile should report.

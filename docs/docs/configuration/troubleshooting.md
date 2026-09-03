@@ -4,9 +4,10 @@ Use these checks when the stack does not start or a client cannot load output.
 
 ## Inspect service state
 
-bash
+```bash
 docker-compose ps
 docker-compose logs --tail=100 gateway core worker web postgres
+```
 
 
 If Compose reports a missing variable, set every required value in .env.
@@ -55,8 +56,9 @@ Do not expose PostgreSQL port 54329 beyond loopback.
 
 Run the default noncredentialed checks:
 
-bash
+```bash
 ./scripts/run-test-suite.sh
+```
 
 
 Use ./scripts/run-test-suite.sh --keep to inspect failed Compose resources.
