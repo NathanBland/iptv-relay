@@ -858,8 +858,10 @@ async fn run_xtream_short_epg_refresh(
     })
 }
 
-/// The low-priority pool capacity for health probes. Probes use a dedicated
-/// pool identifier suffix so they never consume a live viewer slot.
+/// The low-priority pool capacity for health probes.
+///
+/// The worker-local broker limits probes within one worker process. Cross-process
+/// admission must also coordinate with the core media broker before production use.
 const HEALTH_PROBE_POOL_CAPACITY: usize = 1;
 /// The minimum transport packets required before a probe declares a stream
 /// alive.
@@ -946,6 +948,37 @@ async fn run_health_probe(
     master_key: &MasterKey,
     provider_stream_id: Uuid,
 ) -> std::result::Result<HealthProbeResult, anyhow::Error> {
+    run_health_probe_with_core_config(catalog, master_key, provider_stream_id, core_probe_config())
+        .await
+}
+
+fn core_probe_config() -> Option<(String, String)> {
+    core_probe_config_from(
+        env::var("IPTV_CORE_INTERNAL_URL").ok(),
+        env::var("IPTV_ADMIN_BOOTSTRAP_TOKEN").ok(),
+    )
+}
+
+fn core_probe_config_from(
+    core_url: Option<String>,
+    token: Option<String>,
+) -> Option<(String, String)> {
+    match (core_url, token) {
+        (Some(core_url), Some(token))
+            if !core_url.trim().is_empty() && !token.trim().is_empty() =>
+        {
+            Some((core_url, token))
+        }
+        _ => None,
+    }
+}
+
+async fn run_health_probe_with_core_config(
+    catalog: &CatalogRepository,
+    master_key: &MasterKey,
+    provider_stream_id: Uuid,
+    core_config: Option<(String, String)>,
+) -> std::result::Result<HealthProbeResult, anyhow::Error> {
     let Some(target) = catalog.load_stream_probe_target(provider_stream_id).await? else {
         return Ok(HealthProbeResult::Missing);
     };
@@ -960,6 +993,21 @@ async fn run_health_probe(
         return Ok(HealthProbeResult::Skipped);
     }
     let url = decrypt_probe_url(master_key, &target)?;
+    let distributed_reservation = match core_config {
+        Some((core_url, token)) => {
+            if let Some(reservation) =
+                reserve_core_probe_slot(&core_url, &token, &target.provider_pool_id).await?
+            {
+                Some(reservation)
+            } else {
+                catalog
+                    .release_stream_checking_claim(provider_stream_id)
+                    .await?;
+                return Ok(HealthProbeResult::Skipped);
+            }
+        }
+        None => None,
+    };
     let pool_id = format!("{}:probe", target.provider_pool_id);
     let broker = ProviderSlotBroker::new(pool_id, HEALTH_PROBE_POOL_CAPACITY);
     let client = Client::new();
@@ -975,6 +1023,9 @@ async fn run_health_probe(
     };
     let probe = StreamProbe::new(broker, client);
     let outcome = probe.run(&spec).await;
+    if let Some(reservation) = distributed_reservation {
+        reservation.release().await;
+    }
     // A skipped probe (low-priority pool full) must not persist an update. The
     // `stream_health_checks.status` check constraint only allows `alive`,
     // `dead`, and `error`, so an `unknown` row would violate it. Skipping the
@@ -992,6 +1043,58 @@ async fn run_health_probe(
     } else {
         HealthProbeResult::Applied
     })
+}
+
+struct CoreProbeReservation {
+    client: Client,
+    url: String,
+    token: String,
+}
+
+impl CoreProbeReservation {
+    async fn release(self) {
+        let _ = self
+            .client
+            .delete(&self.url)
+            .bearer_auth(&self.token)
+            .send()
+            .await;
+    }
+}
+
+async fn reserve_core_probe_slot(
+    core_url: &str,
+    token: &str,
+    pool_id: &Uuid,
+) -> Result<Option<CoreProbeReservation>, anyhow::Error> {
+    let client = Client::new();
+    let base = core_url.trim_end_matches('/');
+    let collection = format!("{base}/internal/v1/provider-reservations");
+    let response = client
+        .post(&collection)
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "pool_id": pool_id,
+            "capacity": HEALTH_PROBE_POOL_CAPACITY,
+        }))
+        .send()
+        .await
+        .context("reserve a core provider slot for health probe")?;
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Ok(None);
+    }
+    let response = response.error_for_status()?;
+    let body: serde_json::Value = response.json().await?;
+    let reservation_id = body
+        .get("reservation_id")
+        .and_then(serde_json::Value::as_str)
+        .context("core provider reservation omitted its id")?
+        .to_owned();
+    Ok(Some(CoreProbeReservation {
+        client,
+        url: format!("{collection}/{reservation_id}"),
+        token: token.to_owned(),
+    }))
 }
 
 /// Decrypts the probe target URL. Falls back to the template when no
@@ -1091,6 +1194,8 @@ fn provider_stream_id_from_payload(payload: &serde_json::Value) -> Option<Uuid> 
 /// a check. Recovers stranded `checking` records before each cycle.
 async fn health_probe_scheduler(catalog: &CatalogRepository, jobs: &JobRepository) {
     info!("health probe scheduler started");
+    let core_url = env::var("IPTV_CORE_INTERNAL_URL").ok();
+    let core_client = Client::new();
     loop {
         tokio::select! {
             () = shutdown_signal() => {
@@ -1098,6 +1203,10 @@ async fn health_probe_scheduler(catalog: &CatalogRepository, jobs: &JobRepositor
                 return;
             }
             () = tokio::time::sleep(HEALTH_PROBE_SCHEDULER_INTERVAL) => {}
+        }
+        if should_defer_health_probes(&core_client, core_url.as_deref()).await {
+            debug!("deferring health probes while playback sessions are active");
+            continue;
         }
         if let Err(error) = catalog
             .recover_stranded_checking_streams(HEALTH_PROBE_STRANDED_TIMEOUT_SECONDS)
@@ -1151,6 +1260,39 @@ async fn health_probe_scheduler(catalog: &CatalogRepository, jobs: &JobRepositor
             }
         }
     }
+}
+
+/// Return true when the core reports at least one active provider session.
+///
+/// Workers use this check to defer low-priority probes during playback. The
+/// check is conservative: an unavailable core also defers probes.
+async fn core_has_active_sessions(client: &Client, core_url: &str) -> bool {
+    let url = format!("{}/metrics", core_url.trim_end_matches('/'));
+    let Ok(response) = client.get(url).send().await else {
+        return true;
+    };
+    let Ok(body) = response.bytes().await else {
+        return true;
+    };
+    let Ok(body) = std::str::from_utf8(&body) else {
+        return true;
+    };
+    metrics_report_active_sessions(body)
+}
+
+async fn should_defer_health_probes(client: &Client, core_url: Option<&str>) -> bool {
+    match core_url {
+        Some(core_url) => core_has_active_sessions(client, core_url).await,
+        None => false,
+    }
+}
+
+fn metrics_report_active_sessions(body: &str) -> bool {
+    body.lines().any(|line| {
+        line.strip_prefix("iptv_media_provider_active_sessions ")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .is_some_and(|active| active > 0)
+    })
 }
 
 async fn run_xtream_refresh(
@@ -1543,7 +1685,7 @@ mod tests {
         extract::{Query, State},
         http::StatusCode,
         response::{IntoResponse, Response},
-        routing::get,
+        routing::{delete, get, post},
     };
     use iptv_media::StreamProbeQuality;
     use std::{
@@ -1558,6 +1700,181 @@ mod tests {
     const OUTPUT_TOKEN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const BOOTSTRAP_TOKEN: &str =
         "2222222222222222222222222222222222222222222222222222222222222222";
+
+    #[test]
+    fn metrics_activity_check_is_conservative_and_aggregate() {
+        assert!(metrics_report_active_sessions(
+            "iptv_media_provider_active_sessions 1\n"
+        ));
+        assert!(!metrics_report_active_sessions(
+            "iptv_media_provider_active_sessions 0\n"
+        ));
+        assert!(!metrics_report_active_sessions("not prometheus data\n"));
+    }
+
+    #[test]
+    fn core_probe_config_requires_both_internal_credentials() {
+        assert_eq!(
+            core_probe_config_from(Some("http://core".to_owned()), Some("token".to_owned())),
+            Some(("http://core".to_owned(), "token".to_owned()))
+        );
+        assert!(core_probe_config_from(Some("http://core".to_owned()), None).is_none());
+        assert!(core_probe_config_from(None, Some("token".to_owned())).is_none());
+        assert!(core_probe_config_from(Some(" ".to_owned()), Some("token".to_owned())).is_none());
+        assert!(
+            core_probe_config_from(Some("http://core".to_owned()), Some(" ".to_owned())).is_none()
+        );
+    }
+
+    #[test]
+    fn core_probe_config_reads_process_environment_safely() {
+        // The test environment can omit either value. The wrapper must still
+        // return a coherent optional configuration without exposing secrets.
+        if let Some((url, token)) = core_probe_config() {
+            assert!(!url.is_empty());
+            assert!(!token.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn core_probe_reservation_treats_capacity_conflict_as_skipped() {
+        let app = Router::new().route(
+            "/internal/v1/provider-reservations",
+            post(|| async { StatusCode::CONFLICT }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let result = reserve_core_probe_slot(
+            &format!("http://{address}/"),
+            "worker-token",
+            &Uuid::now_v7(),
+        )
+        .await
+        .expect("capacity conflict is a normal skip");
+        assert!(result.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn core_probe_reservation_rejects_failed_or_malformed_core_responses() {
+        for malformed in [false, true] {
+            let app = Router::new().route(
+                "/internal/v1/provider-reservations",
+                post(move || async move {
+                    if malformed {
+                        (StatusCode::OK, "not-json").into_response()
+                    } else {
+                        StatusCode::BAD_GATEWAY.into_response()
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let result = reserve_core_probe_slot(
+                &format!("http://{address}"),
+                "worker-token",
+                &Uuid::now_v7(),
+            )
+            .await;
+            assert!(result.is_err());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn core_probe_reservation_release_calls_core_delete_endpoint() {
+        let release_count = Arc::new(AtomicUsize::new(0));
+        let release_count_for_route = Arc::clone(&release_count);
+        let app = Router::new()
+            .route(
+                "/internal/v1/provider-reservations",
+                post(|| async { Json(serde_json::json!({"reservation_id":"reservation-1"})) }),
+            )
+            .route(
+                "/internal/v1/provider-reservations/{reservation_id}",
+                delete(move || {
+                    release_count_for_route.fetch_add(1, Ordering::SeqCst);
+                    async { StatusCode::NO_CONTENT }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let reservation = reserve_core_probe_slot(
+            &format!("http://{address}"),
+            "worker-token",
+            &Uuid::now_v7(),
+        )
+        .await
+        .unwrap()
+        .expect("core reservation");
+        reservation.release().await;
+        assert_eq!(release_count.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn core_active_session_check_reads_metrics_and_defers_when_core_is_unavailable() {
+        let app = Router::new().route(
+            "/metrics",
+            get(|| async { "iptv_media_provider_active_sessions 2\n" }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = Client::new();
+        let active_url = format!("http://{address}/");
+        assert!(core_has_active_sessions(&client, &active_url).await);
+        assert!(should_defer_health_probes(&client, Some(&active_url)).await);
+        server.abort();
+
+        let invalid_body_app =
+            Router::new().route("/metrics", get(|| async { vec![0xff_u8, 0xfe_u8] }));
+        let invalid_body_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let invalid_body_address = invalid_body_listener.local_addr().unwrap();
+        let invalid_body_server = tokio::spawn(async move {
+            axum::serve(invalid_body_listener, invalid_body_app)
+                .await
+                .unwrap();
+        });
+        assert!(
+            core_has_active_sessions(&client, &format!("http://{invalid_body_address}/")).await
+        );
+        invalid_body_server.abort();
+
+        let broken_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broken_address = broken_listener.local_addr().unwrap();
+        let broken_server = tokio::spawn(async move {
+            let (mut socket, _) = broken_listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nx",
+            )
+            .await
+            .unwrap();
+        });
+        assert!(core_has_active_sessions(&client, &format!("http://{broken_address}/")).await);
+        broken_server.await.unwrap();
+
+        assert!(core_has_active_sessions(&client, "http://127.0.0.1:1").await);
+        assert!(!should_defer_health_probes(&client, None).await);
+        assert!(should_defer_health_probes(&client, Some("http://127.0.0.1:1")).await);
+    }
 
     /// Computes the MPEG-2 CRC32 used by PSI sections. The polynomial is
     /// 0x04c11db7, which differs from the standard CRC32.
@@ -3316,23 +3633,25 @@ mod tests {
         let addr = listener.local_addr().expect("local address");
         let ts_data = ts_bytes.clone();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut buf = [0_u8; 1024];
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                tokio::io::AsyncReadExt::read(&mut socket, &mut buf),
-            )
-            .await;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\n\r\n",
-                ts_data.len()
-            );
-            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
-                .await
-                .expect("write headers");
-            tokio::io::AsyncWriteExt::write_all(&mut socket, &ts_data)
-                .await
-                .expect("write body");
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buf = [0_u8; 1024];
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    tokio::io::AsyncReadExt::read(&mut socket, &mut buf),
+                )
+                .await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\n\r\n",
+                    ts_data.len()
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                    .await
+                    .expect("write headers");
+                tokio::io::AsyncWriteExt::write_all(&mut socket, &ts_data)
+                    .await
+                    .expect("write body");
+            }
         });
 
         let url = format!("http://{addr}/stream.ts");
@@ -3372,19 +3691,98 @@ mod tests {
         .expect("insert provider stream");
         transaction.commit().await.expect("commit");
 
-        let result = run_health_probe(&catalog, &master_key, stream_id)
+        let core_app = Router::new()
+            .route(
+                "/internal/v1/provider-reservations",
+                post(|| async { Json(serde_json::json!({"reservation_id": "probe-1"})) }),
+            )
+            .route(
+                "/internal/v1/provider-reservations/{reservation_id}",
+                delete(|| async { StatusCode::NO_CONTENT }),
+            );
+        let core_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("probe call succeeds");
-        assert_eq!(result, HealthProbeResult::Applied);
+            .expect("bind core test server");
+        let core_address = core_listener.local_addr().expect("core local address");
+        let core_server = tokio::spawn(async move {
+            axum::serve(core_listener, core_app).await.unwrap();
+        });
 
-        // The stream health status must be `alive`.
+        let result_without_core =
+            run_health_probe_with_core_config(&catalog, &master_key, stream_id, None)
+                .await
+                .expect("probe call succeeds without core reservation");
+        assert_eq!(result_without_core, HealthProbeResult::Applied);
+        sqlx::query("UPDATE provider_streams SET health_status = 'unknown' WHERE id = $1")
+            .bind(stream_id)
+            .execute(&pool)
+            .await
+            .expect("reset stream health for core reservation probe");
+
+        let result = run_health_probe_with_core_config(
+            &catalog,
+            &master_key,
+            stream_id,
+            Some((
+                format!("http://{core_address}"),
+                "test-bootstrap-token".to_owned(),
+            )),
+        )
+        .await
+        .expect("probe call succeeds");
+        assert_eq!(result, HealthProbeResult::Applied);
+        core_server.abort();
+
+        let status: String =
+            sqlx::query_scalar("SELECT health_status FROM provider_streams WHERE id = $1")
+                .bind(stream_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch alive status");
+        assert_eq!(status, "alive");
+
+        // A full core pool must release the local checking claim and skip the
+        // probe without changing the stream health state.
+        sqlx::query("UPDATE provider_streams SET health_status = 'unknown' WHERE id = $1")
+            .bind(stream_id)
+            .execute(&pool)
+            .await
+            .expect("reset stream health for conflict probe");
+        let conflict_app = Router::new().route(
+            "/internal/v1/provider-reservations",
+            post(|| async { StatusCode::CONFLICT }),
+        );
+        let conflict_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind conflict core server");
+        let conflict_address = conflict_listener
+            .local_addr()
+            .expect("conflict core local address");
+        let conflict_server = tokio::spawn(async move {
+            axum::serve(conflict_listener, conflict_app).await.unwrap();
+        });
+        let skipped = run_health_probe_with_core_config(
+            &catalog,
+            &master_key,
+            stream_id,
+            Some((
+                format!("http://{conflict_address}"),
+                "test-bootstrap-token".to_owned(),
+            )),
+        )
+        .await
+        .expect("capacity conflict is a normal skip");
+        assert_eq!(skipped, HealthProbeResult::Skipped);
+        conflict_server.abort();
+
+        // The skipped probe must release its checking claim.
         let status: String =
             sqlx::query_scalar("SELECT health_status FROM provider_streams WHERE id = $1")
                 .bind(stream_id)
                 .fetch_one(&pool)
                 .await
                 .expect("fetch status");
-        assert_eq!(status, "alive");
+        assert_eq!(status, "unknown");
 
         let _ = server.await;
 

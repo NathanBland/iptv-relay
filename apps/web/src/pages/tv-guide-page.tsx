@@ -9,10 +9,8 @@ import { Input } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
 import { useDebouncedValue } from '@/lib/hooks/use-debounced-value'
-import { partitionProgrammesAt } from '@/lib/programmes'
+import { formatProgrammeTime, partitionProgrammesAt } from '@/lib/programmes'
 import type { IptvApiClient } from '@/lib/api/types'
-
-const timeFormatter = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' })
 
 export function TvGuidePage({ client = apiClient }: { client?: IptvApiClient }) {
   const [searchInput, setSearchInput] = useState('')
@@ -25,12 +23,14 @@ export function TvGuidePage({ client = apiClient }: { client?: IptvApiClient }) 
     ...apiQueries(client).programmes(programmeQuery),
     placeholderData: keepPreviousData,
   })
+  const regionQuery = useQuery(apiQueries(client).regionSettings)
   const enabledChannelsQuery = useQuery({
     ...apiQueries(client).channels({ enabled: true, limit: 500 }),
   })
   const programmes = query.data?.items ?? []
   const total = query.data?.total ?? 0
   const enabledChannels = enabledChannelsQuery.data?.items ?? []
+  const timezone = regionQuery.data?.settings.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone
 
   const { current, upcoming } = useMemo(() => {
     return partitionProgrammesAt(programmes, Date.now())
@@ -77,7 +77,7 @@ export function TvGuidePage({ client = apiClient }: { client?: IptvApiClient }) 
                         <p className="truncate text-xs text-slate-500">{programme.channel}</p>
                       </div>
                       <time className="shrink-0 font-mono text-xs text-slate-500" dateTime={programme.start}>
-                        {timeFormatter.format(new Date(programme.start))}
+                        {formatProgrammeTime(programme.start, timezone)}
                       </time>
                     </li>
                   ))}
@@ -100,7 +100,7 @@ export function TvGuidePage({ client = apiClient }: { client?: IptvApiClient }) 
                         <p className="truncate text-xs text-slate-500">{programme.channel}</p>
                       </div>
                       <time className="shrink-0 font-mono text-xs text-slate-500" dateTime={programme.start}>
-                        {timeFormatter.format(new Date(programme.start))}
+                        {formatProgrammeTime(programme.start, timezone)}
                       </time>
                     </li>
                   ))}

@@ -4639,6 +4639,20 @@ async fn try_mark_stream_checking_deduplicates_concurrent_probes() {
             .unwrap();
     assert_eq!(status, "checking");
 
+    // Admission failure must release only the current checking claim.
+    catalog
+        .release_stream_checking_claim(stream_id)
+        .await
+        .unwrap();
+    let released_status: String =
+        sqlx::query_scalar("SELECT health_status FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(released_status, "unknown");
+    assert!(catalog.try_mark_stream_checking(stream_id).await.unwrap());
+
     // A second concurrent claim must return false and leave the stream in
     // `checking` so a second worker does not probe the same stream.
     let second = catalog.try_mark_stream_checking(stream_id).await.unwrap();

@@ -84,3 +84,19 @@ Treat `unsafe` as a last resort.
 Exhaust all safe alternatives before you use `unsafe`.
 
 Document the safety invariant when `unsafe` is necessary.
+
+## Test runner
+
+Use `./scripts/run-test-suite.sh` as the standard repository-root test command.
+
+Run the default command for all noncredentialed gates.
+
+Use `--keep` when you need to inspect runner-owned Compose resources after a failure.
+
+Use `--live` only when the operator supplies authorized live-provider credentials.
+
+Run `make test-runner` when you change the runner or its documented behavior.
+
+Do not call broad Docker cleanup commands from the runner or from an agent.
+
+Keep `.env.live` and other credential files untracked and unchanged.

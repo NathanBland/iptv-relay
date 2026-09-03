@@ -34,7 +34,7 @@ use iptv_domain::{
 use iptv_media::{
     AcquireError, HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSessionSnapshot,
     HttpTsSourceSpec, InputAdapterPolicy, MpegTsRingConfig, PoolSnapshot, ProviderSpec,
-    SessionFailureKind, SessionStartError, SessionState, ViewerHandle,
+    SessionFailureKind, SessionStartError, SessionState, SlotLease, ViewerHandle,
 };
 use iptv_persistence::{
     AuditEventRecord, CatalogRepository, ChannelPlaybackCandidateRow, ChannelPlaybackPlan,
@@ -104,6 +104,8 @@ pub struct AppState {
     runtime_versions: RuntimeVersions,
     started_at: Instant,
     media: HttpTsSessionManager,
+    internal_reservations: Arc<std::sync::Mutex<HashMap<String, (SlotLease, Instant)>>>,
+    internal_token_hash: [u8; 32],
     source_repository: Option<SourceRepository>,
     job_repository: Option<JobRepository>,
     catalog_repository: Option<CatalogRepository>,
@@ -125,6 +127,8 @@ impl fmt::Debug for AppState {
             .field("runtime_versions", &self.runtime_versions)
             .field("started_at", &self.started_at)
             .field("media", &self.media)
+            .field("internal_reservations", &"<redacted>")
+            .field("internal_token_hash", &"<redacted>")
             .field("source_repository", &self.source_repository)
             .field("job_repository", &self.job_repository)
             .field("catalog_repository", &self.catalog_repository)
@@ -163,6 +167,8 @@ impl AppState {
             runtime_versions: config.runtime_versions,
             started_at: Instant::now(),
             media: HttpTsSessionManager::new(reqwest::Client::new()),
+            internal_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            internal_token_hash: token_hash(&config.admin_bootstrap_token),
             source_repository,
             job_repository,
             catalog_repository,
@@ -858,11 +864,103 @@ pub fn router(state: AppState) -> Router {
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/metrics", get(metrics))
+        .route(
+            "/internal/v1/provider-reservations",
+            post(reserve_provider_slot),
+        )
+        .route(
+            "/internal/v1/provider-reservations/{reservation_id}",
+            axum::routing::delete(release_provider_slot),
+        )
         .merge(control)
         .merge(output_routes())
         .layer(CompressionLayer::new())
         .layer(CatchPanicLayer::new())
         .with_state(state)
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderReservationRequest {
+    pool_id: String,
+    capacity: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ProviderReservationResponse {
+    reservation_id: String,
+}
+
+fn internal_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(token) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    token_hash(token) == state.internal_token_hash
+}
+
+async fn reserve_provider_slot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProviderReservationRequest>,
+) -> Response {
+    if !internal_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if request.pool_id.trim().is_empty() || request.capacity == 0 {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let reservation_id = Uuid::now_v7().to_string();
+    let lease = match state.media.reserve_provider_slot(
+        request.pool_id,
+        request.capacity,
+        format!("probe:{reservation_id}"),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => return provider_reservation_error_status(&error).into_response(),
+    };
+    let mut reservations = state
+        .internal_reservations
+        .lock()
+        .expect("reservation mutex is not poisoned");
+    let now = Instant::now();
+    reservations.retain(|_, (_, expires_at)| *expires_at > now);
+    reservations.insert(
+        reservation_id.clone(),
+        (lease, now + Duration::from_secs(30)),
+    );
+    Json(ProviderReservationResponse { reservation_id }).into_response()
+}
+
+fn provider_reservation_error_status(error: &AcquireError) -> StatusCode {
+    match error {
+        AcquireError::AtCapacity { .. } => StatusCode::CONFLICT,
+        AcquireError::LeaseIdExhausted => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+async fn release_provider_slot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(reservation_id): Path<String>,
+) -> Response {
+    if !internal_authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let removed = state
+        .internal_reservations
+        .lock()
+        .expect("reservation mutex is not poisoned")
+        .remove(&reservation_id);
+    if removed.is_some() {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
 }
 
 fn source_control_routes() -> Router<AppState> {
@@ -8649,6 +8747,195 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn internal_provider_reservation_shares_core_capacity() {
+        let app_state = state();
+        let app = router(app_state.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/v1/provider-reservations")
+            .header(header::AUTHORIZATION, "Bearer admin-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"pool_id":"pool-a","capacity":1}"#))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: ProviderReservationResponse =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+
+        let second = Request::builder()
+            .method("POST")
+            .uri("/internal/v1/provider-reservations")
+            .header(header::AUTHORIZATION, "Bearer admin-secret")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"pool_id":"pool-a","capacity":1}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(second).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+
+        let release = Request::builder()
+            .method("DELETE")
+            .uri(format!(
+                "/internal/v1/provider-reservations/{}",
+                body.reservation_id
+            ))
+            .header(header::AUTHORIZATION, "Bearer admin-secret")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(release).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let missing = app
+            .oneshot(admin_request(
+                "DELETE",
+                "/internal/v1/provider-reservations/missing-reservation",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn internal_provider_reservation_handler_direct_path_tracks_lease_lifecycle() {
+        let state = state();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer admin-secret"),
+        );
+        let response = reserve_provider_slot(
+            State(state.clone()),
+            headers.clone(),
+            Json(ProviderReservationRequest {
+                pool_id: "direct-handler-pool".to_owned(),
+                capacity: 1,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let reservation: ProviderReservationResponse = serde_json::from_slice(&body).unwrap();
+        let released =
+            release_provider_slot(State(state), headers, Path(reservation.reservation_id)).await;
+        assert_eq!(released.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn internal_provider_reservation_rejects_unauthorized_requests() {
+        let app_state = state();
+        let debug = format!("{app_state:?}");
+        assert!(debug.contains("internal_reservations: \"<redacted>\""));
+        assert!(debug.contains("internal_token_hash: \"<redacted>\""));
+        let app = router(app_state.clone());
+        for request in [
+            Request::post("/internal/v1/provider-reservations")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"pool_id":"pool-a","capacity":1}"#))
+                .unwrap(),
+            Request::post("/internal/v1/provider-reservations")
+                .header(header::AUTHORIZATION, "Token admin-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"pool_id":"pool-a","capacity":1}"#))
+                .unwrap(),
+            Request::post("/internal/v1/provider-reservations")
+                .header(header::AUTHORIZATION, "Bearer wrong-token")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"pool_id":"pool-a","capacity":1}"#))
+                .unwrap(),
+            Request::post("/internal/v1/provider-reservations")
+                .header(header::AUTHORIZATION, "Basic admin-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"pool_id":"pool-a","capacity":1}"#))
+                .unwrap(),
+            Request::delete("/internal/v1/provider-reservations/reservation-id")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let direct = release_provider_slot(
+            State(app_state),
+            HeaderMap::new(),
+            Path("reservation-id".to_owned()),
+        )
+        .await;
+        assert_eq!(direct.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn internal_provider_reservation_rejects_malformed_and_invalid_requests() {
+        let app = router(state());
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::post("/internal/v1/provider-reservations")
+                    .header(header::AUTHORIZATION, "Bearer admin-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("not-json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        for body in [
+            r#"{"pool_id":"","capacity":1}"#,
+            r#"{"pool_id":"   ","capacity":1}"#,
+            r#"{"pool_id":"pool-a","capacity":0}"#,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/internal/v1/provider-reservations")
+                        .header(header::AUTHORIZATION, "Bearer admin-secret")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_provider_reservation_direct_release_reports_unknown_id() {
+        let response = release_provider_slot(
+            State(state()),
+            HeaderMap::from_iter([(
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer admin-secret"),
+            )]),
+            Path("missing-reservation".to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn provider_reservation_error_status_maps_capacity_and_identifier_exhaustion() {
+        assert_eq!(
+            provider_reservation_error_status(&AcquireError::AtCapacity {
+                pool_id: "pool".into(),
+                capacity: 1,
+                active_sessions: 1,
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            provider_reservation_error_status(&AcquireError::LeaseIdExhausted),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

@@ -81,3 +81,9 @@ Treat `unsafe` as a last resort.
 Exhaust all safe alternatives before you use `unsafe`.
 
 Document the safety invariant when `unsafe` is necessary.
+
+## Test runner
+
+Use `./scripts/run-test-suite.sh` for repository-root verification when you change or assess project behavior.
+Use `--keep` only when you need retained test containers for diagnosis.
+Keep `.env.live` untracked and never print live credentials.

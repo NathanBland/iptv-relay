@@ -3538,6 +3538,24 @@ impl CatalogRepository {
         Ok(rows != 0)
     }
 
+    /// Releases a health-probe claim when admission is unavailable.
+    ///
+    /// The update affects only the claim made by the current probe attempt.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn release_stream_checking_claim(
+        &self,
+        provider_stream_id: Uuid,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "UPDATE provider_streams SET health_status = 'unknown' \
+             WHERE id = $1 AND health_status = 'checking'",
+        )
+        .bind(provider_stream_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Lists streams that need health checking (unknown or dead status).
     ///
     /// # Errors

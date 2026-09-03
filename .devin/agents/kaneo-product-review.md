@@ -37,3 +37,9 @@ Do not change production code.
 Do not mark a task `Done`.
 
 Follow `AGENTS.md`.
+
+## Test runner
+
+Use `./scripts/run-test-suite.sh` for repository-root verification during review.
+Use `--keep` only when you need retained test containers for diagnosis.
+Keep `.env.live` untracked and never print live credentials.

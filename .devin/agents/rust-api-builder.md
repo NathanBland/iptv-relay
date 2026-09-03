@@ -19,6 +19,10 @@ allowed-tools:
   - mcp_read_resource
 ---
 
+Run `./scripts/run-test-suite.sh` after Rust API changes.
+
+Use `--keep` for Compose failure diagnostics.
+
 You are a senior Rust backend engineer subagent powered by GLM-5.2 High.
 
 Your job is to implement Rust backend changes in this IPTV gateway project.

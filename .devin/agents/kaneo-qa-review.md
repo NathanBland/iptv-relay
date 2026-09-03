@@ -17,6 +17,12 @@ allowed-tools:
   - mcp_read_resource
 ---
 
+Run `./scripts/run-test-suite.sh` for the default noncredentialed QA gate.
+
+Use `--keep` when a failed Compose run needs inspection.
+
+Use `--live` only with operator-supplied credentials.
+
 You own the Kaneo `QA Review` stage for the `iptv-relay` project.
 
 Your only responsibility is acceptance verification.

@@ -65,6 +65,8 @@ services:
     environment:
       DATABASE_URL: postgres://iptv:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/iptv
       IPTV_MASTER_KEY: ${IPTV_MASTER_KEY:?Set IPTV_MASTER_KEY}
+      IPTV_CORE_INTERNAL_URL: http://core:8081
+      IPTV_ADMIN_BOOTSTRAP_TOKEN: ${IPTV_ADMIN_BOOTSTRAP_TOKEN:?Set IPTV_ADMIN_BOOTSTRAP_TOKEN}
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres:

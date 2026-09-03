@@ -448,6 +448,20 @@ Run the full CI pipeline:
 make ci
 ```
 
+Run the isolated non-credentialed suite:
+
+```bash
+./scripts/run-test-suite.sh
+```
+
+The runner uses a unique Compose project and removes its test resources after the run.
+
+The runner keeps build caches for later runs.
+
+Pass `--keep` to inspect test resources after a failure.
+
+Pass `--live` to include credentialed live-provider tests.
+
 Run the media acceptance test:
 
 ```bash

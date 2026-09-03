@@ -1,4 +1,4 @@
-.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-openapi-drift-check test-caddy-security postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
+.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-runner test-openapi-drift-check test-caddy-security postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
 
 DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
 
@@ -61,6 +61,9 @@ coverage: coverage-rust coverage-web
 
 test-coverage-script:
 	./scripts/test-changed-line-coverage.sh
+
+test-runner:
+	./scripts/test-run-test-suite.sh
 
 test-openapi-drift-check:
 	./scripts/test-openapi-drift-check.sh
@@ -155,10 +158,9 @@ jellyfin-acceptance:
 	IPTV_PUBLIC_BASE_URL=http://gateway:8080 docker-compose --project-name iptv-jellyfin-acceptance --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from jellyfin-acceptance jellyfin-acceptance
 
 live-acceptance-gateway:
-	docker-compose --env-file .env.test build core
-	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from live-acceptance-gateway live-acceptance-gateway
-	docker-compose --env-file .env.test --profile test stop fake-provider
-	docker-compose --env-file .env.test --profile test rm -f live-acceptance-gateway
+	trap 'IPTV_GATEWAY_PORT=18080 IPTV_POSTGRES_PORT=54339 docker-compose --project-name iptv-live-acceptance --env-file .env.test down --volumes --remove-orphans' EXIT; \
+	IPTV_GATEWAY_PORT=18080 IPTV_POSTGRES_PORT=54339 docker-compose --project-name iptv-live-acceptance --env-file .env.test build core; \
+	IPTV_GATEWAY_PORT=18080 IPTV_POSTGRES_PORT=54339 docker-compose --project-name iptv-live-acceptance --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from live-acceptance-gateway live-acceptance-gateway
 
 scale-gate-build:
 	cargo build --release -p iptv-gateway --features scale-gate --bin scale-gate

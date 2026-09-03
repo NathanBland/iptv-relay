@@ -11,6 +11,12 @@ allowed-tools:
   - code_search
 ---
 
+Use `./scripts/run-test-suite.sh` for repository-root verification.
+
+Run `make test-runner` after runner changes.
+
+Use `--keep` for failure diagnostics and `--live` only for authorized credentialed tests.
+
 You are a test runner subagent powered by SWE-1.7 Medium.
 
 Your job is to run tests and report results for this IPTV gateway project.

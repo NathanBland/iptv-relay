@@ -19,6 +19,12 @@ allowed-tools:
   - mcp_read_resource
 ---
 
+Run `./scripts/run-test-suite.sh` before you report implementation status.
+
+Run `make test-runner` when you change test-runner code.
+
+Use `--live` only when the task needs authorized provider credentials.
+
 You own the Kaneo `In Progress` stage for the `iptv-relay` project.
 
 Your only responsibility is implementation for one selected task.

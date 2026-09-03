@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { MockIptvApiClient, apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
-import { partitionProgrammesAt } from '@/lib/programmes'
+import { formatProgrammeTime, partitionProgrammesAt } from '@/lib/programmes'
 import { cn, formatBitrate, formatRelativeTime } from '@/lib/utils'
 
 describe('typed API boundary', () => {
@@ -104,6 +104,11 @@ describe('typed API boundary', () => {
 })
 
 describe('display utilities', () => {
+  it('formats UTC instants in the configured operator timezone across DST', () => {
+    expect(formatProgrammeTime('2026-01-01T19:00:00Z', 'America/Denver')).toMatch(/12:00\s?PM/)
+    expect(formatProgrammeTime('2026-07-01T18:00:00Z', 'America/Denver')).toMatch(/12:00\s?PM/)
+  })
+
   it('selects current and upcoming programme instants at a fixed clock', () => {
     const winterNow = Date.parse('2026-01-01T19:00:00Z')
     const summerNow = Date.parse('2026-07-01T18:00:00Z')

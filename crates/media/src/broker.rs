@@ -192,6 +192,11 @@ impl ProviderSlotBroker {
     /// The wait prevents a viewer from failing during the short interval when
     /// a previous session closes its provider socket and releases its lease.
     /// The timeout still returns [`AcquireError::AtCapacity`] for a full pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcquireError::AtCapacity`] when the timeout expires or
+    /// [`AcquireError::LeaseIdExhausted`] when the lease identifier space ends.
     pub async fn acquire_wait(
         &self,
         session_key: impl Into<Arc<str>>,
@@ -319,6 +324,18 @@ mod tests {
         assert!(matches!(error, AcquireError::AtCapacity { .. }));
     }
 
+    #[tokio::test]
+    async fn acquire_wait_propagates_lease_identifier_exhaustion() {
+        let broker = ProviderSlotBroker::new("account-a", 1);
+        broker.inner.state.lock().next_lease_id = u64::MAX;
+        let error = broker
+            .acquire_wait("channel-1", Duration::from_millis(5))
+            .await
+            .unwrap_err();
+        assert_eq!(error, AcquireError::LeaseIdExhausted);
+        assert_eq!(broker.snapshot().active_sessions, 0);
+    }
+
     #[test]
     fn three_channels_and_six_viewers_consume_three_leases() {
         let broker = Arc::new(ProviderSlotBroker::new("shared-provider-pool", 3));
@@ -355,6 +372,30 @@ mod tests {
                 .collect();
             assert_eq!(ids.len(), 1, "each channel must share one lease");
         }
+        assert_eq!(broker.snapshot().active_sessions, 0);
+    }
+
+    #[test]
+    fn lease_identifier_exhaustion_is_reported_without_inserting_a_session() {
+        let broker = ProviderSlotBroker::new("pool", 1);
+        broker.inner.state.lock().next_lease_id = u64::MAX;
+        assert!(matches!(
+            broker.try_acquire("channel"),
+            Err(AcquireError::LeaseIdExhausted)
+        ));
+        assert_eq!(broker.snapshot().active_sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn acquire_wait_reports_lease_identifier_exhaustion() {
+        let broker = ProviderSlotBroker::new("pool", 1);
+        broker.inner.state.lock().next_lease_id = u64::MAX;
+        assert!(matches!(
+            broker
+                .acquire_wait("channel", Duration::from_millis(1))
+                .await,
+            Err(AcquireError::LeaseIdExhausted)
+        ));
         assert_eq!(broker.snapshot().active_sessions, 0);
     }
 

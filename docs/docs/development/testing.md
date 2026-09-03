@@ -158,6 +158,48 @@ Run the live-provider gate separately because it needs provider credentials:
 make live-acceptance
 ```
 
+## Isolated test runner
+
+Run the root test runner when you need one command for all non-credentialed gates:
+
+```bash
+./scripts/run-test-suite.sh
+```
+
+The runner uses a unique Compose project name for each run.
+
+The runner selects free host ports for PostgreSQL and the gateway.
+
+The runner removes its containers, networks, and volumes after the run.
+
+The runner keeps repository build caches to reduce the next run time.
+
+Pass `--keep` when you need to inspect the test services after a failure:
+
+```bash
+./scripts/run-test-suite.sh --keep
+```
+
+Pass `--live` only when the environment contains authorized provider credentials:
+
+```bash
+./scripts/run-test-suite.sh --live
+```
+
+The live stage stays disabled by default.
+
+The default run includes build, unit, integration, coverage, acceptance, Compose, scale, and documentation gates.
+
+The default run includes the Jellyfin acceptance gate with the deterministic test provider.
+
+Override `IPTV_TEST_DATABASE_URL`, `IPTV_POSTGRES_PORT`, or `IPTV_GATEWAY_PORT` when the default values conflict.
+
+Run the runner self-test without Docker:
+
+```bash
+make test-runner
+```
+
 ## Acceptance tests
 
 Run the deterministic media acceptance test:

@@ -15,6 +15,12 @@ allowed-tools:
   - mcp_read_resource
 ---
 
+Verify the repository with `./scripts/run-test-suite.sh` before you audit completion.
+
+Require a passing `make test-runner` result for test-runner changes.
+
+Do not require `--live` for the default audit.
+
 You own the Kaneo `Done` stage for the `iptv-relay` project.
 
 Your only responsibility is completion-record integrity.

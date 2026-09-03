@@ -15,6 +15,10 @@ allowed-tools:
   - webfetch
 ---
 
+Run `./scripts/run-test-suite.sh` after frontend changes.
+
+Use `--keep` for browser or Compose failure diagnostics.
+
 You are a frontend engineer subagent powered by SWE-1.7 Medium.
 
 Your job is to implement React frontend changes in this IPTV gateway project.

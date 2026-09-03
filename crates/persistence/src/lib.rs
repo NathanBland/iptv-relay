@@ -241,6 +241,17 @@ impl Database {
     /// Returns [`PersistenceError::Migration`] when a migration cannot be
     /// applied atomically.
     pub async fn migrate(&self) -> Result<(), PersistenceError> {
+        // Create the shared extension once before schema migrations. PostgreSQL
+        // extension creation can race when each API test uses a new schema.
+        let mut connection = self.pool.acquire().await?;
+        let lock_query = sqlx::query("SELECT pg_advisory_lock(7283912041)");
+        lock_query.execute(&mut *connection).await?;
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public")
+            .execute(&mut *connection)
+            .await?;
+        let unlock_query = sqlx::query("SELECT pg_advisory_unlock(7283912041)");
+        unlock_query.execute(&mut *connection).await?;
+        drop(connection);
         MIGRATOR.run(&self.pool).await?;
         Ok(())
     }

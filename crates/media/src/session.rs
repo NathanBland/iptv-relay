@@ -408,6 +408,35 @@ impl HttpTsSessionManager {
             .map(|broker| broker.snapshot())
     }
 
+    /// Reserve a provider slot for a caller outside this process.
+    ///
+    /// The returned lease stays active until the caller drops it. This method
+    /// lets a worker coordinate probe capacity with core playback sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcquireError::AtCapacity`] when no provider slot is available
+    /// or [`AcquireError::LeaseIdExhausted`] when the broker cannot issue an id.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the provider disappears between configuration and lookup.
+    pub fn reserve_provider_slot(
+        &self,
+        pool_id: impl Into<Arc<str>>,
+        capacity: usize,
+        reservation_key: impl Into<Arc<str>>,
+    ) -> Result<crate::SlotLease, AcquireError> {
+        let pool_id = pool_id.into();
+        self.configure_provider(ProviderSpec::new(Arc::clone(&pool_id), capacity));
+        let broker = self
+            .inner
+            .providers
+            .get(&pool_id)
+            .expect("provider configured before reservation");
+        broker.try_acquire(reservation_key)
+    }
+
     /// Lists live shared sessions without disclosing endpoint URLs or headers.
     pub fn list_snapshots(&self) -> Vec<HttpTsSessionSnapshot> {
         self.inner
@@ -939,6 +968,7 @@ fn acquire_recovery_lease(
     broker.try_acquire(allocation_key).map(Some).map_err(|_| ())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn recover_session(
     context: RecoveryContext<'_>,
     previous_endpoint: usize,
@@ -1937,6 +1967,17 @@ mod tests {
         manager.configure_provider(ProviderSpec::new("provider", 1));
         manager.configure_provider(ProviderSpec::new("provider", 2));
         assert_eq!(manager.provider_snapshot("provider").unwrap().capacity, 2);
+        let reservation = manager
+            .reserve_provider_slot("reservation-pool", 1, "worker-probe")
+            .expect("configured provider accepts a reservation");
+        assert_eq!(
+            manager
+                .provider_snapshot("reservation-pool")
+                .unwrap()
+                .active_sessions,
+            1
+        );
+        drop(reservation);
 
         let source = HttpTsSourceSpec::new(
             HttpTsSessionKey::new("unknown", "source", 1),
@@ -2087,6 +2128,85 @@ mod tests {
             .await
             .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_stops_before_endpoint_selection_when_all_viewers_leave() {
+        let client = Client::new();
+        let providers = DashMap::new();
+        let source_id: Arc<str> = "source".into();
+        let diagnostics = Arc::new(SessionDiagnostics::new(HttpTsSessionKey::new(
+            "provider", "source", 1,
+        )));
+        let ring = MpegTsRing::new(MpegTsRingConfig::new(2, 0).unwrap());
+        let result = recover_session(
+            RecoveryContext {
+                client: &client,
+                providers: &providers,
+                allocation_source_id: &source_id,
+                allocation_generation: 1,
+                endpoints: &[],
+                ring: &ring,
+                diagnostics: &diagnostics,
+                recovery: RecoveryPolicy::default(),
+                startup_timeout: Duration::from_millis(10),
+            },
+            0,
+            "provider",
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn pump_stops_and_closes_ring_when_initial_upstream_fails_without_viewers() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 256];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = Client::new();
+        let response = client
+            .get(format!("http://{address}/empty.ts"))
+            .send()
+            .await
+            .unwrap();
+        let broker = ProviderSlotBroker::new("provider", 1);
+        let lease = broker.try_acquire("source").unwrap();
+        let ring = MpegTsRing::new(MpegTsRingConfig::new(2, 0).unwrap());
+        let diagnostics = SessionDiagnostics::new(HttpTsSessionKey::new("provider", "source", 1));
+        let config = HttpPumpConfig {
+            client: client.clone(),
+            providers: Arc::new(DashMap::new()),
+            allocation_source_id: Arc::from("source"),
+            allocation_generation: 1,
+            endpoints: Vec::new(),
+            diagnostics: Arc::clone(&diagnostics),
+            recovery: RecoveryPolicy::disabled(),
+            startup_timeout: Duration::from_millis(10),
+            read_timeout: Duration::from_millis(10),
+        };
+
+        pump_http_ts(response, ring.clone(), lease, config).await;
+        assert_eq!(
+            diagnostics.snapshot(ring.snapshot()).state,
+            SessionState::Stopping
+        );
+        assert!(ring.snapshot().closed.is_some());
+        server.await.unwrap();
     }
 
     fn local_viewer(

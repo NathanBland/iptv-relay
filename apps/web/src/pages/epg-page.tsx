@@ -11,11 +11,10 @@ import { Input } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
 import { useDebouncedValue } from '@/lib/hooks/use-debounced-value'
+import { formatProgrammeTime } from '@/lib/programmes'
 import type { IptvApiClient } from '@/lib/api/types'
 
 const PAGE_SIZE = 100
-
-const timeFormatter = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit', timeZone: 'America/Denver' })
 
 export function EpgPage({ client = apiClient }: { client?: IptvApiClient }) {
   const [searchInput, setSearchInput] = useState('')
@@ -30,9 +29,11 @@ export function EpgPage({ client = apiClient }: { client?: IptvApiClient }) {
     ...apiQueries(client).programmes(programmeQuery),
     placeholderData: keepPreviousData,
   })
+  const regionQuery = useQuery(apiQueries(client).regionSettings)
   const programmes = query.data?.items ?? []
   const total = query.data?.total ?? 0
   const pageCount = Math.ceil(total / PAGE_SIZE)
+  const timezone = regionQuery.data?.settings.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
     count: programmes.length,
@@ -77,7 +78,7 @@ export function EpgPage({ client = apiClient }: { client?: IptvApiClient }) {
                         className="absolute left-0 top-0 grid w-full grid-cols-[5rem_1fr_auto] items-center gap-3 border-b border-white/7 px-4 py-3"
                         style={{ height: `${virtualItem.size}px`, transform: `translateY(${virtualItem.start}px)` }}
                       >
-                        <time className="font-mono text-xs text-slate-500" dateTime={programme.start}>{timeFormatter.format(new Date(programme.start))}</time>
+                        <time className="font-mono text-xs text-slate-500" dateTime={programme.start}>{formatProgrammeTime(programme.start, timezone)}</time>
                         <div className="min-w-0"><p className="truncate text-sm font-medium text-white">{programme.title}</p><p className="truncate text-xs text-slate-500">{programme.channel} · {programme.source}</p></div>
                         <Badge tone={programme.confidence >= 95 ? 'success' : 'warning'}>{programme.confidence}%</Badge>
                       </li>

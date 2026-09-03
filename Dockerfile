@@ -31,18 +31,11 @@ COPY --from=planner /build/recipe.json recipe.json
 # cold cache builds. The cached layer makes the slower one-job cook a one-time
 # cost that is paid only when the dependency set changes.
 RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo chef cook --release -j 1 --recipe-path recipe.json
-# Build application binaries. Limit parallelism to two jobs to match the cook
-# step and to avoid OOM kills on memory-constrained runners.
 COPY . .
-RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 1 -p iptv-gateway
-# Build the deterministic scale gate binary. The `scale-gate` feature enables
-# the fixture generators in `iptv-parsers` and adds no new dependencies. Limit
-# parallelism to one job because the scale-gate feature expands the fixture
-# generators in `iptv-parsers` and raises peak rustc memory above the 1.9 GiB
-# Docker Desktop limit. Two jobs OOM-kill rustc on the second build while the
-# first core build at two jobs stays below the limit. One job keeps the scale
-# budgets and the other build settings unchanged.
-RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 1 -p iptv-gateway --features scale-gate --bin scale-gate
+# Build every runtime and test binary in one Cargo invocation. The scale-gate
+# feature also builds the normal binaries, so one invocation avoids a second
+# full release compilation. Keep one job to stay below the local memory limit.
+RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 1 -p iptv-gateway --features scale-gate --bins
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
