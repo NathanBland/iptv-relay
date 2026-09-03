@@ -109,6 +109,10 @@ describe('display utilities', () => {
     expect(formatProgrammeTime('2026-07-01T18:00:00Z', 'America/Denver')).toMatch(/12:00\s?PM/)
   })
 
+  it('falls back to browser formatting for an invalid timezone', () => {
+    expect(formatProgrammeTime('2026-01-01T19:00:00Z', 'Invalid/Timezone')).toMatch(/12:00\s?PM/)
+  })
+
   it('selects current and upcoming programme instants at a fixed clock', () => {
     const winterNow = Date.parse('2026-01-01T19:00:00Z')
     const summerNow = Date.parse('2026-07-01T18:00:00Z')

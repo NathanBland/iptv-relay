@@ -529,10 +529,29 @@ for file_data in data.get("data", [{}])[0].get("files", []):
         segments = file_data.get("segments", [])
         if segments:
             coverage_by_line = {}
+            executable_by_line = {}
             for segment in segments:
                 line = int(segment[0])
                 count = int(segment[2])
                 coverage_by_line[line] = coverage_by_line.get(line, False) or count > 0
+                executable_by_line[line] = executable_by_line.get(line, False) or bool(segment[3])
+            # LLVM can emit zero-count continuation segments for a statement
+            # that executes on an adjacent line. Do not report punctuation-only
+            # continuation lines as misses when the surrounding statement ran.
+            source_lines = {}
+            try:
+                with open(target, encoding="utf-8") as source:
+                    source_lines = {index: value.strip() for index, value in enumerate(source, 1)}
+            except OSError:
+                pass
+            for line, executable in list(executable_by_line.items()):
+                if executable or coverage_by_line.get(line, False):
+                    continue
+                text = source_lines.get(line, "")
+                if not text.startswith((".", ")", "?", ",")):
+                    continue
+                if coverage_by_line.get(line - 1, False) or coverage_by_line.get(line + 1, False):
+                    coverage_by_line[line] = True
             for line, covered in sorted(coverage_by_line.items()):
                 if not covered:
                     print(line)
