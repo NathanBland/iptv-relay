@@ -27,7 +27,17 @@ require_command() {
   }
 }
 
-for command_name in docker-compose jq grep; do
+# Detect the docker compose command (v2 plugin or v1 standalone).
+if docker compose version >/dev/null 2>&1; then
+  DOCKER_COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  DOCKER_COMPOSE=(docker-compose)
+else
+  printf 'missing required command: docker compose or docker-compose\n' >&2
+  exit 2
+fi
+
+for command_name in jq grep; do
   require_command "$command_name"
 done
 
@@ -38,7 +48,7 @@ done
 # Resolve the release Compose config with a stable IPTV_VERSION and the
 # tracked appliance env example so the file interpolates without operator
 # secrets. The env example contains only placeholders, not real secrets.
-CONFIG_JSON="$(IPTV_VERSION=latest docker-compose -f "$COMPOSE_FILE" --env-file "$ROOT_DIR/.env.appliance.example" config --format json 2>/dev/null)"
+CONFIG_JSON="$(IPTV_VERSION=latest "${DOCKER_COMPOSE[@]}" -f "$COMPOSE_FILE" --env-file "$ROOT_DIR/.env.appliance.example" config --format json 2>/dev/null)"
 
 fail() {
   printf 'release compose regression failed: %s\n' "$1" >&2

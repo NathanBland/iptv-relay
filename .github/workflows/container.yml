@@ -87,7 +87,7 @@ jobs:
         run: ./scripts/check-caddy-security.sh
 
       - name: Run release compose config check
-        run: IPTV_VERSION=latest docker-compose -f docker-compose.appliance.yml --env-file .env.appliance.example config --quiet
+        run: IPTV_VERSION=latest docker compose -f docker-compose.appliance.yml --env-file .env.appliance.example config --quiet
 
       - name: Run release compose regression tests
         run: ./scripts/test-release-compose.sh
