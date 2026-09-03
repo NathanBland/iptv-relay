@@ -235,7 +235,9 @@ describe('expanded management pages', () => {
       epgChannelId: `epg-${channelId}`,
       method: confidence > 0.9 ? 'tvg-id' : 'fuzzy',
       confidence,
-      evidence: {},
+      evidence: confidence > 0.9
+        ? { match: 'exact tvg-id', source: `source.${channelId}` }
+        : { match: 'normalized name', reason: 'candidate requires review' },
       reviewStatus: 'applied' as const,
       reviewedBy: null,
       reviewedAt: null,
@@ -257,8 +259,8 @@ describe('expanded management pages', () => {
     const reconcile = vi.spyOn(client, 'reconcileEpg').mockResolvedValue({ mappingsApplied: 12, mappingsRemoved: 2, reviewQueued: 3 })
     const remove = vi.spyOn(client, 'removeChannelEpgMapping').mockResolvedValue()
     vi.spyOn(client, 'getReviewCandidates').mockResolvedValue([
-      { id: 'candidate-1', channelId: 'review', epgChannelId: 'epg-one', method: 'name', confidence: 0.97, evidence: {}, createdAt: timestamp, epgXmltvId: 'one.xmltv', epgDisplayName: 'Candidate One' },
-      { id: 'candidate-2', channelId: 'review', epgChannelId: 'epg-two', method: 'fuzzy', confidence: 0.88, evidence: {}, createdAt: timestamp, epgXmltvId: null, epgDisplayName: null },
+      { id: 'candidate-1', channelId: 'review', epgChannelId: 'epg-one', method: 'name', confidence: 0.97, evidence: { match: 'ambiguous normalized name', candidates: 2 }, createdAt: timestamp, epgXmltvId: 'one.xmltv', epgDisplayName: 'Candidate One' },
+      { id: 'candidate-2', channelId: 'review', epgChannelId: 'epg-two', method: 'fuzzy', confidence: 0.88, evidence: { active: true, attempts: 2, tags: ['alternate', 'fuzzy'], details: { source: 'provider' }, empty: null }, createdAt: timestamp, epgXmltvId: null, epgDisplayName: null },
     ])
     const resolve = vi.spyOn(client, 'resolveReview').mockResolvedValue()
 
@@ -269,6 +271,10 @@ describe('expanded management pages', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Reconcile now' }))
     expect(await screen.findByText(/Applied:/)).toHaveTextContent('12')
     expect(reconcile).toHaveBeenCalledOnce()
+    await userEvent.click(screen.getAllByText('Why this match?')[0]!)
+    expect(screen.getAllByText('Match:')).not.toHaveLength(0)
+    expect(screen.getByText('exact tvg-id')).toBeInTheDocument()
+    expect(screen.getByText('source.high')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Remove mapping for Channel low' }))
     await waitFor(() => expect(remove).toHaveBeenCalledWith('low'))
     await userEvent.click(screen.getByRole('button', { name: 'Next' }))
@@ -280,6 +286,9 @@ describe('expanded management pages', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Review' }))
     expect(await screen.findByText('Candidate One')).toBeInTheDocument()
     expect(screen.getByText('Unknown')).toBeInTheDocument()
+    await userEvent.click(screen.getAllByText('Why this match?')[0]!)
+    expect(screen.getByText('ambiguous normalized name')).toBeInTheDocument()
+    expect(screen.getAllByText('2')).not.toHaveLength(0)
     await userEvent.click(screen.getAllByRole('button', { name: 'Accept' })[0]!)
     await waitFor(() => expect(resolve).toHaveBeenCalledWith('review', true, 'epg-one'))
     await userEvent.click(screen.getByRole('button', { name: 'Review' }))
@@ -360,6 +369,13 @@ describe('expanded management pages', () => {
     expect(await screen.findByText('Revision 2')).toBeInTheDocument()
 
     await userEvent.click(screen.getAllByRole('button', { name: /Roll back/ })[1]!)
+    const preview = screen.getByRole('alertdialog', { name: 'Confirm reconciliation rollback' })
+    expect(preview).toHaveTextContent('restores the source channels, stream links, and EPG mappings')
+    expect(rollback).not.toHaveBeenCalled()
+    await userEvent.click(within(preview).getByRole('button', { name: 'Cancel' }))
+    expect(screen.queryByRole('alertdialog', { name: 'Confirm reconciliation rollback' })).not.toBeInTheDocument()
+    await userEvent.click(screen.getAllByRole('button', { name: /Roll back/ })[1]!)
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm rollback' }))
     await waitFor(() => expect(rollback).toHaveBeenCalledWith('source-rollback', { revision: 1 }))
     expect(await screen.findByText(/Restored 1 channel/)).toBeInTheDocument()
 
@@ -371,6 +387,7 @@ describe('expanded management pages', () => {
       detail: 'The target revision does not exist for this source.',
     }))
     await userEvent.click(screen.getAllByRole('button', { name: /Roll back/ })[0]!)
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm rollback' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('target revision does not exist')
   })
 

@@ -320,6 +320,42 @@ function methodLabel(method: string): string {
   return method
 }
 
+function evidenceValue(value: unknown): string {
+  if (value === null || value === undefined) return 'None'
+  if (typeof value === 'string') return value
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (Array.isArray(value)) return value.map((item) => evidenceValue(item)).join(', ')
+  return JSON.stringify(value) ?? 'Unavailable'
+}
+
+function evidenceLabel(key: string): string {
+  return key
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/^./, (character) => character.toUpperCase())
+}
+
+function MatchRationale({ evidence }: { evidence: Record<string, unknown> }) {
+  const entries = Object.entries(evidence)
+  return (
+    <details className="mt-2 text-xs text-slate-400">
+      <summary className="cursor-pointer text-ocean-300 hover:text-ocean-200">Why this match?</summary>
+      {entries.length === 0 ? (
+        <p className="mt-1">No match evidence recorded.</p>
+      ) : (
+        <dl className="mt-1 space-y-1">
+          {entries.map(([key, value]) => (
+            <div key={key} className="flex gap-2">
+              <dt className="font-medium text-slate-500">{evidenceLabel(key)}:</dt>
+              <dd className="break-all text-slate-300">{evidenceValue(value)}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </details>
+  )
+}
+
 function MappingRow({
   mapping,
   showReviewActions,
@@ -372,8 +408,14 @@ function MappingRow({
           <div>
             <p className="text-sm text-slate-200">{mapping.epgDisplayName}</p>
             {mapping.epgXmltvId ? <p className="mt-0.5 font-mono text-[0.68rem] text-slate-600">{mapping.epgXmltvId}</p> : null}
+            <MatchRationale evidence={mapping.evidence} />
           </div>
-        ) : <span className="text-slate-500">—</span>}
+        ) : (
+          <div>
+            <span className="text-slate-500">—</span>
+            <MatchRationale evidence={mapping.evidence} />
+          </div>
+        )}
       </TableCell>
       <TableCell><Badge tone={methodTone(mapping.method)}>{methodLabel(mapping.method)}</Badge></TableCell>
       <TableCell>
@@ -537,6 +579,7 @@ function CandidateReviewRow({
                     <div>
                       <p className="text-sm text-slate-200">{candidate.epgDisplayName ?? candidate.epgXmltvId ?? 'Unknown'}</p>
                       {candidate.epgXmltvId ? <p className="font-mono text-[0.68rem] text-slate-600">{candidate.epgXmltvId}</p> : null}
+                      <MatchRationale evidence={candidate.evidence} />
                     </div>
                   </div>
                   <div className="flex gap-1">
@@ -575,6 +618,7 @@ function ReconciliationRollbackCard({ client }: { client: IptvApiClient }) {
   const queryClient = useQueryClient()
   const [sourceId, setSourceId] = useState('')
   const [rollbackTarget, setRollbackTarget] = useState<number | null>(null)
+  const [rollbackPreview, setRollbackPreview] = useState<ReconciliationRevision | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const revisionsQuery = useQuery({
@@ -587,6 +631,7 @@ function ReconciliationRollbackCard({ client }: { client: IptvApiClient }) {
     onSuccess: () => {
       setError(null)
       setRollbackTarget(null)
+      setRollbackPreview(null)
       queryClient.invalidateQueries({ queryKey: ['reconciliation', 'revisions', sourceId] })
       queryClient.invalidateQueries({ queryKey: ['epg-mappings'] })
       queryClient.invalidateQueries({ queryKey: ['epg-unmapped'] })
@@ -650,7 +695,9 @@ function ReconciliationRollbackCard({ client }: { client: IptvApiClient }) {
                   disabled={rollbackMutation.isPending && rollbackTarget === revision.revision}
                   onClick={() => {
                     setRollbackTarget(revision.revision)
-                    rollbackMutation.mutate(revision.revision)
+                    rollbackMutation.reset()
+                    setError(null)
+                    setRollbackPreview(revision)
                   }}
                 >
                   <RotateCcw aria-hidden="true" className="size-4" />
@@ -660,6 +707,30 @@ function ReconciliationRollbackCard({ client }: { client: IptvApiClient }) {
             ))}
           </div>
         )}
+        {rollbackPreview ? (
+          <div className="space-y-3 rounded-lg border border-amber-400/30 bg-amber-400/5 p-4" role="alertdialog" aria-label="Confirm reconciliation rollback">
+            <div>
+              <p className="text-sm font-medium text-amber-100">Confirm rollback to revision {rollbackPreview.revision}</p>
+              <p className="mt-1 text-xs text-amber-100/80">
+                This action restores the source channels, stream links, and EPG mappings from this revision. The current state remains in history.
+              </p>
+              <p className="mt-1 text-xs text-amber-100/60">Review created by {rollbackPreview.actor} on {new Date(rollbackPreview.createdAt).toLocaleString()}.</p>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                variant="danger"
+                size="sm"
+                disabled={rollbackMutation.isPending}
+                onClick={() => rollbackMutation.mutate(rollbackPreview.revision)}
+              >
+                {rollbackMutation.isPending ? 'Rolling back…' : 'Confirm rollback'}
+              </Button>
+              <Button variant="ghost" size="sm" disabled={rollbackMutation.isPending} onClick={() => { setRollbackPreview(null); setRollbackTarget(null) }}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        ) : null}
         {rollbackMutation.data ? (
           <p role="status" className="text-xs text-mint-400">
             Restored {rollbackMutation.data.channelsRestored} channel(s), {rollbackMutation.data.streamLinksRestored} stream link(s), and {rollbackMutation.data.epgMappingsRestored} EPG mapping(s) to revision {rollbackMutation.data.targetRevision}.
