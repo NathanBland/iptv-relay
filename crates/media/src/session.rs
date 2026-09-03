@@ -606,7 +606,9 @@ async fn start_http_ts_session(
         .ok_or_else(|| SessionStartError::UnknownProvider {
             pool_id: Arc::clone(&primary_pool_id),
         })?;
-    let lease = broker.try_acquire(source.key.allocation_key())?;
+    let lease = broker
+        .acquire_wait(source.key.allocation_key(), source.startup_timeout)
+        .await?;
     let lease_id = lease.lease_id();
     diagnostics.set_state(SessionState::Starting);
 
@@ -836,6 +838,11 @@ async fn pump_http_ts(
 
     loop {
         diagnostics.record_failure(active_failure);
+        if !diagnostics.has_viewers() {
+            diagnostics.set_state(SessionState::Stopping);
+            ring.close(RingCloseReason::Shutdown);
+            return;
+        }
         resources.body.take();
         let Some(recovered) = recover_session(
             RecoveryContext {
@@ -964,6 +971,9 @@ async fn recover_session(
     let mut attempt = 0_usize;
 
     while Instant::now() < deadline {
+        if !diagnostics.has_viewers() {
+            return None;
+        }
         let failover_offset = usize::from(endpoints.len() > 1);
         let endpoint_index = (previous_endpoint + failover_offset + attempt) % endpoints.len();
         let is_failover = endpoint_index != previous_endpoint;

@@ -7,6 +7,7 @@ for file in "${files[@]}"; do
   grep -F "script-src 'self' 'unsafe-inline'" "$file" >/dev/null
   grep -F "script-src-attr 'none'" "$file" >/dev/null
   grep -F "object-src 'none'" "$file" >/dev/null
+  grep -F "flush_interval -1" "$file" >/dev/null
 done
 
 echo "Caddy security policy checks passed"

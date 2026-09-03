@@ -218,6 +218,10 @@ impl SessionDiagnostics {
         self.inner.lock().reconnect_attempts
     }
 
+    pub(crate) fn has_viewers(&self) -> bool {
+        !self.inner.lock().viewers.is_empty()
+    }
+
     pub(crate) fn register_viewer(
         self: &Arc<Self>,
         generation: u64,
@@ -338,6 +342,7 @@ mod tests {
         diagnostics.set_state(SessionState::Recovering);
         let first = diagnostics.register_viewer(0, 2);
         let second = diagnostics.register_viewer(0, 4);
+        assert!(diagnostics.has_viewers());
         assert!(!diagnostics.viewers_drained(0, 4));
         first.update(0, 4);
         assert!(diagnostics.viewers_drained(0, 4));
@@ -359,6 +364,7 @@ mod tests {
 
         drop(first);
         drop(second);
+        assert!(!diagnostics.has_viewers());
         assert_eq!(diagnostics.snapshot(ring_snapshot()).viewer_count, 0);
     }
 }

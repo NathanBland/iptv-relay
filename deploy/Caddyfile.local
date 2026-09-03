@@ -15,7 +15,9 @@
 
 	@core path /api/* /auth/* /health/* /metrics /out/*
 	handle @core {
-		reverse_proxy host.docker.internal:8081
+		reverse_proxy host.docker.internal:8081 {
+			flush_interval -1
+		}
 	}
 
 	handle {

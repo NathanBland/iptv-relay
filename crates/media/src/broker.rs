@@ -8,6 +8,10 @@ use std::{
 
 use parking_lot::Mutex;
 use thiserror::Error;
+use tokio::{
+    sync::Notify,
+    time::{Duration, Instant},
+};
 
 /// A connection-slot broker scoped to one provider account or shared pool.
 ///
@@ -31,6 +35,7 @@ impl fmt::Debug for ProviderSlotBroker {
 struct BrokerInner {
     pool_id: Arc<str>,
     state: Mutex<BrokerState>,
+    released: Notify,
 }
 
 #[derive(Debug)]
@@ -84,6 +89,8 @@ impl Drop for LeaseInner {
         if should_remove {
             state.sessions.remove(&self.session_key);
         }
+        drop(state);
+        broker.released.notify_waiters();
     }
 }
 
@@ -124,6 +131,7 @@ impl ProviderSlotBroker {
                     next_lease_id: 1,
                     sessions: HashMap::new(),
                 }),
+                released: Notify::new(),
             }),
         }
     }
@@ -179,12 +187,42 @@ impl ProviderSlotBroker {
         Ok(SlotLease { inner: lease })
     }
 
+    /// Waits for a slot when the pool is full, then acquires it atomically.
+    ///
+    /// The wait prevents a viewer from failing during the short interval when
+    /// a previous session closes its provider socket and releases its lease.
+    /// The timeout still returns [`AcquireError::AtCapacity`] for a full pool.
+    pub async fn acquire_wait(
+        &self,
+        session_key: impl Into<Arc<str>>,
+        timeout: Duration,
+    ) -> Result<SlotLease, AcquireError> {
+        let session_key = session_key.into();
+        let deadline = Instant::now() + timeout;
+        loop {
+            let notified = self.inner.released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.try_acquire(Arc::clone(&session_key)) {
+                Ok(lease) => return Ok(lease),
+                Err(error @ AcquireError::LeaseIdExhausted) => return Err(error),
+                Err(error @ AcquireError::AtCapacity { .. }) => {
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    let _ = tokio::time::timeout_at(deadline, notified).await;
+                }
+            }
+        }
+    }
+
     /// Changes the cap without terminating existing allocations.
     ///
     /// Lowering the cap below current usage only prevents new unique sessions;
     /// idempotent acquisitions of existing sessions continue to succeed.
     pub fn set_capacity(&self, capacity: usize) {
         self.inner.state.lock().capacity = capacity;
+        self.inner.released.notify_waiters();
     }
 
     pub fn snapshot(&self) -> PoolSnapshot {
@@ -249,6 +287,36 @@ mod tests {
         drop(second);
         assert_eq!(broker.snapshot().active_sessions, 0);
         assert!(broker.try_acquire("channel-2").is_ok());
+    }
+
+    #[tokio::test]
+    async fn acquire_wait_retries_after_a_slot_is_released() {
+        let broker = ProviderSlotBroker::new("account-a", 1);
+        let lease = broker.try_acquire("channel-1").unwrap();
+        let waiter = {
+            let broker = broker.clone();
+            tokio::spawn(async move {
+                broker
+                    .acquire_wait("channel-2", Duration::from_secs(1))
+                    .await
+                    .unwrap()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(lease);
+        let replacement = waiter.await.unwrap();
+        assert_eq!(replacement.session_key(), "channel-2");
+    }
+
+    #[tokio::test]
+    async fn acquire_wait_returns_capacity_after_timeout() {
+        let broker = ProviderSlotBroker::new("account-a", 1);
+        let _lease = broker.try_acquire("channel-1").unwrap();
+        let error = broker
+            .acquire_wait("channel-2", Duration::from_millis(5))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AcquireError::AtCapacity { .. }));
     }
 
     #[test]
