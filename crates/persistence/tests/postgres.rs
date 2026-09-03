@@ -3622,7 +3622,7 @@ async fn operator_settings_persist_precedence_revisions_and_rollback() {
 
     // Revision history is recorded newest first.
     let revisions = catalog
-        .list_operator_setting_revisions("global", "")
+        .list_operator_setting_revisions("global", "", 500)
         .await
         .unwrap();
     assert_eq!(revisions.len(), 2);
@@ -3637,6 +3637,13 @@ async fn operator_settings_persist_precedence_revisions_and_rollback() {
         revisions[0].after_value["media.ring.duration_seconds"],
         json!(20)
     );
+
+    let newest = catalog
+        .list_operator_setting_revisions("global", "", 1)
+        .await
+        .unwrap();
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest[0].revision, 2);
 
     // Rollback to revision 1 restores the earlier value and bumps to 3.
     let restored = catalog

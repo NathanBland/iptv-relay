@@ -5335,6 +5335,7 @@ impl CatalogRepository {
     }
 
     /// Lists revision history rows for one scope, newest first.
+    /// The limit is clamped to the shared maximum page size.
     ///
     /// # Errors
     ///
@@ -5344,7 +5345,9 @@ impl CatalogRepository {
         &self,
         scope: &str,
         scope_id: &str,
+        limit: i64,
     ) -> Result<Vec<OperatorSettingRevisionRow>, PersistenceError> {
+        let limit = limit.clamp(1, MAX_PAGE_SIZE);
         let resource_id = operator_setting_resource_id(scope, scope_id);
         let rows: Vec<OperatorSettingRevisionRow> = sqlx::query_as(
             r"
@@ -5352,9 +5355,11 @@ impl CatalogRepository {
             FROM revisions
             WHERE resource_type = 'operator-settings' AND resource_id = $1
             ORDER BY revision DESC
+            LIMIT $2
             ",
         )
         .bind(resource_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)

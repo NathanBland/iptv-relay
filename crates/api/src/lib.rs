@@ -57,6 +57,8 @@ use crate::auth::{
 };
 use crate::oidc::OidcError;
 
+const OPERATOR_SETTING_REVISION_PAGE_SIZE: i64 = 500;
+
 #[derive(Clone)]
 pub struct AppConfig {
     pub public_base_url: String,
@@ -2742,7 +2744,11 @@ async fn list_operator_revisions(
         return persistence_unavailable();
     };
     match catalog
-        .list_operator_setting_revisions(scope.as_str(), scope_id)
+        .list_operator_setting_revisions(
+            scope.as_str(),
+            scope_id,
+            OPERATOR_SETTING_REVISION_PAGE_SIZE,
+        )
         .await
     {
         Ok(rows) => Json(
