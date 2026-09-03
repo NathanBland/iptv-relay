@@ -12,7 +12,6 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
 
 jobs:
   v1-gates:
@@ -121,6 +120,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Set lowercase image prefix
+        id: prefix
+        run: echo "prefix=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -138,7 +141,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_PREFIX }}${{ matrix.suffix }}
+          images: ${{ steps.prefix.outputs.prefix }}${{ matrix.suffix }}
           tags: |
             type=ref,event=tag
             type=semver,pattern={{version}}
@@ -167,13 +170,13 @@ jobs:
 
       - name: Sign image digest
         env:
-          IMAGE_NAME: ${{ env.IMAGE_PREFIX }}${{ matrix.suffix }}
+          IMAGE_NAME: ${{ steps.prefix.outputs.prefix }}${{ matrix.suffix }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
 
       - name: Verify image signature
         env:
-          IMAGE_NAME: ${{ env.IMAGE_PREFIX }}${{ matrix.suffix }}
+          IMAGE_NAME: ${{ steps.prefix.outputs.prefix }}${{ matrix.suffix }}
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}
         run: |
