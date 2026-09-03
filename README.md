@@ -478,15 +478,17 @@ make live-acceptance
 
 ## Documentation
 
-The full documentation site lives in the `docs/` directory. Build and serve it locally with MkDocs:
+The full documentation site lives in the `docs/` directory. Preview it locally with MkDocs:
 
 ```bash
-cd docs
-pip install -r requirements.txt
-mkdocs serve
+python3 -m venv docs/.venv
+docs/.venv/bin/python -m pip install -r docs/requirements.txt
+docs/.venv/bin/mkdocs serve --config-file docs/mkdocs.yml
 ```
 
 Open the local site at `http://127.0.0.1:8000`.
+
+The generated `docs/site/` directory is local build output. Git ignores this directory.
 
 Use the `iptv-relay` Kaneo project for current tasks and verified feature status.
 

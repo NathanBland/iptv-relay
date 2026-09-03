@@ -8,6 +8,7 @@
 /apps/web/coverage/
 /apps/web/playwright-report/
 /apps/web/test-results/
+/docs/site/
 # Ignore local environment files. Keep safe templates tracked.
 **/.env*
 !**/.env.example

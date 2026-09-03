@@ -100,3 +100,29 @@ make compose-dev-up
 ```
 
 See [Docker Compose](../configuration/docker-compose.md#dev-mode) for details.
+
+## Preview documentation
+
+Create the documentation environment:
+
+```bash
+python3 -m venv docs/.venv
+docs/.venv/bin/python -m pip install -r docs/requirements.txt
+```
+
+Start the local preview:
+
+```bash
+docs/.venv/bin/mkdocs serve --config-file docs/mkdocs.yml
+```
+
+Open `http://127.0.0.1:8000` in a browser. The preview reloads after a documentation file changes.
+
+Build the strict site from the repository root:
+
+```bash
+make docs-build
+./scripts/check-doc-links.sh
+```
+
+The generated `docs/site/` directory is local output. Git ignores this directory.

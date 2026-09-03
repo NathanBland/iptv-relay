@@ -1,6 +1,6 @@
 site_name: IPTV Gateway
 site_description: IPTV management and media gateway
-site_url: https://nathanbland.github.io/iptv/
+site_url: https://nathanbland.github.io/iptv-relay/
 theme:
   name: material
   features:
