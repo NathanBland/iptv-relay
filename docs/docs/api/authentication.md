@@ -1,6 +1,6 @@
 # Authentication
 
-The control API requires authentication for all endpoints under `/api/v1`. The gateway supports session cookies, a bootstrap bearer, and CSRF protection.
+The control API requires authentication for all endpoints under `/api/v1`. The gateway supports session cookies, a bootstrap bearer, operator API tokens, and CSRF protection.
 
 ## OIDC sign-in
 
@@ -67,7 +67,31 @@ The first successful password sign-in disables the bootstrap token. A restart do
 
 Do not put the bootstrap token in a URL. Do not use it for routine automation.
 
-The current release does not provide general API tokens. Use a session cookie for later API access.
+## Operator API tokens
+
+Use an operator API token for automation after the bootstrap bearer is disabled. The token endpoints require the `admin` scope. The server returns the plaintext token only in the create or rotate response.
+
+Supported scopes are `read`, `control`, `output`, and `admin`.
+
+- `read` permits read-only control API requests.
+- `control` permits control API mutations and also satisfies `read`.
+- `output` permits Jellyfin setup reads and output-token rotation.
+- `admin` satisfies every scope and manages operator API tokens.
+
+Create a token with a required name and one or more scopes:
+
+```bash
+curl -b cookies.txt -X POST http://localhost:8080/api/v1/auth/tokens \
+  -H "Content-Type: application/json" \
+  -H "x-csrf-token: <csrf-cookie-value>" \
+  -d '{"name":"sync job","scopes":["read","control"]}'
+```
+
+Save the `token` value from the response. The server does not return it again.
+
+List token metadata with `GET /api/v1/auth/tokens`. Rotate a token with `POST /api/v1/auth/tokens/{token_id}/rotate`. Revoke a token with `POST /api/v1/auth/tokens/{token_id}/revoke`.
+
+Do not put an operator API token in a URL or commit it to a repository.
 
 ## CSRF protection
 
@@ -97,3 +121,7 @@ When `IPTV_ADMIN_PASSWORD_HASH` is set, the core service ignores the plaintext p
 | POST | `/api/v1/auth/logout` | End the current session. |
 | GET | `/api/v1/auth/oidc/start` | Start OIDC sign-in and redirect to the provider. |
 | GET | `/api/v1/auth/oidc/callback` | Validate the provider response and create a session. |
+| GET | `/api/v1/auth/tokens` | List operator API token metadata. Requires `admin`. |
+| POST | `/api/v1/auth/tokens` | Create an operator API token. Requires `admin`. |
+| POST | `/api/v1/auth/tokens/{token_id}/rotate` | Rotate an operator API token. Requires `admin`. |
+| POST | `/api/v1/auth/tokens/{token_id}/revoke` | Revoke an operator API token. Requires `admin`. |

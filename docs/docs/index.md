@@ -33,6 +33,7 @@ The HTTP output route applies database provider limits and ordered alternate str
 - M3U playlist ingestion.
 - Xtream Codes live-stream ingestion.
 - XMLTV EPG ingestion.
+- Network-tuner source records. The refresh worker does not ingest network-tuner sources.
 - Configurable source refresh intervals.
 - Manual source sync.
 
@@ -86,8 +87,7 @@ The TV Guide page shows the current programme first and uses the browser timezon
 
 The v1 runtime does not execute stream profiles, probe streams with `ffprobe`, enforce multi-user grants, or record media files.
 
-The dynamic-event scan creates durable event and filler programmes for legacy templates and built-in sports rules.
-Stored `event_rule_sets` and per-template filler or category settings do not drive the scan yet.
+The dynamic-event scan creates durable event and filler programmes from provider stream names. The scan applies the built-in sports rules to each enabled event template and uses the template timezone, duration, title, and filler settings. Stored `event_rule_sets` do not drive the scan.
 
 ## Next steps
 

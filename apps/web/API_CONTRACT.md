@@ -111,6 +111,8 @@ Returns a JSON array of source objects:
 
 `kind` is one of `M3U`, `Xtream`, `XMLTV`, or `Network tuner`. `state` is one of `healthy`, `degraded`, `offline`, or `syncing`.
 
+The API accepts `Network tuner` records, but the refresh worker does not ingest them. A sync job for this kind ends with an unsupported-source error.
+
 ## POST `/api/v1/sources`
 
 Request:

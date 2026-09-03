@@ -1,6 +1,6 @@
 # Sources API
 
-The sources API manages M3U, Xtream, XMLTV, and network-tuner sources. All endpoints require admin authentication.
+The sources API manages M3U, Xtream, XMLTV, and network-tuner records. All endpoints require authentication with the required scope.
 
 ## Endpoints
 
@@ -46,6 +46,8 @@ curl -X POST http://localhost:8080/api/v1/sources \
 ```
 
 The `kind` value is case-sensitive. Use `M3U`, `Xtream`, `XMLTV`, or `Network tuner`.
+
+The API accepts `Network tuner` records for catalog planning. The refresh worker does not ingest network tuners. A manual or scheduled sync for this kind fails with `source type is not supported by the refresh worker`.
 
 Set `timezone` in the request when the XMLTV source uses local wall-clock values without offsets:
 

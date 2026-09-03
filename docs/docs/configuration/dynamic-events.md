@@ -2,7 +2,7 @@
 
 An event template is a stored regular-expression rule. The scan endpoint stores provider-stream matches as event-channel records.
 
-The scan parses event dates, times, teams, leagues, and timezones for built-in rules and legacy templates.
+The scan parses event dates, times, teams, and timezones with built-in sports rules.
 The scan creates durable event and filler programmes for matched channels.
 The scan publishes these programmes through the XMLTV output.
 The scan does not create a canonical channel.
@@ -21,8 +21,7 @@ The scan does not create a canonical channel.
 | `timezone` | IANA timezone for event timestamps without an offset. Defaults to `UTC`. |
 | `fillerTitle` | Title for filler programmes around events. Defaults to `No programs available`. |
 
-The scan uses the regular expression, group name, and supported guide fields.
-It extracts event data from matching stream names.
+The scan uses the template regular expression to select provider streams. It then applies the built-in sports rules to extract event data from matching stream names.
 
 The current scan can link a record to the first enabled channel in the configured group. The scan does not create a canonical channel.
 
@@ -34,8 +33,7 @@ Use this expression to match a possible NFL stream name.
 (?i)^NFL\s+(.+?)\s+vs\.?\s+(.+?)\s+(\d{4}-\d{2}-\d{2})
 ```
 
-The scan stores the matched source title as programme provenance.
-Legacy templates do not apply capture groups to `channelNameFormat`.
+The scan stores the matched source title as programme provenance. It applies the template timezone, duration, title, and filler settings to generated programmes. It does not apply capture groups to `channelNameFormat`.
 
 ## Create a template record
 

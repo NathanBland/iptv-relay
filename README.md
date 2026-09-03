@@ -35,6 +35,7 @@ The agent-readable research reference is [`IPTV_End_to_End_Field_Guide.md`](IPTV
 - M3U playlist ingestion.
 - Xtream Codes live-stream ingestion.
 - XMLTV EPG ingestion.
+- Network-tuner source records. The refresh worker does not ingest network-tuner sources.
 - Configurable source refresh intervals.
 - Manual source sync.
 
@@ -230,6 +231,12 @@ The gateway sends all other paths to web port 3000.
 | GET | `/api/v1/auth/status` | Return the current session status. |
 | POST | `/api/v1/auth/login` | Start an admin session. |
 | POST | `/api/v1/auth/logout` | End the current session. |
+| GET | `/api/v1/auth/tokens` | List operator API token metadata. |
+| POST | `/api/v1/auth/tokens` | Create an operator API token. The plaintext value is returned once. |
+| POST | `/api/v1/auth/tokens/{token_id}/rotate` | Rotate an operator API token. The plaintext value is returned once. |
+| POST | `/api/v1/auth/tokens/{token_id}/revoke` | Revoke an operator API token. |
+
+Operator API tokens support `read`, `control`, `output`, and `admin` scopes. The `control` scope also permits read requests. The `admin` scope satisfies every scope. Store each plaintext token securely because the API does not return it again.
 
 ### System
 
@@ -368,7 +375,8 @@ The gateway sends all other paths to web port 3000.
 |--------|----------|-------------|
 | GET | `/api/v1/jobs` | List jobs. |
 | POST | `/api/v1/jobs/{job_id}/cancel` | Cancel a job. |
-| PUT | `/api/v1/jellyfin` | Save the Jellyfin configuration. |
+| GET | `/api/v1/jellyfin/setup` | Return the published Jellyfin URLs. |
+| POST | `/api/v1/jellyfin/setup/rotate` | Rotate the output token and return new Jellyfin URLs once. |
 
 ## Output endpoints
 
@@ -378,7 +386,7 @@ At startup, the core stores the token hash in the environment output profile.
 
 The initial profile includes all enabled channels. Output requests use the channel selection and tuner count from this profile.
 
-After a token change, restart the core. The prior token stays valid for five minutes.
+After an API rotation, the prior token stays valid for the configured overlap window. The default overlap is five minutes.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -400,11 +408,13 @@ Run the doctor check before tests:
 make doctor
 ```
 
-Run Rust and web tests:
+Run the standard non-credentialed test suite:
 
 ```bash
-make test
+./scripts/run-test-suite.sh
 ```
+
+The runner uses an isolated Compose project, removes test resources, and keeps build caches for later runs. Pass `--keep` to inspect resources after a failure. Pass `--live` only when authorized live-provider credentials are available.
 
 Run Rust and web tests in parallel:
 
@@ -447,20 +457,6 @@ Run the full CI pipeline:
 ```bash
 make ci
 ```
-
-Run the isolated non-credentialed suite:
-
-```bash
-./scripts/run-test-suite.sh
-```
-
-The runner uses a unique Compose project and removes its test resources after the run.
-
-The runner keeps build caches for later runs.
-
-Pass `--keep` to inspect test resources after a failure.
-
-Pass `--live` to include credentialed live-provider tests.
 
 Run the media acceptance test:
 

@@ -1,6 +1,6 @@
 # Events API
 
-The events API manages dynamic event templates and event channels for sports leagues.
+The events API manages dynamic event templates and event-channel records. A scan matches active provider stream names with the built-in sports rules and stores generated event and filler programmes.
 
 ## Endpoints
 
@@ -92,7 +92,7 @@ curl -X POST http://localhost:8080/api/v1/event-templates/{template_id}/scan \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
 ```
 
-The response returns the count of scanned event channels.
+The response returns the count of updated event channels. The scan does not create a canonical channel. It ignores provider streams without a supported event date and time.
 
 ## Prune past event channels
 

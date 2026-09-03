@@ -1,6 +1,6 @@
 # Sources
 
-A source is an M3U playlist, an Xtream Codes account, an XMLTV guide, or a network tuner. The worker downloads, parses, and activates each source on a schedule.
+A source is an M3U playlist, an Xtream Codes account, an XMLTV guide, or a network-tuner record. The worker downloads, parses, and activates supported sources on a schedule.
 
 ## Source types
 
@@ -9,7 +9,7 @@ A source is an M3U playlist, an Xtream Codes account, an XMLTV guide, or a netwo
 | M3U | `M3U` | HTTP playlist of `#EXTINF` stream entries. |
 | Xtream | `Xtream` | Xtream Codes live-stream account. |
 | XMLTV | `XMLTV` | XMLTV guide document. |
-| Network tuner | `Network tuner` | HDHomeRun or similar network tuner. |
+| Network tuner | `Network tuner` | Reserved source record. The refresh worker does not ingest this source type. |
 
 The `kind` value is case-sensitive. Use the exact value from the table.
 
@@ -29,6 +29,8 @@ curl -X POST http://localhost:8080/api/v1/sources \
 ```
 
 The endpoint returns the created source with its ID. The worker enqueues a `refresh-source` job.
+
+Do not use `Network tuner` as an active ingestion source. The API stores this record, but the refresh worker marks its sync as unsupported.
 
 ### Set the XMLTV timezone
 

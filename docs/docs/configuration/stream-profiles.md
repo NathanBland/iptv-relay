@@ -2,6 +2,8 @@
 
 A stream profile is a stored configuration record. The current media path does not read or execute a stream profile.
 
+Create and assign profiles only when you need to store future media settings. A profile assignment does not change the stream URL, adapter, command, buffer, user agent, or referer.
+
 The v1 media plan supports native HTTP, FFmpeg, and VLC adapters. The current profile schema also accepts `streamlink` and `custom` values.
 
 Do not use `streamlink` or `custom` values for v1 deployments. Do not rely on a profile assignment to change playback behavior.

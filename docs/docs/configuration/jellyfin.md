@@ -46,6 +46,8 @@ The endpoint generates a cryptographically random token. The endpoint stores onl
 
 Set `overlapSeconds` between `0` and `86400`. The default value is `300`. During the overlap window, both the old and new tokens accept output requests.
 
+Use an authenticated session or an operator API token with the `output` or `admin` scope for Jellyfin setup requests. A session mutation requires its CSRF header.
+
 After the rotation, the `GET /api/v1/jellyfin/setup` endpoint returns `regeneration-required`. The plaintext token is not retained. Call the rotate endpoint again to receive a new plaintext token.
 
 ## Add the tuner to Jellyfin

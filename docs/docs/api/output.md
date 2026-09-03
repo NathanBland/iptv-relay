@@ -8,7 +8,7 @@ At startup, the core stores the token hash in the environment output profile.
 
 The initial profile includes all enabled channels. Output requests use the channel selection and tuner count from this profile.
 
-After a token change, restart the core. The prior token stays valid for five minutes.
+After a token rotation, the previous token stays valid for the configured overlap window. The default overlap is five minutes.
 
 The current UI does not configure output-profile channel selections.
 
@@ -65,6 +65,8 @@ curl http://localhost:8080/out/{token}/hdhr/lineup.json
 ## Jellyfin setup
 
 The gateway does not accept a `PUT /api/v1/jellyfin` request. Use the Jellyfin setup endpoints to read the published URLs and to rotate the output token.
+
+These endpoints require an authenticated session or an operator API token with the `output` or `admin` scope. Session mutations also require CSRF protection.
 
 Read the published setup URLs:
 
