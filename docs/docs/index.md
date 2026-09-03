@@ -10,11 +10,16 @@ You are responsible for the providers, URLs, credentials, and content that you c
 The maintainers do not control or endorse third-party content.
 The maintainers are not responsible for the use of third-party content.
 
-Documentation examples can use the bootstrap bearer. These examples work only before the first successful password sign-in.
+## Appliance install
 
-The gateway exposes M3U, XMLTV, and HDHomeRun-compatible output endpoints.
-Provider credentials stay out of output URLs.
-Each output URL has an output token in its path.
+The pull-only appliance bundle uses the signed release images from GitHub Container Registry.
+You do not clone the repository and you do not compile code in this path.
+
+The bundle publishes three application images: `core` and `worker`, `web`, and the `gateway` reverse proxy.
+The Caddy configuration is baked into the gateway image, so you do not need `deploy/Caddyfile` on the host.
+The appliance Compose file starts the full stack: `gateway`, `web`, `core`, `worker`, and `postgres`.
+
+See [Quick Start](quick-start.md) for the appliance install steps, platform guides, upgrades, rollbacks, and backups.
 
 ## Architecture
 
@@ -99,7 +104,7 @@ The dynamic-event scan creates durable event and filler programmes from provider
 
 ## Next steps
 
-- [Quick Start](quick-start.md): Start the stack with Docker Compose.
+- [Quick Start](quick-start.md): Start the appliance with the pull-only Compose bundle.
 - [Configuration](configuration/docker-compose.md): Configure services and volumes.
 - [API Reference](api/authentication.md): Learn the control API.
 - [Development](development/local-setup.md): Set up a local development environment.

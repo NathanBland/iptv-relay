@@ -1,10 +1,13 @@
-# Production Deployment
+# Source Build Deployment
 
-Use Docker Compose for a single-host production deployment.
+This page documents a source-build deployment for developers who build the images from a repository checkout.
+For the pull-only appliance path on production hosts, use the [Appliance Install](appliance-install.md) bundle instead.
+
+Use Docker Compose for a single-host source-build deployment.
 
 ## Requirements
 
-Install Docker Engine, Docker Compose, OpenSSL, and cURL.
+Install Docker Engine, Docker Compose, OpenSSL, cURL, and Git.
 Use a stable release or commit.
 Provide persistent storage for the postgres-data volume.
 

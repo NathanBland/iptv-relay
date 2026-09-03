@@ -24,8 +24,9 @@ nav:
   - Home: index.md
   - Quick Start: quick-start.md
   - Configuration:
+      - Appliance Install: configuration/appliance-install.md
       - Docker Compose: configuration/docker-compose.md
-      - Production Deployment: configuration/deployment.md
+      - Source Build Deployment: configuration/deployment.md
       - Troubleshooting: configuration/troubleshooting.md
       - Environment Variables: configuration/environment-variables.md
       - Sources: configuration/sources.md
