@@ -28,12 +28,16 @@ The workflow signs the published image digest with Cosign keyless signing.
 Use this command to verify a signature:
 
 ```bash
+REPOSITORY=OWNER/REPOSITORY
+VERSION=v1.0.0
+REF="refs/tags/${VERSION}"
 cosign verify \
-  --certificate-identity-regexp='https://github.com/.*/.github/workflows/.*' \
+  --certificate-identity="https://github.com/${REPOSITORY}/.github/workflows/container.yml@${REF}" \
   --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-  ghcr.io/OWNER/REPOSITORY:VERSION
+  "ghcr.io/${REPOSITORY}:${VERSION}"
 ```
 
 Replace `OWNER`, `REPOSITORY`, and `VERSION` with the release values.
+Set `REF` to `refs/tags/${VERSION}` for a tagged release.
 
 Do not publish an image from a working tree that contains provider credentials.

@@ -19,8 +19,19 @@ env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
 
 jobs:
+  v1-gates:
+    name: Run v1 gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Run noncredentialed v1 gates
+        run: ./scripts/run-test-suite.sh
+
   image:
     name: Build and sign image
+    needs: v1-gates
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -69,4 +80,15 @@ jobs:
       - name: Sign image digest
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}
         run: cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+      - name: Verify image signature
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}
+        run: |
+          cosign verify \
+            --certificate-identity="${COSIGN_CERTIFICATE_IDENTITY}" \
+            --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}"
