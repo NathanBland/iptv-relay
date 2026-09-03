@@ -10,7 +10,6 @@ fuzz/corpus
 fuzz/target
 node_modules
 apps/web/node_modules
-apps/web/.output
 apps/web/coverage
 apps/web/test-results
 apps/web/playwright-report
