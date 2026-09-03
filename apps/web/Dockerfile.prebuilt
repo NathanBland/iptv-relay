@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1.7
+# Runtime-only image for pre-built web assets.
+# The CI workflow builds assets natively on amd64, then copies .output
+# into this image for both linux/amd64 and linux/arm64 platforms.
+# This avoids running Vite under QEMU emulation, which core dumps.
+FROM node:24-alpine
+ENV NODE_ENV=production
+ENV HOST=0.0.0.0
+ENV PORT=3000
+WORKDIR /app
+COPY .output ./.output
+USER node
+EXPOSE 3000
+CMD ["node", ".output/server/index.mjs"]

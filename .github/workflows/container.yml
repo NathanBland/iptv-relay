@@ -103,10 +103,6 @@ jobs:
             context: .
             file: ./Dockerfile
             suffix: ''
-          - target: web
-            context: ./apps/web
-            file: ./apps/web/Dockerfile
-            suffix: -web
           - target: gateway
             context: .
             file: ./Dockerfile.gateway
@@ -177,6 +173,102 @@ jobs:
       - name: Verify image signature
         env:
           IMAGE_NAME: ${{ steps.prefix.outputs.prefix }}${{ matrix.suffix }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}
+        run: |
+          cosign verify \
+            --certificate-identity="${COSIGN_CERTIFICATE_IDENTITY}" \
+            --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
+            "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+  web-image:
+    name: Build and sign web image
+    needs: v1-gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set lowercase image prefix
+        id: prefix
+        run: echo "prefix=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+
+      - name: Build web assets natively
+        working-directory: apps/web
+        run: |
+          pnpm install --frozen-lockfile
+          CI=true pnpm run build
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.prefix.outputs.prefix }}-web
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
+
+      - name: Build and push web image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./apps/web
+          file: ./apps/web/Dockerfile.prebuilt
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image digest
+        env:
+          IMAGE_NAME: ${{ steps.prefix.outputs.prefix }}-web
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+      - name: Verify image signature
+        env:
+          IMAGE_NAME: ${{ steps.prefix.outputs.prefix }}-web
           IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
           COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}
         run: |
