@@ -22,14 +22,16 @@ Migration `0017_stream_profiles.sql` adds default records for Direct, FFmpeg, VL
 
 ## Stored fields
 
+The JSON request and response bodies use snake_case field names. The OpenAPI schema for `StreamProfileResponse` and `CreateStreamProfileRequest` defines these fields.
+
 | Field | Stored content |
 |---|---|
 | `name` | The profile name. |
-| `profileType` | A profile type value. |
+| `profile_type` | A profile type value. |
 | `command` | A command text value. |
 | `arguments` | An argument array value. |
-| `bufferSeconds` | A buffer-duration value. |
-| `userAgent` | A user-agent value. |
+| `buffer_seconds` | A buffer-duration value. |
+| `user_agent` | A user-agent value. |
 | `referer` | A referer value. |
 
 The current media path ignores every field in this table. Do not store provider credentials in a profile record.
@@ -44,9 +46,9 @@ curl -X POST http://localhost:8080/api/v1/stream-profiles \
   -H "Content-Type: application/json" \
   -d '{
     "name": "FFmpeg HD",
-    "profileType": "ffmpeg",
-    "bufferSeconds": 5,
-    "userAgent": "VLC/3.0"
+    "profile_type": "ffmpeg",
+    "buffer_seconds": 5,
+    "user_agent": "VLC/3.0"
   }'
 ```
 
@@ -55,6 +57,26 @@ Use this endpoint to list stream-profile records.
 ```bash
 curl http://localhost:8080/api/v1/stream-profiles \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
+```
+
+The response returns an array of `StreamProfileResponse` objects. Each object uses the snake_case field names from the OpenAPI schema:
+
+```json
+[
+  {
+    "id": "11111111-1111-1111-1111-111111111111",
+    "name": "FFmpeg HD",
+    "profile_type": "ffmpeg",
+    "command": null,
+    "arguments": [],
+    "buffer_seconds": 5,
+    "user_agent": "VLC/3.0",
+    "referer": null,
+    "enabled": true,
+    "created_at": "2025-01-01T00:00:00Z",
+    "updated_at": "2025-01-01T00:00:00Z"
+  }
+]
 ```
 
 Use this endpoint to delete a stream-profile record.
@@ -72,7 +94,7 @@ Use this endpoint to store a profile assignment for one channel.
 curl -X POST http://localhost:8080/api/v1/channels/{channel_id}/stream-profile \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"profileId": "..."}'
+  -d '{"stream_profile_id": "..."}'
 ```
 
 Use this endpoint to remove all profile assignments from one channel.

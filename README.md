@@ -98,8 +98,7 @@ The TV Guide page shows the current programme first and formats times in the bro
 
 The v1 runtime does not execute stream profiles, probe streams with `ffprobe`, enforce multi-user grants, or record media files.
 
-The dynamic-event scan creates durable event and filler programmes for legacy templates and built-in sports rules.
-Stored `event_rule_sets` and per-template filler or category settings do not drive the scan yet.
+The dynamic-event scan creates durable event and filler programmes from provider stream names. The scan applies the built-in sports rules to each enabled event template and uses the template timezone, duration, title, and filler settings. Stored `event_rule_sets` do not drive the scan.
 
 ## Quick start
 
@@ -251,6 +250,8 @@ Operator API tokens support `read`, `control`, `output`, and `admin` scopes. The
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/v1/system` | Return system counts and runtime versions. |
+| GET | `/api/v1/support/bundle` | Return a redacted support bundle. Requires admin. |
+| GET | `/api/v1/support/logs` | Return recent redacted support log entries. Requires admin. |
 | GET | `/api/v1/settings/schema` | Return the settings schema. |
 | GET | `/api/v1/openapi.json` | Return the OpenAPI document. |
 | GET | `/health/live` | Return liveness status. |
@@ -307,6 +308,7 @@ Operator API tokens support `read`, `control`, `output`, and `admin` scopes. The
 | POST | `/api/v1/event-templates` | Create an event template. |
 | PATCH | `/api/v1/event-templates/{template_id}` | Update an event template. |
 | DELETE | `/api/v1/event-templates/{template_id}` | Delete an event template. |
+| GET | `/api/v1/event-templates/suggestions` | List suggested event templates from live stream data. |
 | GET | `/api/v1/event-channels` | List event channels. |
 | POST | `/api/v1/event-templates/{template_id}/scan` | Store matching provider-stream records. |
 | POST | `/api/v1/event-templates/{template_id}/prune` | Hide old event-channel records. |
@@ -400,7 +402,7 @@ After an API rotation, the prior token stays valid for the configured overlap wi
 |--------|----------|-------------|
 | GET | `/out/{token}/playlist.m3u` | Return the M3U playlist. |
 | GET | `/out/{token}/xmltv.xml` | Return the XMLTV guide. |
-| GET | `/out/{token}/stream/{channel_path}` | Stream a channel as MPEG-TS. |
+| GET | `/out/{token}/stream/{*channel_path}` | Stream a channel as MPEG-TS. |
 | GET | `/out/{token}/hdhr/discover.json` | Return the HDHomeRun discovery document. |
 | GET | `/out/{token}/hdhr/lineup.json` | Return the HDHomeRun lineup. |
 | GET | `/out/{token}/hdhr/lineup_status.json` | Return the HDHomeRun lineup status. |

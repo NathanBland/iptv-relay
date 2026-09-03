@@ -126,3 +126,36 @@ make docs-build
 ```
 
 The generated `docs/site/` directory is local output. Git ignores this directory.
+
+## Publish documentation
+
+The `Deploy docs` GitHub Actions workflow builds the strict site and publishes it to GitHub Pages.
+
+The default site address is `https://nathanbland.github.io/iptv-relay/`.
+
+### Custom domain
+
+A custom domain needs an external DNS record. The repository cannot create or change this record.
+
+1. Add a CNAME record at your DNS provider.
+2. Point the record to `nathanbland.github.io`.
+3. Set the custom domain in the GitHub Pages settings for the repository.
+
+The DNS change is an external task. The documentation build does not depend on it.
+
+### Verify the published site
+
+Wait for the `Deploy docs` workflow to complete. Then run this command:
+
+```bash
+curl --fail --head https://nathanbland.github.io/iptv-relay/
+```
+
+For a custom domain, replace the address with your domain:
+
+```bash
+curl --fail --head https://docs.example.com/
+dig docs.example.com CNAME
+```
+
+A successful response returns the HTTP status `200`.

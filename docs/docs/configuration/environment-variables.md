@@ -31,7 +31,7 @@ The gateway enables OIDC when the issuer and client ID are set. Set at least one
 | `IPTV_OIDC_REDIRECT_URL` | Derived | Callback URL. The default uses `IPTV_PUBLIC_BASE_URL`. |
 | `IPTV_OIDC_ALLOWED_SUBJECTS` | _empty_ | Comma or space separated approved subject values. |
 | `IPTV_OIDC_ALLOWED_EMAILS` | _empty_ | Comma or space separated approved verified email values. |
-| `IPTV_OIDC_SCOPES` | `openid profile email` | Space separated scopes. The `openid` scope is required. |
+| `IPTV_OIDC_SCOPES` | `openid profile email` | Space separated scopes. When empty, the gateway uses `openid profile email`. Include `openid` for standard OpenID Connect claims. |
 
 The login page shows the OIDC option only when the gateway reports OIDC as enabled.
 

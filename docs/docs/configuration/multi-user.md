@@ -24,13 +24,15 @@ curl -X POST http://localhost:8080/api/v1/users \
   -H "Content-Type: application/json" \
   -d '{
     "username": "alice",
-    "displayName": "Alice",
+    "display_name": "Alice",
     "password": "a-strong-password",
     "role": "operator"
   }'
 ```
 
 The endpoint accepts `admin`, `operator`, and `viewer` role values. The endpoint does not create a usable sign-in account.
+
+The request and response bodies use snake_case field names. The OpenAPI schema for `CreateUserRequest`, `UpdateUserRequest`, and `UserResponse` defines the `display_name` field.
 
 ## List, update, or delete user records
 
@@ -41,13 +43,15 @@ curl http://localhost:8080/api/v1/users \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
 ```
 
+The response returns an array of `UserResponse` objects. Each object includes `id`, `username`, `display_name`, `role`, `enabled`, `last_login_at`, `created_at`, and `updated_at`.
+
 Use this endpoint to update one user record.
 
 ```bash
 curl -X PATCH http://localhost:8080/api/v1/users/{user_id} \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"displayName": "Alice Smith", "enabled": true}'
+  -d '{"display_name": "Alice Smith", "enabled": true}'
 ```
 
 Use this endpoint to delete one user record.

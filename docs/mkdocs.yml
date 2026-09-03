@@ -42,6 +42,7 @@ nav:
       - Security, Backup, and Recovery: configuration/security.md
   - API Reference:
       - Authentication: api/authentication.md
+      - System: api/system.md
       - Sources: api/sources.md
       - Channels: api/channels.md
       - EPG: api/epg.md
