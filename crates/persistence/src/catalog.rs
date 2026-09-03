@@ -519,21 +519,107 @@ impl CatalogRepository {
                 ))
             })?;
 
-        // Remove the account's current automatic channels. The cascade
-        // deletes their stream links and EPG mappings. Manual channels for
-        // the account and all channels for other accounts are untouched.
-        let channels_removed: i64 = sqlx::query(
+        // Capture the current state before any mutation. The rollback itself
+        // creates a new revision, so this value must describe the state that
+        // the rollback replaces. Capturing it after the restore would make
+        // the audit record claim that both sides of the transition are the
+        // restored state and would make the rollback history non-reversible.
+        let before_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
+
+        let target_channel_ids: Vec<Uuid> =
+            snapshot.channels.iter().map(|channel| channel.id).collect();
+
+        // A channel has dependents outside the reconciliation set. Deleting
+        // it would cascade-delete recordings, rules, generated programmes,
+        // profile assignments, user grants, review candidates, and event
+        // links. Detach such channels instead. This preserves the dependent
+        // rows while removing the channel from the automatic provider set.
+        let preserved_channel_ids: Vec<Uuid> = sqlx::query_scalar(
             r"
-            DELETE FROM channels
-            WHERE provider_account_id = $1 AND managed_by = 'automatic'
+            SELECT c.id
+            FROM channels c
+            WHERE c.provider_account_id = $1
+              AND c.managed_by = 'automatic'
+              AND NOT (c.id = ANY($2))
+              AND (
+                  EXISTS (SELECT 1 FROM output_profile_channels opc WHERE opc.channel_id = c.id)
+                  OR EXISTS (SELECT 1 FROM user_channel_grants ucg WHERE ucg.channel_id = c.id)
+                  OR EXISTS (SELECT 1 FROM recording_rules rr WHERE rr.channel_id = c.id)
+                  OR EXISTS (SELECT 1 FROM recordings r WHERE r.channel_id = c.id)
+                  OR EXISTS (SELECT 1 FROM channel_stream_profiles csp WHERE csp.channel_id = c.id)
+                  OR EXISTS (SELECT 1 FROM generated_programmes gp WHERE gp.channel_id = c.id)
+                  OR EXISTS (SELECT 1 FROM event_channels ec WHERE ec.channel_id = c.id)
+                  OR EXISTS (SELECT 1 FROM review_candidates rc WHERE rc.channel_id = c.id)
+              )
+            ORDER BY c.id
             ",
         )
         .bind(account_id)
-        .execute(&mut *transaction)
-        .await?
-        .rows_affected()
-        .try_into()
-        .unwrap_or(i64::MAX);
+        .bind(&target_channel_ids)
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        if !preserved_channel_ids.is_empty() {
+            sqlx::query(
+                r"
+                UPDATE channels
+                SET enabled = false,
+                    managed_by = 'manual',
+                    provider_account_id = NULL,
+                    canonical_key = NULL,
+                    updated_at = now(),
+                    revision = revision + 1
+                WHERE id = ANY($1)
+                ",
+            )
+            .bind(&preserved_channel_ids)
+            .execute(&mut *transaction)
+            .await?;
+        }
+
+        // Delete only channels with no external dependents. Their
+        // reconciliation-owned stream links and EPG mappings can be replaced
+        // safely below. Channels for other accounts remain untouched.
+        let channels_to_remove: Vec<Uuid> = sqlx::query_scalar(
+            r"
+            SELECT c.id
+            FROM channels c
+            WHERE c.provider_account_id = $1
+              AND c.managed_by = 'automatic'
+              AND NOT (c.id = ANY($2))
+              AND NOT (c.id = ANY($3))
+            ORDER BY c.id
+            ",
+        )
+        .bind(account_id)
+        .bind(&target_channel_ids)
+        .bind(&preserved_channel_ids)
+        .fetch_all(&mut *transaction)
+        .await?;
+        let channels_removed: i64 = if channels_to_remove.is_empty() {
+            0
+        } else {
+            sqlx::query("DELETE FROM channels WHERE id = ANY($1)")
+                .bind(&channels_to_remove)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected()
+                .try_into()
+                .unwrap_or(i64::MAX)
+        };
+
+        // Replace links and mappings for the target channel set. Keep the
+        // rows for preserved channels because they remain valid manual data.
+        if !target_channel_ids.is_empty() {
+            sqlx::query("DELETE FROM channel_streams WHERE channel_id = ANY($1)")
+                .bind(&target_channel_ids)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("DELETE FROM channel_epg_mappings WHERE channel_id = ANY($1)")
+                .bind(&target_channel_ids)
+                .execute(&mut *transaction)
+                .await?;
+        }
 
         // Re-create the snapshot channels with their original ids. When the
         // original channel number is now taken by a non-account channel, fall
@@ -541,12 +627,17 @@ impl CatalogRepository {
         // constraint stays satisfied.
         let mut channels_restored: i64 = 0;
         for channel in &snapshot.channels {
-            let channel_number =
-                if channel_number_available(&mut transaction, &channel.channel_number).await? {
-                    channel.channel_number.clone()
-                } else {
-                    next_channel_number(&mut transaction).await?
-                };
+            let channel_number = if channel_number_available_for(
+                &mut transaction,
+                &channel.channel_number,
+                channel.id,
+            )
+            .await?
+            {
+                channel.channel_number.clone()
+            } else {
+                next_channel_number(&mut transaction).await?
+            };
             sqlx::query(
                 r"
                 INSERT INTO channels
@@ -634,7 +725,6 @@ impl CatalogRepository {
             epg_mappings_restored += 1;
         }
 
-        let before_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
         let current_revision =
             current_reconciliation_revision(&mut transaction, account_id).await?;
         let after_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
@@ -5554,15 +5644,19 @@ async fn record_reconciliation_revision(
     Ok(())
 }
 
-/// Returns true when no channel currently holds the given channel number.
-async fn channel_number_available(
+/// Returns true when no other channel currently holds the given channel
+/// number. The channel being restored may already have that number.
+async fn channel_number_available_for(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     channel_number: &str,
+    channel_id: Uuid,
 ) -> Result<bool, PersistenceError> {
-    let taken: i64 = sqlx::query_scalar("SELECT count(*) FROM channels WHERE channel_number = $1")
-        .bind(channel_number)
-        .fetch_one(&mut **transaction)
-        .await?;
+    let taken: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM channels WHERE channel_number = $1 AND id <> $2")
+            .bind(channel_number)
+            .bind(channel_id)
+            .fetch_one(&mut **transaction)
+            .await?;
     Ok(taken == 0)
 }
 

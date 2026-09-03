@@ -4208,6 +4208,32 @@ async fn reconciliation_rollback_restores_channels_streams_and_epg_mappings() {
     .unwrap();
     assert_eq!(restored_mapping_count, 1);
 
+    // The rollback revision must capture the pre-rollback state in
+    // `before_value`. The previous implementation captured both snapshots
+    // after restoration, which made the audit transition non-reversible.
+    let rollback_revision = catalog
+        .list_reconciliation_revisions(account_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|revision| revision.actor == "integration-test")
+        .expect("rollback revision is recorded");
+    assert_eq!(rollback_revision.revision, 4);
+    assert_eq!(
+        rollback_revision
+            .before_value
+            .as_ref()
+            .and_then(|value| value["channels"].as_array())
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        rollback_revision.after_value["channels"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
     // Rollback to a missing revision returns the not-found error.
     let missing = catalog
         .rollback_reconciliation(account_id, 99, "integration-test")
@@ -4239,6 +4265,240 @@ async fn reconciliation_rollback_restores_channels_streams_and_epg_mappings() {
         .await
         .unwrap();
     transaction.commit().await.unwrap();
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn reconciliation_rollback_preserves_channel_dependents() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let suffix = uuid::Uuid::now_v7();
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    let stream_id = uuid::Uuid::now_v7();
+    let extra_channel_id = uuid::Uuid::now_v7();
+    let output_profile_id = uuid::Uuid::now_v7();
+    let user_id = uuid::Uuid::now_v7();
+    let recording_rule_id = uuid::Uuid::now_v7();
+    let recording_id = uuid::Uuid::now_v7();
+    let event_template_id = uuid::Uuid::now_v7();
+    let event_channel_id = uuid::Uuid::now_v7();
+    let generated_id = uuid::Uuid::now_v7();
+    let epg_source_id = uuid::Uuid::now_v7();
+    let epg_snapshot_id = uuid::Uuid::now_v7();
+    let epg_channel_id = uuid::Uuid::now_v7();
+    let review_id = uuid::Uuid::now_v7();
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("Dependent rollback account {suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, channel_number, url_template, supported) VALUES ($1, $2, $3, 'target', 'Target', 'target.tvg', '101', 'https://provider.test/stream', true)",
+    )
+    .bind(stream_id)
+    .bind(snapshot_id)
+    .bind(account_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO epg_sources (id, name, url_template) VALUES ($1, $2, 'https://guide.test/guide.xml')",
+    )
+    .bind(epg_source_id)
+    .bind(format!("Dependent guide {suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, epg_source_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'xmltv', 'active', $3, 1, 1)",
+    )
+    .bind(epg_snapshot_id)
+    .bind(epg_source_id)
+    .bind(epg_snapshot_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO epg_channels (id, source_snapshot_id, epg_source_id, xmltv_id) VALUES ($1, $2, $3, 'dependent.epg')",
+    )
+    .bind(epg_channel_id)
+    .bind(epg_snapshot_id)
+    .bind(epg_source_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+
+    catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+    let target_revision = catalog
+        .list_reconciliation_revisions(account_id)
+        .await
+        .unwrap()[0]
+        .revision;
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO channels (id, channel_number, name, group_name, provider_account_id, canonical_key, managed_by) VALUES ($1, '102', 'Obsolete', 'Test', $2, 'obsolete.tvg', 'automatic')",
+    )
+    .bind(extra_channel_id)
+    .bind(account_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO output_profiles (id, name, token_hash, tuner_count) VALUES ($1, $2, $3, 1)",
+    )
+    .bind(output_profile_id)
+    .bind(format!("Dependent output {suffix}"))
+    .bind(vec![8_u8; 32])
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO output_profile_channels (output_profile_id, channel_id, position) VALUES ($1, $2, 0)",
+    )
+    .bind(output_profile_id)
+    .bind(extra_channel_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, display_name, password_hash) VALUES ($1, $2, 'Dependent User', 'hash')",
+    )
+    .bind(user_id)
+    .bind(format!("dependent-{suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO user_channel_grants (user_id, channel_id) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(extra_channel_id)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO recording_rules (id, name, channel_id) VALUES ($1, 'Dependent rule', $2)",
+    )
+    .bind(recording_rule_id)
+    .bind(extra_channel_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO recordings (id, rule_id, channel_id, title, starts_at, ends_at) VALUES ($1, $2, $3, 'Dependent recording', now(), now() + interval '1 hour')",
+    )
+    .bind(recording_id)
+    .bind(recording_rule_id)
+    .bind(extra_channel_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO channel_stream_profiles (channel_id, stream_profile_id) VALUES ($1, '22222222-0000-0000-0000-000000000001')",
+    )
+    .bind(extra_channel_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO event_templates (id, name, display_name, match_regex, channel_name_format, group_name) VALUES ($1, $2, 'Dependent event', '.*', '{event}', 'Test')",
+    )
+    .bind(event_template_id)
+    .bind(format!("dependent-event-{suffix}"))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO event_channels (id, template_id, channel_id, slot_number) VALUES ($1, $2, $3, 1)",
+    )
+    .bind(event_channel_id)
+    .bind(event_template_id)
+    .bind(extra_channel_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO generated_programmes (id, event_channel_id, channel_id, template_id, rule_id, rule_name, source_title, kind, starts_at, stops_at, title) VALUES ($1, $2, $3, $4, $5, 'Dependent rule', 'Dependent event', 'event', now(), now() + interval '30 minutes', 'Dependent event')",
+    )
+    .bind(generated_id)
+    .bind(event_channel_id)
+    .bind(extra_channel_id)
+    .bind(event_template_id)
+    .bind(uuid::Uuid::now_v7())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO review_candidates (id, channel_id, epg_channel_id, method, confidence) VALUES ($1, $2, $3, 'fuzzy', 0.5)",
+    )
+    .bind(review_id)
+    .bind(extra_channel_id)
+    .bind(epg_channel_id)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+
+    let stats = catalog
+        .rollback_reconciliation(account_id, target_revision, "dependent-test")
+        .await
+        .unwrap();
+    assert_eq!(stats.channels_removed, 0);
+
+    for (table, column) in [
+        ("output_profile_channels", "channel_id"),
+        ("user_channel_grants", "channel_id"),
+        ("recording_rules", "channel_id"),
+        ("recordings", "channel_id"),
+        ("channel_stream_profiles", "channel_id"),
+        ("generated_programmes", "channel_id"),
+        ("event_channels", "channel_id"),
+        ("review_candidates", "channel_id"),
+    ] {
+        let query = format!("SELECT count(*) FROM {table} WHERE {column} = $1");
+        let count: i64 = sqlx::query_scalar(&query)
+            .bind(extra_channel_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "dependent row in {table} must survive rollback");
+    }
+    let detached: (bool, String, Option<uuid::Uuid>) = sqlx::query_as(
+        "SELECT enabled, managed_by, provider_account_id FROM channels WHERE id = $1",
+    )
+    .bind(extra_channel_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(detached, (false, "manual".to_owned(), None));
 
     drop(catalog);
     drop(pool);
