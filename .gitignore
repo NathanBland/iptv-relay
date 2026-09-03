@@ -8,8 +8,11 @@
 /apps/web/coverage/
 /apps/web/playwright-report/
 /apps/web/test-results/
-/.env
-/.env.local
+# Ignore local environment files. Keep safe templates tracked.
+**/.env*
+!**/.env.example
+!**/.env.test
+
 /data/
 *.profraw
 lcov.info
