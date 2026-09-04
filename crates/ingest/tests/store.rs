@@ -79,6 +79,7 @@ fn provider_snapshot(
     format: IngestFormat,
     streams: Vec<PreparedProviderStream>,
 ) -> PreparedSnapshot {
+    let record_count = u64::try_from(streams.len()).expect("stream count fits u64");
     let mut provider_streams = StagedRows::new(1_000);
     for stream in streams {
         provider_streams.push(stream).expect("stage stream");
@@ -89,7 +90,7 @@ fn provider_snapshot(
         format,
         checksum_sha256: format!("{:064x}", Uuid::now_v7().as_u128()),
         byte_count: 1,
-        record_count: 1,
+        record_count,
         diagnostic_count: 0,
         diagnostics: json!([]),
         provider_streams,
@@ -104,6 +105,8 @@ fn epg_snapshot(
     channels: Vec<PreparedEpgChannel>,
     programmes: Vec<PreparedProgramme>,
 ) -> PreparedSnapshot {
+    let record_count =
+        u64::try_from(channels.len() + programmes.len()).expect("EPG record count fits u64");
     let mut epg_channels = StagedRows::new(1_000);
     for channel in channels {
         epg_channels.push(channel).expect("stage channel");
@@ -118,7 +121,7 @@ fn epg_snapshot(
         format: IngestFormat::Xmltv,
         checksum_sha256: format!("{:064x}", Uuid::now_v7().as_u128()),
         byte_count: 1,
-        record_count: 1,
+        record_count,
         diagnostic_count: 0,
         diagnostics: json!([]),
         provider_streams: StagedRows::new(1_000),
