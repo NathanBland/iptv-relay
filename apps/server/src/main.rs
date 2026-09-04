@@ -25,7 +25,7 @@ use iptv_persistence::{
 };
 use reqwest::{Client, Url, header::HeaderMap};
 use sha2::{Digest, Sha256};
-use tokio::{net::TcpListener, process::Command, signal, time::sleep};
+use tokio::{net::TcpListener, process::Command, signal, sync::Notify, time::sleep};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -432,6 +432,39 @@ async fn worker() -> Result<()> {
         }
     });
 
+    let job_notify = std::sync::Arc::new(Notify::new());
+    let listener_notify = job_notify.clone();
+    let listener_pool = database.pool().clone();
+    let listener_handle = tokio::spawn(async move {
+        loop {
+            let mut listener = match sqlx::postgres::PgListener::connect_with(&listener_pool).await
+            {
+                Ok(l) => l,
+                Err(error) => {
+                    warn!(%error, "LISTEN connection failed, retrying in 5s");
+                    sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            if let Err(error) = listener.listen("job_available").await {
+                warn!(%error, "LISTEN subscribe failed, retrying in 5s");
+                sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            info!("LISTEN job_available connected");
+            loop {
+                match listener.recv().await {
+                    Ok(_notification) => listener_notify.notify_one(),
+                    Err(error) => {
+                        warn!(%error, "LISTEN connection lost, reconnecting");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let fallback_interval = Duration::from_secs(5);
     loop {
         tokio::select! {
             () = shutdown_signal() => {
@@ -456,7 +489,12 @@ async fn worker() -> Result<()> {
                             sleep(Duration::from_secs(2)).await;
                         }
                     }
-                    Ok(None) => sleep(Duration::from_millis(200)).await,
+                    Ok(None) => {
+                        tokio::select! {
+                            () = job_notify.notified() => {}
+                            () = sleep(fallback_interval) => {}
+                        }
+                    }
                     Err(error) => {
                         error!(%error, "job claim failed");
                         sleep(Duration::from_secs(2)).await;
@@ -465,6 +503,8 @@ async fn worker() -> Result<()> {
             }
         }
     }
+
+    listener_handle.abort();
 
     scheduler_handle.abort();
     probe_scheduler_handle.abort();
