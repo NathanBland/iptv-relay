@@ -86,6 +86,7 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
     mutationFn: (input: SourceInput) => client.createSource(input),
     onSuccess: (source) => {
       queryClient.setQueryData<Source[]>(['sources'], (current = []) => [...current, source])
+      queryClient.invalidateQueries({ queryKey: ['source-sync-status', source.id] })
       setNotice(`${source.name} was added and its first sync has started.`)
       setShowForm(false)
     },

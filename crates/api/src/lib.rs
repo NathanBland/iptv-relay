@@ -3138,11 +3138,22 @@ async fn create_source(
         .create_with_timezone(&source, "operator", request.timezone.as_deref())
         .await
     {
-        Ok(created) => (
-            StatusCode::CREATED,
-            Json(SourceResponse::from(&created.source)),
-        )
-            .into_response(),
+        Ok(created) => {
+            // Enqueue an immediate refresh job so the first sync starts
+            // without a manual trigger from the user.
+            if let Some(job_repository) = &state.job_repository {
+                let job = iptv_persistence::NewJob::immediate(
+                    "refresh-source",
+                    serde_json::json!({ "sourceId": created.source.id.to_string() }),
+                );
+                let _ = job_repository.enqueue(&job).await;
+            }
+            (
+                StatusCode::CREATED,
+                Json(SourceResponse::from(&created.source)),
+            )
+                .into_response()
+        }
         Err(error) => persistence_error_response(error),
     }
 }
