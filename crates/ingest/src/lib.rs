@@ -20,7 +20,7 @@ pub use pipeline::{
     EndpointProtector, IngestRequest, IngestResult, Ingestor, JobControl, prepare_snapshot,
     prepare_streaming_snapshot,
 };
-pub use store::PgSnapshotStore;
+pub use store::{ActivationProgress, PgSnapshotStore};
 pub use xtream_endpoints::{XtreamEndpoints, XtreamPublicEndpoints, XtreamStreamEndpointTemplate};
 
 use thiserror::Error;

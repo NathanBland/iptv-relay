@@ -6,17 +6,18 @@ use std::{
 use anyhow::{Context, Result, bail};
 use iptv_api::{AppConfig, AppState, RuntimeVersions, hash_admin_password};
 use iptv_ingest::{
-    ArtifactLimits, DownloadRequest, EndpointProtector, IngestError, IngestFormat, IngestProgress,
-    IngestRequest, IngestResult, Ingestor, JobControl, ParsedArtifact, PgSnapshotStore,
-    ProtectedEndpoint, SnapshotOwner, XtreamEndpoints, XtreamPayloadKind, download_http,
-    parse_artifact_with_source_timezone, prepare_snapshot, unpack_artifact,
+    ActivationProgress, ArtifactLimits, DownloadRequest, EndpointProtector, IngestError,
+    IngestFormat, IngestProgress, IngestRequest, IngestResult, Ingestor, JobControl,
+    ParsedArtifact, PgSnapshotStore, ProtectedEndpoint, SnapshotOwner, XtreamEndpoints,
+    XtreamPayloadKind, download_http, parse_artifact_with_source_timezone, prepare_snapshot,
+    unpack_artifact,
 };
 use iptv_media::{
     ProviderSlotBroker, StreamProbe, StreamProbeFailure, StreamProbeOutcome, StreamProbeSpec,
 };
 use iptv_persistence::{
-    CatalogRepository, Database, JobRecord, JobRepository, MasterKey, NewJob, SourceKind,
-    SourceRepository, StreamHealthUpdate, StreamProbeTargetRow,
+    CatalogRepository, Database, EpgMappingStats, JobRecord, JobRepository, MasterKey, NewJob,
+    ReconcileStats, SourceKind, SourceRepository, StreamHealthUpdate, StreamProbeTargetRow,
 };
 use reqwest::{Client, Url, header::HeaderMap};
 use sha2::{Digest, Sha256};
@@ -634,7 +635,7 @@ async fn run_source_refresh(
             endpoint,
             source.id,
             source.timezone,
-            control,
+            control.clone(),
             protector,
             snapshots,
         )
@@ -655,28 +656,16 @@ async fn run_source_refresh(
             xtream_stream_endpoint: None,
             xtream_category_names: HashMap::new(),
         };
-        Ingestor::new(protector, control, snapshots.clone())
+        Ingestor::new(protector, control.clone(), snapshots.clone())
             .run(&request)
             .await
             .map_err(RefreshError::Ingest)?
     };
-    // Report the reconcile stage before catalog reconciliation starts. This
-    // heartbeat is best-effort; a failure does not stop the refresh.
-    let reconcile_progress = serde_json::json!({
-        "stage": "reconciling",
-        "percent": 85,
-        "bytesDownloaded": result.downloaded_bytes,
-        "recordsProcessed": result.records,
-        "message": "Reconciling channels",
-    });
-    if let Err(error) = jobs.heartbeat(job.id, worker_id, &reconcile_progress).await {
-        warn!(job_id = %job.id, error = %error, "failed to report reconcile progress");
-    }
-    run_post_refresh_catalog(source.kind, source.id, catalog)
+    run_post_refresh_catalog(source.kind, source.id, catalog, &control, &result)
         .await
         .map_err(|error| {
-            warn!(job_id = %job.id, source_id = %source.id, error = %error, "catalog post-refresh work failed");
-            RefreshError::Catalog
+            warn!(job_id = %job.id, source_id = %source.id, error = ?error, "catalog post-refresh work failed");
+            error
         })?;
     if source.kind == SourceKind::Xtream {
         match jobs.enqueue_xtream_short_epg(source.id).await {
@@ -872,29 +861,45 @@ async fn run_xtream_short_epg_refresh(
             downloaded_bytes,
             decoded_bytes,
             records_seen: snapshot.record_count,
-            records_prepared: snapshot.record_count,
+            records_prepared: 0,
         })
         .await
         .map_err(RefreshError::Ingest)?;
+    let staging_progress = WorkerStagingProgress {
+        control: &control,
+        downloaded_bytes,
+        decoded_bytes,
+        records_seen: snapshot.record_count,
+    };
     let snapshot_id = snapshots
-        .activate(&snapshot)
+        .activate_with_progress(&snapshot, &staging_progress)
         .await
         .map_err(RefreshError::Ingest)?;
-    catalog.reconcile_epg_mappings().await.map_err(|error| {
-        warn!(source_id = %source.id, error = %error, "Xtream short EPG reconciliation failed");
-        RefreshError::Catalog
-    })?;
-    catalog.scan_all_event_channels().await.map_err(|error| {
-        warn!(source_id = %source.id, error = %error, "Xtream short EPG event scan failed");
-        RefreshError::Catalog
-    })?;
-    Ok(IngestResult {
+    let result = IngestResult {
         snapshot_id,
         checksum_sha256: snapshot.checksum_sha256,
         downloaded_bytes,
         decoded_bytes,
         records: snapshot.record_count,
-    })
+    };
+    checkpoint_reconciliation(&control, &result, "reconciling-epg", 0).await?;
+    let mapping_stats = catalog.reconcile_epg_mappings().await.map_err(|error| {
+        warn!(source_id = %source.id, error = %error, "Xtream short EPG reconciliation failed");
+        RefreshError::Catalog
+    })?;
+    checkpoint_reconciliation(
+        &control,
+        &result,
+        "reconciling-events",
+        u64::try_from(mapping_stats.mappings_applied.max(0)).unwrap_or(u64::MAX),
+    )
+    .await?;
+    let event_count = catalog.scan_all_event_channels().await.map_err(|error| {
+        warn!(source_id = %source.id, error = %error, "Xtream short EPG event scan failed");
+        RefreshError::Catalog
+    })?;
+    checkpoint_reconciliation(&control, &result, "reconciling-complete", event_count).await?;
+    Ok(result)
 }
 
 /// The low-priority pool capacity for health probes.
@@ -1501,38 +1506,40 @@ struct XtreamPayload {
     checksum_sha256: String,
 }
 
-type CatalogFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), iptv_persistence::PersistenceError>> + Send + 'a>>;
+type ProviderReconcileFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<ReconcileStats, iptv_persistence::PersistenceError>> + Send + 'a,
+    >,
+>;
+type EpgReconcileFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<EpgMappingStats, iptv_persistence::PersistenceError>>
+            + Send
+            + 'a,
+    >,
+>;
+type EventReconcileFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<u64, iptv_persistence::PersistenceError>> + Send + 'a>>;
 
 trait PostRefreshCatalog {
-    fn reconcile_provider_account(&self, source_id: Uuid) -> CatalogFuture<'_>;
-    fn reconcile_epg_mappings(&self) -> CatalogFuture<'_>;
-    fn scan_all_event_channels(&self) -> CatalogFuture<'_>;
+    fn reconcile_provider_account(&self, source_id: Uuid) -> ProviderReconcileFuture<'_>;
+    fn reconcile_epg_mappings(&self) -> EpgReconcileFuture<'_>;
+    fn scan_all_event_channels(&self) -> EventReconcileFuture<'_>;
 }
 
 impl PostRefreshCatalog for CatalogRepository {
-    fn reconcile_provider_account(&self, source_id: Uuid) -> CatalogFuture<'_> {
-        Box::pin(async move {
-            CatalogRepository::reconcile_provider_account(self, source_id)
-                .await
-                .map(|_| ())
-        })
+    fn reconcile_provider_account(&self, source_id: Uuid) -> ProviderReconcileFuture<'_> {
+        Box::pin(
+            async move { CatalogRepository::reconcile_provider_account(self, source_id).await },
+        )
     }
 
-    fn reconcile_epg_mappings(&self) -> CatalogFuture<'_> {
-        Box::pin(async move {
-            CatalogRepository::reconcile_epg_mappings(self)
-                .await
-                .map(|_| ())
-        })
+    fn reconcile_epg_mappings(&self) -> EpgReconcileFuture<'_> {
+        Box::pin(async move { CatalogRepository::reconcile_epg_mappings(self).await })
     }
 
-    fn scan_all_event_channels(&self) -> CatalogFuture<'_> {
-        Box::pin(async move {
-            CatalogRepository::scan_all_event_channels(self)
-                .await
-                .map(|_| ())
-        })
+    fn scan_all_event_channels(&self) -> EventReconcileFuture<'_> {
+        Box::pin(async move { CatalogRepository::scan_all_event_channels(self).await })
     }
 }
 
@@ -1540,17 +1547,75 @@ async fn run_post_refresh_catalog<C: PostRefreshCatalog>(
     source_kind: SourceKind,
     source_id: Uuid,
     catalog: &C,
-) -> Result<(), iptv_persistence::PersistenceError> {
+    control: &impl JobControl,
+    result: &IngestResult,
+) -> std::result::Result<(), RefreshError> {
     match source_kind {
         SourceKind::M3u | SourceKind::Xtream => {
-            catalog.reconcile_provider_account(source_id).await?;
-            catalog.reconcile_epg_mappings().await?;
-            catalog.scan_all_event_channels().await?;
+            checkpoint_reconciliation(control, result, "reconciling-channels", 0).await?;
+            let channel_stats = catalog
+                .reconcile_provider_account(source_id)
+                .await
+                .map_err(|_| RefreshError::Catalog)?;
+            checkpoint_reconciliation(
+                control,
+                result,
+                "reconciling-epg",
+                u64::try_from(channel_stats.channels.max(0)).unwrap_or(u64::MAX),
+            )
+            .await?;
+            let mapping_stats = catalog
+                .reconcile_epg_mappings()
+                .await
+                .map_err(|_| RefreshError::Catalog)?;
+            checkpoint_reconciliation(
+                control,
+                result,
+                "reconciling-events",
+                u64::try_from(mapping_stats.mappings_applied.max(0)).unwrap_or(u64::MAX),
+            )
+            .await?;
+            let event_count = catalog
+                .scan_all_event_channels()
+                .await
+                .map_err(|_| RefreshError::Catalog)?;
+            checkpoint_reconciliation(control, result, "reconciling-complete", event_count).await?;
         }
-        SourceKind::Xmltv => catalog.reconcile_epg_mappings().await?,
+        SourceKind::Xmltv => {
+            checkpoint_reconciliation(control, result, "reconciling-epg", 0).await?;
+            let mapping_stats = catalog
+                .reconcile_epg_mappings()
+                .await
+                .map_err(|_| RefreshError::Catalog)?;
+            checkpoint_reconciliation(
+                control,
+                result,
+                "reconciling-complete",
+                u64::try_from(mapping_stats.mappings_applied.max(0)).unwrap_or(u64::MAX),
+            )
+            .await?;
+        }
         SourceKind::NetworkTuner => {}
     }
     Ok(())
+}
+
+async fn checkpoint_reconciliation(
+    control: &impl JobControl,
+    result: &IngestResult,
+    phase: &str,
+    records_prepared: u64,
+) -> std::result::Result<(), RefreshError> {
+    control
+        .checkpoint(&IngestProgress {
+            phase: phase.to_owned(),
+            downloaded_bytes: result.downloaded_bytes,
+            decoded_bytes: result.decoded_bytes,
+            records_seen: result.records,
+            records_prepared,
+        })
+        .await
+        .map_err(RefreshError::Ingest)
 }
 
 fn source_id_from_payload(payload: &serde_json::Value) -> Option<Uuid> {
@@ -1615,15 +1680,39 @@ impl JobControl for WorkerJobControl {
         {
             return Err(IngestError::Cancelled);
         }
-        let progress = refresh_progress_json(
-            &progress.phase,
-            progress.downloaded_bytes,
-            progress.records_seen,
-        );
+        let progress = refresh_progress_json(progress);
         self.repository
             .heartbeat(self.job_id, &self.worker_id, &progress)
             .await
             .map_err(|_| IngestError::OwnershipLost)
+    }
+}
+
+#[derive(Debug)]
+struct WorkerStagingProgress<'a> {
+    control: &'a WorkerJobControl,
+    downloaded_bytes: u64,
+    decoded_bytes: u64,
+    records_seen: u64,
+}
+
+impl ActivationProgress for WorkerStagingProgress<'_> {
+    fn checkpoint(
+        &self,
+        records_staged: u64,
+        _records_total: u64,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), IngestError>> + '_>> {
+        Box::pin(async move {
+            self.control
+                .checkpoint(&IngestProgress {
+                    phase: "staging".to_owned(),
+                    downloaded_bytes: self.downloaded_bytes,
+                    decoded_bytes: self.decoded_bytes,
+                    records_seen: self.records_seen,
+                    records_prepared: records_staged,
+                })
+                .await
+        })
     }
 }
 
@@ -1635,38 +1724,103 @@ impl JobControl for WorkerJobControl {
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss
 )]
-fn refresh_progress_json(
-    phase: &str,
-    downloaded_bytes: u64,
-    records_seen: u64,
-) -> serde_json::Value {
-    let (stage, percent, message): (&'static str, u8, &'static str) = match phase {
-        "downloading" => {
-            // Scale the percent from 1 to 14 based on downloaded bytes so the
-            // UI shows progress during long downloads even without a
-            // content-length header. 1 MB maps to ~3%, 50 MB to ~12%.
-            let scaled = if downloaded_bytes == 0 {
-                1_u8
-            } else {
-                let mb = (downloaded_bytes as f64) / 1_048_576.0;
-                let log_mb = mb.log2().max(0.0);
-                let raw = 1.0 + log_mb * 1.5;
-                raw.clamp(1.0, 14.0) as u8
-            };
-            ("downloading", scaled, "Downloading source data")
-        }
-        "downloaded" => ("downloading", 15, "Downloaded source data"),
-        "decoded" => ("parsing", 30, "Decoded source artifact"),
-        "parsed" => ("parsing", 45, "Parsed source records"),
-        "staging" => ("parsing", 55, "Staged source records"),
-        "activated" => ("activating", 70, "Activated snapshot"),
-        _ => ("downloading", 0, "Refreshing source"),
-    };
+fn refresh_progress_json(progress: &IngestProgress) -> serde_json::Value {
+    let (stage, percent, records_processed, message): (&'static str, u8, u64, String) =
+        match progress.phase.as_str() {
+            "downloading" => {
+                // Scale the percent from 1 to 14 based on downloaded bytes so the
+                // UI shows progress during long downloads even without a
+                // content-length header. 1 MB maps to ~3%, 50 MB to ~12%.
+                let scaled = if progress.downloaded_bytes == 0 {
+                    1_u8
+                } else {
+                    let mb = (progress.downloaded_bytes as f64) / 1_048_576.0;
+                    let log_mb = mb.log2().max(0.0);
+                    let raw = 1.0 + log_mb * 1.5;
+                    raw.clamp(1.0, 14.0) as u8
+                };
+                (
+                    "downloading",
+                    scaled,
+                    progress.records_seen,
+                    "Downloading source data".to_owned(),
+                )
+            }
+            "downloaded" => (
+                "downloading",
+                15,
+                progress.records_seen,
+                "Downloaded source data".to_owned(),
+            ),
+            "decoded" => (
+                "parsing",
+                30,
+                progress.records_seen,
+                "Decoded source artifact".to_owned(),
+            ),
+            "parsed" => (
+                "parsing",
+                45,
+                progress.records_seen,
+                "Parsed source records".to_owned(),
+            ),
+            "staging" => {
+                let total = progress.records_seen;
+                let staged = progress.records_prepared.min(total);
+                let completed = staged.saturating_mul(15).checked_div(total).unwrap_or(0);
+                let percent = 55 + u8::try_from(completed.min(15)).unwrap_or(15);
+                (
+                    "parsing",
+                    percent,
+                    staged,
+                    format!("Staged {staged} of {total} source records"),
+                )
+            }
+            "activated" => (
+                "activating",
+                70,
+                progress.records_seen,
+                "Activated snapshot".to_owned(),
+            ),
+            "reconciling-channels" => (
+                "reconciling",
+                85,
+                progress.records_prepared,
+                "Reconciling channels".to_owned(),
+            ),
+            "reconciling-epg" => (
+                "reconciling",
+                90,
+                progress.records_prepared,
+                format!("Reconciled {} channels", progress.records_prepared),
+            ),
+            "reconciling-events" => (
+                "reconciling",
+                95,
+                progress.records_prepared,
+                format!("Reconciled {} guide mappings", progress.records_prepared),
+            ),
+            "reconciling-complete" => (
+                "reconciling",
+                99,
+                progress.records_prepared,
+                format!(
+                    "Updated {} dynamic event channels",
+                    progress.records_prepared
+                ),
+            ),
+            _ => (
+                "downloading",
+                0,
+                progress.records_seen,
+                "Refreshing source".to_owned(),
+            ),
+        };
     serde_json::json!({
         "stage": stage,
         "percent": percent,
-        "bytesDownloaded": downloaded_bytes,
-        "recordsProcessed": records_seen,
+        "bytesDownloaded": progress.downloaded_bytes,
+        "recordsProcessed": records_processed,
         "message": message,
     })
 }
@@ -2005,16 +2159,58 @@ mod tests {
     }
 
     impl PostRefreshCatalog for TestPostRefreshCatalog {
-        fn reconcile_provider_account(&self, _: Uuid) -> CatalogFuture<'_> {
-            Box::pin(async move { self.call("provider") })
+        fn reconcile_provider_account(&self, _: Uuid) -> ProviderReconcileFuture<'_> {
+            Box::pin(async move {
+                self.call("provider")?;
+                Ok(ReconcileStats {
+                    channels: 4,
+                    orphaned_channels_removed: 1,
+                    stream_links: 6,
+                })
+            })
         }
 
-        fn reconcile_epg_mappings(&self) -> CatalogFuture<'_> {
-            Box::pin(async move { self.call("epg") })
+        fn reconcile_epg_mappings(&self) -> EpgReconcileFuture<'_> {
+            Box::pin(async move {
+                self.call("epg")?;
+                Ok(EpgMappingStats {
+                    mappings_applied: 3,
+                    mappings_removed: 0,
+                    review_queued: 1,
+                })
+            })
         }
 
-        fn scan_all_event_channels(&self) -> CatalogFuture<'_> {
-            Box::pin(async move { self.call("events") })
+        fn scan_all_event_channels(&self) -> EventReconcileFuture<'_> {
+            Box::pin(async move {
+                self.call("events")?;
+                Ok(2)
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingJobControl {
+        progress: Mutex<Vec<IngestProgress>>,
+    }
+
+    impl JobControl for RecordingJobControl {
+        async fn checkpoint(
+            &self,
+            progress: &IngestProgress,
+        ) -> std::result::Result<(), IngestError> {
+            self.progress.lock().expect("lock").push(progress.clone());
+            Ok(())
+        }
+    }
+
+    fn ingest_result() -> IngestResult {
+        IngestResult {
+            snapshot_id: Uuid::now_v7(),
+            checksum_sha256: "0".repeat(64),
+            downloaded_bytes: 12,
+            decoded_bytes: 24,
+            records: 100,
         }
     }
 
@@ -2170,15 +2366,45 @@ mod tests {
     #[tokio::test]
     async fn m3u_post_refresh_scans_events_after_reconciliation() {
         let catalog = TestPostRefreshCatalog::default();
-        run_post_refresh_catalog(SourceKind::M3u, Uuid::now_v7(), &catalog)
-            .await
-            .expect("post-refresh work");
+        let control = RecordingJobControl::default();
+        run_post_refresh_catalog(
+            SourceKind::M3u,
+            Uuid::now_v7(),
+            &catalog,
+            &control,
+            &ingest_result(),
+        )
+        .await
+        .expect("post-refresh work");
         assert_eq!(catalog.calls(), ["provider", "epg", "events"]);
+        let progress = control
+            .progress
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|entry| (entry.phase.clone(), entry.records_prepared))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            progress,
+            [
+                ("reconciling-channels".to_owned(), 0),
+                ("reconciling-epg".to_owned(), 4),
+                ("reconciling-events".to_owned(), 3),
+                ("reconciling-complete".to_owned(), 2),
+            ]
+        );
 
         let xtream = TestPostRefreshCatalog::default();
-        run_post_refresh_catalog(SourceKind::Xtream, Uuid::now_v7(), &xtream)
-            .await
-            .expect("Xtream post-refresh work");
+        let control = RecordingJobControl::default();
+        run_post_refresh_catalog(
+            SourceKind::Xtream,
+            Uuid::now_v7(),
+            &xtream,
+            &control,
+            &ingest_result(),
+        )
+        .await
+        .expect("Xtream post-refresh work");
         assert_eq!(xtream.calls(), ["provider", "epg", "events"]);
     }
 
@@ -2188,17 +2414,31 @@ mod tests {
             fail_at: Some("provider"),
             ..TestPostRefreshCatalog::default()
         };
+        let failed_control = RecordingJobControl::default();
         assert!(
-            run_post_refresh_catalog(SourceKind::M3u, Uuid::now_v7(), &failed)
-                .await
-                .is_err()
+            run_post_refresh_catalog(
+                SourceKind::M3u,
+                Uuid::now_v7(),
+                &failed,
+                &failed_control,
+                &ingest_result(),
+            )
+            .await
+            .is_err()
         );
         assert_eq!(failed.calls(), ["provider"]);
 
         let xmltv = TestPostRefreshCatalog::default();
-        run_post_refresh_catalog(SourceKind::Xmltv, Uuid::now_v7(), &xmltv)
-            .await
-            .expect("XMLTV post-refresh work");
+        let control = RecordingJobControl::default();
+        run_post_refresh_catalog(
+            SourceKind::Xmltv,
+            Uuid::now_v7(),
+            &xmltv,
+            &control,
+            &ingest_result(),
+        )
+        .await
+        .expect("XMLTV post-refresh work");
         assert_eq!(xmltv.calls(), ["epg"]);
     }
 
@@ -2979,15 +3219,50 @@ mod tests {
             ("downloaded", "downloading", 15, "Downloaded source data"),
             ("decoded", "parsing", 30, "Decoded source artifact"),
             ("parsed", "parsing", 45, "Parsed source records"),
-            ("staging", "parsing", 55, "Staged source records"),
+            ("staging", "parsing", 55, "Staged 0 of 7 source records"),
             ("activated", "activating", 70, "Activated snapshot"),
+            (
+                "reconciling-channels",
+                "reconciling",
+                85,
+                "Reconciling channels",
+            ),
+            (
+                "reconciling-epg",
+                "reconciling",
+                90,
+                "Reconciled 0 channels",
+            ),
+            (
+                "reconciling-events",
+                "reconciling",
+                95,
+                "Reconciled 0 guide mappings",
+            ),
+            (
+                "reconciling-complete",
+                "reconciling",
+                99,
+                "Updated 0 dynamic event channels",
+            ),
             ("unknown", "downloading", 0, "Refreshing source"),
         ] {
-            let progress = refresh_progress_json(phase, 123, 7);
+            let progress = refresh_progress_json(&IngestProgress {
+                phase: phase.to_owned(),
+                downloaded_bytes: 123,
+                decoded_bytes: 0,
+                records_seen: 7,
+                records_prepared: 0,
+            });
             assert_eq!(progress["stage"], stage);
             assert_eq!(progress["percent"], percent);
             assert_eq!(progress["bytesDownloaded"], 123);
-            assert_eq!(progress["recordsProcessed"], 7);
+            let expected_records = if phase.starts_with("reconciling") || phase == "staging" {
+                0
+            } else {
+                7
+            };
+            assert_eq!(progress["recordsProcessed"], expected_records);
             assert_eq!(progress["message"], message);
         }
     }
@@ -2995,18 +3270,53 @@ mod tests {
     #[test]
     fn refresh_progress_download_percent_scales_with_bytes() {
         // 0 bytes = 1%, 1 MB = 1%, 4 MB = 4%, 50 MB = ~9%, 100 MB = ~11%.
-        let zero = refresh_progress_json("downloading", 0, 0);
+        let zero = refresh_progress_json(&IngestProgress {
+            phase: "downloading".to_owned(),
+            ..IngestProgress::default()
+        });
         assert_eq!(zero["percent"], 1);
-        let one_mb = refresh_progress_json("downloading", 1_048_576, 0);
+        let one_mb = refresh_progress_json(&IngestProgress {
+            phase: "downloading".to_owned(),
+            downloaded_bytes: 1_048_576,
+            ..IngestProgress::default()
+        });
         assert_eq!(one_mb["percent"], 1);
-        let fifty_mb = refresh_progress_json("downloading", 50 * 1_048_576, 0);
+        let fifty_mb = refresh_progress_json(&IngestProgress {
+            phase: "downloading".to_owned(),
+            downloaded_bytes: 50 * 1_048_576,
+            ..IngestProgress::default()
+        });
         let pct = fifty_mb["percent"].as_u64().unwrap();
         assert!(
             (8..=14).contains(&pct),
             "50MB should map to 8-14%, got {pct}"
         );
-        let huge = refresh_progress_json("downloading", 500 * 1_048_576, 0);
+        let huge = refresh_progress_json(&IngestProgress {
+            phase: "downloading".to_owned(),
+            downloaded_bytes: 500 * 1_048_576,
+            ..IngestProgress::default()
+        });
         assert_eq!(huge["percent"], 14);
+    }
+
+    #[test]
+    fn refresh_progress_advances_for_each_staging_batch() {
+        let total = 1_000;
+        for (staged, percent) in [(0, 55), (500, 62), (1_000, 70)] {
+            let progress = refresh_progress_json(&IngestProgress {
+                phase: "staging".to_owned(),
+                downloaded_bytes: 1,
+                decoded_bytes: 1,
+                records_seen: total,
+                records_prepared: staged,
+            });
+            assert_eq!(progress["percent"], percent);
+            assert_eq!(progress["recordsProcessed"], staged);
+            assert_eq!(
+                progress["message"],
+                format!("Staged {staged} of {total} source records")
+            );
+        }
     }
 
     #[tokio::test]

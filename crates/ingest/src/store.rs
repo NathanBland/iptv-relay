@@ -3,11 +3,38 @@ use crate::{
     SnapshotOwner, StagedRows,
 };
 use sqlx::{PgPool, Postgres, QueryBuilder};
+use std::{future::Future, pin::Pin};
 use uuid::Uuid;
 
 const PROVIDER_STREAM_BATCH: usize = 500;
 const EPG_CHANNEL_BATCH: usize = 1_000;
 const PROGRAMME_BATCH: usize = 1_000;
+
+/// Reports each completed snapshot write batch.
+///
+/// The caller persists these reports outside the snapshot transaction. A
+/// cancelled report returns an error and rolls back the transaction.
+pub trait ActivationProgress: Send + Sync {
+    #[allow(clippy::missing_errors_doc)]
+    fn checkpoint(
+        &self,
+        records_staged: u64,
+        records_total: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IngestError>> + '_>>;
+}
+
+#[derive(Debug)]
+struct NoopActivationProgress;
+
+impl ActivationProgress for NoopActivationProgress {
+    fn checkpoint(
+        &self,
+        _records_staged: u64,
+        _records_total: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IngestError>> + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PgSnapshotStore {
@@ -27,6 +54,20 @@ impl PgSnapshotStore {
     /// Any failure rolls back staging and leaves the previous active snapshot untouched.
     #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
     pub async fn activate(&self, snapshot: &PreparedSnapshot) -> Result<Uuid, IngestError> {
+        self.activate_with_progress(snapshot, &NoopActivationProgress)
+            .await
+    }
+
+    /// Inserts one snapshot and reports each completed database write batch.
+    ///
+    /// A report failure rolls back the snapshot transaction. The reports do
+    /// not make staged rows visible before the transaction commits.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn activate_with_progress(
+        &self,
+        snapshot: &PreparedSnapshot,
+        progress: &dyn ActivationProgress,
+    ) -> Result<Uuid, IngestError> {
         if !snapshot.is_nonempty() {
             return Err(IngestError::EmptySnapshot {
                 format: snapshot.format.display_name(),
@@ -77,6 +118,9 @@ impl PgSnapshotStore {
             .bind(existing_id)
             .execute(&mut *transaction)
             .await?;
+            progress
+                .checkpoint(snapshot.record_count, snapshot.record_count)
+                .await?;
             transaction.commit().await?;
             return Ok(existing_id);
         }
@@ -102,11 +146,16 @@ impl PgSnapshotStore {
         .execute(&mut *transaction)
         .await?;
 
+        let records_total = snapshot.record_count;
+        let mut records_staged = 0_u64;
         insert_provider_streams(
             &mut transaction,
             snapshot.id,
             provider_account_id,
             &snapshot.provider_streams,
+            progress,
+            &mut records_staged,
+            records_total,
         )
         .await?;
         insert_epg_channels(
@@ -116,9 +165,26 @@ impl PgSnapshotStore {
             epg_source_id,
             snapshot.format.snapshot_kind(),
             &snapshot.epg_channels,
+            progress,
+            &mut records_staged,
+            records_total,
         )
         .await?;
-        insert_programmes(&mut transaction, snapshot.id, &snapshot.programmes).await?;
+        insert_programmes(
+            &mut transaction,
+            snapshot.id,
+            &snapshot.programmes,
+            progress,
+            &mut records_staged,
+            records_total,
+        )
+        .await?;
+
+        if records_staged != records_total {
+            return Err(IngestError::InvalidRequest(
+                "snapshot staging count does not match record count",
+            ));
+        }
 
         supersede_current(
             &mut transaction,
@@ -192,6 +258,9 @@ async fn insert_provider_streams(
     snapshot_id: Uuid,
     provider_account_id: Option<Uuid>,
     streams: &StagedRows<PreparedProviderStream>,
+    progress: &dyn ActivationProgress,
+    records_staged: &mut u64,
+    records_total: u64,
 ) -> Result<(), IngestError> {
     if streams.is_empty() {
         return Ok(());
@@ -229,10 +298,12 @@ async fn insert_provider_streams(
                 .push_bind(stream.supported);
         });
         query.build().execute(&mut **transaction).await?;
+        checkpoint_staging(progress, records_staged, chunk.len(), records_total).await?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_epg_channels(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
     snapshot_id: Uuid,
@@ -240,6 +311,9 @@ async fn insert_epg_channels(
     epg_source_id: Option<Uuid>,
     snapshot_kind: &str,
     channels: &StagedRows<PreparedEpgChannel>,
+    progress: &dyn ActivationProgress,
+    records_staged: &mut u64,
+    records_total: u64,
 ) -> Result<(), IngestError> {
     if channels.is_empty() {
         return Ok(());
@@ -278,6 +352,7 @@ async fn insert_epg_channels(
                 .push_bind(&channel.metadata);
         });
         query.build().execute(&mut **transaction).await?;
+        checkpoint_staging(progress, records_staged, chunk.len(), records_total).await?;
     }
     Ok(())
 }
@@ -286,6 +361,9 @@ async fn insert_programmes(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
     snapshot_id: Uuid,
     programmes: &StagedRows<PreparedProgramme>,
+    progress: &dyn ActivationProgress,
+    records_staged: &mut u64,
+    records_total: u64,
 ) -> Result<(), IngestError> {
     for chunk in programmes.batches(PROGRAMME_BATCH)? {
         let chunk = chunk?;
@@ -313,8 +391,30 @@ async fn insert_programmes(
                 .push_bind(&programme.metadata);
         });
         query.build().execute(&mut **transaction).await?;
+        checkpoint_staging(progress, records_staged, chunk.len(), records_total).await?;
     }
     Ok(())
+}
+
+async fn checkpoint_staging(
+    progress: &dyn ActivationProgress,
+    records_staged: &mut u64,
+    batch_len: usize,
+    records_total: u64,
+) -> Result<(), IngestError> {
+    let batch_len = u64::try_from(batch_len)
+        .map_err(|_| IngestError::InvalidRequest("snapshot batch count exceeds u64"))?;
+    *records_staged = records_staged
+        .checked_add(batch_len)
+        .ok_or(IngestError::InvalidRequest(
+            "snapshot staging count exceeds u64",
+        ))?;
+    if *records_staged > records_total {
+        return Err(IngestError::InvalidRequest(
+            "snapshot staging count exceeds record count",
+        ));
+    }
+    progress.checkpoint(*records_staged, records_total).await
 }
 
 #[cfg(test)]

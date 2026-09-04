@@ -1,8 +1,8 @@
 #[cfg(test)]
 use crate::parse::parse_artifact;
 use crate::{
-    ArtifactLimits, DecodedArtifact, DownloadRequest, DownloadedArtifact, IngestError,
-    IngestFormat, IngestProgress, ParsedArtifact, PgSnapshotStore, PreparedEpgChannel,
+    ActivationProgress, ArtifactLimits, DecodedArtifact, DownloadRequest, DownloadedArtifact,
+    IngestError, IngestFormat, IngestProgress, ParsedArtifact, PgSnapshotStore, PreparedEpgChannel,
     PreparedProgramme, PreparedProviderStream, PreparedSnapshot, ProtectedEndpoint, SnapshotOwner,
     StagedRows, XtreamStreamEndpointTemplate, download_stream, unpack_artifact,
 };
@@ -91,11 +91,59 @@ pub trait JobControl: Send + Sync {
 #[allow(async_fn_in_trait)]
 pub trait SnapshotActivator: Send + Sync {
     async fn activate(&self, snapshot: &PreparedSnapshot) -> Result<Uuid, IngestError>;
+
+    /// Activates a snapshot and reports each completed write batch.
+    ///
+    /// Implementations that do not stage rows in batches can use the default
+    /// activation behavior.
+    async fn activate_with_progress(
+        &self,
+        snapshot: &PreparedSnapshot,
+        _progress: &dyn ActivationProgress,
+    ) -> Result<Uuid, IngestError> {
+        self.activate(snapshot).await
+    }
 }
 
 impl SnapshotActivator for PgSnapshotStore {
     async fn activate(&self, snapshot: &PreparedSnapshot) -> Result<Uuid, IngestError> {
         self.activate(snapshot).await
+    }
+
+    async fn activate_with_progress(
+        &self,
+        snapshot: &PreparedSnapshot,
+        progress: &dyn ActivationProgress,
+    ) -> Result<Uuid, IngestError> {
+        self.activate_with_progress(snapshot, progress).await
+    }
+}
+
+#[derive(Debug)]
+struct IngestStagingProgress<'a, C> {
+    control: &'a C,
+    downloaded_bytes: u64,
+    decoded_bytes: u64,
+    records_seen: u64,
+}
+
+impl<C: JobControl> ActivationProgress for IngestStagingProgress<'_, C> {
+    fn checkpoint(
+        &self,
+        records_staged: u64,
+        _records_total: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), IngestError>> + '_>> {
+        Box::pin(async move {
+            self.control
+                .checkpoint(&IngestProgress {
+                    phase: "staging".to_owned(),
+                    downloaded_bytes: self.downloaded_bytes,
+                    decoded_bytes: self.decoded_bytes,
+                    records_seen: self.records_seen,
+                    records_prepared: records_staged,
+                })
+                .await
+        })
     }
 }
 
@@ -402,14 +450,21 @@ where
             .checkpoint("parsed", byte_count, byte_count, records_seen, 0)
             .await;
         let records = snapshot.record_count;
-        let _ = self
-            .checkpoint("staging", byte_count, byte_count, records_seen, records)
-            .await;
+        self.checkpoint("staging", byte_count, byte_count, records_seen, 0)
+            .await?;
 
-        let snapshot_id = self.store.activate(&snapshot).await?;
-        let _ = self
-            .checkpoint("activated", byte_count, byte_count, records_seen, records)
-            .await;
+        let staging_progress = IngestStagingProgress {
+            control: &self.control,
+            downloaded_bytes: byte_count,
+            decoded_bytes: byte_count,
+            records_seen,
+        };
+        let snapshot_id = self
+            .store
+            .activate_with_progress(&snapshot, &staging_progress)
+            .await?;
+        self.checkpoint("activated", byte_count, byte_count, records_seen, records)
+            .await?;
 
         info!(
             records,
@@ -500,7 +555,7 @@ where
         result
     }
 
-    #[allow(clippy::missing_errors_doc)]
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
     pub async fn run_downloaded(
         &self,
         request: &IngestRequest,
@@ -578,15 +633,18 @@ where
         self.checkpoint("parsed", downloaded_bytes, decoded_bytes, records_seen, 0)
             .await?;
         let records = snapshot.record_count;
-        self.checkpoint(
-            "staging",
+        self.checkpoint("staging", downloaded_bytes, decoded_bytes, records_seen, 0)
+            .await?;
+        let staging_progress = IngestStagingProgress {
+            control: &self.control,
             downloaded_bytes,
             decoded_bytes,
             records_seen,
-            records,
-        )
-        .await?;
-        let snapshot_id = self.store.activate(&snapshot).await?;
+        };
+        let snapshot_id = self
+            .store
+            .activate_with_progress(&snapshot, &staging_progress)
+            .await?;
         self.checkpoint(
             "activated",
             downloaded_bytes,
@@ -1517,6 +1575,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct TestControl {
         phases: Mutex<Vec<String>>,
+        progress: Mutex<Vec<IngestProgress>>,
         cancel_at: Option<&'static str>,
     }
 
@@ -1526,6 +1585,7 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push(progress.phase.clone());
+            self.progress.lock().expect("lock").push(progress.clone());
             if self.cancel_at == Some(progress.phase.as_str()) {
                 Err(IngestError::Cancelled)
             } else {
@@ -1553,6 +1613,26 @@ mod tests {
                 .collect::<Vec<_>>();
             self.stable_keys.lock().expect("lock").extend(keys);
             Ok(snapshot.id)
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BatchedTestStore;
+
+    impl SnapshotActivator for BatchedTestStore {
+        async fn activate(&self, snapshot: &PreparedSnapshot) -> Result<Uuid, IngestError> {
+            Ok(snapshot.id)
+        }
+
+        async fn activate_with_progress(
+            &self,
+            snapshot: &PreparedSnapshot,
+            progress: &dyn ActivationProgress,
+        ) -> Result<Uuid, IngestError> {
+            let total = snapshot.record_count;
+            progress.checkpoint(1, total).await?;
+            progress.checkpoint(total, total).await?;
+            self.activate(snapshot).await
         }
     }
 
@@ -1604,11 +1684,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staging_progress_reports_each_completed_batch() {
+        let ingestor = Ingestor::new(TestProtector, TestControl::default(), BatchedTestStore);
+        let result = ingestor
+            .run_downloaded(
+                &request(IngestFormat::M3u),
+                downloaded(
+                    b"#EXTM3U\n#EXTINF:-1,One\nhttps://example.test/one\n#EXTINF:-1,Two\nhttps://example.test/two\n",
+                ),
+            )
+            .await
+            .expect("ingest");
+        assert_eq!(result.records, 2);
+        let staged = ingestor
+            .control
+            .progress
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|progress| progress.phase == "staging")
+            .map(|progress| (progress.records_prepared, progress.records_seen))
+            .collect::<Vec<_>>();
+        assert_eq!(staged, [(0, 2), (1, 2), (2, 2)]);
+    }
+
+    #[tokio::test]
     async fn cancellation_before_staging_never_activates() {
         let ingestor = Ingestor::new(
             TestProtector,
             TestControl {
                 phases: Mutex::default(),
+                progress: Mutex::default(),
                 cancel_at: Some("parsed"),
             },
             TestStore::default(),
@@ -1630,6 +1736,7 @@ mod tests {
             TestProtector,
             TestControl {
                 phases: Mutex::default(),
+                progress: Mutex::default(),
                 cancel_at: Some("downloading"),
             },
             TestStore::default(),
