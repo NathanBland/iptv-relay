@@ -1827,6 +1827,47 @@ impl JobRepository {
         Ok(result.rows_affected())
     }
 
+    /// Recovers jobs left in `running` status by a worker that restarted
+    /// mid-job. Jobs with remaining attempts return to `queued`. Jobs at or
+    /// above `max_attempts` move to `failed` with a `worker restarted
+    /// mid-job` error. Call this on worker startup before the job loop begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when either update fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn recover_stranded_jobs(&self) -> Result<u64, PersistenceError> {
+        let requeued = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'queued',
+                locked_by = NULL,
+                locked_at = NULL,
+                heartbeat_at = NULL,
+                updated_at = now()
+            WHERE status = 'running' AND attempts < max_attempts
+            ",
+        )
+        .execute(&self.pool)
+        .await?;
+        let failed = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'failed',
+                last_error = 'worker restarted mid-job',
+                completed_at = now(),
+                locked_by = NULL,
+                locked_at = NULL,
+                heartbeat_at = NULL,
+                updated_at = now()
+            WHERE status = 'running' AND attempts >= max_attempts
+            ",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(requeued.rows_affected() + failed.rows_affected())
+    }
+
     /// Lists failed jobs for operator inspection (dead-letter queue).
     ///
     /// # Errors

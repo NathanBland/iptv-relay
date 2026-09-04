@@ -3984,6 +3984,29 @@ impl CatalogRepository {
         Ok(result.rows_affected().try_into().unwrap_or(i64::MAX))
     }
 
+    /// Resets every provider stream in `checking` status back to `unknown`.
+    ///
+    /// Call this on worker startup before the job loop begins. A worker that
+    /// restarted mid-probe leaves streams in `checking` forever. This method
+    /// returns all such streams to the probe queue without a timeout filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn reset_stranded_checking_streams(&self) -> Result<i64, PersistenceError> {
+        let result = sqlx::query(
+            r"
+            UPDATE provider_streams
+            SET health_status = 'unknown'
+            WHERE health_status = 'checking'
+            ",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected().try_into().unwrap_or(i64::MAX))
+    }
+
     /// Lists the channel IDs linked to one provider stream.
     ///
     /// The probe uses this to re-rank affected channels after a health update.

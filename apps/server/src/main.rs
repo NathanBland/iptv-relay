@@ -365,6 +365,18 @@ async fn worker() -> Result<()> {
     let worker_id = worker_id_from(|name| env::var(name));
     info!(%worker_id, "job worker started");
 
+    // Recover jobs and streams stranded by a previous worker that restarted
+    // mid-job. Run this before the job loop begins so a fresh worker reclaims
+    // work that the prior process left in `running` or `checking` status.
+    match repository.recover_stranded_jobs().await {
+        Ok(count) => info!("Recovered {count} stranded jobs on startup"),
+        Err(error) => warn!(%error, "stranded job recovery failed on startup"),
+    }
+    match catalog.reset_stranded_checking_streams().await {
+        Ok(count) => info!("Reset {count} stranded checking streams on startup"),
+        Err(error) => warn!(%error, "stranded checking stream reset failed on startup"),
+    }
+
     // Spawn the scheduler that enqueues refresh jobs for due sources.
     let scheduler_sources = sources.clone();
     let scheduler_jobs = repository.clone();
@@ -3219,6 +3231,165 @@ mod tests {
             .expect("error was persisted");
         assert!(error.contains("refresh job payload is invalid"));
         delete_job(&pool, job.id).await;
+    }
+
+    #[tokio::test]
+    async fn recover_stranded_jobs_requeues_running_jobs_with_attempts_left() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let jobs = JobRepository::new(pool.clone());
+
+        let mut new_job = iptv_persistence::NewJob::immediate("noop", serde_json::json!({}));
+        new_job.max_attempts = 3;
+        let job = jobs.enqueue(&new_job).await.expect("enqueue job");
+        // Simulate a worker that claimed the job once, then died mid-job.
+        sqlx::query(
+            "UPDATE jobs SET status = 'running', locked_by = $2, locked_at = now(), \
+             attempts = 1, heartbeat_at = now() WHERE id = $1",
+        )
+        .bind(job.id)
+        .bind("dead-worker")
+        .execute(&pool)
+        .await
+        .expect("force job to running");
+
+        let recovered = jobs
+            .recover_stranded_jobs()
+            .await
+            .expect("recover stranded jobs");
+        assert!(recovered >= 1);
+        assert_eq!(job_status(&pool, job.id).await, "queued");
+        delete_job(&pool, job.id).await;
+    }
+
+    #[tokio::test]
+    async fn recover_stranded_jobs_fails_running_jobs_at_max_attempts() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let jobs = JobRepository::new(pool.clone());
+
+        let mut new_job = iptv_persistence::NewJob::immediate("noop", serde_json::json!({}));
+        new_job.max_attempts = 1;
+        let job = jobs.enqueue(&new_job).await.expect("enqueue job");
+        // Simulate a worker that exhausted all attempts, then died mid-job.
+        sqlx::query(
+            "UPDATE jobs SET status = 'running', locked_by = $2, locked_at = now(), \
+             attempts = 1, max_attempts = 1, heartbeat_at = now() WHERE id = $1",
+        )
+        .bind(job.id)
+        .bind("dead-worker")
+        .execute(&pool)
+        .await
+        .expect("force job to running at max attempts");
+
+        let recovered = jobs
+            .recover_stranded_jobs()
+            .await
+            .expect("recover stranded jobs");
+        assert!(recovered >= 1);
+        assert_eq!(job_status(&pool, job.id).await, "failed");
+        let error = job_last_error(&pool, job.id)
+            .await
+            .expect("error was persisted");
+        assert_eq!(error, "worker restarted mid-job");
+        delete_job(&pool, job.id).await;
+    }
+
+    #[tokio::test]
+    async fn reset_stranded_checking_streams_returns_checking_to_unknown() {
+        let Some(database) = integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let pool = database.pool().clone();
+        let catalog = CatalogRepository::new(pool.clone());
+        let suffix = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let snapshot_id = Uuid::now_v7();
+        let stream_id = Uuid::now_v7();
+
+        let mut transaction = pool.begin().await.expect("begin transaction");
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, name, source_type, base_url_template, max_connections) \
+             VALUES ($1, $2, 'm3u', 'https://provider.test/', 2)",
+        )
+        .bind(account_id)
+        .bind(format!("Stranded reset test {suffix}"))
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider account");
+        sqlx::query(
+            "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) \
+             VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+        )
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(snapshot_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .expect("insert snapshot");
+        sqlx::query(
+            "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, group_name, url_template, supported) \
+             VALUES ($1, $2, $3, $4, $5, 'news', 'https://provider.test/stream', true)",
+        )
+        .bind(stream_id)
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(format!("stranded-reset-{suffix}"))
+        .bind("Stranded Reset Stream")
+        .execute(&mut *transaction)
+        .await
+        .expect("insert provider stream");
+        transaction.commit().await.expect("commit");
+
+        sqlx::query("UPDATE provider_streams SET health_status = 'checking' WHERE id = $1")
+            .bind(stream_id)
+            .execute(&pool)
+            .await
+            .expect("mark stream as checking");
+
+        let reset = catalog
+            .reset_stranded_checking_streams()
+            .await
+            .expect("reset stranded checking streams");
+        assert!(reset >= 1);
+
+        let status: String =
+            sqlx::query_scalar("SELECT health_status FROM provider_streams WHERE id = $1")
+                .bind(stream_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch stream status");
+        assert_eq!(status, "unknown");
+
+        let mut transaction = pool.begin().await.expect("begin cleanup");
+        sqlx::query("DELETE FROM stream_health_checks WHERE provider_stream_id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete health checks");
+        sqlx::query("DELETE FROM provider_streams WHERE id = $1")
+            .bind(stream_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider stream");
+        sqlx::query("DELETE FROM source_snapshots WHERE id = $1")
+            .bind(snapshot_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete snapshot");
+        sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .expect("delete provider account");
+        transaction.commit().await.expect("commit cleanup");
     }
 
     #[tokio::test]
