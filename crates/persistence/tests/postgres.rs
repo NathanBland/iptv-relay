@@ -497,7 +497,7 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
             .unwrap(),
         ProviderReconciliationFinalization::Cancelled
     );
-    assert!(jobs.cancel(parent.id).await.unwrap());
+    assert!(!jobs.cancel(parent.id).await.unwrap());
     let canceled_run_status: String =
         sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")
             .bind(run_id)
@@ -544,6 +544,47 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
         .unwrap()
         .expect("canceled runs create a fresh reconciliation run");
     assert_ne!(replacement_run.id, run_id);
+    let replacement_partition_job = jobs
+        .enqueue(&NewJob::immediate(
+            "reconcile-provider-partition",
+            json!({
+                "runId": replacement_run.id,
+                "partitionNumber": "0",
+                "sourceId": account_id,
+                "parentJobId": replacement_parent.id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        jobs.fail_reconciliation_parent_for_terminal_child(
+            replacement_parent.id,
+            &json!({"stage": "failed", "percent": 85}),
+            "reconciliation partition exhausted retries",
+        )
+        .await
+        .unwrap()
+    );
+    let failed_parent_status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+        .bind(replacement_parent.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(failed_parent_status, "failed");
+    let failed_run_status: String =
+        sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")
+            .bind(replacement_run.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(failed_run_status, "failed");
+    let canceled_sibling_status: String =
+        sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(replacement_partition_job.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(canceled_sibling_status, "cancelled");
     let preserved_run_status: String =
         sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")
             .bind(run_id)

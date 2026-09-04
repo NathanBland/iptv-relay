@@ -2110,8 +2110,28 @@ impl JobRepository {
         .await?
         .rows_affected()
             == 1;
+        let siblings_cancelled = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                locked_by = NULL, locked_at = NULL, heartbeat_at = NULL,
+                last_error = 'reconciliation parent failed'
+            WHERE payload->>'parentJobId' = $1
+              AND kind IN (
+                  'reconcile-provider-partition',
+                  'finalize-provider-reconciliation'
+              )
+              AND status IN ('queued', 'running')
+              AND coalesce(progress->>'activationLocked', 'false') <> 'true'
+            ",
+        )
+        .bind(parent_job_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            > 0;
         transaction.commit().await?;
-        Ok(run_failed || parent_failed)
+        Ok(run_failed || parent_failed || siblings_cancelled)
     }
 
     /// Fails the source refresh when any reconciliation child exhausts retries.
@@ -2172,8 +2192,28 @@ impl JobRepository {
         .await?
         .rows_affected()
             == 1;
+        let siblings_cancelled = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                locked_by = NULL, locked_at = NULL, heartbeat_at = NULL,
+                last_error = 'reconciliation parent failed'
+            WHERE payload->>'parentJobId' = $1
+              AND kind IN (
+                  'reconcile-provider-partition',
+                  'finalize-provider-reconciliation'
+              )
+              AND status IN ('queued', 'running')
+              AND coalesce(progress->>'activationLocked', 'false') <> 'true'
+            ",
+        )
+        .bind(parent_job_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            > 0;
         transaction.commit().await?;
-        Ok(run_failed || parent_failed)
+        Ok(run_failed || parent_failed || siblings_cancelled)
     }
 
     /// Cancels a queued or running job. Workers observe cancellation through
@@ -2183,36 +2223,124 @@ impl JobRepository {
     ///
     /// Returns [`PersistenceError::JobNotFound`] if no job exists and a
     /// database error if cancellation cannot be persisted.
+    #[allow(clippy::too_many_lines)]
     pub async fn cancel(&self, job_id: Uuid) -> Result<bool, PersistenceError> {
         let mut transaction = self.pool.begin().await?;
-        let kind: Option<String> = sqlx::query_scalar(
+        let target: Option<(String, Value, String, bool)> = sqlx::query_as(
             r"
-            UPDATE jobs
-            SET status = 'cancelled', completed_at = now(), updated_at = now(),
-                locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+            SELECT kind, payload, status,
+                   coalesce(progress->>'activationLocked', 'false') = 'true'
+            FROM jobs
             WHERE id = $1
-              AND status IN ('queued', 'running')
-              AND coalesce(progress->>'activationLocked', 'false') <> 'true'
-            RETURNING kind
             ",
         )
         .bind(job_id)
         .fetch_optional(&mut *transaction)
         .await?;
-        let Some(kind) = kind else {
-            let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)")
-                    .bind(job_id)
-                    .fetch_one(&mut *transaction)
-                    .await?;
+        let Some((kind, payload, status, activation_locked)) = target else {
             transaction.commit().await?;
-            return if exists {
-                Ok(false)
-            } else {
-                Err(PersistenceError::JobNotFound(job_id))
-            };
+            return Err(PersistenceError::JobNotFound(job_id));
         };
-        if kind == "refresh-source" {
+        if !matches!(status.as_str(), "queued" | "running") || activation_locked {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+
+        let child_kind = matches!(
+            kind.as_str(),
+            "reconcile-provider-partition" | "finalize-provider-reconciliation"
+        );
+        let parent_job_id = if kind == "refresh-source" {
+            Some(job_id)
+        } else if child_kind {
+            payload
+                .get("parentJobId")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<Uuid>().ok())
+        } else {
+            None
+        };
+
+        let Some(parent_job_id) = parent_job_id else {
+            let canceled = sqlx::query(
+                r"
+                UPDATE jobs
+                SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                    locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+                WHERE id = $1 AND status IN ('queued', 'running')
+                ",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+                == 1;
+            transaction.commit().await?;
+            return Ok(canceled);
+        };
+
+        let parent: Option<(String, bool)> = sqlx::query_as(
+            r"
+            SELECT status, coalesce(progress->>'activationLocked', 'false') = 'true'
+            FROM jobs
+            WHERE id = $1 AND kind = 'refresh-source'
+            FOR UPDATE
+            ",
+        )
+        .bind(parent_job_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((parent_status, parent_activation_locked)) = parent else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        if parent_activation_locked {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+
+        let parent_canceled = if matches!(parent_status.as_str(), "queued" | "running") {
+            sqlx::query(
+                r"
+                UPDATE jobs
+                SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                    locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+                WHERE id = $1 AND status IN ('queued', 'running')
+                ",
+            )
+            .bind(parent_job_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+                == 1
+        } else {
+            false
+        };
+
+        let target_canceled = if kind == "refresh-source" {
+            parent_canceled
+        } else {
+            sqlx::query(
+                r"
+                UPDATE jobs
+                SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                    locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+                WHERE id = $1 AND status IN ('queued', 'running')
+                  AND coalesce(progress->>'activationLocked', 'false') <> 'true'
+                ",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+                == 1
+        };
+        if kind == "refresh-source" && !parent_canceled {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+
+        if parent_canceled || target_canceled {
             sqlx::query(
                 r"
                 UPDATE jobs
@@ -2227,7 +2355,7 @@ impl JobRepository {
                   AND coalesce(progress->>'activationLocked', 'false') <> 'true'
                 ",
             )
-            .bind(job_id.to_string())
+            .bind(parent_job_id.to_string())
             .execute(&mut *transaction)
             .await?;
             sqlx::query(
@@ -2237,12 +2365,12 @@ impl JobRepository {
                 WHERE parent_job_id = $1 AND status IN ('queued', 'processing')
                 ",
             )
-            .bind(job_id)
+            .bind(parent_job_id)
             .execute(&mut *transaction)
             .await?;
         }
         transaction.commit().await?;
-        Ok(true)
+        Ok(parent_canceled || target_canceled)
     }
 
     /// Cancels one source refresh and its queued or running child jobs.

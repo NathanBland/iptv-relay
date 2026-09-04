@@ -840,6 +840,14 @@ async fn run_provider_reconciliation_partition_job(
     let Some((run_id, partition_number, source_id, parent_job_id)) =
         provider_reconciliation_partition_from_payload(&job.payload)
     else {
+        jobs.fail(
+            job.id,
+            worker_id,
+            job.attempts,
+            job.max_attempts,
+            "reconciliation partition payload is invalid",
+        )
+        .await?;
         if job.attempts >= job.max_attempts
             && let Some(parent_job_id) = reconciliation_parent_from_payload(&job.payload)
         {
@@ -854,14 +862,6 @@ async fn run_provider_reconciliation_partition_job(
             )
             .await?;
         }
-        jobs.fail(
-            job.id,
-            worker_id,
-            job.attempts,
-            job.max_attempts,
-            "reconciliation partition payload is invalid",
-        )
-        .await?;
         return Ok(());
     };
     if !jobs
@@ -935,6 +935,14 @@ async fn run_provider_reconciliation_partition_job(
         }
         Err(error) => {
             warn!(job_id = %job.id, run_id = %run_id, partition_number, error = %error, "reconciliation partition failed");
+            jobs.fail(
+                job.id,
+                worker_id,
+                job.attempts,
+                job.max_attempts,
+                "reconciliation partition preparation failed",
+            )
+            .await?;
             if job.attempts >= job.max_attempts {
                 jobs.fail_reconciliation_parent_if_exhausted(
                     parent_job_id,
@@ -949,14 +957,6 @@ async fn run_provider_reconciliation_partition_job(
                 )
                 .await?;
             }
-            jobs.fail(
-                job.id,
-                worker_id,
-                job.attempts,
-                job.max_attempts,
-                "reconciliation partition preparation failed",
-            )
-            .await?;
             Ok(())
         }
     }
@@ -973,6 +973,14 @@ async fn run_provider_reconciliation_finalizer_job(
     let Some((run_id, _source_id, parent_job_id)) =
         provider_reconciliation_finalizer_from_payload(&job.payload)
     else {
+        jobs.fail(
+            job.id,
+            worker_id,
+            job.attempts,
+            job.max_attempts,
+            "reconciliation finalizer payload is invalid",
+        )
+        .await?;
         if job.attempts >= job.max_attempts
             && let Some(parent_job_id) = reconciliation_parent_from_payload(&job.payload)
         {
@@ -987,14 +995,6 @@ async fn run_provider_reconciliation_finalizer_job(
             )
             .await?;
         }
-        jobs.fail(
-            job.id,
-            worker_id,
-            job.attempts,
-            job.max_attempts,
-            "reconciliation finalizer payload is invalid",
-        )
-        .await?;
         return Ok(());
     };
     if jobs.is_cancelled(parent_job_id).await.unwrap_or(true) {
@@ -1151,6 +1151,14 @@ async fn run_provider_reconciliation_finalizer_job(
         }
         Err(error) => {
             warn!(job_id = %job.id, run_id = %run_id, error = %error, "reconciliation finalizer failed");
+            jobs.fail(
+                job.id,
+                worker_id,
+                job.attempts,
+                job.max_attempts,
+                "reconciliation finalization failed",
+            )
+            .await?;
             if job.attempts >= job.max_attempts {
                 jobs.fail_reconciliation_parent_for_terminal_child(
                     parent_job_id,
@@ -1164,14 +1172,6 @@ async fn run_provider_reconciliation_finalizer_job(
                 )
                 .await?;
             }
-            jobs.fail(
-                job.id,
-                worker_id,
-                job.attempts,
-                job.max_attempts,
-                "reconciliation finalization failed",
-            )
-            .await?;
             Ok(())
         }
     }
