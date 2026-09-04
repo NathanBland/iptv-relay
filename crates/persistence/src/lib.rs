@@ -1611,6 +1611,19 @@ pub struct DeadLetterRecord {
     pub resolved_at: Option<DateTime<Utc>>,
     pub resolution: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Failure stage label derived from the job's last progress checkpoint.
+    ///
+    /// Refresh-family jobs persist a `stage` key through `JobRepository::heartbeat`.
+    /// Jobs that never reported a checkpoint archive with a NULL stage.
+    pub failure_stage: Option<String>,
+    /// Set when the originating job row carries a correlation id.
+    ///
+    /// Jobs rows currently carry no such column, so archived entries are NULL.
+    pub correlation_id: Option<Uuid>,
+    /// Set when the originating job row carries a reconciliation run id.
+    ///
+    /// Jobs rows currently carry no such column, so archived entries are NULL.
+    pub run_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug)]
@@ -2817,6 +2830,10 @@ impl JobRepository {
     /// The retry delay uses exponential backoff based on the attempt count.
     /// The delay is `2^attempts` seconds, capped at 300 seconds.
     ///
+    /// A terminal failure archives the job in the same transaction as the
+    /// status update. The archive insert rolls back together with the status
+    /// update when ownership was lost or any statement fails.
+    ///
     /// # Errors
     ///
     /// Returns [`PersistenceError::JobOwnership`] for a stale owner and
@@ -2838,6 +2855,7 @@ impl JobRepository {
         };
         let available_at = Utc::now() + chrono::Duration::seconds(delay_seconds);
         let redacted = redact_error(error_summary);
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r"
             UPDATE jobs
@@ -2852,7 +2870,7 @@ impl JobRepository {
         .bind(status)
         .bind(&redacted)
         .bind(available_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         ensure_owned(result.rows_affected(), job_id, worker_id)?;
         if !will_retry {
@@ -2861,9 +2879,10 @@ impl JobRepository {
                 r"
                 INSERT INTO dead_letter_jobs
                     (original_job_id, kind, payload, error_category, error_message,
-                     attempt_count, max_attempts, first_failed_at, last_failed_at)
+                     attempt_count, max_attempts, first_failed_at, last_failed_at,
+                     failure_stage)
                 SELECT id, kind, payload, $2, $3, attempts, max_attempts,
-                       created_at, now()
+                       created_at, now(), progress->>'stage'
                 FROM jobs WHERE id = $1
                 ON CONFLICT DO NOTHING
                 ",
@@ -2871,9 +2890,10 @@ impl JobRepository {
             .bind(job_id)
             .bind(category)
             .bind(&redacted)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2894,7 +2914,8 @@ impl JobRepository {
             r"
             SELECT id, original_job_id, kind, payload, error_category, error_message,
                    attempt_count, max_attempts, first_failed_at, last_failed_at,
-                   resolved_at, resolution, created_at
+                   resolved_at, resolution, created_at, failure_stage, correlation_id,
+                   run_id
             FROM dead_letter_jobs
             WHERE ($1::text IS NULL OR kind = $1)
               AND ($2::text IS NULL OR error_category = $2)
@@ -2926,7 +2947,8 @@ impl JobRepository {
             r"
             SELECT id, original_job_id, kind, payload, error_category, error_message,
                    attempt_count, max_attempts, first_failed_at, last_failed_at,
-                   resolved_at, resolution, created_at
+                   resolved_at, resolution, created_at, failure_stage, correlation_id,
+                   run_id
             FROM dead_letter_jobs WHERE id = $1
             ",
         )
@@ -2947,7 +2969,8 @@ impl JobRepository {
             r"
             SELECT id, original_job_id, kind, payload, error_category, error_message,
                    attempt_count, max_attempts, first_failed_at, last_failed_at,
-                   resolved_at, resolution, created_at
+                   resolved_at, resolution, created_at, failure_stage, correlation_id,
+                   run_id
             FROM dead_letter_jobs
             WHERE id = $1 AND resolved_at IS NULL
             FOR UPDATE
