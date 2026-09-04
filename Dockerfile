@@ -25,23 +25,23 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
 # Cook dependencies in release mode. This layer stays cached until
-# Cargo.toml or Cargo.lock changes. Limit cook parallelism to one job so the
-# heaviest dependency (chrono-tz) compiles alone. This keeps peak memory below
-# the local 2 vCPU / 1.9 GiB Docker Desktop limit and prevents SIGKILL during
-# cold cache builds. The cached layer makes the slower one-job cook a one-time
-# cost that is paid only when the dependency set changes.
-# BuildKit mount caches persist Rust registry and build artifacts across
-# builds even when Docker layers are invalidated, speeding up rebuilds.
+# Cargo.toml or Cargo.lock changes. The BuildKit registry mount cache
+# avoids re-downloading crates but does not shadow /build/target, so
+# the compiled deps live in the Docker layer and are cached by GHA.
+# Use -j 4 for CI runners (4 vCPU, 16 GB RAM). Set CARGO_BUILD_JOBS=1
+# to override for local Docker Desktop builds with less memory.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/build/target,sharing=locked \
-    CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo chef cook --release -j 1 --recipe-path recipe.json
+    CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \
+    cargo chef cook --release -j "${CARGO_BUILD_JOBS:-4}" --recipe-path recipe.json
 COPY . .
 # Build every runtime and test binary in one Cargo invocation. The scale-gate
 # feature also builds the normal binaries, so one invocation avoids a second
-# full release compilation. Keep one job to stay below the local memory limit.
+# full release compilation. The registry mount cache speeds up any crate
+# downloads that changed since the cook step. Binaries are copied to /tmp
+# so they survive even if a target mount cache is added later.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/build/target,sharing=locked \
-    CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 1 -p iptv-gateway --features scale-gate --bins && \
+    CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 \
+    cargo build --release --locked -j "${CARGO_BUILD_JOBS:-4}" -p iptv-gateway --features scale-gate --bins && \
     cp /build/target/release/iptv-gateway /tmp/iptv-gateway && \
     cp /build/target/release/test-provider /tmp/test-provider && \
     cp /build/target/release/media-acceptance /tmp/media-acceptance && \
