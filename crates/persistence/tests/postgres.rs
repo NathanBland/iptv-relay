@@ -61,6 +61,7 @@ impl ProviderReconciliationProgress for RecordingReconciliationProgress {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn migrations_and_job_lifecycle_are_transactionally_usable() {
     let Some(database_url) = database_url() else {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
@@ -136,6 +137,44 @@ async fn migrations_and_job_lifecycle_are_transactionally_usable() {
     assert!(!error.contains("alice"));
     assert!(!error.contains("secret"));
     assert!(!error.contains("value"));
+
+    let mut parent = NewJob::immediate("refresh-source", json!({"sourceId": "source"}));
+    parent.max_attempts = 1;
+    let parent = repository.enqueue(&parent).await.unwrap();
+    let claimed_parent = repository
+        .claim("integration-worker")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed_parent.id, parent.id);
+    repository
+        .fail(
+            parent.id,
+            "integration-worker",
+            claimed_parent.attempts,
+            claimed_parent.max_attempts,
+            "refresh scheduling failed",
+        )
+        .await
+        .unwrap();
+    assert!(
+        !repository
+            .fail_reconciliation_parent_for_terminal_child(
+                parent.id,
+                &json!({"stage": "failed", "percent": 70}),
+                "refresh scheduling failed",
+            )
+            .await
+            .unwrap()
+    );
+    let parent_state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM jobs WHERE id = $1")
+            .bind(parent.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(parent_state.0, "failed");
+    assert_eq!(parent_state.1.as_deref(), Some("refresh scheduling failed"));
 
     drop(database);
     drop_isolated_schema(&admin, &schema).await;

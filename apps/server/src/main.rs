@@ -605,6 +605,8 @@ async fn run_refresh_job(
             }
             let summary = error.persisted_summary();
             info!(job_id = %job.id, error = ?error, summary, "source refresh failed");
+            jobs.fail(job.id, worker_id, job.attempts, job.max_attempts, summary)
+                .await?;
             if source_refresh && job.attempts >= job.max_attempts {
                 jobs.fail_reconciliation_parent_for_terminal_child(
                     job.id,
@@ -617,8 +619,6 @@ async fn run_refresh_job(
                 )
                 .await?;
             }
-            jobs.fail(job.id, worker_id, job.attempts, job.max_attempts, summary)
-                .await?;
         }
     }
     Ok(())
