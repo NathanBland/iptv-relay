@@ -1060,7 +1060,6 @@ async fn run_provider_reconciliation_finalizer_job(
                 &serde_json::json!({
                     "stage": "completed",
                     "percent": 100,
-                    "recordsProcessed": 0,
                     "message": "Source refresh completed",
                 }),
             )
@@ -1102,7 +1101,6 @@ async fn run_provider_reconciliation_finalizer_job(
                 &serde_json::json!({
                     "stage": "completed",
                     "percent": 100,
-                    "recordsProcessed": 0,
                     "message": "Source refresh completed",
                 }),
             )
@@ -1129,7 +1127,6 @@ async fn run_provider_reconciliation_finalizer_job(
                 &serde_json::json!({
                     "stage": "completed",
                     "percent": 100,
-                    "recordsProcessed": 0,
                     "message": "Source refresh superseded by a newer refresh",
                 }),
             )

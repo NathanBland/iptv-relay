@@ -2048,8 +2048,9 @@ impl JobRepository {
             SET heartbeat_at = now(),
                 progress = CASE
                     WHEN coalesce(progress->>'activationLocked', 'false') = 'true'
-                    THEN $2 || jsonb_build_object('activationLocked', true)
-                    ELSE $2
+                    THEN (progress - 'activationLocked') || $2
+                         || jsonb_build_object('activationLocked', true)
+                    ELSE progress || $2
                 END,
                 updated_at = now()
             WHERE id = $1 AND kind = 'refresh-source' AND status = 'running'
@@ -2101,7 +2102,7 @@ impl JobRepository {
             UPDATE jobs
             SET status = 'succeeded', completed_at = now(), heartbeat_at = NULL,
                 locked_by = NULL, locked_at = NULL, last_error = NULL,
-                progress = $2, updated_at = now()
+                progress = (progress - 'activationLocked') || $2, updated_at = now()
             WHERE id = $1
             ",
         )

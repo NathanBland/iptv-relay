@@ -12989,7 +12989,12 @@ mod tests {
             status: "running".to_owned(),
             priority: 0,
             payload: serde_json::json!({"sourceId": source_id}),
-            progress: serde_json::json!({"stage": "reconciling-partitions", "percent": 85}),
+            progress: serde_json::json!({
+                "stage": "reconciling-partitions",
+                "percent": 85,
+                "bytesDownloaded": 4096,
+                "recordsProcessed": 7,
+            }),
             attempts: 1,
             max_attempts: 3,
             available_at: now,
@@ -13035,5 +13040,19 @@ mod tests {
             SourceSyncStatusResponse::from_job(selected).status,
             "running"
         );
+
+        jobs[1].status = "succeeded".to_owned();
+        jobs[1].progress = serde_json::json!({
+            "stage": "completed",
+            "percent": 100,
+            "bytesDownloaded": 4096,
+            "recordsProcessed": 7,
+            "message": "Source refresh completed",
+        });
+        let completed = SourceSyncStatusResponse::from_job(&jobs[1]);
+        assert_eq!(completed.status, "succeeded");
+        assert_eq!(completed.percent, 100);
+        assert_eq!(completed.bytes_downloaded, 4096);
+        assert_eq!(completed.records_processed, 7);
     }
 }
