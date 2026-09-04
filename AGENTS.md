@@ -111,6 +111,16 @@ Use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for all column additions.
 
 Use `DROP TABLE IF EXISTS` and `DROP INDEX IF EXISTS` for all drop operations.
 
+Use `CREATE INDEX CONCURRENTLY` for all index creation on large tables.
+
+Large tables have more than 100000 rows.
+
+Put each `CREATE INDEX CONCURRENTLY` in its own migration file.
+
+Add `-- no-transaction` as the first line of each concurrent index migration.
+
+Do not put more than one statement in a `-- no-transaction` migration file.
+
 Do not change an existing migration file after it is deployed.
 
 Create a new migration file for every schema change.
