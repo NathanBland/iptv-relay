@@ -1253,26 +1253,33 @@ impl SourceRepository {
             UPDATE jobs
             SET status = 'cancelled', completed_at = now(), updated_at = now(),
                 locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
-            WHERE status IN ('queued', 'running')
-              AND (
-                  (
-                      kind = 'refresh-source'
-                      AND payload->>'sourceId' = $1
+            WHERE kind = 'refresh-source'
+              AND payload->>'sourceId' = $1
+              AND status IN ('queued', 'running')
+            ",
+        )
+        .bind(&source_id_text)
+        .execute(&mut *transaction)
+        .await?;
+        // Update parents first, then children, to match the reconciliation
+        // cancellation lock order and avoid deadlocks with active workers.
+        sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+            WHERE kind IN (
+                      'reconcile-provider-partition',
+                      'finalize-provider-reconciliation'
                   )
-                  OR (
-                      kind IN (
-                          'reconcile-provider-partition',
-                          'finalize-provider-reconciliation'
-                      )
-                      AND (
-                          payload->>'sourceId' = $1
-                          OR payload->>'parentJobId' IN (
-                              SELECT id::text
-                              FROM jobs
-                              WHERE kind = 'refresh-source'
-                                AND payload->>'sourceId' = $1
-                          )
-                      )
+              AND status IN ('queued', 'running')
+              AND (
+                  payload->>'sourceId' = $1
+                  OR payload->>'parentJobId' IN (
+                      SELECT id::text
+                      FROM jobs
+                      WHERE kind = 'refresh-source'
+                        AND payload->>'sourceId' = $1
                   )
               )
             ",
