@@ -626,6 +626,33 @@ impl CatalogRepository {
             transaction.commit().await?;
             return Ok(ProviderReconciliationFinalization::Cancelled);
         }
+        // Lock the snapshot before the run. Run creation uses this same order
+        // so a parent retry cannot deadlock with finalizer publication.
+        let run_reference: Option<(Uuid, Uuid)> = sqlx::query_as(
+            r"
+            SELECT provider_account_id, source_snapshot_id
+            FROM provider_reconciliation_runs
+            WHERE id = $1
+            ",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((account_id, snapshot_id)) = run_reference else {
+            return Err(PersistenceError::InvalidSource(
+                "reconciliation run was not found".to_owned(),
+            ));
+        };
+        sqlx::query(
+            "SELECT 1 FROM source_snapshots WHERE id = $1 AND provider_account_id = $2 FOR UPDATE",
+        )
+        .bind(snapshot_id)
+        .bind(account_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            PersistenceError::InvalidSource("staged provider snapshot was not found".to_owned())
+        })?;
         let run: Option<(Uuid, Uuid, String)> = sqlx::query_as(
             r"
             SELECT provider_account_id, source_snapshot_id, status

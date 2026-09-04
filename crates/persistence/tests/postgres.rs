@@ -274,6 +274,103 @@ async fn provider_reconciliation_partitions_conserve_canonical_key_counts() {
 }
 
 #[tokio::test]
+async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let jobs = JobRepository::new(pool.clone());
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    let run_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template)
+         VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("lock-order-{account_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots
+            (id, provider_account_id, kind, status, checksum_sha256, byte_count,
+             record_count, staged_at)
+         VALUES ($1, $2, 'm3u', 'staging', $3, 0, 0, now())",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(format!("lock-order-{snapshot_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let parent = jobs
+        .enqueue(&NewJob::immediate(
+            "refresh-source",
+            json!({"sourceId": account_id}),
+        ))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_reconciliation_runs
+            (id, provider_account_id, source_snapshot_id, parent_job_id,
+             status, partition_count, total_keys, completed_keys)
+         VALUES ($1, $2, $3, $4, 'processing', 1, 0, 0)",
+    )
+    .bind(run_id)
+    .bind(account_id)
+    .bind(snapshot_id)
+    .bind(parent.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_reconciliation_partitions
+            (run_id, partition_number, status, key_count, completed_keys)
+         VALUES ($1, 0, 'succeeded', 0, 0)",
+    )
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let finalizer = jobs
+        .enqueue(&NewJob::immediate(
+            "finalize-provider-reconciliation",
+            json!({
+                "runId": run_id,
+                "sourceId": account_id,
+                "parentJobId": parent.id,
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let create_catalog = catalog.clone();
+    let finalize_catalog = catalog.clone();
+    let (create_result, finalize_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            tokio::join!(
+                create_catalog.create_or_load_provider_reconciliation_run(
+                    snapshot_id,
+                    parent.id,
+                    1,
+                ),
+                finalize_catalog.finalize_provider_reconciliation(run_id, parent.id, finalizer.id,),
+            )
+        })
+        .await
+        .expect("reconciliation transactions should complete without a deadlock");
+    assert!(create_result.is_ok());
+    assert!(finalize_result.is_ok());
+
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn canceled_parent_cannot_publish_provider_reconciliation() {
     let Some(database_url) = database_url() else {
