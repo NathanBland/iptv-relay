@@ -373,11 +373,25 @@ async fn worker() -> Result<()> {
     });
 
     // Spawn the scheduler that enqueues low-priority health probe jobs.
+    // Health probes are disabled by default. Set IPTV_HEALTH_PROBES_ENABLED=true
+    // to enable them. When enabled, only streams mapped to enabled channels
+    // are probed.
+    let health_probes_enabled = env::var("IPTV_HEALTH_PROBES_ENABLED")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"));
     let probe_catalog = catalog.clone();
     let probe_jobs = repository.clone();
-    let probe_scheduler_handle = tokio::spawn(async move {
-        health_probe_scheduler(&probe_catalog, &probe_jobs).await;
-    });
+    let probe_scheduler_handle = if health_probes_enabled {
+        info!("health probe scheduler enabled");
+        tokio::spawn(async move {
+            health_probe_scheduler(&probe_catalog, &probe_jobs).await;
+        })
+    } else {
+        info!("health probe scheduler disabled (set IPTV_HEALTH_PROBES_ENABLED=true to enable)");
+        tokio::spawn(async move {
+            // Idle task that does nothing when probes are disabled.
+            shutdown_signal().await;
+        })
+    };
 
     // Spawn the reaper that resets jobs whose heartbeat is older than the
     // lease timeout. A worker that crashed or lost its lease leaves a job

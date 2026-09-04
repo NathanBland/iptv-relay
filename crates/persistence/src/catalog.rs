@@ -3905,9 +3905,11 @@ impl CatalogRepository {
 
     /// Lists provider streams that need a health probe.
     ///
-    /// The query selects streams in `unknown` or `dead` status, plus streams
-    /// stuck in `checking` longer than `stranded_timeout_seconds`. The
-    /// scheduler uses this to enqueue low-priority probe jobs.
+    /// The query selects only streams mapped to enabled channels with status
+    /// `unknown` or `dead`, plus streams stuck in `checking` longer than
+    /// `stranded_timeout_seconds`. The scheduler uses this to enqueue
+    /// low-priority probe jobs. Streams without a channel mapping are not
+    /// probed, which bounds the probe backlog to the channel count.
     ///
     /// # Errors
     ///
@@ -3921,7 +3923,7 @@ impl CatalogRepository {
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
         let rows: Vec<StreamHealthRow> = sqlx::query_as(
             r"
-            SELECT ps.id AS provider_stream_id, ps.name AS stream_name,
+            SELECT DISTINCT ps.id AS provider_stream_id, ps.name AS stream_name,
                    ps.group_name, ps.health_status, ps.health_checked_at,
                    ps.health_error, ps.video_codec, ps.video_resolution,
                    ps.video_width, ps.video_height,
@@ -3930,6 +3932,8 @@ impl CatalogRepository {
                    ps.bitrate_kbps, ps.provider_account_id
             FROM provider_streams ps
             JOIN provider_accounts pa ON pa.id = ps.provider_account_id
+            JOIN channel_streams cs ON cs.provider_stream_id = ps.id
+            JOIN channels c ON c.id = cs.channel_id AND c.enabled
             WHERE ps.supported = true
               AND pa.enabled = true
               AND (
