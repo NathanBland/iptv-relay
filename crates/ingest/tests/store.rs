@@ -499,6 +499,147 @@ async fn activate_reports_durable_progress_after_each_database_batch() {
 }
 
 #[tokio::test]
+async fn stage_commits_immutable_rows_before_atomic_activation() {
+    let Some(pool) = pool().await else {
+        eprintln!("{DATABASE_URL_ENV} is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let account_id = create_provider_account(&pool).await;
+    let store = iptv_ingest::PgSnapshotStore::new(pool.clone());
+    let mut streams = StagedRows::new(1_000);
+    streams
+        .push(provider_stream("durable-one"))
+        .expect("stage stream");
+    streams
+        .push(provider_stream("durable-two"))
+        .expect("stage stream");
+    let snapshot_id = Uuid::now_v7();
+    let snapshot = PreparedSnapshot {
+        id: snapshot_id,
+        owner: SnapshotOwner::ProviderAccount(account_id),
+        format: IngestFormat::M3u,
+        checksum_sha256: format!("{:064x}", snapshot_id.as_u128()),
+        byte_count: 2,
+        record_count: 2,
+        diagnostic_count: 0,
+        diagnostics: json!([]),
+        provider_streams: streams,
+        epg_channels: StagedRows::new(1_000),
+        programmes: StagedRows::new(1_000),
+    };
+
+    assert_eq!(store.stage(&snapshot).await.expect("stage"), snapshot_id);
+    assert_eq!(snapshot_status(&pool, snapshot_id).await, "staging");
+    let staged_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT staged_at FROM source_snapshots WHERE id = $1")
+            .bind(snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .expect("staged timestamp");
+    assert!(staged_at.is_some());
+    let staged_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM provider_streams WHERE snapshot_id = $1")
+            .bind(snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .expect("staged rows");
+    assert_eq!(staged_rows, 2);
+    assert!(active_snapshot_id(&pool, account_id).await.is_none());
+
+    assert_eq!(
+        store
+            .activate_staged(snapshot_id)
+            .await
+            .expect("activate staged"),
+        snapshot_id
+    );
+    assert_eq!(snapshot_status(&pool, snapshot_id).await, "active");
+
+    cleanup_provider(&pool, account_id).await;
+}
+
+#[tokio::test]
+async fn staging_same_checksum_is_idempotent_and_discard_preserves_active_data() {
+    let Some(pool) = pool().await else {
+        eprintln!("{DATABASE_URL_ENV} is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let account_id = create_provider_account(&pool).await;
+    let store = iptv_ingest::PgSnapshotStore::new(pool.clone());
+    let snapshot_id = Uuid::now_v7();
+    let mut streams = StagedRows::new(1_000);
+    streams
+        .push(provider_stream("idempotent"))
+        .expect("stage stream");
+    let snapshot = PreparedSnapshot {
+        id: snapshot_id,
+        owner: SnapshotOwner::ProviderAccount(account_id),
+        format: IngestFormat::M3u,
+        checksum_sha256: "idempotent-checksum".repeat(4),
+        byte_count: 1,
+        record_count: 1,
+        diagnostic_count: 0,
+        diagnostics: json!([]),
+        provider_streams: streams,
+        epg_channels: StagedRows::new(1_000),
+        programmes: StagedRows::new(1_000),
+    };
+    assert_eq!(store.stage(&snapshot).await.expect("stage"), snapshot_id);
+    assert_eq!(
+        store.stage(&snapshot).await.expect("stage again"),
+        snapshot_id
+    );
+    assert!(store.discard_staged(snapshot_id).await.expect("discard"));
+    assert!(active_snapshot_id(&pool, account_id).await.is_none());
+    assert!(
+        !store
+            .discard_staged(snapshot_id)
+            .await
+            .expect("discard again")
+    );
+
+    cleanup_provider(&pool, account_id).await;
+}
+
+#[tokio::test]
+async fn failed_staged_activation_keeps_the_previous_active_snapshot() {
+    let Some(pool) = pool().await else {
+        eprintln!("{DATABASE_URL_ENV} is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let account_id = create_provider_account(&pool).await;
+    let store = iptv_ingest::PgSnapshotStore::new(pool.clone());
+
+    let active = provider_snapshot(
+        account_id,
+        IngestFormat::M3u,
+        vec![provider_stream("active")],
+    );
+    let active_id = active.id;
+    assert_eq!(store.activate(&active).await.expect("active"), active_id);
+
+    let staged = provider_snapshot(
+        account_id,
+        IngestFormat::M3u,
+        vec![provider_stream("staged")],
+    );
+    let staged_id = staged.id;
+    let mut staged = staged;
+    staged.record_count = 1;
+    store.stage(&staged).await.expect("stage replacement");
+    sqlx::query("DELETE FROM provider_streams WHERE snapshot_id = $1")
+        .bind(staged_id)
+        .execute(&pool)
+        .await
+        .expect("remove staged row");
+
+    assert!(store.activate_staged(staged_id).await.is_err());
+    assert_eq!(active_snapshot_id(&pool, account_id).await, Some(active_id));
+    assert!(store.discard_staged(staged_id).await.expect("discard"));
+    cleanup_provider(&pool, account_id).await;
+}
+
+#[tokio::test]
 async fn activate_batches_programmes_across_the_batch_boundary() {
     let Some(pool) = pool().await else {
         eprintln!("{DATABASE_URL_ENV} is unset; skipping PostgreSQL integration test");

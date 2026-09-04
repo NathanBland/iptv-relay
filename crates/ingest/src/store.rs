@@ -50,6 +50,237 @@ impl PgSnapshotStore {
         &self.pool
     }
 
+    /// Stores a complete snapshot with `staging` status.
+    ///
+    /// The transaction commits before a worker reads the snapshot. Active
+    /// provider and guide data remains unchanged until `activate_staged`.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn stage(&self, snapshot: &PreparedSnapshot) -> Result<Uuid, IngestError> {
+        self.stage_with_progress(snapshot, &NoopActivationProgress)
+            .await
+    }
+
+    /// Stores one immutable snapshot and reports each completed write batch.
+    ///
+    /// A failed checkpoint rolls back the staging transaction. A successful
+    /// return means that workers can read the rows from a new transaction.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn stage_with_progress(
+        &self,
+        snapshot: &PreparedSnapshot,
+        progress: &dyn ActivationProgress,
+    ) -> Result<Uuid, IngestError> {
+        validate_snapshot(snapshot)?;
+        let byte_count = to_i64(snapshot.byte_count)?;
+        let record_count = to_i64(snapshot.record_count)?;
+        let diagnostic_count = to_i64(snapshot.diagnostic_count)?;
+        let provider_account_id = match snapshot.owner {
+            SnapshotOwner::ProviderAccount(id) => Some(id),
+            SnapshotOwner::EpgSource(_) => None,
+        };
+        let epg_source_id = match snapshot.owner {
+            SnapshotOwner::ProviderAccount(_) => None,
+            SnapshotOwner::EpgSource(id) => Some(id),
+        };
+
+        let mut transaction = self.pool.begin().await?;
+        if let Some((existing_id, status)) = sqlx::query_as::<_, (Uuid, String)>(
+            r"
+            SELECT id, status
+            FROM source_snapshots
+            WHERE provider_account_id IS NOT DISTINCT FROM $1
+              AND epg_source_id IS NOT DISTINCT FROM $2
+              AND kind = $3 AND checksum_sha256 = $4
+            FOR UPDATE
+            ",
+        )
+        .bind(provider_account_id)
+        .bind(epg_source_id)
+        .bind(snapshot.format.snapshot_kind())
+        .bind(&snapshot.checksum_sha256)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            if status == "active" {
+                transaction.commit().await?;
+                progress
+                    .checkpoint(snapshot.record_count, snapshot.record_count)
+                    .await?;
+                return Ok(existing_id);
+            }
+            if status == "staging" {
+                let complete = staged_row_count(&mut transaction, existing_id).await?;
+                if complete == snapshot.record_count {
+                    transaction.commit().await?;
+                    progress
+                        .checkpoint(snapshot.record_count, snapshot.record_count)
+                        .await?;
+                    return Ok(existing_id);
+                }
+                return Err(IngestError::InvalidRequest(
+                    "matching staged snapshot is incomplete; discard it before retrying",
+                ));
+            }
+            if status == "superseded" {
+                let complete = staged_row_count(&mut transaction, existing_id).await?;
+                if complete != snapshot.record_count {
+                    return Err(IngestError::InvalidRequest(
+                        "matching superseded snapshot is incomplete",
+                    ));
+                }
+                sqlx::query(
+                    "UPDATE source_snapshots SET status = 'staging', staged_at = now(), activated_at = NULL WHERE id = $1",
+                )
+                .bind(existing_id)
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                progress
+                    .checkpoint(snapshot.record_count, snapshot.record_count)
+                    .await?;
+                return Ok(existing_id);
+            }
+            // Rejected snapshots remain audit records and cannot be reused.
+            return Err(IngestError::InvalidRequest(
+                "matching snapshot already exists in a terminal state",
+            ));
+        }
+
+        insert_snapshot_header(
+            &mut transaction,
+            snapshot,
+            provider_account_id,
+            epg_source_id,
+            byte_count,
+            record_count,
+            diagnostic_count,
+        )
+        .await?;
+        let mut records_staged = 0_u64;
+        insert_provider_streams(
+            &mut transaction,
+            snapshot.id,
+            provider_account_id,
+            &snapshot.provider_streams,
+            progress,
+            &mut records_staged,
+            snapshot.record_count,
+        )
+        .await?;
+        insert_epg_channels(
+            &mut transaction,
+            snapshot.id,
+            provider_account_id,
+            epg_source_id,
+            snapshot.format.snapshot_kind(),
+            &snapshot.epg_channels,
+            progress,
+            &mut records_staged,
+            snapshot.record_count,
+        )
+        .await?;
+        insert_programmes(
+            &mut transaction,
+            snapshot.id,
+            &snapshot.programmes,
+            progress,
+            &mut records_staged,
+            snapshot.record_count,
+        )
+        .await?;
+        if records_staged != snapshot.record_count {
+            return Err(IngestError::InvalidRequest(
+                "snapshot staging count does not match record count",
+            ));
+        }
+        sqlx::query("UPDATE source_snapshots SET staged_at = now() WHERE id = $1")
+            .bind(snapshot.id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(snapshot.id)
+    }
+
+    /// Publishes a complete staged snapshot in one transaction.
+    ///
+    /// The previous active snapshot remains visible until this transaction
+    /// commits. The method is idempotent when the snapshot is already active.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn activate_staged(&self, snapshot_id: Uuid) -> Result<Uuid, IngestError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<Uuid>,
+                Option<Uuid>,
+                String,
+                String,
+                i64,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
+        >(
+            r"
+            SELECT provider_account_id, epg_source_id, kind, status,
+                   record_count, staged_at
+            FROM source_snapshots
+            WHERE id = $1
+            FOR UPDATE
+            ",
+        )
+        .bind(snapshot_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(IngestError::InvalidRequest("staged snapshot was not found"))?;
+        let (provider_account_id, epg_source_id, kind, status, record_count, staged_at) = row;
+        if status == "active" {
+            transaction.commit().await?;
+            return Ok(snapshot_id);
+        }
+        if status != "staging" || staged_at.is_none() {
+            return Err(IngestError::InvalidRequest(
+                "snapshot is not ready for activation",
+            ));
+        }
+        let actual_count = staged_row_count(&mut transaction, snapshot_id).await?;
+        if actual_count != u64::try_from(record_count).unwrap_or(u64::MAX) {
+            return Err(IngestError::InvalidRequest(
+                "staged snapshot record count does not match its header",
+            ));
+        }
+        supersede_current(
+            &mut transaction,
+            provider_account_id,
+            epg_source_id,
+            &kind,
+            snapshot_id,
+        )
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE source_snapshots SET status = 'active', activated_at = now() WHERE id = $1 AND status = 'staging'",
+        )
+        .bind(snapshot_id)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(IngestError::InvalidRequest(
+                "staged snapshot was not activatable",
+            ));
+        }
+        transaction.commit().await?;
+        Ok(snapshot_id)
+    }
+
+    /// Removes an incomplete staged snapshot without changing active data.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn discard_staged(&self, snapshot_id: Uuid) -> Result<bool, IngestError> {
+        let deleted =
+            sqlx::query("DELETE FROM source_snapshots WHERE id = $1 AND status = 'staging'")
+                .bind(snapshot_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(deleted.rows_affected() == 1)
+    }
+
     /// Inserts a complete immutable snapshot and activates it in one transaction.
     /// Any failure rolls back staging and leaves the previous active snapshot untouched.
     #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
@@ -68,12 +299,7 @@ impl PgSnapshotStore {
         snapshot: &PreparedSnapshot,
         progress: &dyn ActivationProgress,
     ) -> Result<Uuid, IngestError> {
-        if !snapshot.is_nonempty() {
-            return Err(IngestError::EmptySnapshot {
-                format: snapshot.format.display_name(),
-            });
-        }
-        validate_owner(snapshot)?;
+        validate_snapshot(snapshot)?;
         let byte_count = to_i64(snapshot.byte_count)?;
         let record_count = to_i64(snapshot.record_count)?;
         let diagnostic_count = to_i64(snapshot.diagnostic_count)?;
@@ -125,25 +351,15 @@ impl PgSnapshotStore {
             return Ok(existing_id);
         }
 
-        sqlx::query(
-            r"
-            INSERT INTO source_snapshots (
-                id, provider_account_id, epg_source_id, kind, status,
-                checksum_sha256, byte_count, record_count, diagnostic_count, diagnostics
-            )
-            VALUES ($1, $2, $3, $4, 'staging', $5, $6, $7, $8, $9)
-            ",
+        insert_snapshot_header(
+            &mut transaction,
+            snapshot,
+            provider_account_id,
+            epg_source_id,
+            byte_count,
+            record_count,
+            diagnostic_count,
         )
-        .bind(snapshot.id)
-        .bind(provider_account_id)
-        .bind(epg_source_id)
-        .bind(snapshot.format.snapshot_kind())
-        .bind(&snapshot.checksum_sha256)
-        .bind(byte_count)
-        .bind(record_count)
-        .bind(diagnostic_count)
-        .bind(&snapshot.diagnostics)
-        .execute(&mut *transaction)
         .await?;
 
         let records_total = snapshot.record_count;
@@ -212,6 +428,66 @@ impl PgSnapshotStore {
         transaction.commit().await?;
         Ok(snapshot.id)
     }
+}
+
+fn validate_snapshot(snapshot: &PreparedSnapshot) -> Result<(), IngestError> {
+    if !snapshot.is_nonempty() {
+        return Err(IngestError::EmptySnapshot {
+            format: snapshot.format.display_name(),
+        });
+    }
+    validate_owner(snapshot)
+}
+
+async fn insert_snapshot_header(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    snapshot: &PreparedSnapshot,
+    provider_account_id: Option<Uuid>,
+    epg_source_id: Option<Uuid>,
+    byte_count: i64,
+    record_count: i64,
+    diagnostic_count: i64,
+) -> Result<(), IngestError> {
+    sqlx::query(
+        r"
+        INSERT INTO source_snapshots (
+            id, provider_account_id, epg_source_id, kind, status,
+            checksum_sha256, byte_count, record_count, diagnostic_count, diagnostics
+        )
+        VALUES ($1, $2, $3, $4, 'staging', $5, $6, $7, $8, $9)
+        ",
+    )
+    .bind(snapshot.id)
+    .bind(provider_account_id)
+    .bind(epg_source_id)
+    .bind(snapshot.format.snapshot_kind())
+    .bind(&snapshot.checksum_sha256)
+    .bind(byte_count)
+    .bind(record_count)
+    .bind(diagnostic_count)
+    .bind(&snapshot.diagnostics)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn staged_row_count(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    snapshot_id: Uuid,
+) -> Result<u64, IngestError> {
+    let count: i64 = sqlx::query_scalar(
+        r"
+        SELECT
+            (SELECT count(*) FROM provider_streams WHERE snapshot_id = $1)
+          + (SELECT count(*) FROM epg_channels WHERE source_snapshot_id = $1)
+          + (SELECT count(*) FROM programmes WHERE source_snapshot_id = $1)
+        ",
+    )
+    .bind(snapshot_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    u64::try_from(count)
+        .map_err(|_| IngestError::InvalidRequest("staged snapshot count is negative"))
 }
 
 fn validate_owner(snapshot: &PreparedSnapshot) -> Result<(), IngestError> {
