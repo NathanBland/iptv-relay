@@ -501,6 +501,7 @@ async fn process_job(
 
 /// Runs one source or Xtream short-EPG refresh job with a heartbeat task and
 /// persists the typed result.
+#[allow(clippy::too_many_lines)]
 async fn run_refresh_job(
     jobs: &JobRepository,
     sources: &SourceRepository,
@@ -604,6 +605,18 @@ async fn run_refresh_job(
             }
             let summary = error.persisted_summary();
             info!(job_id = %job.id, error = ?error, summary, "source refresh failed");
+            if source_refresh && job.attempts >= job.max_attempts {
+                jobs.fail_reconciliation_parent_for_terminal_child(
+                    job.id,
+                    &serde_json::json!({
+                        "stage": "failed",
+                        "percent": 70,
+                        "message": summary,
+                    }),
+                    summary,
+                )
+                .await?;
+            }
             jobs.fail(job.id, worker_id, job.attempts, job.max_attempts, summary)
                 .await?;
         }
@@ -788,6 +801,16 @@ async fn schedule_provider_reconciliation(
                 RefreshError::Catalog
             })?;
     }
+    if !jobs
+        .reconciliation_partition_jobs_are_present(run.id)
+        .await
+        .map_err(|error| {
+            warn!(run_id = %run.id, error = %error, "could not verify reconciliation partition jobs");
+            RefreshError::Catalog
+        })?
+    {
+        return Err(RefreshError::Catalog);
+    }
     // A first finalizer can return `Pending` before worker jobs complete. The
     // final completed partition schedules another attempt.
     jobs.enqueue_provider_reconciliation_finalizer_if_idle(run.id, source_id, parent_job_id)
@@ -827,6 +850,7 @@ async fn run_provider_reconciliation_partition_job(
                     "percent": 85,
                     "message": "Reconciliation partition payload remained invalid after retries",
                 }),
+                "reconciliation partition payload remained invalid after retries",
             )
             .await?;
         }
@@ -959,6 +983,7 @@ async fn run_provider_reconciliation_finalizer_job(
                     "percent": 99,
                     "message": "Reconciliation finalizer payload remained invalid after retries",
                 }),
+                "reconciliation finalizer payload remained invalid after retries",
             )
             .await?;
         }
@@ -1135,6 +1160,7 @@ async fn run_provider_reconciliation_finalizer_job(
                         "runId": run_id,
                         "message": "Reconciliation finalizer exhausted retries",
                     }),
+                    "reconciliation finalizer exhausted retries",
                 )
                 .await?;
             }

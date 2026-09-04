@@ -1726,6 +1726,38 @@ impl JobRepository {
         Ok(record)
     }
 
+    /// Checks that every unfinished reconciliation partition has an open job.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn reconciliation_partition_jobs_are_present(
+        &self,
+        run_id: Uuid,
+    ) -> Result<bool, PersistenceError> {
+        let run_id_text = run_id.to_string();
+        let complete: bool = sqlx::query_scalar(
+            r"
+            SELECT NOT EXISTS (
+                SELECT 1
+                FROM provider_reconciliation_partitions p
+                WHERE p.run_id = $1
+                  AND p.status IN ('queued', 'processing')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM jobs j
+                      WHERE j.kind = 'reconcile-provider-partition'
+                        AND j.status IN ('queued', 'running')
+                        AND j.payload->>'runId' = $2
+                        AND j.payload->>'partitionNumber' = p.partition_number::text
+                  )
+            )
+            ",
+        )
+        .bind(run_id)
+        .bind(run_id_text)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(complete)
+    }
+
     /// Enqueues one finalizer job when no finalizer for the run is open.
     ///
     /// A finalizer can complete while partitions remain. The last completed
@@ -2088,6 +2120,7 @@ impl JobRepository {
         &self,
         parent_job_id: Uuid,
         progress: &Value,
+        error_summary: &str,
     ) -> Result<bool, PersistenceError> {
         let mut transaction = self.pool.begin().await?;
         let parent_status: Option<String> = sqlx::query_scalar(
@@ -2127,13 +2160,14 @@ impl JobRepository {
             UPDATE jobs
             SET status = 'failed', completed_at = now(), heartbeat_at = NULL,
                 locked_by = NULL, locked_at = NULL, progress = $2,
-                last_error = 'reconciliation child exhausted retries', updated_at = now()
+                last_error = $3, updated_at = now()
             WHERE id = $1 AND kind = 'refresh-source'
               AND status IN ('queued', 'running')
             ",
         )
         .bind(parent_job_id)
         .bind(progress)
+        .bind(redact_error(error_summary))
         .execute(&mut *transaction)
         .await?
         .rows_affected()
