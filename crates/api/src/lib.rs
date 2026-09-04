@@ -3640,26 +3640,12 @@ async fn source_sync_status(
         )
         .response();
     };
-    let jobs = match job_repository.list_recent(500).await {
+    let jobs = match job_repository.list_recent_source_sync(source_id, 500).await {
         Ok(jobs) => jobs,
         Err(error) => return persistence_error_response(error),
     };
     let target = source_id.to_string();
-    let matches: Vec<_> = jobs
-        .iter()
-        .filter(|job| {
-            job.kind == "refresh-source"
-                && job.payload.get("sourceId").and_then(|v| v.as_str()) == Some(&target)
-        })
-        .collect();
-    // Prefer an active job (running or queued) over a terminal one so the
-    // UI shows live progress even when a retry or scheduled refresh created
-    // a newer terminal job.
-    let most_recent = matches
-        .iter()
-        .find(|job| job.status == "running" || job.status == "queued")
-        .or_else(|| matches.first());
-    match most_recent {
+    match select_source_sync_job(&jobs, &target) {
         Some(job) => Json(SourceSyncStatusResponse::from_job(job)).into_response(),
         None => ProblemDetails::new(
             StatusCode::NOT_FOUND,
@@ -3705,17 +3691,14 @@ async fn cancel_source_sync(
         )
         .response();
     };
-    let jobs = match job_repository.list_recent(500).await {
+    let jobs = match job_repository.list_recent_source_sync(source_id, 500).await {
         Ok(jobs) => jobs,
         Err(error) => return persistence_error_response(error),
     };
     let target = source_id.to_string();
-    let active_job = jobs.iter().find(|job| {
-        job.kind == "refresh-source"
-            && job.payload.get("sourceId").and_then(|v| v.as_str()) == Some(&target)
-            && (job.status == "queued" || job.status == "running")
-    });
-    let Some(job) = active_job else {
+    let Some(parent) = latest_source_refresh_job(&jobs, &target)
+        .filter(|job| job.status == "queued" || job.status == "running")
+    else {
         return ProblemDetails::new(
             StatusCode::NOT_FOUND,
             "sync-not-active",
@@ -3724,7 +3707,7 @@ async fn cancel_source_sync(
         )
         .response();
     };
-    match job_repository.cancel(job.id).await {
+    match job_repository.cancel_source_sync(parent.id).await {
         Ok(true) => Json(SaveResult {
             ok: true,
             message: "Sync cancelled.".to_owned(),
@@ -5488,7 +5471,48 @@ struct CatalogEvent {
     timestamp: DateTime<Utc>,
 }
 
-/// Deduplicate refresh-source jobs by source ID for SSE emission.
+fn latest_source_refresh_job<'a>(jobs: &'a [JobRecord], source_id: &str) -> Option<&'a JobRecord> {
+    jobs.iter()
+        .filter(|job| {
+            job.kind == "refresh-source"
+                && job
+                    .payload
+                    .get("sourceId")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(source_id)
+        })
+        .max_by_key(|job| (job.created_at, job.id))
+}
+
+fn sync_child_parent_id(job: &JobRecord) -> Option<&str> {
+    match job.kind.as_str() {
+        "reconcile-provider-partition" | "finalize-provider-reconciliation" => job
+            .payload
+            .get("parentJobId")
+            .and_then(serde_json::Value::as_str),
+        _ => None,
+    }
+}
+
+fn select_source_sync_job<'a>(jobs: &'a [JobRecord], source_id: &str) -> Option<&'a JobRecord> {
+    let parent = latest_source_refresh_job(jobs, source_id)?;
+    let parent_id = parent.id.to_string();
+    let priority = |status: &str| -> u8 {
+        match status {
+            "running" => 4,
+            "queued" => 3,
+            "succeeded" | "failed" => 2,
+            "cancelled" => 1,
+            _ => 0,
+        }
+    };
+    jobs.iter()
+        .filter(|job| sync_child_parent_id(job) == Some(parent_id.as_str()))
+        .max_by_key(|job| (priority(job.status.as_str()), job.updated_at, job.id))
+        .or(Some(parent))
+}
+
+/// Deduplicate refresh and reconciliation jobs by source ID for SSE emission.
 ///
 /// Priority: running > queued > succeeded/failed > cancelled.
 /// Terminal jobs are only included for 60 seconds after their last
@@ -5504,22 +5528,44 @@ fn dedup_sync_progress(jobs: &[JobRecord]) -> Vec<(&str, &JobRecord)> {
             _ => 0,
         }
     };
+    let mut latest_parents = std::collections::HashMap::new();
+    for job in jobs.iter().filter(|job| job.kind == "refresh-source") {
+        let source_id = job
+            .payload
+            .get("sourceId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let replace = latest_parents
+            .get(source_id)
+            .is_none_or(|existing: &&JobRecord| {
+                (job.created_at, job.id) > (existing.created_at, existing.id)
+            });
+        if replace {
+            latest_parents.insert(source_id, job);
+        }
+    }
     let mut seen: std::collections::HashMap<&str, &JobRecord> = std::collections::HashMap::new();
-    for job in jobs.iter().filter(|job| {
-        if job.kind != "refresh-source" {
-            return false;
-        }
-        match job.status.as_str() {
-            "queued" | "running" => true,
-            "succeeded" | "failed" | "cancelled" => (now - job.updated_at).num_seconds() < 60,
-            _ => false,
-        }
+    for job in jobs.iter().filter(|job| match job.status.as_str() {
+        "queued" | "running" => true,
+        "succeeded" | "failed" | "cancelled" => (now - job.updated_at).num_seconds() < 60,
+        _ => false,
     }) {
         let source_id = job
             .payload
             .get("sourceId")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
+        let Some(parent) = latest_parents.get(source_id) else {
+            continue;
+        };
+        let parent_id = parent.id.to_string();
+        if let Some(child_parent_id) = sync_child_parent_id(job) {
+            if child_parent_id != parent_id {
+                continue;
+            }
+        } else if job.kind != "refresh-source" || parent.id != job.id {
+            continue;
+        }
         let existing = seen.get(source_id);
         if existing.is_none()
             || priority(job.status.as_str()) > priority(existing.unwrap().status.as_str())
@@ -12927,5 +12973,56 @@ mod tests {
                 .unwrap()
                 .starts_with("event: heartbeat\n")
         );
+    }
+
+    #[test]
+    fn source_sync_status_selects_reconciliation_child_for_latest_parent() {
+        let source_id = Uuid::now_v7();
+        let parent_id = Uuid::now_v7();
+        let child_id = Uuid::now_v7();
+        let now = Utc::now();
+        let parent = JobRecord {
+            id: parent_id,
+            kind: "refresh-source".to_owned(),
+            status: "running".to_owned(),
+            priority: 0,
+            payload: serde_json::json!({"sourceId": source_id}),
+            progress: serde_json::json!({"stage": "reconciling-partitions", "percent": 85}),
+            attempts: 1,
+            max_attempts: 3,
+            available_at: now,
+            locked_by: Some("worker".to_owned()),
+            locked_at: Some(now),
+            heartbeat_at: Some(now),
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        let child = JobRecord {
+            id: child_id,
+            kind: "reconcile-provider-partition".to_owned(),
+            status: "running".to_owned(),
+            priority: 0,
+            payload: serde_json::json!({
+                "sourceId": source_id,
+                "parentJobId": parent_id,
+            }),
+            progress: serde_json::json!({"stage": "reconciling-partition", "percent": 92}),
+            attempts: 1,
+            max_attempts: 3,
+            available_at: now,
+            locked_by: Some("worker".to_owned()),
+            locked_at: Some(now),
+            heartbeat_at: Some(now),
+            last_error: None,
+            created_at: now + chrono::Duration::milliseconds(1),
+            updated_at: now + chrono::Duration::milliseconds(1),
+            completed_at: None,
+        };
+        let jobs = vec![child, parent];
+        let selected = select_source_sync_job(&jobs, &source_id.to_string()).expect("job exists");
+        assert_eq!(selected.id, child_id);
+        assert_eq!(SourceSyncStatusResponse::from_job(selected).percent, 92);
     }
 }
