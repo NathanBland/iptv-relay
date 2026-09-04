@@ -130,6 +130,9 @@ describe('management pages', () => {
       password: 'secret',
       endpoint: '',
     })))
+    await userEvent.click(screen.getByRole('button', { name: /Add source/ }))
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Source type' }), 'Xtream')
+    expect(screen.getByLabelText('Password')).toHaveValue('')
   })
 
   it('filters and sorts the TanStack channel table', async () => {

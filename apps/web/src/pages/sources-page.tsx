@@ -165,6 +165,7 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
     validators: { onSubmit: sourceSchema },
     onSubmit: async ({ value }) => {
       await mutation.mutateAsync(value)
+      form.reset()
     },
   })
 

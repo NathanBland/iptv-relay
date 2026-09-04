@@ -358,19 +358,46 @@ struct SystemInfo {
     versions: RuntimeVersions,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct CreateSourceRequest {
     name: String,
     kind: String,
     /// Use `endpoint` for M3U, XMLTV, and network-tuner sources.
+    #[schema(write_only = true)]
     endpoint: Option<String>,
     /// Use `serverUrl`, `username`, and `password` for a standard Xtream source.
     /// Keep `endpoint` for an advanced, complete `player_api.php` URL.
+    #[schema(write_only = true)]
     server_url: Option<String>,
+    #[schema(write_only = true)]
     username: Option<String>,
+    #[schema(write_only = true)]
     password: Option<String>,
     timezone: Option<String>,
+}
+
+impl fmt::Debug for CreateSourceRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateSourceRequest")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("endpoint", &redacted_option(self.endpoint.as_ref()))
+            .field("server_url", &redacted_option(self.server_url.as_ref()))
+            .field("username", &redacted_option(self.username.as_ref()))
+            .field("password", &redacted_option(self.password.as_ref()))
+            .field("timezone", &self.timezone)
+            .finish()
+    }
+}
+
+fn redacted_option(value: Option<&String>) -> &'static str {
+    if value.is_some() {
+        "<redacted>"
+    } else {
+        "<unset>"
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -3233,7 +3260,11 @@ fn canonical_source_endpoint(
                 "Xtream server URL, username, and password are required together".to_owned(),
             )
         })?;
-        if request.endpoint.is_some() {
+        if request
+            .endpoint
+            .as_deref()
+            .is_some_and(|endpoint| !endpoint.trim().is_empty())
+        {
             return Err(PersistenceError::InvalidSource(
                 "use either Xtream credentials or an advanced endpoint".to_owned(),
             ));
@@ -3340,8 +3371,7 @@ fn parse_http_url(value: &str, label: &str) -> Result<url::Url, PersistenceError
 }
 
 fn nonblank_secret<'a>(value: &'a str, label: &str) -> Result<&'a str, PersistenceError> {
-    let value = value.trim();
-    if value.is_empty() {
+    if value.trim().is_empty() {
         return Err(PersistenceError::InvalidSource(format!(
             "Xtream {label} must not be blank"
         )));
@@ -12705,7 +12735,7 @@ mod tests {
         let request = CreateSourceRequest {
             name: "Provider".to_owned(),
             kind: "Xtream".to_owned(),
-            endpoint: None,
+            endpoint: Some(String::new()),
             server_url: Some("https://provider.test:8443/panel/".to_owned()),
             username: Some("user/name".to_owned()),
             password: Some("p?a#ss".to_owned()),
@@ -12717,6 +12747,16 @@ mod tests {
             endpoint,
             "https://provider.test:8443/panel/player_api.php?username=user%2Fname&password=p%3Fa%23ss"
         );
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("user/name"));
+        assert!(!debug.contains("p?a#ss"));
+        assert!(debug.contains("<redacted>"));
+
+        let preserved =
+            build_xtream_player_api_endpoint("https://provider.test", " user ", " pass ")
+                .expect("whitespace around credential bytes is valid");
+        assert!(preserved.contains("username=+user+"));
+        assert!(preserved.contains("password=+pass+"));
     }
 
     #[test]
