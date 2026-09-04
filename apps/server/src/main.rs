@@ -5938,7 +5938,92 @@ mod tests {
             record,
         )
         .await
-        .expect("process M3U refresh");
+        .expect("stage M3U refresh");
+        assert_eq!(
+            job_status(&pool, created.refresh_job.id).await,
+            "running",
+            "the refresh parent remains active until reconciliation finalization"
+        );
+
+        let mut child_count = 0;
+        loop {
+            let child: Option<JobRecord> = sqlx::query_as(
+                r"
+                SELECT *
+                FROM jobs
+                WHERE status = 'queued'
+                  AND kind IN (
+                      'reconcile-provider-partition',
+                      'finalize-provider-reconciliation'
+                  )
+                  AND payload->>'parentJobId' = $1
+                ORDER BY created_at, id
+                LIMIT 1
+                ",
+            )
+            .bind(created.refresh_job.id.to_string())
+            .fetch_optional(&pool)
+            .await
+            .expect("fetch M3U reconciliation child job");
+            let Some(child) = child else {
+                break;
+            };
+            child_count += 1;
+            force_running(&pool, child.id, worker_id).await;
+            let child = fetch_job(&pool, child.id).await;
+            process_job(
+                &jobs,
+                &sources,
+                &snapshots,
+                &catalog,
+                &master_key,
+                worker_id,
+                child,
+            )
+            .await
+            .expect("process M3U reconciliation child job");
+        }
+        assert!(
+            child_count > 0,
+            "M3U refresh did not schedule reconciliation"
+        );
+
+        let child_statuses: Vec<String> = sqlx::query_scalar(
+            r"
+            SELECT status
+            FROM jobs
+            WHERE kind IN (
+                'reconcile-provider-partition',
+                'finalize-provider-reconciliation'
+            )
+              AND payload->>'parentJobId' = $1
+            ORDER BY created_at, id
+            ",
+        )
+        .bind(created.refresh_job.id.to_string())
+        .fetch_all(&pool)
+        .await
+        .expect("fetch M3U reconciliation child statuses");
+        assert!(
+            child_statuses.iter().all(|status| status == "succeeded"),
+            "M3U reconciliation children did not all succeed: {child_statuses:?}"
+        );
+        let finalizer_status: String = sqlx::query_scalar(
+            r"
+            SELECT status
+            FROM jobs
+            WHERE kind = 'finalize-provider-reconciliation'
+              AND payload->>'parentJobId' = $1
+            ORDER BY created_at, id
+            LIMIT 1
+            ",
+        )
+        .bind(created.refresh_job.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .expect("fetch M3U finalizer status");
+        assert_eq!(finalizer_status, "succeeded");
+
         let status = job_status(&pool, created.refresh_job.id).await;
         assert_eq!(
             status,
