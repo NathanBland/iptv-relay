@@ -1217,8 +1217,8 @@ impl SourceRepository {
     /// Deletes a source and all related data in one transaction.
     ///
     /// Removes the provider account or EPG source, cancels pending refresh
-    /// jobs, and records an audit event. Cascade deletes remove snapshots,
-    /// provider streams, programmes, and channel associations.
+    /// jobs, and records an audit event. Child rows are deleted explicitly
+    /// before the parent to avoid long cascade chains on large tables.
     ///
     /// # Errors
     ///
@@ -1240,11 +1240,15 @@ impl SourceRepository {
             return Err(PersistenceError::SourceNotFound(source_id));
         }
 
+        // Cancel pending refresh jobs for this source.
         sqlx::query("UPDATE jobs SET status = 'cancelled' WHERE kind = 'refresh-source' AND payload->>'sourceId' = $1 AND status IN ('queued', 'running')")
             .bind(source_id.to_string())
             .execute(&mut *transaction)
             .await?;
 
+        // Delete automatic channels owned by this provider. This cascades
+        // to channel_streams, channel_epg_mappings, stream_profiles,
+        // generated_programmes, dvr_recordings, and user_channel_access.
         sqlx::query(
             "DELETE FROM channels WHERE provider_account_id = $1 AND managed_by = 'automatic'",
         )
@@ -1252,6 +1256,35 @@ impl SourceRepository {
         .execute(&mut *transaction)
         .await?;
 
+        // Delete provider streams explicitly before the cascade from
+        // source_snapshots. This avoids a deep cascade chain when the
+        // provider has millions of streams. The index on
+        // provider_streams(provider_account_id) makes this an index scan.
+        sqlx::query("DELETE FROM provider_streams WHERE provider_account_id = $1")
+            .bind(source_id)
+            .execute(&mut *transaction)
+            .await?;
+
+        // Delete programmes and EPG channels through their snapshot
+        // references before snapshots are removed. The indexes on
+        // programmes(source_snapshot_id) and epg_channels(source_snapshot_id)
+        // make these index scans instead of full table scans.
+        sqlx::query(
+            "DELETE FROM programmes WHERE source_snapshot_id IN (SELECT id FROM source_snapshots WHERE provider_account_id = $1)",
+        )
+        .bind(source_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM epg_channels WHERE source_snapshot_id IN (SELECT id FROM source_snapshots WHERE provider_account_id = $1)",
+        )
+        .bind(source_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        // Now delete the provider account and EPG source. The remaining
+        // cascades (source_snapshots, xtream_short_epg) are small.
         sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
             .bind(source_id)
             .execute(&mut *transaction)
