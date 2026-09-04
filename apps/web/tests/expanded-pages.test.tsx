@@ -546,6 +546,7 @@ describe('expanded management pages', () => {
         bitrateKbps: index === 0 ? 6000 : null,
         providerAccountId: 'provider-1',
       })),
+      estimated: false,
     })
     const check = vi.spyOn(client, 'triggerHealthCheck').mockResolvedValue({ queued: 4 })
     const rank = vi.spyOn(client, 'rankAllStreams').mockResolvedValue({ ranked: 4 })

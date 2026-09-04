@@ -202,6 +202,7 @@ describe('management workflow accessibility', () => {
         videoHeight: 1080, videoFps: 60, audioCodec: null, audioChannels: null, audioSampleRate: null,
         bitrateKbps: 6000, providerAccountId: 'provider-1',
       }],
+      estimated: false,
     })
     renderWithQuery(<StreamHealthPage client={client} />)
     expect(await screen.findByRole('heading', { name: 'Stream Health', level: 1 })).toBeInTheDocument()
