@@ -570,14 +570,8 @@ async fn run_refresh_job(
                 );
                 return Ok(());
             }
-            if !source_refresh {
-                let completed_progress = serde_json::json!({
-                    "stage": "completed",
-                    "percent": 100,
-                    "bytesDownloaded": result.downloaded_bytes,
-                    "recordsProcessed": result.records,
-                    "message": "Xtream short EPG refresh completed",
-                });
+            if !execution.deferred {
+                let completed_progress = completed_refresh_progress(source_refresh, &result);
                 if let Err(error) = jobs.heartbeat(job.id, worker_id, &completed_progress).await {
                     warn!(job_id = %job.id, error = %error, "failed to report completed progress");
                 }
@@ -733,6 +727,20 @@ async fn run_source_refresh(
         }
     }
     Ok(RefreshExecution { result, deferred })
+}
+
+fn completed_refresh_progress(source_refresh: bool, result: &IngestResult) -> serde_json::Value {
+    serde_json::json!({
+        "stage": "completed",
+        "percent": 100,
+        "bytesDownloaded": result.downloaded_bytes,
+        "recordsProcessed": result.records,
+        "message": if source_refresh {
+            "Source refresh completed"
+        } else {
+            "Xtream short EPG refresh completed"
+        },
+    })
 }
 
 /// Creates one deterministic worker job for each staged provider partition.
@@ -4126,6 +4134,22 @@ mod tests {
             ..IngestProgress::default()
         });
         assert_eq!(huge["percent"], 14);
+    }
+
+    #[test]
+    fn completed_refresh_progress_reports_terminal_100_percent() {
+        let result = ingest_result();
+        for (source_refresh, message) in [
+            (true, "Source refresh completed"),
+            (false, "Xtream short EPG refresh completed"),
+        ] {
+            let progress = completed_refresh_progress(source_refresh, &result);
+            assert_eq!(progress["stage"], "completed");
+            assert_eq!(progress["percent"], 100);
+            assert_eq!(progress["bytesDownloaded"], 12);
+            assert_eq!(progress["recordsProcessed"], 100);
+            assert_eq!(progress["message"], message);
+        }
     }
 
     #[test]
