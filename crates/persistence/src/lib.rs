@@ -1596,6 +1596,23 @@ pub struct JobRecord {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug, FromRow)]
+pub struct DeadLetterRecord {
+    pub id: Uuid,
+    pub original_job_id: Uuid,
+    pub kind: String,
+    pub payload: Value,
+    pub error_category: String,
+    pub error_message: String,
+    pub attempt_count: i32,
+    pub max_attempts: i32,
+    pub first_failed_at: DateTime<Utc>,
+    pub last_failed_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolution: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewJob {
     pub kind: String,
@@ -2820,6 +2837,7 @@ impl JobRepository {
             0
         };
         let available_at = Utc::now() + chrono::Duration::seconds(delay_seconds);
+        let redacted = redact_error(error_summary);
         let result = sqlx::query(
             r"
             UPDATE jobs
@@ -2832,11 +2850,174 @@ impl JobRepository {
         .bind(job_id)
         .bind(worker_id)
         .bind(status)
-        .bind(redact_error(error_summary))
+        .bind(&redacted)
         .bind(available_at)
         .execute(&self.pool)
         .await?;
-        ensure_owned(result.rows_affected(), job_id, worker_id)
+        ensure_owned(result.rows_affected(), job_id, worker_id)?;
+        if !will_retry {
+            let category = categorize_error(error_summary);
+            sqlx::query(
+                r"
+                INSERT INTO dead_letter_jobs
+                    (original_job_id, kind, payload, error_category, error_message,
+                     attempt_count, max_attempts, first_failed_at, last_failed_at)
+                SELECT id, kind, payload, $2, $3, attempts, max_attempts,
+                       created_at, now()
+                FROM jobs WHERE id = $1
+                ON CONFLICT DO NOTHING
+                ",
+            )
+            .bind(job_id)
+            .bind(category)
+            .bind(&redacted)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Lists dead-letter entries with optional filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    pub async fn list_dead_letter_jobs(
+        &self,
+        kind: Option<&str>,
+        error_category: Option<&str>,
+        unresolved_only: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<DeadLetterRecord>, PersistenceError> {
+        let rows = sqlx::query_as::<_, DeadLetterRecord>(
+            r"
+            SELECT id, original_job_id, kind, payload, error_category, error_message,
+                   attempt_count, max_attempts, first_failed_at, last_failed_at,
+                   resolved_at, resolution, created_at
+            FROM dead_letter_jobs
+            WHERE ($1::text IS NULL OR kind = $1)
+              AND ($2::text IS NULL OR error_category = $2)
+              AND (NOT $3 OR resolved_at IS NULL)
+            ORDER BY created_at DESC
+            LIMIT $4 OFFSET $5
+            ",
+        )
+        .bind(kind)
+        .bind(error_category)
+        .bind(unresolved_only)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Returns a single dead-letter entry by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    pub async fn get_dead_letter_job(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<DeadLetterRecord>, PersistenceError> {
+        let row = sqlx::query_as::<_, DeadLetterRecord>(
+            r"
+            SELECT id, original_job_id, kind, payload, error_category, error_message,
+                   attempt_count, max_attempts, first_failed_at, last_failed_at,
+                   resolved_at, resolution, created_at
+            FROM dead_letter_jobs WHERE id = $1
+            ",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Re-enqueues a dead-letter entry as a new job and marks it as replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    pub async fn replay_dead_letter_job(&self, id: Uuid) -> Result<Option<Uuid>, PersistenceError> {
+        let mut tx = self.pool.begin().await?;
+        let record = sqlx::query_as::<_, DeadLetterRecord>(
+            r"
+            SELECT id, original_job_id, kind, payload, error_category, error_message,
+                   attempt_count, max_attempts, first_failed_at, last_failed_at,
+                   resolved_at, resolution, created_at
+            FROM dead_letter_jobs
+            WHERE id = $1 AND resolved_at IS NULL
+            FOR UPDATE
+            ",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(record) = record else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let new_job_id = Uuid::new_v4();
+        sqlx::query(
+            r"
+            INSERT INTO jobs (id, kind, payload, status, max_attempts, priority, available_at, created_at, updated_at)
+            VALUES ($1, $2, $3, 'queued', $4, 0, now(), now(), now())
+            ",
+        )
+        .bind(new_job_id)
+        .bind(&record.kind)
+        .bind(&record.payload)
+        .bind(record.max_attempts)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE dead_letter_jobs SET resolved_at = now(), resolution = 'replayed' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(new_job_id))
+    }
+
+    /// Marks a dead-letter entry as closed without replaying.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    pub async fn close_dead_letter_job(
+        &self,
+        id: Uuid,
+        resolution: &str,
+    ) -> Result<bool, PersistenceError> {
+        let result = sqlx::query(
+            r"
+            UPDATE dead_letter_jobs
+            SET resolved_at = now(), resolution = $2
+            WHERE id = $1 AND resolved_at IS NULL
+            ",
+        )
+        .bind(id)
+        .bind(resolution)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Returns the count of unresolved dead-letter entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    pub async fn dead_letter_count(&self) -> Result<i64, PersistenceError> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM dead_letter_jobs WHERE resolved_at IS NULL")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count)
     }
 
     /// Recovers stale running jobs so another worker can claim them.
@@ -3004,6 +3185,25 @@ pub fn redact_error(error: &str) -> String {
         }
     }
     redacted
+}
+
+fn categorize_error(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        "timeout"
+    } else if lower.contains("cancelled") || lower.contains("canceled") {
+        "cancelled"
+    } else if lower.contains("connect")
+        || lower.contains("dns")
+        || lower.contains("temporarily")
+        || lower.contains("503")
+        || lower.contains("502")
+        || lower.contains("429")
+    {
+        "transient"
+    } else {
+        "permanent"
+    }
 }
 
 fn sensitive_diagnostic_key(key: &str) -> bool {

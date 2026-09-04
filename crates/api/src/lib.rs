@@ -38,11 +38,11 @@ use iptv_media::{
 };
 use iptv_persistence::{
     AuditEventRecord, CatalogRepository, ChannelPlaybackCandidateRow, ChannelPlaybackPlan,
-    ChannelQuery, CreateEventTemplate, Database, EventTemplateQuery, EventTemplateUpdate,
-    JobRecord, JobRepository, LineupApplyStats, LineupCategoryRow, LineupChannelRow,
-    LineupTemplateRow, MasterKey, NewSource, OperatorSettingScopeState, OutputProfileRow,
-    OutputProfileTokenHash, PersistenceError, ProgrammeQuery, SourceKind, SourceRepository,
-    SourceSummary, redact_diagnostics, redact_error,
+    ChannelQuery, CreateEventTemplate, Database, DeadLetterRecord, EventTemplateQuery,
+    EventTemplateUpdate, JobRecord, JobRepository, LineupApplyStats, LineupCategoryRow,
+    LineupChannelRow, LineupTemplateRow, MasterKey, NewSource, OperatorSettingScopeState,
+    OutputProfileRow, OutputProfileTokenHash, PersistenceError, ProgrammeQuery, SourceKind,
+    SourceRepository, SourceSummary, redact_diagnostics, redact_error,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -480,6 +480,43 @@ impl From<&JobRecord> for JobResponse {
     }
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+struct DeadLetterResponse {
+    id: String,
+    original_job_id: String,
+    kind: String,
+    payload: serde_json::Value,
+    error_category: String,
+    error_message: String,
+    attempt_count: i32,
+    max_attempts: i32,
+    first_failed_at: DateTime<Utc>,
+    last_failed_at: DateTime<Utc>,
+    resolved_at: Option<DateTime<Utc>>,
+    resolution: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+impl From<&DeadLetterRecord> for DeadLetterResponse {
+    fn from(record: &DeadLetterRecord) -> Self {
+        Self {
+            id: record.id.to_string(),
+            original_job_id: record.original_job_id.to_string(),
+            kind: record.kind.clone(),
+            payload: redact_diagnostics(&record.payload),
+            error_category: record.error_category.clone(),
+            error_message: record.error_message.clone(),
+            attempt_count: record.attempt_count,
+            max_attempts: record.max_attempts,
+            first_failed_at: record.first_failed_at,
+            last_failed_at: record.last_failed_at,
+            resolved_at: record.resolved_at,
+            resolution: record.resolution.clone(),
+            created_at: record.created_at,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct ChannelResponse {
@@ -888,7 +925,7 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, reset_source_circuit_breaker, list_groups, list_jobs, cancel_job, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, reset_source_circuit_breaker, list_groups, list_jobs, cancel_job, list_dead_letters, get_dead_letter, replay_dead_letter, close_dead_letter, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
     components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SupportLogEntry, SupportBundleResponse, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
@@ -1100,6 +1137,16 @@ fn source_control_routes() -> Router<AppState> {
         .route(
             "/api/v1/jobs/{job_id}/cancel",
             axum::routing::post(cancel_job),
+        )
+        .route("/api/v1/dead-letters", get(list_dead_letters))
+        .route("/api/v1/dead-letters/{id}", get(get_dead_letter))
+        .route(
+            "/api/v1/dead-letters/{id}/replay",
+            axum::routing::post(replay_dead_letter),
+        )
+        .route(
+            "/api/v1/dead-letters/{id}/close",
+            axum::routing::post(close_dead_letter),
         )
 }
 
@@ -3902,6 +3949,209 @@ async fn cancel_job(
             "job-not-cancellable",
             "Job cannot be cancelled",
             "the job is already in a terminal state",
+        )
+        .response(),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeadLetterQuery {
+    kind: Option<String>,
+    error_category: Option<String>,
+    unresolved_only: Option<bool>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/dead-letters",
+    tag = "dead-letters",
+    params(
+        ("kind" = Option<String>, Query, description = "Filter by job kind"),
+        ("error_category" = Option<String>, Query, description = "Filter by error category"),
+        ("unresolved_only" = Option<bool>, Query, description = "Show only unresolved entries"),
+        ("limit" = Option<i64>, Query, description = "Page size, default 50"),
+        ("offset" = Option<i64>, Query, description = "Zero-based page offset")
+    ),
+    responses(
+        (status = 200, body = [DeadLetterResponse]),
+        (status = 401, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn list_dead_letters(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<DeadLetterQuery>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    let Some(repository) = &state.job_repository else {
+        return persistence_unavailable();
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0).max(0);
+    match repository
+        .list_dead_letter_jobs(
+            query.kind.as_deref(),
+            query.error_category.as_deref(),
+            query.unresolved_only.unwrap_or(true),
+            limit,
+            offset,
+        )
+        .await
+    {
+        Ok(records) => {
+            let body: Vec<DeadLetterResponse> =
+                records.iter().map(DeadLetterResponse::from).collect();
+            Json(body).into_response()
+        }
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/dead-letters/{id}",
+    tag = "dead-letters",
+    params(("id" = String, Path, description = "Dead letter entry ID")),
+    responses(
+        (status = 200, body = DeadLetterResponse),
+        (status = 401, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn get_dead_letter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    let Some(repository) = &state.job_repository else {
+        return persistence_unavailable();
+    };
+    let Ok(id) = Uuid::parse_str(&id) else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-id",
+            "Invalid dead letter ID",
+            "supply a valid UUID",
+        )
+        .response();
+    };
+    match repository.get_dead_letter_job(id).await {
+        Ok(Some(record)) => Json(DeadLetterResponse::from(&record)).into_response(),
+        Ok(None) => ProblemDetails::new(
+            StatusCode::NOT_FOUND,
+            "not-found",
+            "Dead letter entry not found",
+            "no dead letter entry exists with the given ID",
+        )
+        .response(),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/dead-letters/{id}/replay",
+    tag = "dead-letters",
+    params(("id" = String, Path, description = "Dead letter entry ID")),
+    responses(
+        (status = 200, body = SaveResult, description = "Entry replayed as a new job"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn replay_dead_letter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin_mutation(&state, &headers) {
+        return response;
+    }
+    let Some(repository) = &state.job_repository else {
+        return persistence_unavailable();
+    };
+    let Ok(id) = Uuid::parse_str(&id) else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-id",
+            "Invalid dead letter ID",
+            "supply a valid UUID",
+        )
+        .response();
+    };
+    match repository.replay_dead_letter_job(id).await {
+        Ok(Some(new_job_id)) => Json(SaveResult {
+            ok: true,
+            message: format!("Replayed as job {new_job_id}."),
+        })
+        .into_response(),
+        Ok(None) => ProblemDetails::new(
+            StatusCode::NOT_FOUND,
+            "not-found",
+            "Dead letter entry not found or already resolved",
+            "no unresolved dead letter entry exists with the given ID",
+        )
+        .response(),
+        Err(error) => persistence_error_response(error),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/dead-letters/{id}/close",
+    tag = "dead-letters",
+    params(("id" = String, Path, description = "Dead letter entry ID")),
+    responses(
+        (status = 200, body = SaveResult, description = "Entry closed"),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 503, body = ProblemDetails)
+    )
+)]
+async fn close_dead_letter(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(response) = require_admin_mutation(&state, &headers) {
+        return response;
+    }
+    let Some(repository) = &state.job_repository else {
+        return persistence_unavailable();
+    };
+    let Ok(id) = Uuid::parse_str(&id) else {
+        return ProblemDetails::new(
+            StatusCode::BAD_REQUEST,
+            "invalid-id",
+            "Invalid dead letter ID",
+            "supply a valid UUID",
+        )
+        .response();
+    };
+    match repository.close_dead_letter_job(id, "closed").await {
+        Ok(true) => Json(SaveResult {
+            ok: true,
+            message: "Dead letter entry closed.".to_owned(),
+        })
+        .into_response(),
+        Ok(false) => ProblemDetails::new(
+            StatusCode::NOT_FOUND,
+            "not-found",
+            "Dead letter entry not found or already resolved",
+            "no unresolved dead letter entry exists with the given ID",
         )
         .response(),
         Err(error) => persistence_error_response(error),
@@ -12195,6 +12445,7 @@ mod tests {
             ("GET", "/api/v1/groups".to_owned(), None),
             ("GET", "/api/v1/jobs".to_owned(), None),
             ("POST", format!("/api/v1/jobs/{job_id}/cancel"), None),
+            ("GET", "/api/v1/dead-letters".to_owned(), None),
             ("POST", "/api/v1/epg/reconcile".to_owned(), None),
             (
                 "GET",
