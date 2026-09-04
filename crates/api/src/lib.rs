@@ -88,8 +88,11 @@ impl fmt::Debug for AppConfig {
 }
 
 #[derive(Clone, Debug, Default, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct RuntimeVersions {
     pub gateway: String,
+    pub git_hash: String,
+    pub git_tag: String,
     pub ffmpeg: Option<String>,
     pub vlc: Option<String>,
 }
@@ -12053,6 +12056,8 @@ mod tests {
         };
         assert_serializes(RuntimeVersions {
             gateway: "test".to_owned(),
+            git_hash: "abc1234".to_owned(),
+            git_tag: "v0.1.0".to_owned(),
             ffmpeg: Some("ffmpeg".to_owned()),
             vlc: Some("vlc".to_owned()),
         });

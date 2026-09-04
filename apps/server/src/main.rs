@@ -1711,6 +1711,8 @@ fn protected_endpoint_template(endpoint: &Url) -> String {
 async fn runtime_versions() -> RuntimeVersions {
     RuntimeVersions {
         gateway: env!("CARGO_PKG_VERSION").to_owned(),
+        git_hash: env!("GIT_COMMIT_HASH").to_owned(),
+        git_tag: env!("GIT_TAG").to_owned(),
         ffmpeg: command_version("ffmpeg", &["-version"]).await,
         vlc: command_version("vlc", &["--version"]).await,
     }
@@ -2389,6 +2391,8 @@ mod tests {
         let environment = server_environment_from(lookup(&required_settings())).expect("settings");
         let versions = RuntimeVersions {
             gateway: "gateway-version".to_owned(),
+            git_hash: "abc1234".to_owned(),
+            git_tag: "v0.1.0".to_owned(),
             ffmpeg: Some("ffmpeg-version".to_owned()),
             vlc: Some("vlc-version".to_owned()),
         };
@@ -2875,6 +2879,8 @@ mod tests {
         let environment = server_environment_from(lookup(&required_settings())).expect("settings");
         let config = environment.into_config(RuntimeVersions {
             gateway: "1.0.0".to_owned(),
+            git_hash: "unknown".to_owned(),
+            git_tag: "unknown".to_owned(),
             ffmpeg: None,
             vlc: None,
         });
