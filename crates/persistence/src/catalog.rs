@@ -3659,7 +3659,7 @@ impl CatalogRepository {
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
         let rows: Vec<StreamHealthRow> = sqlx::query_as(
             r"
-            SELECT ps.id AS provider_stream_id, ps.name AS stream_name,
+            SELECT DISTINCT ps.id AS provider_stream_id, ps.name AS stream_name,
                    ps.group_name, ps.health_status, ps.health_checked_at,
                    ps.health_error, ps.video_codec, ps.video_resolution,
                    ps.video_width, ps.video_height,
@@ -3667,8 +3667,12 @@ impl CatalogRepository {
                    ps.audio_codec, ps.audio_channels, ps.audio_sample_rate,
                    ps.bitrate_kbps, ps.provider_account_id
             FROM provider_streams ps
+            JOIN provider_accounts pa ON pa.id = ps.provider_account_id
+            JOIN channel_streams cs ON cs.provider_stream_id = ps.id
+            JOIN channels c ON c.id = cs.channel_id AND c.enabled
             WHERE ps.health_status IN ('unknown', 'dead')
               AND ps.supported = true
+              AND pa.enabled = true
             ORDER BY ps.health_status, ps.name
             LIMIT $1
             ",
