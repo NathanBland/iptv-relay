@@ -111,6 +111,14 @@ pub trait SnapshotActivator: Send + Sync {
     ) -> Result<Uuid, IngestError> {
         self.activate(snapshot).await
     }
+
+    /// Gives the durable completion phase for progress reports.
+    ///
+    /// The default store publishes a snapshot. A staging store can return
+    /// `staged` when later workers publish its rows atomically.
+    fn completion_phase(&self) -> &'static str {
+        "activated"
+    }
 }
 
 impl SnapshotActivator for PgSnapshotStore {
@@ -472,8 +480,14 @@ where
             .store
             .activate_with_progress(&snapshot, &staging_progress)
             .await?;
-        self.checkpoint("activated", byte_count, byte_count, records_seen, records)
-            .await?;
+        self.checkpoint(
+            self.store.completion_phase(),
+            byte_count,
+            byte_count,
+            records_seen,
+            records,
+        )
+        .await?;
 
         info!(
             records,
@@ -656,7 +670,7 @@ where
             .activate_with_progress(&snapshot, &staging_progress)
             .await?;
         self.checkpoint(
-            "activated",
+            self.store.completion_phase(),
             downloaded_bytes,
             decoded_bytes,
             records_seen,

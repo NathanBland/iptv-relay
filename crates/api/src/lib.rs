@@ -5506,10 +5506,12 @@ fn select_source_sync_job<'a>(jobs: &'a [JobRecord], source_id: &str) -> Option<
             _ => 0,
         }
     };
-    jobs.iter()
+    let child = jobs
+        .iter()
         .filter(|job| sync_child_parent_id(job) == Some(parent_id.as_str()))
-        .max_by_key(|job| (priority(job.status.as_str()), job.updated_at, job.id))
-        .or(Some(parent))
+        .filter(|job| matches!(job.status.as_str(), "queued" | "running"))
+        .max_by_key(|job| (priority(job.status.as_str()), job.updated_at, job.id));
+    child.or(Some(parent))
 }
 
 /// Deduplicate refresh and reconciliation jobs by source ID for SSE emission.
@@ -13020,9 +13022,18 @@ mod tests {
             updated_at: now + chrono::Duration::milliseconds(1),
             completed_at: None,
         };
-        let jobs = vec![child, parent];
+        let mut jobs = vec![child, parent];
         let selected = select_source_sync_job(&jobs, &source_id.to_string()).expect("job exists");
         assert_eq!(selected.id, child_id);
         assert_eq!(SourceSyncStatusResponse::from_job(selected).percent, 92);
+
+        jobs[0].status = "succeeded".to_owned();
+        let selected =
+            select_source_sync_job(&jobs, &source_id.to_string()).expect("parent exists");
+        assert_eq!(selected.id, parent_id);
+        assert_eq!(
+            SourceSyncStatusResponse::from_job(selected).status,
+            "running"
+        );
     }
 }

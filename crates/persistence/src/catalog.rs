@@ -93,6 +93,68 @@ pub struct ProviderReconciliationUpdate {
     pub keys_total: u64,
 }
 
+/// One durable parallel reconciliation run for a staged provider snapshot.
+///
+/// The run does not change public channels until its finalizer publishes it.
+#[derive(Clone, Debug, FromRow, Serialize, PartialEq, Eq)]
+pub struct ProviderReconciliationRun {
+    pub id: Uuid,
+    pub provider_account_id: Uuid,
+    pub source_snapshot_id: Uuid,
+    pub parent_job_id: Option<Uuid>,
+    pub status: String,
+    pub partition_count: i32,
+    pub total_keys: i64,
+    pub completed_keys: i64,
+}
+
+/// Aggregate durable progress for a parallel reconciliation run.
+#[derive(Clone, Debug, FromRow, Serialize, PartialEq, Eq)]
+pub struct ProviderReconciliationRunProgress {
+    pub run_id: Uuid,
+    pub status: String,
+    pub partition_count: i64,
+    pub partitions_completed: i64,
+    pub total_keys: i64,
+    pub completed_keys: i64,
+}
+
+/// One result of idempotent partition preparation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderReconciliationPartitionResult {
+    pub run_id: Uuid,
+    pub partition_number: i32,
+    pub keys_completed: i64,
+    pub total_keys: i64,
+    pub already_completed: bool,
+}
+
+type ProviderReconciliationPartitionRow = (
+    String,
+    String,
+    Uuid,
+    i32,
+    i64,
+    String,
+    Option<DateTime<Utc>>,
+);
+
+type ProviderReconciliationSnapshotRow =
+    (String, String, Option<DateTime<Utc>>, DateTime<Utc>, i64);
+
+/// Result from one attempt to publish all prepared reconciliation candidates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderReconciliationFinalization {
+    /// One or more partitions still need work. Public output is unchanged.
+    Pending(ProviderReconciliationRunProgress),
+    /// The staged snapshot and its catalog became public in one transaction.
+    Published(ReconcileStats),
+    /// A previous finalizer already published the run.
+    AlreadyPublished,
+    /// A newer provider snapshot already became public.
+    Superseded,
+}
+
 /// Persists reconciliation checkpoints outside the catalog transaction.
 ///
 /// A checkpoint error rolls back the catalog transaction. A checkpoint does
@@ -119,6 +181,609 @@ impl ProviderReconciliationProgress for NoopProviderReconciliationProgress {
 impl CatalogRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Creates or returns durable work for one complete staged M3U or Xtream snapshot.
+    ///
+    /// A snapshot that is already active returns `None`. Workers can safely
+    /// call this method again after a coordinator retry.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn create_or_load_provider_reconciliation_run(
+        &self,
+        snapshot_id: Uuid,
+        parent_job_id: Uuid,
+        requested_partitions: i32,
+    ) -> Result<Option<ProviderReconciliationRun>, PersistenceError> {
+        let partition_count = requested_partitions.clamp(1, 64);
+        let mut transaction = self.pool.begin().await?;
+        let snapshot: Option<(Uuid, String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
+            r"
+            SELECT provider_account_id, kind, status, staged_at
+            FROM source_snapshots
+            WHERE id = $1
+            FOR UPDATE
+            ",
+        )
+        .bind(snapshot_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((provider_account_id, kind, status, staged_at)) = snapshot else {
+            return Err(PersistenceError::InvalidSource(
+                "staged provider snapshot was not found".to_owned(),
+            ));
+        };
+        if !matches!(kind.as_str(), "m3u" | "xtream") {
+            return Err(PersistenceError::InvalidSource(
+                "parallel reconciliation requires an M3U or Xtream snapshot".to_owned(),
+            ));
+        }
+        if status == "active" {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        if status != "staging" || staged_at.is_none() {
+            return Err(PersistenceError::InvalidSource(
+                "provider snapshot is not ready for reconciliation".to_owned(),
+            ));
+        }
+
+        if let Some(run) = sqlx::query_as::<_, ProviderReconciliationRun>(
+            r"
+            SELECT id, provider_account_id, source_snapshot_id, parent_job_id, status,
+                   partition_count, total_keys, completed_keys
+            FROM provider_reconciliation_runs
+            WHERE source_snapshot_id = $1
+            FOR UPDATE
+            ",
+        )
+        .bind(snapshot_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        {
+            if run.status != "processing" {
+                // A checksum-equivalent snapshot can become staging again
+                // after a newer snapshot supersedes it. Rebuild its durable
+                // run so terminal state does not strand the staged snapshot.
+                sqlx::query("DELETE FROM provider_reconciliation_candidates WHERE run_id = $1")
+                    .bind(run.id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(
+                    r"
+                    UPDATE provider_reconciliation_partitions
+                    SET status = 'queued', completed_keys = 0, attempts = 0,
+                        worker_id = NULL, completed_at = NULL, updated_at = now()
+                    WHERE run_id = $1
+                    ",
+                )
+                .bind(run.id)
+                .execute(&mut *transaction)
+                .await?;
+                let run = sqlx::query_as::<_, ProviderReconciliationRun>(
+                    r"
+                    UPDATE provider_reconciliation_runs
+                    SET status = 'processing', parent_job_id = $2, completed_keys = 0,
+                        published_at = NULL, updated_at = now()
+                    WHERE id = $1
+                    RETURNING id, provider_account_id, source_snapshot_id, parent_job_id, status,
+                              partition_count, total_keys, completed_keys
+                    ",
+                )
+                .bind(run.id)
+                .bind(parent_job_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                return Ok(Some(run));
+            }
+            transaction.commit().await?;
+            return Ok(Some(run));
+        }
+
+        let total_keys: i64 = sqlx::query_scalar(
+            r"
+            SELECT count(*)
+            FROM (
+                SELECT COALESCE(NULLIF(tvg_id, ''), 'stream:' || stable_key)
+                FROM provider_streams
+                WHERE snapshot_id = $1 AND supported
+                GROUP BY COALESCE(NULLIF(tvg_id, ''), 'stream:' || stable_key)
+            ) AS canonical_keys
+            ",
+        )
+        .bind(snapshot_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if total_keys == 0 {
+            // Keep invalid provider data out of the staging state. A terminal
+            // status also prevents repeated retries from stranding the same
+            // checksum as an unpublishable snapshot.
+            sqlx::query(
+                "UPDATE source_snapshots SET status = 'rejected' WHERE id = $1 AND status = 'staging'",
+            )
+            .bind(snapshot_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Err(PersistenceError::InvalidSource(
+                "staged provider snapshot contains no supported channels".to_owned(),
+            ));
+        }
+
+        let run_id = Uuid::now_v7();
+        let run = sqlx::query_as::<_, ProviderReconciliationRun>(
+            r"
+            INSERT INTO provider_reconciliation_runs
+                (id, provider_account_id, source_snapshot_id, parent_job_id, status, partition_count, total_keys)
+            VALUES ($1, $2, $3, $4, 'processing', $5, $6)
+            RETURNING id, provider_account_id, source_snapshot_id, parent_job_id, status,
+                      partition_count, total_keys, completed_keys
+            ",
+        )
+        .bind(run_id)
+        .bind(provider_account_id)
+        .bind(snapshot_id)
+        .bind(parent_job_id)
+        .bind(partition_count)
+        .bind(total_keys)
+        .fetch_one(&mut *transaction)
+        .await?;
+
+        for partition_number in 0..partition_count {
+            let key_count: i64 = sqlx::query_scalar(
+                r"
+                SELECT count(*)
+                FROM (
+                    SELECT COALESCE(NULLIF(tvg_id, ''), 'stream:' || stable_key) AS canonical_key
+                    FROM provider_streams
+                    WHERE snapshot_id = $1
+                      AND supported
+                    GROUP BY canonical_key
+                ) AS canonical_keys
+                WHERE mod(
+                    mod(hashtextextended(canonical_key, 0), $3::bigint) + $3::bigint,
+                    $3::bigint
+                ) = $2::bigint
+                ",
+            )
+            .bind(snapshot_id)
+            .bind(i64::from(partition_number))
+            .bind(i64::from(partition_count))
+            .fetch_one(&mut *transaction)
+            .await?;
+            sqlx::query(
+                r"
+                INSERT INTO provider_reconciliation_partitions
+                    (run_id, partition_number, status, key_count)
+                VALUES ($1, $2, 'queued', $3)
+                ON CONFLICT (run_id, partition_number) DO NOTHING
+                ",
+            )
+            .bind(run_id)
+            .bind(partition_number)
+            .bind(key_count)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(Some(run))
+    }
+
+    /// Returns aggregate partition progress from durable reconciliation state.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn provider_reconciliation_progress(
+        &self,
+        run_id: Uuid,
+    ) -> Result<ProviderReconciliationRunProgress, PersistenceError> {
+        provider_reconciliation_progress(&self.pool, run_id).await
+    }
+
+    /// Prepares one immutable snapshot partition without changing public output.
+    ///
+    /// The canonical key hash fixes one key to one partition. Repeated work is
+    /// safe because candidate rows and candidate stream rows have stable keys.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn process_provider_reconciliation_partition(
+        &self,
+        run_id: Uuid,
+        partition_number: i32,
+        worker_id: &str,
+    ) -> Result<ProviderReconciliationPartitionResult, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let row: Option<ProviderReconciliationPartitionRow> = sqlx::query_as(
+            r"
+                SELECT p.status, r.status, r.source_snapshot_id, r.partition_count,
+                       p.key_count, ss.status, ss.staged_at
+                FROM provider_reconciliation_partitions p
+                JOIN provider_reconciliation_runs r ON r.id = p.run_id
+                JOIN source_snapshots ss ON ss.id = r.source_snapshot_id
+                WHERE p.run_id = $1 AND p.partition_number = $2
+                FOR UPDATE OF p
+                ",
+        )
+        .bind(run_id)
+        .bind(partition_number)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((
+            partition_status,
+            run_status,
+            snapshot_id,
+            partition_count,
+            key_count,
+            snapshot_status,
+            staged_at,
+        )) = row
+        else {
+            return Err(PersistenceError::InvalidSource(
+                "reconciliation partition was not found".to_owned(),
+            ));
+        };
+        if partition_status == "succeeded" {
+            transaction.commit().await?;
+            return Ok(ProviderReconciliationPartitionResult {
+                run_id,
+                partition_number,
+                keys_completed: key_count,
+                total_keys: key_count,
+                already_completed: true,
+            });
+        }
+        if run_status != "processing" || snapshot_status != "staging" || staged_at.is_none() {
+            return Err(PersistenceError::InvalidSource(
+                "reconciliation run is not ready for partition work".to_owned(),
+            ));
+        }
+
+        sqlx::query(
+            r"
+            UPDATE provider_reconciliation_partitions
+            SET status = 'processing', attempts = attempts + 1, worker_id = $3, updated_at = now()
+            WHERE run_id = $1 AND partition_number = $2
+            ",
+        )
+        .bind(run_id)
+        .bind(partition_number)
+        .bind(worker_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r"
+            WITH grouped AS (
+                SELECT COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key) AS canonical_key,
+                       (array_agg(ps.name ORDER BY ps.id))[1] AS name,
+                       (array_agg(ps.group_name ORDER BY ps.id)
+                            FILTER (WHERE ps.group_name IS NOT NULL))[1] AS group_name,
+                       (array_agg(ps.logo_url ORDER BY ps.id)
+                            FILTER (WHERE ps.logo_url IS NOT NULL AND ps.logo_url <> ''))[1] AS logo_url,
+                       (array_agg(ps.channel_number ORDER BY ps.id)
+                            FILTER (WHERE ps.channel_number IS NOT NULL AND ps.channel_number <> ''))[1] AS preferred_number
+                FROM provider_streams ps
+                WHERE ps.snapshot_id = $1
+                  AND ps.supported
+                  AND mod(
+                      mod(hashtextextended(COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key), 0), $3::bigint)
+                      + $3::bigint,
+                      $3::bigint
+                  ) = $2::bigint
+                GROUP BY canonical_key
+            )
+            INSERT INTO provider_reconciliation_candidates
+                (run_id, canonical_key, name, group_name, logo_url, preferred_number)
+            SELECT $4, canonical_key, name, group_name, logo_url, preferred_number
+            FROM grouped
+            ON CONFLICT (run_id, canonical_key) DO UPDATE SET
+                name = EXCLUDED.name,
+                group_name = EXCLUDED.group_name,
+                logo_url = EXCLUDED.logo_url,
+                preferred_number = EXCLUDED.preferred_number
+            ",
+        )
+        .bind(snapshot_id)
+        .bind(i64::from(partition_number))
+        .bind(i64::from(partition_count))
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        sqlx::query(
+            r"
+            INSERT INTO provider_reconciliation_candidate_streams
+                (run_id, canonical_key, provider_stream_id)
+            SELECT $4,
+                   COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key),
+                   ps.id
+            FROM provider_streams ps
+            WHERE ps.snapshot_id = $1
+              AND ps.supported
+              AND mod(
+                  mod(hashtextextended(COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key), 0), $3::bigint)
+                  + $3::bigint,
+                  $3::bigint
+              ) = $2::bigint
+            ON CONFLICT DO NOTHING
+            ",
+        )
+        .bind(snapshot_id)
+        .bind(i64::from(partition_number))
+        .bind(i64::from(partition_count))
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await?;
+
+        let candidate_count: i64 = sqlx::query_scalar(
+            r"
+            SELECT count(*)
+            FROM provider_reconciliation_candidates
+            WHERE run_id = $1
+              AND mod(
+                  mod(hashtextextended(canonical_key, 0), $3::bigint) + $3::bigint,
+                  $3::bigint
+              ) = $2::bigint
+            ",
+        )
+        .bind(run_id)
+        .bind(i64::from(partition_number))
+        .bind(i64::from(partition_count))
+        .fetch_one(&mut *transaction)
+        .await?;
+        if candidate_count != key_count {
+            return Err(PersistenceError::InvalidSource(
+                "reconciliation candidate count does not match its partition".to_owned(),
+            ));
+        }
+        sqlx::query(
+            r"
+            UPDATE provider_reconciliation_partitions
+            SET status = 'succeeded', completed_keys = key_count, completed_at = now(), updated_at = now()
+            WHERE run_id = $1 AND partition_number = $2
+            ",
+        )
+        .bind(run_id)
+        .bind(partition_number)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r"
+            UPDATE provider_reconciliation_runs
+            SET completed_keys = (
+                    SELECT coalesce(sum(completed_keys), 0)
+                    FROM provider_reconciliation_partitions
+                    WHERE run_id = $1
+                ),
+                updated_at = now()
+            WHERE id = $1
+            ",
+        )
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(ProviderReconciliationPartitionResult {
+            run_id,
+            partition_number,
+            keys_completed: key_count,
+            total_keys: key_count,
+            already_completed: false,
+        })
+    }
+
+    /// Publishes complete candidates and their staged snapshot in one transaction.
+    ///
+    /// The method returns `Pending` until every partition succeeds. It never
+    /// makes one partition visible to playback clients.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn finalize_provider_reconciliation(
+        &self,
+        run_id: Uuid,
+    ) -> Result<ProviderReconciliationFinalization, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '300s'")
+            .execute(&mut *transaction)
+            .await?;
+        let run: Option<(Uuid, Uuid, String)> = sqlx::query_as(
+            r"
+            SELECT provider_account_id, source_snapshot_id, status
+            FROM provider_reconciliation_runs
+            WHERE id = $1
+            FOR UPDATE
+            ",
+        )
+        .bind(run_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((account_id, snapshot_id, status)) = run else {
+            return Err(PersistenceError::InvalidSource(
+                "reconciliation run was not found".to_owned(),
+            ));
+        };
+        if status == "published" {
+            transaction.commit().await?;
+            return Ok(ProviderReconciliationFinalization::AlreadyPublished);
+        }
+        if status != "processing" {
+            return Err(PersistenceError::InvalidSource(
+                "reconciliation run is not ready for publication".to_owned(),
+            ));
+        }
+        // Serialize publication for one provider account. Without this lock,
+        // an older run can publish after a newer run and roll public data back.
+        sqlx::query("SELECT 1 FROM provider_accounts WHERE id = $1 FOR UPDATE")
+            .bind(account_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let unfinished: i64 = sqlx::query_scalar(
+            r"
+            SELECT count(*)
+            FROM provider_reconciliation_partitions
+            WHERE run_id = $1 AND status <> 'succeeded'
+            ",
+        )
+        .bind(run_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if unfinished > 0 {
+            transaction.commit().await?;
+            return Ok(ProviderReconciliationFinalization::Pending(
+                self.provider_reconciliation_progress(run_id).await?,
+            ));
+        }
+        let snapshot: Option<ProviderReconciliationSnapshotRow> = sqlx::query_as(
+            r"
+            SELECT kind, status, staged_at, fetched_at, record_count
+            FROM source_snapshots
+            WHERE id = $1 AND provider_account_id = $2
+            FOR UPDATE
+            ",
+        )
+        .bind(snapshot_id)
+        .bind(account_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((kind, snapshot_status, staged_at, fetched_at, record_count)) = snapshot else {
+            return Err(PersistenceError::InvalidSource(
+                "staged provider snapshot was not found".to_owned(),
+            ));
+        };
+        if !matches!(kind.as_str(), "m3u" | "xtream")
+            || snapshot_status != "staging"
+            || staged_at.is_none()
+        {
+            return Err(PersistenceError::InvalidSource(
+                "staged provider snapshot is not ready for publication".to_owned(),
+            ));
+        }
+        let newer_active: Option<Uuid> = sqlx::query_scalar(
+            r"
+            SELECT id
+            FROM source_snapshots
+            WHERE provider_account_id = $1
+              AND kind = $2
+              AND status = 'active'
+              AND (fetched_at > $3 OR (fetched_at = $3 AND id > $4))
+            LIMIT 1
+            ",
+        )
+        .bind(account_id)
+        .bind(&kind)
+        .bind(fetched_at)
+        .bind(snapshot_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if newer_active.is_some() {
+            sqlx::query(
+                "UPDATE source_snapshots SET status = 'superseded' WHERE id = $1 AND status = 'staging'",
+            )
+            .bind(snapshot_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE provider_reconciliation_runs SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status = 'processing'",
+            )
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(ProviderReconciliationFinalization::Superseded);
+        }
+        let stream_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM provider_streams WHERE snapshot_id = $1")
+                .bind(snapshot_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if stream_count != record_count {
+            return Err(PersistenceError::InvalidSource(
+                "staged provider snapshot record count does not match its streams".to_owned(),
+            ));
+        }
+        let candidate_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM provider_reconciliation_candidates WHERE run_id = $1",
+        )
+        .bind(run_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let total_keys: i64 =
+            sqlx::query_scalar("SELECT total_keys FROM provider_reconciliation_runs WHERE id = $1")
+                .bind(run_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        if candidate_count != total_keys {
+            return Err(PersistenceError::InvalidSource(
+                "reconciliation candidates are incomplete".to_owned(),
+            ));
+        }
+
+        let before_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
+        let current_revision =
+            current_reconciliation_revision(&mut transaction, account_id).await?;
+        let channel_count = upsert_candidate_channels(&mut transaction, account_id, run_id).await?;
+        let stale_link_count =
+            remove_stale_candidate_channel_stream_links(&mut transaction, account_id, run_id)
+                .await?;
+        let linked_count =
+            upsert_candidate_channel_stream_links(&mut transaction, account_id, run_id).await?;
+        let orphans_removed =
+            remove_candidate_orphaned_channels(&mut transaction, account_id, run_id).await?;
+
+        sqlx::query(
+            r"
+            UPDATE source_snapshots
+            SET status = 'superseded'
+            WHERE provider_account_id = $1
+              AND kind IN ('m3u', 'xtream')
+              AND status = 'active'
+              AND id <> $2
+            ",
+        )
+        .bind(account_id)
+        .bind(snapshot_id)
+        .execute(&mut *transaction)
+        .await?;
+        let activated = sqlx::query(
+            r"
+            UPDATE source_snapshots
+            SET status = 'active', activated_at = now()
+            WHERE id = $1 AND status = 'staging'
+            ",
+        )
+        .bind(snapshot_id)
+        .execute(&mut *transaction)
+        .await?;
+        if activated.rows_affected() != 1 {
+            return Err(PersistenceError::InvalidSource(
+                "staged provider snapshot was not activatable".to_owned(),
+            ));
+        }
+        let after_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
+        record_reconciliation_revision(
+            &mut transaction,
+            account_id,
+            current_revision + 1,
+            "system",
+            before_snapshot,
+            after_snapshot,
+        )
+        .await?;
+        sqlx::query(
+            r"
+            UPDATE provider_reconciliation_runs
+            SET status = 'published', completed_keys = total_keys,
+                published_at = now(), updated_at = now()
+            WHERE id = $1 AND status = 'processing'
+            ",
+        )
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(ProviderReconciliationFinalization::Published(
+            ReconcileStats {
+                channels: channel_count,
+                orphaned_channels_removed: orphans_removed,
+                stream_links: stale_link_count.saturating_add(linked_count),
+            },
+        ))
     }
 
     /// Reconciles active provider snapshots into canonical channels and
@@ -1204,6 +1869,34 @@ async fn active_supported_stream_count(
     .fetch_one(&mut **transaction)
     .await?;
     Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
+}
+
+async fn provider_reconciliation_progress(
+    pool: &PgPool,
+    run_id: Uuid,
+) -> Result<ProviderReconciliationRunProgress, PersistenceError> {
+    let row = sqlx::query_as::<_, ProviderReconciliationRunProgress>(
+        r"
+        SELECT r.id AS run_id,
+               r.status,
+               r.partition_count::bigint AS partition_count,
+               count(p.partition_number) FILTER (WHERE p.status = 'succeeded')::bigint
+                    AS partitions_completed,
+               r.total_keys,
+               coalesce(sum(p.completed_keys), 0)::bigint AS completed_keys
+        FROM provider_reconciliation_runs r
+        LEFT JOIN provider_reconciliation_partitions p ON p.run_id = r.id
+        WHERE r.id = $1
+        GROUP BY r.id, r.status, r.partition_count, r.total_keys
+        ",
+    )
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        PersistenceError::InvalidSource("reconciliation run was not found".to_owned())
+    })?;
+    Ok(row)
 }
 
 async fn active_canonical_key_count(
@@ -3543,6 +4236,195 @@ async fn upsert_canonical_channels_batch(
     .unwrap_or(i64::MAX);
 
     Ok(ReconcileCountRow { channels: inserted })
+}
+
+async fn upsert_candidate_channels(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    run_id: Uuid,
+) -> Result<i64, PersistenceError> {
+    let inserted: i64 = sqlx::query(
+        r"
+        WITH ranked_candidates AS (
+            SELECT rc.*,
+                   row_number() OVER (
+                       PARTITION BY rc.preferred_number
+                       ORDER BY rc.canonical_key
+                   ) AS preferred_rank
+            FROM provider_reconciliation_candidates rc
+            WHERE rc.run_id = $2
+        ),
+        channel_rows AS (
+            SELECT
+                COALESCE(
+                    c.id,
+                    regexp_replace(
+                        md5('iptv-channel:v1:' || $1::text || ':' || rc.canonical_key),
+                        '^(.{8})(.{4})(.{4})(.{4})(.{12})$',
+                        '\1-\2-\3-\4-\5'
+                    )::uuid
+                ) AS id,
+                rc.canonical_key,
+                rc.name,
+                rc.group_name,
+                rc.logo_url,
+                CASE
+                    WHEN rc.preferred_number IS NOT NULL
+                         AND rc.preferred_rank = 1
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM channels occupied
+                             WHERE occupied.channel_number = rc.preferred_number
+                               AND (c.id IS NULL OR occupied.id <> c.id)
+                         )
+                    THEN rc.preferred_number
+                    WHEN c.id IS NOT NULL THEN c.channel_number
+                    ELSE nextval('canonical_channel_number_seq')::text
+                END AS channel_number
+            FROM ranked_candidates rc
+            LEFT JOIN channels c
+              ON c.provider_account_id = $1
+             AND c.canonical_key = rc.canonical_key
+        )
+        INSERT INTO channels
+            (id, channel_number, name, group_name, logo_url, enabled,
+             managed_by, provider_account_id, canonical_key, revision)
+        SELECT id, channel_number, name, group_name, logo_url, true,
+               'automatic', $1, canonical_key, 1
+        FROM channel_rows
+        ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            group_name = EXCLUDED.group_name,
+            logo_url = EXCLUDED.logo_url,
+            enabled = true,
+            updated_at = now(),
+            revision = channels.revision + 1
+        WHERE (channels.name, channels.group_name, channels.logo_url, channels.enabled)
+              IS DISTINCT FROM
+              (EXCLUDED.name, EXCLUDED.group_name, EXCLUDED.logo_url, EXCLUDED.enabled)
+        ",
+    )
+    .bind(account_id)
+    .bind(run_id)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected()
+    .try_into()
+    .unwrap_or(i64::MAX);
+    Ok(inserted)
+}
+
+async fn remove_stale_candidate_channel_stream_links(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    run_id: Uuid,
+) -> Result<i64, PersistenceError> {
+    // Move existing priorities out of the incoming range before the upsert.
+    // Otherwise, swapping two stream priorities can violate the immediate
+    // UNIQUE (channel_id, priority) constraint during the insert.
+    sqlx::query(
+        r"
+        UPDATE channel_streams cs
+        SET priority = cs.priority + 1000000
+        FROM channels c
+        WHERE cs.channel_id = c.id
+          AND c.provider_account_id = $1
+          AND c.managed_by = 'automatic'
+        ",
+    )
+    .bind(account_id)
+    .execute(&mut **transaction)
+    .await?;
+    let deleted: i64 = sqlx::query(
+        r"
+        DELETE FROM channel_streams cs
+        USING channels c
+        WHERE cs.channel_id = c.id
+          AND c.provider_account_id = $1
+          AND c.managed_by = 'automatic'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM provider_reconciliation_candidate_streams rcs
+              WHERE rcs.run_id = $2
+                AND rcs.canonical_key = c.canonical_key
+                AND rcs.provider_stream_id = cs.provider_stream_id
+          )
+        ",
+    )
+    .bind(account_id)
+    .bind(run_id)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected()
+    .try_into()
+    .unwrap_or(i64::MAX);
+    Ok(deleted)
+}
+
+async fn upsert_candidate_channel_stream_links(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    run_id: Uuid,
+) -> Result<i64, PersistenceError> {
+    let affected: i64 = sqlx::query(
+        r"
+        INSERT INTO channel_streams (channel_id, provider_stream_id, priority, evidence)
+        SELECT c.id,
+               rcs.provider_stream_id,
+               row_number() OVER (
+                   PARTITION BY c.id
+                   ORDER BY rcs.provider_stream_id
+               ) - 1,
+               jsonb_build_object('reconciled', now(), 'runId', $2::text)
+        FROM provider_reconciliation_candidate_streams rcs
+        JOIN channels c
+          ON c.provider_account_id = $1
+         AND c.managed_by = 'automatic'
+         AND c.canonical_key = rcs.canonical_key
+        WHERE rcs.run_id = $2
+        ON CONFLICT (channel_id, provider_stream_id) DO UPDATE SET
+            priority = EXCLUDED.priority,
+            evidence = EXCLUDED.evidence
+        WHERE (channel_streams.priority, channel_streams.evidence)
+              IS DISTINCT FROM (EXCLUDED.priority, EXCLUDED.evidence)
+        ",
+    )
+    .bind(account_id)
+    .bind(run_id)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected()
+    .try_into()
+    .unwrap_or(i64::MAX);
+    Ok(affected)
+}
+
+async fn remove_candidate_orphaned_channels(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    run_id: Uuid,
+) -> Result<i64, PersistenceError> {
+    let deleted: i64 = sqlx::query(
+        r"
+        DELETE FROM channels c
+        WHERE c.provider_account_id = $1
+          AND c.managed_by = 'automatic'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM provider_reconciliation_candidates rc
+              WHERE rc.run_id = $2
+                AND rc.canonical_key = c.canonical_key
+          )
+        ",
+    )
+    .bind(account_id)
+    .bind(run_id)
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected()
+    .try_into()
+    .unwrap_or(i64::MAX);
+    Ok(deleted)
 }
 
 async fn remove_orphaned_channels(

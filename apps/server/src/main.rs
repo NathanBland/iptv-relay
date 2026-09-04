@@ -8,9 +8,9 @@ use iptv_api::{AppConfig, AppState, RuntimeVersions, hash_admin_password};
 use iptv_ingest::{
     ActivationProgress, ArtifactLimits, DownloadRequest, EndpointProtector, IngestError,
     IngestFormat, IngestProgress, IngestRequest, IngestResult, Ingestor, JobControl,
-    ParsedArtifact, PgSnapshotStore, ProtectedEndpoint, SnapshotOwner, XtreamEndpoints,
-    XtreamPayloadKind, download_http, parse_artifact_with_source_timezone, prepare_snapshot,
-    unpack_artifact,
+    ParsedArtifact, PgSnapshotStore, ProtectedEndpoint, SnapshotActivator, SnapshotOwner,
+    XtreamEndpoints, XtreamPayloadKind, download_http, parse_artifact_with_source_timezone,
+    prepare_snapshot, unpack_artifact,
 };
 use iptv_media::{
     ProviderSlotBroker, StreamProbe, StreamProbeFailure, StreamProbeOutcome, StreamProbeSpec,
@@ -19,9 +19,9 @@ use iptv_media::{
 use iptv_persistence::NewJob;
 use iptv_persistence::{
     CatalogRepository, DEFAULT_RECONCILIATION_BATCH_SIZE, Database, EpgMappingStats, JobRecord,
-    JobRepository, MasterKey, ProviderReconciliationPhase, ProviderReconciliationProgress,
-    ProviderReconciliationUpdate, ReconcileStats, SourceKind, SourceRepository, StreamHealthUpdate,
-    StreamProbeTargetRow,
+    JobRepository, MasterKey, ProviderReconciliationFinalization, ProviderReconciliationPhase,
+    ProviderReconciliationProgress, ProviderReconciliationUpdate, ReconcileStats, SourceKind,
+    SourceRepository, StreamHealthUpdate, StreamProbeTargetRow,
 };
 use reqwest::{Client, Url, header::HeaderMap};
 use sha2::{Digest, Sha256};
@@ -474,6 +474,12 @@ async fn process_job(
     if job.kind == "health-probe" {
         return run_health_probe_job(jobs, catalog, master_key, worker_id, &job).await;
     }
+    if job.kind == "reconcile-provider-partition" {
+        return run_provider_reconciliation_partition_job(jobs, catalog, worker_id, &job).await;
+    }
+    if job.kind == "finalize-provider-reconciliation" {
+        return run_provider_reconciliation_finalizer_job(jobs, catalog, worker_id, &job).await;
+    }
     if job.kind != "refresh-source" && job.kind != "refresh-xtream-short-epg" {
         warn!(job_id = %job.id, kind = %job.kind, "unsupported job kind");
         jobs.fail(
@@ -538,24 +544,43 @@ async fn run_refresh_job(
             jobs, sources, snapshots, catalog, master_key, worker_id, &job,
         )
         .await
+        .map(|result| RefreshExecution {
+            result,
+            deferred: false,
+        })
     };
     heartbeat_handle.abort();
 
     match refresh_result {
-        Ok(result) => {
-            let completed_progress = serde_json::json!({
-                "stage": "completed",
-                "percent": 100,
-                "bytesDownloaded": result.downloaded_bytes,
-                "recordsProcessed": result.records,
-                "message": if source_refresh {
-                    "Source refresh completed"
-                } else {
-                    "Xtream short EPG refresh completed"
-                },
-            });
-            if let Err(error) = jobs.heartbeat(job.id, worker_id, &completed_progress).await {
-                warn!(job_id = %job.id, error = %error, "failed to report completed progress");
+        Ok(execution) => {
+            let result = execution.result;
+            if execution.deferred {
+                if let Some(source_id) = source_id_from_payload(&job.payload)
+                    && let Err(error) = sources
+                        .mark_source_refreshed(source_id, chrono::Utc::now())
+                        .await
+                {
+                    warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
+                }
+                info!(
+                    job_id = %job.id,
+                    snapshot_id = %result.snapshot_id,
+                    records = result.records,
+                    "source refresh staged; waiting for reconciliation finalizer"
+                );
+                return Ok(());
+            }
+            if !source_refresh {
+                let completed_progress = serde_json::json!({
+                    "stage": "completed",
+                    "percent": 100,
+                    "bytesDownloaded": result.downloaded_bytes,
+                    "recordsProcessed": result.records,
+                    "message": "Xtream short EPG refresh completed",
+                });
+                if let Err(error) = jobs.heartbeat(job.id, worker_id, &completed_progress).await {
+                    warn!(job_id = %job.id, error = %error, "failed to report completed progress");
+                }
             }
             jobs.succeed(job.id, worker_id).await?;
             if source_refresh
@@ -592,6 +617,7 @@ async fn run_refresh_job(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_source_refresh(
     jobs: &JobRepository,
     sources: &SourceRepository,
@@ -600,7 +626,7 @@ async fn run_source_refresh(
     master_key: &MasterKey,
     worker_id: &str,
     job: &JobRecord,
-) -> std::result::Result<IngestResult, RefreshError> {
+) -> std::result::Result<RefreshExecution, RefreshError> {
     let source_id = source_id_from_payload(&job.payload).ok_or(RefreshError::InvalidPayload)?;
     let source = sources.load_for_job(source_id).await.map_err(|error| {
         warn!(source_id = %source_id, error = %error, "failed to load source for refresh");
@@ -646,29 +672,55 @@ async fn run_source_refresh(
             xtream_stream_endpoint: None,
             xtream_category_names: HashMap::new(),
         };
-        Ingestor::new(protector, control.clone(), snapshots.clone())
+        if source.kind == SourceKind::M3u {
+            Ingestor::new(
+                protector,
+                control.clone(),
+                StagedSnapshotActivator::new(snapshots.clone()),
+            )
             .run(&request)
             .await
-            .map_err(RefreshError::Ingest)?
+        } else {
+            // XMLTV has no deferred provider reconciliation. Publish its
+            // snapshot before mapping the guide against active rows.
+            Ingestor::new(protector, control.clone(), snapshots.clone())
+                .run(&request)
+                .await
+        }
+        .map_err(RefreshError::Ingest)?
     };
-    let reconciliation_progress = WorkerProviderReconciliationProgress {
-        control: &control,
-        result: &result,
-    };
-    run_post_refresh_catalog(
-        source.kind,
-        source.id,
-        catalog,
-        &control,
-        &result,
-        &reconciliation_progress,
-        reconciliation_batch_size(),
-    )
+    let deferred = if matches!(source.kind, SourceKind::M3u | SourceKind::Xtream) {
+        schedule_provider_reconciliation(
+            jobs,
+            catalog,
+            &control,
+            &result,
+            source.id,
+            job.id,
+            reconciliation_partition_count(),
+        )
+        .await?
+    } else {
+        let reconciliation_progress = WorkerProviderReconciliationProgress {
+            control: &control,
+            result: &result,
+        };
+        run_post_refresh_catalog(
+            source.kind,
+            source.id,
+            catalog,
+            &control,
+            &result,
+            &reconciliation_progress,
+            reconciliation_batch_size(),
+        )
         .await
         .map_err(|error| {
             warn!(job_id = %job.id, source_id = %source.id, error = ?error, "catalog post-refresh work failed");
             error
         })?;
+        false
+    };
     if source.kind == SourceKind::Xtream {
         match jobs.enqueue_xtream_short_epg(source.id).await {
             Ok(Some(guide_job)) => {
@@ -680,7 +732,391 @@ async fn run_source_refresh(
             }
         }
     }
-    Ok(result)
+    Ok(RefreshExecution { result, deferred })
+}
+
+/// Creates one deterministic worker job for each staged provider partition.
+///
+/// The source refresh only stages immutable rows. Its child workers prepare
+/// candidates, and one finalizer later makes the staged catalog public.
+async fn schedule_provider_reconciliation(
+    jobs: &JobRepository,
+    catalog: &CatalogRepository,
+    control: &impl JobControl,
+    result: &IngestResult,
+    source_id: Uuid,
+    parent_job_id: Uuid,
+    partition_count: i32,
+) -> std::result::Result<bool, RefreshError> {
+    let Some(run) = catalog
+        .create_or_load_provider_reconciliation_run(
+            result.snapshot_id,
+            parent_job_id,
+            partition_count,
+        )
+        .await
+        .map_err(|error| {
+            warn!(snapshot_id = %result.snapshot_id, error = %error, "could not create provider reconciliation run");
+            RefreshError::Catalog
+        })?
+    else {
+        // A checksum-equivalent snapshot was already active. No background
+        // work can make the existing output more complete.
+        checkpoint_reconciliation(control, result, "reconciling-complete", 0).await?;
+        return Ok(false);
+    };
+
+    checkpoint_reconciliation(control, result, "reconciling-partitions", 0).await?;
+    for partition_number in 0..run.partition_count {
+        jobs.enqueue_provider_reconciliation_partition_if_idle(
+            run.id,
+            partition_number,
+            source_id,
+            parent_job_id,
+        )
+            .await
+            .map_err(|error| {
+                warn!(run_id = %run.id, partition_number, error = %error, "could not enqueue reconciliation partition");
+                RefreshError::Catalog
+            })?;
+    }
+    // A first finalizer can return `Pending` before worker jobs complete. The
+    // final completed partition schedules another attempt.
+    jobs.enqueue_provider_reconciliation_finalizer_if_idle(run.id, source_id, parent_job_id)
+        .await
+        .map_err(|error| {
+            warn!(run_id = %run.id, error = %error, "could not enqueue reconciliation finalizer");
+            RefreshError::Catalog
+        })?;
+    info!(
+        run_id = %run.id,
+        snapshot_id = %result.snapshot_id,
+        partition_count = run.partition_count,
+        total_keys = run.total_keys,
+        "queued staged provider reconciliation"
+    );
+    Ok(true)
+}
+
+/// Prepares one source-snapshot partition and schedules its atomic finalizer.
+async fn run_provider_reconciliation_partition_job(
+    jobs: &JobRepository,
+    catalog: &CatalogRepository,
+    worker_id: &str,
+    job: &JobRecord,
+) -> Result<()> {
+    let Some((run_id, partition_number, source_id, parent_job_id)) =
+        provider_reconciliation_partition_from_payload(&job.payload)
+    else {
+        jobs.fail(
+            job.id,
+            worker_id,
+            job.attempts,
+            job.max_attempts,
+            "reconciliation partition payload is invalid",
+        )
+        .await?;
+        return Ok(());
+    };
+    if !jobs
+        .heartbeat_reconciliation_parent(
+            parent_job_id,
+            &serde_json::json!({
+                "stage": "reconciling",
+                "percent": 85,
+                "runId": run_id,
+                "partitionNumber": partition_number,
+                "message": "Preparing reconciliation partition",
+            }),
+        )
+        .await?
+    {
+        return Ok(());
+    }
+    match catalog
+        .process_provider_reconciliation_partition(run_id, partition_number, worker_id)
+        .await
+    {
+        Ok(result) => {
+            let aggregate = catalog.provider_reconciliation_progress(run_id).await?;
+            let percent = reconciliation_partition_percent(&aggregate);
+            jobs.heartbeat_reconciliation_parent(
+                parent_job_id,
+                &serde_json::json!({
+                    "stage": "reconciling",
+                    "percent": percent,
+                    "runId": run_id,
+                    "partitionNumber": partition_number,
+                    "keysProcessed": aggregate.completed_keys,
+                    "keysTotal": aggregate.total_keys,
+                    "partitionsCompleted": aggregate.partitions_completed,
+                    "partitionCount": aggregate.partition_count,
+                    "message": "Reconciliation partition completed",
+                }),
+            )
+            .await?;
+            jobs.heartbeat(
+                job.id,
+                worker_id,
+                &serde_json::json!({
+                    "stage": "reconciling-partition",
+                    "percent": percent,
+                    "runId": run_id,
+                    "partitionNumber": partition_number,
+                    "keysProcessed": result.keys_completed,
+                    "keysTotal": result.total_keys,
+                    "bytesDownloaded": 0,
+                    "recordsProcessed": result.keys_completed,
+                    "partitionsCompleted": aggregate.partitions_completed,
+                    "partitionCount": aggregate.partition_count,
+                    "message": if result.already_completed {
+                        "Reconciliation partition was already complete"
+                    } else {
+                        "Reconciliation partition completed"
+                    },
+                }),
+            )
+            .await?;
+            jobs.succeed(job.id, worker_id).await?;
+            jobs.enqueue_provider_reconciliation_finalizer_if_idle(
+                run_id,
+                source_id,
+                parent_job_id,
+            )
+            .await?;
+            Ok(())
+        }
+        Err(error) => {
+            warn!(job_id = %job.id, run_id = %run_id, partition_number, error = %error, "reconciliation partition failed");
+            jobs.fail(
+                job.id,
+                worker_id,
+                job.attempts,
+                job.max_attempts,
+                "reconciliation partition preparation failed",
+            )
+            .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Finalizes complete provider candidates, then runs serial guide work.
+#[allow(clippy::too_many_lines)]
+async fn run_provider_reconciliation_finalizer_job(
+    jobs: &JobRepository,
+    catalog: &CatalogRepository,
+    worker_id: &str,
+    job: &JobRecord,
+) -> Result<()> {
+    let Some((run_id, _source_id, parent_job_id)) =
+        provider_reconciliation_finalizer_from_payload(&job.payload)
+    else {
+        jobs.fail(
+            job.id,
+            worker_id,
+            job.attempts,
+            job.max_attempts,
+            "reconciliation finalizer payload is invalid",
+        )
+        .await?;
+        return Ok(());
+    };
+    if jobs.is_cancelled(parent_job_id).await.unwrap_or(true) {
+        return Ok(());
+    }
+    match catalog.finalize_provider_reconciliation(run_id).await {
+        Ok(ProviderReconciliationFinalization::Pending(progress)) => {
+            jobs.heartbeat_reconciliation_parent(
+                parent_job_id,
+                &serde_json::json!({
+                    "stage": "reconciling",
+                    "percent": reconciliation_partition_percent(&progress),
+                    "runId": run_id,
+                    "keysProcessed": progress.completed_keys,
+                    "keysTotal": progress.total_keys,
+                    "partitionsCompleted": progress.partitions_completed,
+                    "partitionCount": progress.partition_count,
+                    "message": "Waiting for reconciliation partitions",
+                }),
+            )
+            .await?;
+            jobs.heartbeat(
+                job.id,
+                worker_id,
+                &serde_json::json!({
+                    "stage": "reconciling-partitions",
+                    "percent": reconciliation_partition_percent(&progress),
+                    "runId": run_id,
+                    "keysProcessed": progress.completed_keys,
+                    "keysTotal": progress.total_keys,
+                    "partitionsCompleted": progress.partitions_completed,
+                    "partitionCount": progress.partition_count,
+                    "message": "Waiting for reconciliation partitions",
+                }),
+            )
+            .await?;
+            jobs.succeed(job.id, worker_id).await?;
+            Ok(())
+        }
+        Ok(ProviderReconciliationFinalization::Published(_)) => {
+            jobs.heartbeat(
+                job.id,
+                worker_id,
+                &serde_json::json!({
+                    "stage": "reconciling-epg",
+                    "percent": 99,
+                    "runId": run_id,
+                    "message": "Reconciling the program guide",
+                }),
+            )
+            .await?;
+            // Only the finalizer that atomically published the catalog starts
+            // EPG reconciliation. Partition workers never mutate guide rows.
+            catalog.reconcile_epg_mappings().await?;
+            catalog.scan_all_event_channels().await?;
+            jobs.complete_reconciliation_parent(
+                parent_job_id,
+                &serde_json::json!({
+                    "stage": "completed",
+                    "percent": 100,
+                    "recordsProcessed": 0,
+                    "message": "Source refresh completed",
+                }),
+            )
+            .await?;
+            jobs.heartbeat(
+                job.id,
+                worker_id,
+                &serde_json::json!({
+                    "stage": "completed",
+                    "percent": 100,
+                    "runId": run_id,
+                    "recordsProcessed": 0,
+                    "message": "Source refresh completed",
+                }),
+            )
+            .await?;
+            jobs.succeed(job.id, worker_id).await?;
+            Ok(())
+        }
+        Ok(ProviderReconciliationFinalization::AlreadyPublished) => {
+            // Publication commits before guide work. Retry guide work when a
+            // worker lost its lease after publication but before completion.
+            jobs.heartbeat(
+                job.id,
+                worker_id,
+                &serde_json::json!({
+                    "stage": "reconciling-epg",
+                    "percent": 99,
+                    "runId": run_id,
+                    "message": "Retrying the program guide reconciliation",
+                }),
+            )
+            .await?;
+            catalog.reconcile_epg_mappings().await?;
+            catalog.scan_all_event_channels().await?;
+            jobs.complete_reconciliation_parent(
+                parent_job_id,
+                &serde_json::json!({
+                    "stage": "completed",
+                    "percent": 100,
+                    "recordsProcessed": 0,
+                    "message": "Source refresh completed",
+                }),
+            )
+            .await?;
+            jobs.heartbeat(
+                job.id,
+                worker_id,
+                &serde_json::json!({
+                    "stage": "completed",
+                    "percent": 100,
+                    "runId": run_id,
+                    "recordsProcessed": 0,
+                    "message": "Source refresh completed",
+                }),
+            )
+            .await?;
+            jobs.succeed(job.id, worker_id).await?;
+            Ok(())
+        }
+        Ok(ProviderReconciliationFinalization::Superseded) => {
+            jobs.complete_reconciliation_parent(
+                parent_job_id,
+                &serde_json::json!({
+                    "stage": "completed",
+                    "percent": 100,
+                    "recordsProcessed": 0,
+                    "message": "Source refresh superseded by a newer refresh",
+                }),
+            )
+            .await?;
+            jobs.heartbeat(
+                job.id,
+                worker_id,
+                &serde_json::json!({
+                    "stage": "completed",
+                    "percent": 100,
+                    "runId": run_id,
+                    "recordsProcessed": 0,
+                    "message": "Source refresh superseded by a newer refresh",
+                }),
+            )
+            .await?;
+            jobs.succeed(job.id, worker_id).await?;
+            Ok(())
+        }
+        Err(error) => {
+            warn!(job_id = %job.id, run_id = %run_id, error = %error, "reconciliation finalizer failed");
+            jobs.fail(
+                job.id,
+                worker_id,
+                job.attempts,
+                job.max_attempts,
+                "reconciliation finalization failed",
+            )
+            .await?;
+            Ok(())
+        }
+    }
+}
+
+fn provider_reconciliation_run_from_payload(payload: &serde_json::Value) -> Option<Uuid> {
+    payload.get("runId")?.as_str()?.parse().ok()
+}
+
+fn provider_reconciliation_partition_from_payload(
+    payload: &serde_json::Value,
+) -> Option<(Uuid, i32, Uuid, Uuid)> {
+    let run_id = provider_reconciliation_run_from_payload(payload)?;
+    let partition_number = payload.get("partitionNumber")?.as_str()?.parse().ok()?;
+    let source_id = payload.get("sourceId")?.as_str()?.parse().ok()?;
+    let parent_job_id = payload.get("parentJobId")?.as_str()?.parse().ok()?;
+    if partition_number < 0 {
+        return None;
+    }
+    Some((run_id, partition_number, source_id, parent_job_id))
+}
+
+fn provider_reconciliation_finalizer_from_payload(
+    payload: &serde_json::Value,
+) -> Option<(Uuid, Uuid, Uuid)> {
+    Some((
+        provider_reconciliation_run_from_payload(payload)?,
+        payload.get("sourceId")?.as_str()?.parse().ok()?,
+        payload.get("parentJobId")?.as_str()?.parse().ok()?,
+    ))
+}
+
+fn reconciliation_partition_percent(
+    progress: &iptv_persistence::ProviderReconciliationRunProgress,
+) -> i64 {
+    if progress.total_keys <= 0 {
+        return 85;
+    }
+    let completed = progress.completed_keys.clamp(0, progress.total_keys);
+    85 + completed.saturating_mul(14) / progress.total_keys
 }
 
 const MAX_SHORT_EPG_STREAMS: i64 = 16;
@@ -1453,10 +1889,14 @@ async fn run_xtream_refresh(
         xtream_stream_endpoint: Some(endpoints.into_stream_template()),
         xtream_category_names: category_names,
     };
-    Ingestor::new(protector, control, snapshots.clone())
-        .run(&request)
-        .await
-        .map_err(RefreshError::Ingest)
+    Ingestor::new(
+        protector,
+        control,
+        StagedSnapshotActivator::new(snapshots.clone()),
+    )
+    .run(&request)
+    .await
+    .map_err(RefreshError::Ingest)
 }
 
 async fn fetch_xtream_payload(
@@ -1629,6 +2069,18 @@ fn reconciliation_batch_size() -> i64 {
         .clamp(1, 10_000)
 }
 
+/// Returns the bounded number of durable provider reconciliation partitions.
+///
+/// Three partitions use three workers by default. The number controls only
+/// candidate preparation. One final transaction still publishes the catalog.
+fn reconciliation_partition_count() -> i32 {
+    env::var("IPTV_RECONCILIATION_PARTITIONS")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or(3)
+        .clamp(1, 64)
+}
+
 async fn checkpoint_reconciliation(
     control: &impl JobControl,
     result: &IngestResult,
@@ -1689,6 +2141,47 @@ impl RefreshError {
             Self::Catalog => "source catalog reconciliation failed",
             Self::Ingest(error) => error.persisted_summary(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct RefreshExecution {
+    result: IngestResult,
+    deferred: bool,
+}
+
+/// Stores provider snapshots for worker reconciliation before public publication.
+///
+/// The finalizer owns the only path that changes active snapshots and channels.
+#[derive(Clone, Debug)]
+struct StagedSnapshotActivator {
+    snapshots: PgSnapshotStore,
+}
+
+impl StagedSnapshotActivator {
+    fn new(snapshots: PgSnapshotStore) -> Self {
+        Self { snapshots }
+    }
+}
+
+impl SnapshotActivator for StagedSnapshotActivator {
+    async fn activate(
+        &self,
+        snapshot: &iptv_ingest::PreparedSnapshot,
+    ) -> std::result::Result<Uuid, IngestError> {
+        self.snapshots.stage(snapshot).await
+    }
+
+    async fn activate_with_progress(
+        &self,
+        snapshot: &iptv_ingest::PreparedSnapshot,
+        progress: &dyn ActivationProgress,
+    ) -> std::result::Result<Uuid, IngestError> {
+        self.snapshots.stage_with_progress(snapshot, progress).await
+    }
+
+    fn completion_phase(&self) -> &'static str {
+        "staged"
     }
 }
 
@@ -1881,6 +2374,18 @@ fn refresh_progress_json(progress: &IngestProgress) -> serde_json::Value {
                 70,
                 progress.records_seen,
                 "Activated snapshot".to_owned(),
+            ),
+            "staged" => (
+                "reconciling",
+                70,
+                progress.records_seen,
+                "Staged snapshot for worker reconciliation".to_owned(),
+            ),
+            "reconciling-partitions" => (
+                "reconciling",
+                85,
+                progress.records_prepared,
+                "Queued provider reconciliation partitions".to_owned(),
             ),
             "reconciling-channels" => (
                 "reconciling",
@@ -2573,6 +3078,37 @@ mod tests {
         )
         .await
         .expect("process refresh job");
+        // Source refresh now only stages provider data. Drive its child jobs
+        // in this helper so existing end-to-end tests assert final public
+        // state without changing production worker scheduling.
+        loop {
+            let child: Option<JobRecord> = sqlx::query_as(
+                r"
+                SELECT *
+                FROM jobs
+                WHERE status = 'queued'
+                  AND kind IN (
+                      'reconcile-provider-partition',
+                      'finalize-provider-reconciliation'
+                  )
+                ORDER BY created_at, id
+                LIMIT 1
+                ",
+            )
+            .fetch_optional(pool)
+            .await
+            .expect("fetch reconciliation child job");
+            let Some(child) = child else {
+                break;
+            };
+            force_running(pool, child.id, worker_id).await;
+            let child = fetch_job(pool, child.id).await;
+            process_job(
+                jobs, sources, snapshots, catalog, master_key, worker_id, child,
+            )
+            .await
+            .expect("process reconciliation child job");
+        }
     }
 
     #[tokio::test]
@@ -3610,6 +4146,68 @@ mod tests {
                 format!("Staged {staged} of {total} source records")
             );
         }
+    }
+
+    #[test]
+    fn staged_provider_progress_reports_partition_work() {
+        let staged = refresh_progress_json(&IngestProgress {
+            phase: "staged".to_owned(),
+            records_seen: 1_000,
+            ..IngestProgress::default()
+        });
+        assert_eq!(staged["stage"], "reconciling");
+        assert_eq!(staged["percent"], 70);
+        let partitions = refresh_progress_json(&IngestProgress {
+            phase: "reconciling-partitions".to_owned(),
+            records_seen: 1_000,
+            ..IngestProgress::default()
+        });
+        assert_eq!(partitions["stage"], "reconciling");
+        assert_eq!(partitions["percent"], 85);
+    }
+
+    #[test]
+    fn reconciliation_partition_payload_requires_valid_nonnegative_values() {
+        let run_id = Uuid::now_v7();
+        let source_id = Uuid::now_v7();
+        let parent_job_id = Uuid::now_v7();
+        let payload = serde_json::json!({
+            "runId": run_id.to_string(),
+            "partitionNumber": "2",
+            "sourceId": source_id.to_string(),
+            "parentJobId": parent_job_id.to_string(),
+        });
+        assert_eq!(
+            provider_reconciliation_partition_from_payload(&payload),
+            Some((run_id, 2, source_id, parent_job_id))
+        );
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"runId": "not-a-uuid", "partitionNumber": "2"}),
+            serde_json::json!({"runId": run_id.to_string(), "partitionNumber": "-1", "sourceId": source_id.to_string(), "parentJobId": parent_job_id.to_string()}),
+            serde_json::json!({"runId": run_id.to_string(), "partitionNumber": 2, "sourceId": source_id.to_string(), "parentJobId": parent_job_id.to_string()}),
+        ] {
+            assert!(provider_reconciliation_partition_from_payload(&payload).is_none());
+        }
+    }
+
+    #[test]
+    fn reconciliation_partition_progress_stays_in_reconciliation_range() {
+        let run_id = Uuid::now_v7();
+        let progress =
+            |completed_keys, total_keys| iptv_persistence::ProviderReconciliationRunProgress {
+                run_id,
+                status: "processing".to_owned(),
+                partition_count: 3,
+                partitions_completed: 0,
+                total_keys,
+                completed_keys,
+            };
+        assert_eq!(reconciliation_partition_percent(&progress(0, 10)), 85);
+        assert_eq!(reconciliation_partition_percent(&progress(5, 10)), 92);
+        assert_eq!(reconciliation_partition_percent(&progress(10, 10)), 99);
+        assert_eq!(reconciliation_partition_percent(&progress(100, 10)), 99);
+        assert_eq!(reconciliation_partition_percent(&progress(0, 0)), 85);
     }
 
     #[tokio::test]

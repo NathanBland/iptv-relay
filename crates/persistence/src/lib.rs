@@ -29,12 +29,14 @@ pub use catalog::{
     LineupChannelRow, LineupTemplateRow, OperatorSettingOverrideRow, OperatorSettingOverrides,
     OperatorSettingRevisionRow, OperatorSettingScopeState, OutputProfileRow,
     OutputProfileTokenHash, ProgrammePage, ProgrammeQuery, ProgrammeRow,
-    ProviderReconciliationPhase, ProviderReconciliationProgress, ProviderReconciliationUpdate,
-    ReconcileStats, ReconciliationRevisionRow, ReconciliationRollbackStats, RecordingRow,
-    RecordingRuleRow, RecordingStats, RegionFilterStats, RegionPrefixRow, RegionSettingsRow,
-    ReviewCandidateRow, StreamHealthPage, StreamHealthRow, StreamHealthStats, StreamHealthUpdate,
-    StreamProbeTargetRow, StreamProfileRow, SystemCounts, UnmappedChannelPage, UnmappedChannelRow,
-    UpdateUserInput, UserRow,
+    ProviderReconciliationFinalization, ProviderReconciliationPartitionResult,
+    ProviderReconciliationPhase, ProviderReconciliationProgress, ProviderReconciliationRun,
+    ProviderReconciliationRunProgress, ProviderReconciliationUpdate, ReconcileStats,
+    ReconciliationRevisionRow, ReconciliationRollbackStats, RecordingRow, RecordingRuleRow,
+    RecordingStats, RegionFilterStats, RegionPrefixRow, RegionSettingsRow, ReviewCandidateRow,
+    StreamHealthPage, StreamHealthRow, StreamHealthStats, StreamHealthUpdate, StreamProbeTargetRow,
+    StreamProfileRow, SystemCounts, UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput,
+    UserRow,
 };
 
 /// Embedded database migrations for the service schema.
@@ -1679,6 +1681,93 @@ impl JobRepository {
         Ok(record)
     }
 
+    /// Enqueues one provider reconciliation partition when it has no open job.
+    ///
+    /// The database unique index prevents duplicate worker claims after a
+    /// coordinator retry. Completed jobs do not block an explicit retry.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn enqueue_provider_reconciliation_partition_if_idle(
+        &self,
+        run_id: Uuid,
+        partition_number: i32,
+        source_id: Uuid,
+        parent_job_id: Uuid,
+    ) -> Result<Option<JobRecord>, PersistenceError> {
+        let run_id_text = run_id.to_string();
+        let partition_text = partition_number.to_string();
+        let source_id_text = source_id.to_string();
+        let parent_job_id_text = parent_job_id.to_string();
+        let record = sqlx::query_as::<_, JobRecord>(
+            r"
+            INSERT INTO jobs (id, kind, payload, available_at)
+            SELECT $1, 'reconcile-provider-partition', $2, now()
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs
+                WHERE id = $3 AND status = 'cancelled'
+                FOR UPDATE
+            )
+            ON CONFLICT ((payload->>'runId'), (payload->>'partitionNumber'))
+                WHERE kind = 'reconcile-provider-partition'
+                  AND status IN ('queued', 'running')
+                DO NOTHING
+            RETURNING *
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(serde_json::json!({
+            "runId": run_id_text,
+            "partitionNumber": partition_text,
+            "sourceId": source_id_text,
+            "parentJobId": parent_job_id_text,
+        }))
+        .bind(parent_job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    /// Enqueues one finalizer job when no finalizer for the run is open.
+    ///
+    /// A finalizer can complete while partitions remain. The last completed
+    /// partition then schedules a new finalizer attempt.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn enqueue_provider_reconciliation_finalizer_if_idle(
+        &self,
+        run_id: Uuid,
+        source_id: Uuid,
+        parent_job_id: Uuid,
+    ) -> Result<Option<JobRecord>, PersistenceError> {
+        let run_id_text = run_id.to_string();
+        let source_id_text = source_id.to_string();
+        let parent_job_id_text = parent_job_id.to_string();
+        let record = sqlx::query_as::<_, JobRecord>(
+            r"
+            INSERT INTO jobs (id, kind, payload, available_at)
+            SELECT $1, 'finalize-provider-reconciliation', $2, now()
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs
+                WHERE id = $3 AND status = 'cancelled'
+                FOR UPDATE
+            )
+            ON CONFLICT ((payload->>'runId'))
+                WHERE kind = 'finalize-provider-reconciliation'
+                  AND status IN ('queued', 'running')
+                DO NOTHING
+            RETURNING *
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(serde_json::json!({
+            "runId": run_id_text,
+            "sourceId": source_id_text,
+            "parentJobId": parent_job_id_text,
+        }))
+        .bind(parent_job_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
     /// Enqueues one low-priority `health-probe` job only when no queued or
     /// running `health-probe` job already targets the stream.
     ///
@@ -1789,7 +1878,13 @@ impl JobRepository {
         let result = sqlx::query(
             r"
             UPDATE jobs
-            SET heartbeat_at = now(), progress = $2, updated_at = now()
+            SET heartbeat_at = now(),
+                progress = CASE
+                    WHEN coalesce(progress->>'activationLocked', 'false') = 'true'
+                    THEN $2 || jsonb_build_object('activationLocked', true)
+                    ELSE $2
+                END,
+                updated_at = now()
             WHERE id = $1 AND kind = 'refresh-source' AND status = 'running'
             ",
         )
@@ -1856,6 +1951,54 @@ impl JobRepository {
         } else {
             Err(PersistenceError::JobNotFound(job_id))
         }
+    }
+
+    /// Cancels one source refresh and its queued or running child jobs.
+    ///
+    /// The parent activation lock still prevents cancellation after snapshot
+    /// publication starts. Child jobs never publish a partial catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when cancellation cannot be persisted.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn cancel_source_sync(&self, parent_job_id: Uuid) -> Result<bool, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let parent_cancelled: bool = sqlx::query_scalar(
+            r"
+            UPDATE jobs
+            SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+            WHERE id = $1
+              AND status IN ('queued', 'running')
+              AND coalesce(progress->>'activationLocked', 'false') <> 'true'
+            RETURNING true
+            ",
+        )
+        .bind(parent_job_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .unwrap_or(false);
+        let child_count = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+            WHERE payload->>'parentJobId' = $1
+              AND kind IN (
+                  'reconcile-provider-partition',
+                  'finalize-provider-reconciliation'
+              )
+              AND status IN ('queued', 'running')
+              AND coalesce(progress->>'activationLocked', 'false') <> 'true'
+            ",
+        )
+        .bind(parent_job_id.to_string())
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        transaction.commit().await?;
+        Ok(parent_cancelled || child_count > 0)
     }
 
     /// Reports whether a worker should stop processing a cancelled job.
