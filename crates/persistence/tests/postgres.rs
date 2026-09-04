@@ -3824,6 +3824,36 @@ async fn source_configuration_and_job_management_work() {
         ))
         .await
         .unwrap();
+    let partition_for_deleted_source = jobs
+        .enqueue(&NewJob::immediate(
+            "reconcile-provider-partition",
+            json!({
+                "runId": uuid::Uuid::now_v7(),
+                "partitionNumber": "0",
+                "sourceId": provider.source.id,
+                "parentJobId": queued_for_deleted_source.id,
+            }),
+        ))
+        .await
+        .unwrap();
+    let finalizer_for_deleted_source = jobs
+        .enqueue(&NewJob::immediate(
+            "finalize-provider-reconciliation",
+            json!({
+                "runId": uuid::Uuid::now_v7(),
+                "sourceId": provider.source.id,
+                "parentJobId": queued_for_deleted_source.id,
+            }),
+        ))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE jobs SET status = 'running', locked_by = 'delete-test-worker', locked_at = now(), heartbeat_at = now() WHERE id = $1",
+    )
+    .bind(finalizer_for_deleted_source.id)
+    .execute(&pool)
+    .await
+    .unwrap();
     sources
         .delete(provider.source.id, "integration-test")
         .await
@@ -3833,6 +3863,17 @@ async fn source_configuration_and_job_management_work() {
             .await
             .unwrap()
     );
+    for job_id in [
+        partition_for_deleted_source.id,
+        finalizer_for_deleted_source.id,
+    ] {
+        let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
     assert!(matches!(
         sources
             .delete(provider.source.id, "integration-test")

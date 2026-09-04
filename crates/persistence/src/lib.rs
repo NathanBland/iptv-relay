@@ -1227,7 +1227,7 @@ impl SourceRepository {
     /// # Errors
     ///
     /// Returns not-found or database errors.
-    #[allow(clippy::missing_errors_doc)]
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
     pub async fn delete(&self, source_id: Uuid, actor: &str) -> Result<(), PersistenceError> {
         let mut transaction = self.pool.begin().await?;
 
@@ -1244,11 +1244,52 @@ impl SourceRepository {
             return Err(PersistenceError::SourceNotFound(source_id));
         }
 
-        // Cancel pending refresh jobs for this source.
-        sqlx::query("UPDATE jobs SET status = 'cancelled' WHERE kind = 'refresh-source' AND payload->>'sourceId' = $1 AND status IN ('queued', 'running')")
-            .bind(source_id.to_string())
-            .execute(&mut *transaction)
-            .await?;
+        // Cancel the parent and all reconciliation children before deleting
+        // source data. Child jobs have no foreign key to the parent job, so
+        // identify them by source or by their refresh parent ID.
+        let source_id_text = source_id.to_string();
+        sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+            WHERE status IN ('queued', 'running')
+              AND (
+                  (
+                      kind = 'refresh-source'
+                      AND payload->>'sourceId' = $1
+                  )
+                  OR (
+                      kind IN (
+                          'reconcile-provider-partition',
+                          'finalize-provider-reconciliation'
+                      )
+                      AND (
+                          payload->>'sourceId' = $1
+                          OR payload->>'parentJobId' IN (
+                              SELECT id::text
+                              FROM jobs
+                              WHERE kind = 'refresh-source'
+                                AND payload->>'sourceId' = $1
+                          )
+                      )
+                  )
+              )
+            ",
+        )
+        .bind(&source_id_text)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r"
+            UPDATE provider_reconciliation_runs
+            SET status = 'cancelled', updated_at = now()
+            WHERE provider_account_id = $1 AND status IN ('queued', 'processing')
+            ",
+        )
+        .bind(source_id)
+        .execute(&mut *transaction)
+        .await?;
 
         // Delete automatic channels owned by this provider. This cascades
         // to channel_streams, channel_epg_mappings, stream_profiles,
