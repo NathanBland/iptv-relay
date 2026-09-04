@@ -6420,3 +6420,298 @@ async fn circuit_breaker_guards_epg_sources_through_the_same_transitions() {
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
 }
+
+/// Enqueues, claims, and terminally fails a job so it archives to the
+/// dead-letter table. Returns the archived record.
+async fn archive_one_terminal_failure(
+    jobs: &JobRepository,
+    kind: &str,
+    payload: Value,
+    error_summary: &str,
+) -> iptv_persistence::DeadLetterRecord {
+    let mut job = NewJob::immediate(kind, payload);
+    job.max_attempts = 1;
+    let enqueued = jobs.enqueue(&job).await.unwrap();
+    let claimed = jobs.claim("dl-worker").await.unwrap().unwrap();
+    assert_eq!(claimed.id, enqueued.id);
+    jobs.fail(
+        claimed.id,
+        "dl-worker",
+        claimed.attempts,
+        claimed.max_attempts,
+        error_summary,
+    )
+    .await
+    .unwrap();
+    let archived = jobs
+        .list_dead_letter_jobs(None, None, true, 10, 0)
+        .await
+        .unwrap();
+    archived
+        .into_iter()
+        .find(|entry| entry.original_job_id == enqueued.id)
+        .expect("the failed job is archived")
+}
+
+#[tokio::test]
+async fn dead_letter_archive_creation_records_redacted_terminal_failure() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let jobs = JobRepository::new(pool.clone());
+
+    let archived = archive_one_terminal_failure(
+        &jobs,
+        "refresh-source",
+        json!({"sourceId": "source-1"}),
+        "request?username=alice&password=secret&token=value failed",
+    )
+    .await;
+
+    assert_eq!(archived.kind, "refresh-source");
+    assert_eq!(archived.payload, json!({"sourceId": "source-1"}));
+    assert_eq!(archived.attempt_count, 1);
+    assert_eq!(archived.max_attempts, 1);
+    assert!(!archived.error_message.contains("alice"));
+    assert!(!archived.error_message.contains("secret"));
+    assert!(!archived.error_message.contains("value"));
+    assert!(archived.resolved_at.is_none());
+    assert!(archived.resolution.is_none());
+    assert!(
+        archived.failure_stage.is_none(),
+        "no checkpoint was reported"
+    );
+
+    // The originating job row is terminal and the archive is a separate row.
+    let job_status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+        .bind(archived.original_job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(job_status, "failed");
+
+    drop(jobs);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn dead_letter_archive_captures_the_last_reported_stage() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let jobs = JobRepository::new(pool.clone());
+
+    let mut job = NewJob::immediate("refresh-source", json!({"sourceId": "source-2"}));
+    job.max_attempts = 1;
+    jobs.enqueue(&job).await.unwrap();
+    let claimed = jobs.claim("dl-worker").await.unwrap().unwrap();
+    jobs.heartbeat(
+        claimed.id,
+        "dl-worker",
+        &json!({"stage": "parsing", "percent": 30, "message": "Parsing source data"}),
+    )
+    .await
+    .unwrap();
+    jobs.fail(
+        claimed.id,
+        "dl-worker",
+        claimed.attempts,
+        claimed.max_attempts,
+        "download timed out",
+    )
+    .await
+    .unwrap();
+
+    let archived = jobs
+        .list_dead_letter_jobs(None, None, true, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(
+        archived[0].failure_stage.as_deref(),
+        Some("parsing"),
+        "the last reported progress stage is archived"
+    );
+    assert_eq!(archived[0].error_category, "timeout");
+
+    drop(jobs);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn dead_letter_replay_creates_a_fresh_claimable_job_and_marks_resolved() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let jobs = JobRepository::new(pool.clone());
+
+    let archived = archive_one_terminal_failure(
+        &jobs,
+        "refresh-source",
+        json!({"sourceId": "source-3"}),
+        "boom",
+    )
+    .await;
+
+    let new_job_id = jobs
+        .replay_dead_letter_job(archived.id)
+        .await
+        .unwrap()
+        .expect("replay returns a new job id");
+
+    // The new job is queued and claimable with a reset attempt count.
+    let claimed = jobs.claim("dl-worker").await.unwrap().unwrap();
+    assert_eq!(claimed.id, new_job_id);
+    assert_eq!(claimed.kind, "refresh-source");
+    assert_eq!(claimed.payload, json!({"sourceId": "source-3"}));
+    assert_eq!(claimed.attempts, 1, "attempts reset on replay");
+
+    // The archive is resolved as replayed and no longer listed unresolved.
+    let resolved: (Option<chrono::DateTime<Utc>>, Option<String>) =
+        sqlx::query_as("SELECT resolved_at, resolution FROM dead_letter_jobs WHERE id = $1")
+            .bind(archived.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(resolved.0.is_some());
+    assert_eq!(resolved.1.as_deref(), Some("replayed"));
+    let unresolved = jobs
+        .list_dead_letter_jobs(None, None, true, 10, 0)
+        .await
+        .unwrap();
+    assert!(
+        unresolved.is_empty(),
+        "replayed entry is no longer unresolved"
+    );
+
+    drop(jobs);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn dead_letter_close_marks_resolved_without_replaying() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let jobs = JobRepository::new(pool.clone());
+
+    let archived = archive_one_terminal_failure(
+        &jobs,
+        "refresh-source",
+        json!({"sourceId": "source-4"}),
+        "boom",
+    )
+    .await;
+
+    assert!(
+        jobs.close_dead_letter_job(archived.id, "closed")
+            .await
+            .unwrap()
+    );
+    // Closing an already-resolved entry reports false.
+    assert!(
+        !jobs
+            .close_dead_letter_job(archived.id, "closed")
+            .await
+            .unwrap()
+    );
+
+    let resolved: (Option<chrono::DateTime<Utc>>, Option<String>) =
+        sqlx::query_as("SELECT resolved_at, resolution FROM dead_letter_jobs WHERE id = $1")
+            .bind(archived.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(resolved.0.is_some());
+    assert_eq!(resolved.1.as_deref(), Some("closed"));
+
+    // No new job was created by closing.
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE status = 'queued'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(queued, 0);
+
+    drop(jobs);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn dead_letter_list_paginates_and_filters_by_kind_and_resolution() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let jobs = JobRepository::new(pool.clone());
+
+    let a = archive_one_terminal_failure(&jobs, "refresh-source", json!({"i": 1}), "boom").await;
+    let b = archive_one_terminal_failure(&jobs, "refresh-source", json!({"i": 2}), "boom").await;
+    let c = archive_one_terminal_failure(&jobs, "health-probe", json!({"i": 3}), "boom").await;
+
+    // Resolve one entry so the unresolved filter excludes it.
+    jobs.close_dead_letter_job(b.id, "closed").await.unwrap();
+
+    // Unresolved only (default) returns the two open entries.
+    let unresolved = jobs
+        .list_dead_letter_jobs(None, None, true, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(unresolved.len(), 2);
+    assert!(unresolved.iter().any(|r| r.id == a.id));
+    assert!(unresolved.iter().any(|r| r.id == c.id));
+
+    // Including resolved returns all three.
+    let all = jobs
+        .list_dead_letter_jobs(None, None, false, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3);
+
+    // Kind filter narrows to refresh-source entries.
+    let refresh = jobs
+        .list_dead_letter_jobs(Some("refresh-source"), None, false, 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(refresh.len(), 2);
+    assert!(refresh.iter().all(|r| r.kind == "refresh-source"));
+
+    // Pagination returns one entry per page in newest-first order.
+    let page = jobs
+        .list_dead_letter_jobs(None, None, false, 1, 0)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    let second_page = jobs
+        .list_dead_letter_jobs(None, None, false, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(second_page.len(), 1);
+    assert_ne!(page[0].id, second_page[0].id);
+
+    drop(jobs);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
