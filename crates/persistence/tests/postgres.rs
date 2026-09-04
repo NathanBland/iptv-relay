@@ -142,6 +142,99 @@ async fn migrations_and_job_lifecycle_are_transactionally_usable() {
 }
 
 #[tokio::test]
+async fn provider_reconciliation_partitions_conserve_canonical_key_counts() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let jobs = JobRepository::new(pool.clone());
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template)
+         VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("partition-count-{account_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots
+            (id, provider_account_id, kind, status, checksum_sha256, byte_count,
+             record_count, staged_at)
+         VALUES ($1, $2, 'm3u', 'staging', $3, 4, 4, now())",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(format!("partition-count-{snapshot_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (stable_key, tvg_id) in [
+        ("first", Some("shared")),
+        ("second", Some("shared")),
+        ("third", Some("unique")),
+        ("fourth", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO provider_streams
+                (id, snapshot_id, provider_account_id, stable_key, name, tvg_id,
+                 url_template, attributes, directives, supported)
+             VALUES ($1, $2, $3, $4, $4, $5, 'https://provider.test/stream',
+                     '{}'::jsonb, '[]'::jsonb, true)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(stable_key)
+        .bind(tvg_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let parent = jobs
+        .enqueue(&NewJob::immediate(
+            "refresh-source",
+            json!({"sourceId": account_id}),
+        ))
+        .await
+        .unwrap();
+
+    let run = catalog
+        .create_or_load_provider_reconciliation_run(snapshot_id, parent.id, 64)
+        .await
+        .unwrap()
+        .expect("staged provider snapshot creates a run");
+    assert_eq!(run.partition_count, 64);
+    assert_eq!(run.total_keys, 3);
+    let (partition_count, key_sum): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), coalesce(sum(key_count), 0)
+         FROM provider_reconciliation_partitions WHERE run_id = $1",
+    )
+    .bind(run.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(partition_count, 64);
+    assert_eq!(key_sum, run.total_keys);
+
+    let same_run = catalog
+        .create_or_load_provider_reconciliation_run(snapshot_id, parent.id, 1)
+        .await
+        .unwrap()
+        .expect("retry returns the existing run");
+    assert_eq!(same_run.id, run.id);
+    assert_eq!(same_run.partition_count, 64);
+
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
 async fn activation_lock_prevents_post_commit_cancellation_and_preserves_progress() {
     let Some(database_url) = database_url() else {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");

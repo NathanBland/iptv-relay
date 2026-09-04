@@ -329,42 +329,41 @@ impl CatalogRepository {
         .fetch_one(&mut *transaction)
         .await?;
 
-        for partition_number in 0..partition_count {
-            let key_count: i64 = sqlx::query_scalar(
-                r"
-                SELECT count(*)
-                FROM (
-                    SELECT COALESCE(NULLIF(tvg_id, ''), 'stream:' || stable_key) AS canonical_key
-                    FROM provider_streams
-                    WHERE snapshot_id = $1
-                      AND supported
-                    GROUP BY canonical_key
-                ) AS canonical_keys
-                WHERE mod(
-                    mod(hashtextextended(canonical_key, 0), $3::bigint) + $3::bigint,
-                    $3::bigint
-                ) = $2::bigint
-                ",
+        // Group canonical keys once, then distribute the counts across all
+        // partitions. This keeps coordinator work O(streams), regardless of
+        // the configured worker partition count.
+        sqlx::query(
+            r"
+            WITH canonical_keys AS (
+                SELECT COALESCE(NULLIF(tvg_id, ''), 'stream:' || stable_key) AS canonical_key
+                FROM provider_streams
+                WHERE snapshot_id = $1
+                  AND supported
+                GROUP BY canonical_key
+            ), partition_counts AS (
+                SELECT mod(
+                           mod(hashtextextended(canonical_key, 0), $2::bigint) + $2::bigint,
+                           $2::bigint
+                       ) AS partition_number,
+                       count(*) AS key_count
+                FROM canonical_keys
+                GROUP BY partition_number
             )
-            .bind(snapshot_id)
-            .bind(i64::from(partition_number))
-            .bind(i64::from(partition_count))
-            .fetch_one(&mut *transaction)
-            .await?;
-            sqlx::query(
-                r"
-                INSERT INTO provider_reconciliation_partitions
-                    (run_id, partition_number, status, key_count)
-                VALUES ($1, $2, 'queued', $3)
-                ON CONFLICT (run_id, partition_number) DO NOTHING
-                ",
-            )
-            .bind(run_id)
-            .bind(partition_number)
-            .bind(key_count)
-            .execute(&mut *transaction)
-            .await?;
-        }
+            INSERT INTO provider_reconciliation_partitions
+                (run_id, partition_number, status, key_count)
+            SELECT $3, partitions.partition_number, 'queued',
+                   COALESCE(partition_counts.key_count, 0)
+            FROM generate_series(0, $2::integer - 1) AS partitions(partition_number)
+            LEFT JOIN partition_counts
+                ON partition_counts.partition_number = partitions.partition_number
+            ON CONFLICT (run_id, partition_number) DO NOTHING
+            ",
+        )
+        .bind(snapshot_id)
+        .bind(i64::from(partition_count))
+        .bind(run_id)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(Some(run))
     }
