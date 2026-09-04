@@ -862,6 +862,11 @@ pub fn router(state: AppState) -> Router {
         .merge(configuration_control_routes())
         .route("/api/v1/openapi.json", get(openapi));
 
+    // SSE routes bypass the compression layer so events flush immediately.
+    // CompressionLayer buffers the response body, which prevents SSE events
+    // from flushing and causes the session-events endpoint to time out.
+    let sse_routes = sse_control_routes();
+
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
@@ -877,6 +882,7 @@ pub fn router(state: AppState) -> Router {
         .merge(control)
         .merge(output_routes())
         .layer(CompressionLayer::new())
+        .merge(sse_routes)
         .layer(CatchPanicLayer::new())
         .with_state(state)
 }
@@ -1132,8 +1138,6 @@ fn event_control_routes() -> Router<AppState> {
 fn operations_control_routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/sessions", get(list_sessions))
-        .route("/api/v1/session-events", get(session_events))
-        .route("/api/v1/catalog-events", get(catalog_events))
         .route("/api/v1/support/bundle", get(support_bundle))
         .route("/api/v1/support/logs", get(support_logs))
         .route("/api/v1/jellyfin/setup", get(jellyfin_setup))
@@ -1172,6 +1176,19 @@ fn operations_control_routes() -> Router<AppState> {
             "/api/v1/channels/{channel_id}/best-stream",
             get(best_stream_for_channel),
         )
+}
+
+/// SSE streaming routes that must bypass the compression layer.
+///
+/// `CompressionLayer` buffers the response body to inspect the
+/// `Content-Type` header before it decides whether to compress. This
+/// buffering prevents SSE events from flushing to the client and causes
+/// the session-events endpoint to hang until the connection times out.
+/// Keep these routes on a separate router that does not use compression.
+fn sse_control_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/session-events", get(session_events))
+        .route("/api/v1/catalog-events", get(catalog_events))
 }
 
 fn configuration_control_routes() -> Router<AppState> {
@@ -6688,6 +6705,7 @@ struct StreamHealthItem {
 struct StreamHealthResponse {
     total: i64,
     items: Vec<StreamHealthItem>,
+    estimated: bool,
 }
 
 impl From<iptv_persistence::StreamHealthRow> for StreamHealthItem {
@@ -6817,6 +6835,7 @@ async fn list_stream_health(
         Ok(page) => Json(StreamHealthResponse {
             total: page.total,
             items: page.items.into_iter().map(StreamHealthItem::from).collect(),
+            estimated: page.estimated,
         })
         .into_response(),
         Err(error) => persistence_error_response(error),
@@ -12305,6 +12324,7 @@ mod tests {
         assert_serializes(StreamHealthResponse {
             total: 0,
             items: vec![],
+            estimated: false,
         });
         assert_serializes(StreamHealthStatsResponse {
             alive: 1,

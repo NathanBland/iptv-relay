@@ -3399,6 +3399,7 @@ pub struct StreamHealthRow {
 pub struct StreamHealthPage {
     pub total: i64,
     pub items: Vec<StreamHealthRow>,
+    pub estimated: bool,
 }
 
 /// Input data for updating stream health after a probe.
@@ -3456,17 +3457,36 @@ impl CatalogRepository {
         let limit = limit.clamp(1, MAX_PAGE_SIZE);
         let offset = offset.max(0);
 
-        let total: i64 = sqlx::query_scalar(
-            r"
-            SELECT count(*) FROM provider_streams ps
-            WHERE ($1::text IS NULL OR ps.health_status = $1)
-              AND ($2::text IS NULL OR ps.group_name = $2)
-            ",
-        )
-        .bind(status_filter)
-        .bind(group_filter)
-        .fetch_one(&self.pool)
-        .await?;
+        // When no filter is applied, use the planner's row estimate from
+        // pg_class.reltuples instead of counting all 6.8M rows. When a
+        // filter is supplied, the filtered subset is small enough for an
+        // exact count using the health_status/group_name partial index.
+        let (total, estimated) = if status_filter.is_none() && group_filter.is_none() {
+            let estimate: Option<i64> = sqlx::query_scalar(
+                r"
+                SELECT reltuples::bigint
+                FROM pg_class
+                WHERE relname = 'provider_streams'
+                  AND relkind = 'r'
+                ",
+            )
+            .fetch_one(&self.pool)
+            .await?;
+            (estimate.unwrap_or(0), true)
+        } else {
+            let count: i64 = sqlx::query_scalar(
+                r"
+                SELECT count(*) FROM provider_streams ps
+                WHERE ($1::text IS NULL OR ps.health_status = $1)
+                  AND ($2::text IS NULL OR ps.group_name = $2)
+                ",
+            )
+            .bind(status_filter)
+            .bind(group_filter)
+            .fetch_one(&self.pool)
+            .await?;
+            (count, false)
+        };
 
         let rows: Vec<StreamHealthRow> = sqlx::query_as(
             r"
@@ -3491,7 +3511,11 @@ impl CatalogRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(StreamHealthPage { total, items: rows })
+        Ok(StreamHealthPage {
+            total,
+            items: rows,
+            estimated,
+        })
     }
 
     /// Updates stream health data after a probe completes.
@@ -3849,25 +3873,32 @@ impl CatalogRepository {
     /// Returns [`PersistenceError::Database`] when the query fails.
     #[allow(clippy::missing_errors_doc)]
     pub async fn stream_health_stats(&self) -> Result<StreamHealthStats, PersistenceError> {
-        let row: (i64, i64, i64, i64) = sqlx::query_as(
+        // Group by health_status so the planner can use the partial index
+        // on provider_streams(health_status, group_name) WHERE supported.
+        // This avoids a full table scan on the 6.8M-row table.
+        let rows: Vec<(String, i64)> = sqlx::query_as(
             r"
-            SELECT
-                count(*) FILTER (WHERE health_status = 'alive') AS alive,
-                count(*) FILTER (WHERE health_status = 'dead') AS dead,
-                count(*) FILTER (WHERE health_status = 'unknown') AS unknown,
-                count(*) FILTER (WHERE health_status = 'checking') AS checking
-            FROM provider_streams WHERE supported = true
+            SELECT health_status, count(*) AS count
+            FROM provider_streams
+            WHERE supported = true
+            GROUP BY health_status
             ",
         )
-        .fetch_one(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
-        Ok(StreamHealthStats {
-            alive: row.0,
-            dead: row.1,
-            unknown: row.2,
-            checking: row.3,
-        })
+        let mut stats = StreamHealthStats::default();
+        for (status, count) in rows {
+            match status.as_str() {
+                "alive" => stats.alive = count,
+                "dead" => stats.dead = count,
+                "unknown" => stats.unknown = count,
+                "checking" => stats.checking = count,
+                _ => {}
+            }
+        }
+
+        Ok(stats)
     }
 
     /// Loads the probe target data for one provider stream.

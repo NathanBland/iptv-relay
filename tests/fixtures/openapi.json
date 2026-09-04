@@ -2818,6 +2818,9 @@
       },
       "StreamHealthResponse": {
         "properties": {
+          "estimated": {
+            "type": "boolean"
+          },
           "items": {
             "items": {
               "$ref": "#/components/schemas/StreamHealthItem"
@@ -2831,7 +2834,8 @@
         },
         "required": [
           "total",
-          "items"
+          "items",
+          "estimated"
         ],
         "type": "object"
       },

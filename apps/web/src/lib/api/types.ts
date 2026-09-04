@@ -226,6 +226,7 @@ export interface StreamHealthItem {
 export interface StreamHealthPage {
   total: number
   items: StreamHealthItem[]
+  estimated: boolean
 }
 
 export interface StreamHealthStats {
