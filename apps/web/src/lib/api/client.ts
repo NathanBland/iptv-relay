@@ -881,7 +881,13 @@ export class FetchIptvApiClient implements IptvApiClient {
     if (limit !== undefined) params.set('limit', String(limit))
     if (offset !== undefined) params.set('offset', String(offset))
     const qs = params.toString() ? `?${params}` : ''
-    return this.request(`${API_PATHS.streamsHealth}${qs}`, (value) => asPage<StreamHealthItem>(value, 'Stream health response'))
+    return this.request(`${API_PATHS.streamsHealth}${qs}`, (value) => {
+      if (!isRecord(value)) throw invalidResponse('Stream health response must be a JSON object.')
+      const total = typeof value.total === 'number' ? value.total : 0
+      const items = asObjectArray<StreamHealthItem>(value.items, 'Stream health response items')
+      const estimated = typeof value.estimated === 'boolean' ? value.estimated : false
+      return { total, items, estimated }
+    })
   }
 
   async getStreamHealthStats(): Promise<StreamHealthStats> {
@@ -1545,7 +1551,7 @@ export class MockIptvApiClient implements IptvApiClient {
   }
 
   async getStreamHealth(): Promise<StreamHealthPage> {
-    return { total: 0, items: [] }
+    return { total: 0, items: [], estimated: false }
   }
 
   async getStreamHealthStats(): Promise<StreamHealthStats> {
