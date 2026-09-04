@@ -1740,6 +1740,88 @@ impl JobRepository {
         Ok(records)
     }
 
+    /// Lists recent refresh and reconciliation jobs for one source.
+    ///
+    /// Child jobs carry the source identifier so control-plane views can show
+    /// reconciliation progress after the refresh job stages its snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn list_recent_source_sync(
+        &self,
+        source_id: Uuid,
+        limit: u16,
+    ) -> Result<Vec<JobRecord>, PersistenceError> {
+        let limit = i64::from(limit.clamp(1, 500));
+        let source_id = source_id.to_string();
+        let records = sqlx::query_as::<_, JobRecord>(
+            r"
+            SELECT *
+            FROM jobs
+            WHERE payload->>'sourceId' = $1
+              AND kind IN (
+                  'refresh-source',
+                  'reconcile-provider-partition',
+                  'finalize-provider-reconciliation'
+              )
+            ORDER BY created_at DESC, id DESC
+            LIMIT $2
+            ",
+        )
+        .bind(source_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(records)
+    }
+
+    /// Updates progress for a refresh that waits for child reconciliation jobs.
+    ///
+    /// The parent worker has returned, so the child worker owns this progress update.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn heartbeat_reconciliation_parent(
+        &self,
+        parent_job_id: Uuid,
+        progress: &Value,
+    ) -> Result<bool, PersistenceError> {
+        let result = sqlx::query(
+            r"
+            UPDATE jobs
+            SET heartbeat_at = now(), progress = $2, updated_at = now()
+            WHERE id = $1 AND kind = 'refresh-source' AND status = 'running'
+            ",
+        )
+        .bind(parent_job_id)
+        .bind(progress)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Completes a refresh after its reconciliation finalizer publishes the catalog.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn complete_reconciliation_parent(
+        &self,
+        parent_job_id: Uuid,
+        progress: &Value,
+    ) -> Result<bool, PersistenceError> {
+        let result = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'succeeded', completed_at = now(), heartbeat_at = NULL,
+                locked_by = NULL, locked_at = NULL, progress = $2, updated_at = now()
+            WHERE id = $1 AND kind = 'refresh-source' AND status = 'running'
+            ",
+        )
+        .bind(parent_job_id)
+        .bind(progress)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Cancels a queued or running job. Workers observe cancellation through
     /// [`Self::is_cancelled`] or a failed ownership-checked heartbeat.
     ///
