@@ -127,6 +127,15 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Set workspace version from git tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Setting workspace version to $VERSION"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          find crates apps -name Cargo.toml -exec \
+            sed -i "s/version = \"[0-9]*\.[0-9]*\.[0-9]*\"/version = \"$VERSION\"/g" {} +
+
       - name: Set lowercase image prefix
         id: prefix
         run: echo "prefix=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"

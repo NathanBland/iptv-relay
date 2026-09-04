@@ -19,12 +19,12 @@ axum.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
-iptv-api = { path = "../../crates/api", version = "0.1.0" }
-iptv-domain = { path = "../../crates/domain", version = "0.1.0" }
-iptv-ingest = { path = "../../crates/ingest", version = "0.1.0" }
-iptv-media = { path = "../../crates/media", version = "0.1.0" }
-iptv-parsers = { path = "../../crates/parsers", version = "0.1.0" }
-iptv-persistence = { path = "../../crates/persistence", version = "0.1.0" }
+iptv-api = { path = "../../crates/api", version = "0.2.4" }
+iptv-domain = { path = "../../crates/domain", version = "0.2.4" }
+iptv-ingest = { path = "../../crates/ingest", version = "0.2.4" }
+iptv-media = { path = "../../crates/media", version = "0.2.4" }
+iptv-parsers = { path = "../../crates/parsers", version = "0.2.4" }
+iptv-persistence = { path = "../../crates/persistence", version = "0.2.4" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
