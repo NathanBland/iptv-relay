@@ -14,13 +14,15 @@ use iptv_parsers::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool};
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, future::Future, pin::Pin};
 use uuid::Uuid;
 
 use crate::PersistenceError;
 
 const DEFAULT_PAGE_SIZE: i64 = 100;
 const MAX_PAGE_SIZE: i64 = 500;
+/// Default canonical-key count for one reconciliation database batch.
+pub const DEFAULT_RECONCILIATION_BATCH_SIZE: i64 = 500;
 
 /// The fixed identity for the environment output profile.
 pub const ENVIRONMENT_OUTPUT_PROFILE_ID: Uuid = Uuid::from_u128(1);
@@ -67,6 +69,53 @@ pub struct CatalogRepository {
     pool: PgPool,
 }
 
+/// One durable provider-catalog reconciliation checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderReconciliationPhase {
+    Snapshot,
+    Channels,
+    StreamLinks,
+    Orphans,
+    Revision,
+}
+
+/// Actual work counts from one provider-catalog reconciliation checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderReconciliationUpdate {
+    pub phase: ProviderReconciliationPhase,
+    /// Rows affected by the completed query phase.
+    pub rows_affected: u64,
+    /// Active supported provider streams that the reconciliation query reads.
+    pub active_streams: u64,
+    /// Canonical keys completed in the current reconciliation phase.
+    pub keys_completed: u64,
+    /// Canonical keys in the current reconciliation phase.
+    pub keys_total: u64,
+}
+
+/// Persists reconciliation checkpoints outside the catalog transaction.
+///
+/// A checkpoint error rolls back the catalog transaction. A checkpoint does
+/// not publish partial catalog results.
+pub trait ProviderReconciliationProgress: Send + Sync {
+    #[allow(clippy::missing_errors_doc)]
+    fn checkpoint(
+        &self,
+        update: ProviderReconciliationUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>>;
+}
+
+struct NoopProviderReconciliationProgress;
+
+impl ProviderReconciliationProgress for NoopProviderReconciliationProgress {
+    fn checkpoint(
+        &self,
+        _update: ProviderReconciliationUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 impl CatalogRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -86,20 +135,98 @@ impl CatalogRepository {
         &self,
         account_id: Uuid,
     ) -> Result<ReconcileStats, PersistenceError> {
+        self.reconcile_provider_account_with_progress(
+            account_id,
+            &NoopProviderReconciliationProgress,
+        )
+        .await
+    }
+
+    /// Reconciles one provider account and reports completed database query phases.
+    ///
+    /// Each update includes actual rows affected and the active-stream count.
+    /// The transaction remains atomic when a progress write fails.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn reconcile_provider_account_with_progress(
+        &self,
+        account_id: Uuid,
+        progress: &dyn ProviderReconciliationProgress,
+    ) -> Result<ReconcileStats, PersistenceError> {
+        self.reconcile_provider_account_with_progress_and_batch(
+            account_id,
+            progress,
+            DEFAULT_RECONCILIATION_BATCH_SIZE,
+        )
+        .await
+    }
+
+    /// Reconciles one provider account in deterministic canonical-key batches.
+    ///
+    /// One transaction contains every batch. A failed batch or checkpoint
+    /// rolls back all catalog changes.
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    pub async fn reconcile_provider_account_with_progress_and_batch(
+        &self,
+        account_id: Uuid,
+        progress: &dyn ProviderReconciliationProgress,
+        batch_size: i64,
+    ) -> Result<ReconcileStats, PersistenceError> {
+        let batch_size = batch_size.clamp(1, 10_000);
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SET LOCAL statement_timeout = '300s'")
             .execute(&mut *transaction)
             .await?;
+        let active_streams = active_supported_stream_count(&mut transaction, account_id).await?;
+        let canonical_key_total = active_canonical_key_count(&mut transaction, account_id).await?;
         // Capture the automatic channel, stream link, and EPG mapping state
         // for this account before reconciliation overwrites it. The snapshot
         // is stored in the shared revisions table so a later rollback can
         // restore channels, streams, and EPG mappings together.
         let before_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
+        progress
+            .checkpoint(ProviderReconciliationUpdate {
+                phase: ProviderReconciliationPhase::Snapshot,
+                rows_affected: 0,
+                active_streams,
+                keys_completed: 0,
+                keys_total: canonical_key_total,
+            })
+            .await?;
         let current_revision =
             current_reconciliation_revision(&mut transaction, account_id).await?;
-        let channel_stats = upsert_canonical_channels(&mut transaction, account_id).await?;
-        let link_count = relink_channel_streams(&mut transaction, account_id).await?;
+        let (channel_count, _) = reconcile_canonical_key_batches(
+            &mut transaction,
+            account_id,
+            batch_size,
+            canonical_key_total,
+            active_streams,
+            progress,
+            ProviderReconciliationPhase::Channels,
+        )
+        .await?;
+        let stale_link_count =
+            remove_stale_channel_stream_links(&mut transaction, account_id).await?;
+        let (linked_count, _) = reconcile_canonical_key_batches(
+            &mut transaction,
+            account_id,
+            batch_size,
+            canonical_key_total,
+            active_streams,
+            progress,
+            ProviderReconciliationPhase::StreamLinks,
+        )
+        .await?;
+        let link_count = stale_link_count.saturating_add(linked_count);
         let orphans_removed = remove_orphaned_channels(&mut transaction, account_id).await?;
+        progress
+            .checkpoint(ProviderReconciliationUpdate {
+                phase: ProviderReconciliationPhase::Orphans,
+                rows_affected: u64::try_from(orphans_removed.max(0)).unwrap_or(u64::MAX),
+                active_streams,
+                keys_completed: canonical_key_total,
+                keys_total: canonical_key_total,
+            })
+            .await?;
         let after_snapshot = capture_reconciliation_snapshot(&mut transaction, account_id).await?;
         record_reconciliation_revision(
             &mut transaction,
@@ -110,10 +237,19 @@ impl CatalogRepository {
             after_snapshot,
         )
         .await?;
+        progress
+            .checkpoint(ProviderReconciliationUpdate {
+                phase: ProviderReconciliationPhase::Revision,
+                rows_affected: 1,
+                active_streams,
+                keys_completed: canonical_key_total,
+                keys_total: canonical_key_total,
+            })
+            .await?;
         transaction.commit().await?;
 
         Ok(ReconcileStats {
-            channels: channel_stats.channels,
+            channels: channel_count,
             orphaned_channels_removed: orphans_removed,
             stream_links: link_count,
         })
@@ -1047,6 +1183,132 @@ impl CatalogRepository {
             guide_coverage,
         })
     }
+}
+
+async fn active_supported_stream_count(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+) -> Result<u64, PersistenceError> {
+    let count: i64 = sqlx::query_scalar(
+        r"
+        SELECT count(*)
+        FROM provider_streams ps
+        JOIN source_snapshots ss ON ss.id = ps.snapshot_id
+        WHERE ss.provider_account_id = $1
+          AND ss.status = 'active'
+          AND ss.kind IN ('m3u', 'xtream')
+          AND ps.supported
+        ",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
+}
+
+async fn active_canonical_key_count(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+) -> Result<u64, PersistenceError> {
+    let count: i64 = sqlx::query_scalar(
+        r"
+        SELECT count(*)
+        FROM (
+            SELECT COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key)
+            FROM provider_streams ps
+            JOIN source_snapshots ss ON ss.id = ps.snapshot_id
+            WHERE ss.provider_account_id = $1
+              AND ss.status = 'active'
+              AND ss.kind IN ('m3u', 'xtream')
+              AND ps.supported
+            GROUP BY COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key)
+        ) AS canonical_keys
+        ",
+    )
+    .bind(account_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    Ok(u64::try_from(count.max(0)).unwrap_or(u64::MAX))
+}
+
+async fn canonical_key_page(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    after: Option<&str>,
+    batch_size: i64,
+) -> Result<Vec<String>, PersistenceError> {
+    sqlx::query_scalar(
+        r"
+        SELECT COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key) AS canonical_key
+        FROM provider_streams ps
+        JOIN source_snapshots ss ON ss.id = ps.snapshot_id
+        WHERE ss.provider_account_id = $1
+          AND ss.status = 'active'
+          AND ss.kind IN ('m3u', 'xtream')
+          AND ps.supported
+          AND ($2::text IS NULL
+               OR COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key) > $2)
+        GROUP BY canonical_key
+        ORDER BY canonical_key
+        LIMIT $3
+        ",
+    )
+    .bind(account_id)
+    .bind(after)
+    .bind(batch_size)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(PersistenceError::from)
+}
+
+async fn reconcile_canonical_key_batches(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    batch_size: i64,
+    keys_total: u64,
+    active_streams: u64,
+    progress: &dyn ProviderReconciliationProgress,
+    phase: ProviderReconciliationPhase,
+) -> Result<(i64, u64), PersistenceError> {
+    let mut after = None;
+    let mut keys_completed = 0_u64;
+    let mut rows_affected = 0_i64;
+    loop {
+        let keys =
+            canonical_key_page(transaction, account_id, after.as_deref(), batch_size).await?;
+        if keys.is_empty() {
+            break;
+        }
+        let affected = match phase {
+            ProviderReconciliationPhase::Channels => {
+                upsert_canonical_channels_batch(transaction, account_id, &keys)
+                    .await?
+                    .channels
+            }
+            ProviderReconciliationPhase::StreamLinks => {
+                upsert_channel_stream_links_batch(transaction, account_id, &keys).await?
+            }
+            _ => {
+                return Err(PersistenceError::InvalidSource(
+                    "invalid reconciliation batch phase".to_owned(),
+                ));
+            }
+        };
+        rows_affected = rows_affected.saturating_add(affected);
+        keys_completed =
+            keys_completed.saturating_add(u64::try_from(keys.len()).unwrap_or(u64::MAX));
+        after = keys.last().cloned();
+        progress
+            .checkpoint(ProviderReconciliationUpdate {
+                phase,
+                rows_affected: u64::try_from(affected.max(0)).unwrap_or(u64::MAX),
+                active_streams,
+                keys_completed,
+                keys_total,
+            })
+            .await?;
+    }
+    Ok((rows_affected, keys_completed))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -3181,9 +3443,10 @@ fn build_suggestion_config(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn upsert_canonical_channels(
+async fn upsert_canonical_channels_batch(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
+    canonical_keys: &[String],
 ) -> Result<ReconcileCountRow, PersistenceError> {
     let inserted: i64 = sqlx::query(
         r"
@@ -3207,6 +3470,7 @@ async fn upsert_canonical_channels(
             FROM provider_streams ps
             WHERE ps.snapshot_id IN (SELECT id FROM active_snapshots)
               AND ps.supported
+              AND COALESCE(NULLIF(ps.tvg_id, ''), 'stream:' || ps.stable_key) = ANY($2)
             GROUP BY canonical_key
         ),
         preferred_deduped AS (
@@ -3271,6 +3535,7 @@ async fn upsert_canonical_channels(
         ",
     )
     .bind(account_id)
+    .bind(canonical_keys)
     .execute(&mut **transaction)
     .await?
     .rows_affected()
@@ -3311,7 +3576,7 @@ async fn remove_orphaned_channels(
     Ok(orphans_removed)
 }
 
-async fn relink_channel_streams(
+async fn remove_stale_channel_stream_links(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: Uuid,
 ) -> Result<i64, PersistenceError> {
@@ -3342,6 +3607,14 @@ async fn relink_channel_streams(
     .try_into()
     .unwrap_or(i64::MAX);
 
+    Ok(deleted)
+}
+
+async fn upsert_channel_stream_links_batch(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    account_id: Uuid,
+    canonical_keys: &[String],
+) -> Result<i64, PersistenceError> {
     let result = sqlx::query(
         r"
         INSERT INTO channel_streams (channel_id, provider_stream_id, priority, evidence)
@@ -3360,17 +3633,18 @@ async fn relink_channel_streams(
           AND ss.status = 'active'
           AND ss.kind IN ('m3u', 'xtream')
           AND ps.supported
+          AND c.canonical_key = ANY($2)
         ON CONFLICT (channel_id, provider_stream_id) DO UPDATE SET
             priority = EXCLUDED.priority
         WHERE channel_streams.priority != EXCLUDED.priority
         ",
     )
     .bind(account_id)
+    .bind(canonical_keys)
     .execute(&mut **transaction)
     .await?;
 
-    let upserted: i64 = result.rows_affected().try_into().unwrap_or(i64::MAX);
-    Ok(upserted + deleted)
+    Ok(result.rows_affected().try_into().unwrap_or(i64::MAX))
 }
 
 /// A row of stream health data returned by the health check listing query.

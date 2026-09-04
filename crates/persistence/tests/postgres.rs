@@ -1,10 +1,17 @@
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
+
 use chrono::{Duration, TimeZone, Utc};
 use iptv_persistence::{
     CatalogRepository, CreateChannelAliasInput, CreateEventTemplate, CreateRecordingInput,
     CreateRecordingRuleInput, CreateStreamProfileInput, CreateUserInput, Database,
     ENVIRONMENT_OUTPUT_PROFILE_ID, ENVIRONMENT_OUTPUT_PROFILE_NAME, EventTemplateQuery,
     EventTemplateUpdate, JobRepository, MasterKey, NewJob, NewSource, OperatorSettingOverrides,
-    OutputProfileTokenHash, PersistenceError, ProgrammeQuery, SourceKind, SourceRepository,
+    OutputProfileTokenHash, PersistenceError, ProgrammeQuery, ProviderReconciliationPhase,
+    ProviderReconciliationProgress, ProviderReconciliationUpdate, SourceKind, SourceRepository,
     SourceUpdate, StreamHealthUpdate, UpdateUserInput,
 };
 use serde_json::{Value, json};
@@ -34,6 +41,23 @@ async fn drop_isolated_schema(admin: &Database, schema: &str) {
         .execute(admin.pool())
         .await
         .unwrap();
+}
+
+#[derive(Default)]
+struct RecordingReconciliationProgress {
+    updates: Mutex<Vec<ProviderReconciliationUpdate>>,
+}
+
+impl ProviderReconciliationProgress for RecordingReconciliationProgress {
+    fn checkpoint(
+        &self,
+        update: ProviderReconciliationUpdate,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send + '_>> {
+        Box::pin(async move {
+            self.updates.lock().unwrap().push(update);
+            Ok(())
+        })
+    }
 }
 
 #[tokio::test]
@@ -113,6 +137,46 @@ async fn migrations_and_job_lifecycle_are_transactionally_usable() {
     assert!(!error.contains("secret"));
     assert!(!error.contains("value"));
 
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn activation_lock_prevents_post_commit_cancellation_and_preserves_progress() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let repository = JobRepository::new(database.pool().clone());
+    let mut job = NewJob::immediate("refresh-source", json!({"sourceId": "test-source"}));
+    job.priority = i32::MAX;
+    let job = repository.enqueue(&job).await.unwrap();
+    let worker = "activation-lock-worker";
+    let claimed = repository.claim(worker).await.unwrap().unwrap();
+    assert_eq!(claimed.id, job.id);
+
+    repository.begin_activation(job.id, worker).await.unwrap();
+    assert!(!repository.cancel(job.id).await.unwrap());
+    repository
+        .heartbeat(job.id, worker, &json!({"stage": "activated"}))
+        .await
+        .unwrap();
+    let progress: Value = sqlx::query_scalar("SELECT progress FROM jobs WHERE id = $1")
+        .bind(job.id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(progress["stage"], "activated");
+    assert_eq!(progress["activationLocked"], true);
+    repository.succeed(job.id, worker).await.unwrap();
+
+    let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+        .bind(job.id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(status, "succeeded");
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
 }
@@ -443,13 +507,54 @@ async fn reconcile_merges_streams_by_tvg_id_and_maps_epg() {
     }
     transaction.commit().await.unwrap();
 
+    let progress = RecordingReconciliationProgress::default();
     let stats = catalog
-        .reconcile_provider_account(account_id)
+        .reconcile_provider_account_with_progress(account_id, &progress)
         .await
         .unwrap();
     // Two canonical channels: one merged from the two news.tvg streams, one for Extra.
     assert_eq!(stats.channels, 2);
     assert_eq!(stats.stream_links, 3);
+    assert_eq!(
+        progress.updates.lock().unwrap().as_slice(),
+        [
+            ProviderReconciliationUpdate {
+                phase: ProviderReconciliationPhase::Snapshot,
+                rows_affected: 0,
+                active_streams: 3,
+                keys_completed: 0,
+                keys_total: 2,
+            },
+            ProviderReconciliationUpdate {
+                phase: ProviderReconciliationPhase::Channels,
+                rows_affected: 2,
+                active_streams: 3,
+                keys_completed: 2,
+                keys_total: 2,
+            },
+            ProviderReconciliationUpdate {
+                phase: ProviderReconciliationPhase::StreamLinks,
+                rows_affected: 3,
+                active_streams: 3,
+                keys_completed: 2,
+                keys_total: 2,
+            },
+            ProviderReconciliationUpdate {
+                phase: ProviderReconciliationPhase::Orphans,
+                rows_affected: 0,
+                active_streams: 3,
+                keys_completed: 2,
+                keys_total: 2,
+            },
+            ProviderReconciliationUpdate {
+                phase: ProviderReconciliationPhase::Revision,
+                rows_affected: 1,
+                active_streams: 3,
+                keys_completed: 2,
+                keys_total: 2,
+            },
+        ]
+    );
 
     let page = catalog
         .list_channels(iptv_persistence::ChannelQuery {
@@ -566,6 +671,73 @@ async fn reconcile_merges_streams_by_tvg_id_and_maps_epg() {
 
     drop(catalog);
     drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn reconciliation_reports_each_deterministic_canonical_key_batch() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("Batch account {account_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'm3u', 'active', $3, 1, 501)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    for index in 0..501 {
+        sqlx::query(
+            "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, url_template, attributes, directives, supported) VALUES ($1, $2, $3, $4, $5, $6, 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(format!("batch-{index:04}"))
+        .bind(format!("Batch {index}"))
+        .bind(format!("batch-{index:04}.tvg"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let progress = RecordingReconciliationProgress::default();
+    CatalogRepository::new(pool)
+        .reconcile_provider_account_with_progress_and_batch(account_id, &progress, 500)
+        .await
+        .unwrap();
+    let (channels, links) = {
+        let updates = progress.updates.lock().unwrap();
+        let channels = updates
+            .iter()
+            .filter(|update| update.phase == ProviderReconciliationPhase::Channels)
+            .map(|update| (update.keys_completed, update.keys_total))
+            .collect::<Vec<_>>();
+        let links = updates
+            .iter()
+            .filter(|update| update.phase == ProviderReconciliationPhase::StreamLinks)
+            .map(|update| (update.keys_completed, update.keys_total))
+            .collect::<Vec<_>>();
+        (channels, links)
+    };
+    assert_eq!(channels, [(500, 501), (501, 501)]);
+    assert_eq!(links, [(500, 501), (501, 501)]);
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
 }
@@ -3257,7 +3429,7 @@ async fn source_configuration_and_job_management_work() {
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(jobs.reap_stale_jobs(60).await.unwrap(), 1);
+    assert_eq!(jobs.recover_stale_jobs(60).await.unwrap(), 1);
     assert!(jobs.cancel(stale.id).await.unwrap());
     assert!(jobs.claim("coverage-worker").await.unwrap().is_none());
 
@@ -3299,6 +3471,213 @@ async fn list_due_sources_preserves_xtream_provider_kind() {
     }));
 
     drop(sources);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn source_refresh_enqueue_is_atomic_for_concurrent_workers() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([57_u8; 32]));
+    let jobs = JobRepository::new(pool.clone());
+    let created = sources
+        .create(
+            &NewSource {
+                name: format!("Concurrent refresh source {}", uuid::Uuid::now_v7()),
+                kind: SourceKind::M3u,
+                endpoint: "https://provider.test/playlist.m3u".to_owned(),
+            },
+            "integration-test",
+        )
+        .await
+        .unwrap();
+    let source_id = created.source.id;
+    jobs.cancel(created.refresh_job.id).await.unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let first_jobs = jobs.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first = async move {
+        first_barrier.wait().await;
+        first_jobs.enqueue_source_refresh_if_idle(source_id).await
+    };
+    let second_jobs = jobs.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second = async move {
+        second_barrier.wait().await;
+        second_jobs.enqueue_source_refresh_if_idle(source_id).await
+    };
+    let third_jobs = jobs.clone();
+    let third_barrier = Arc::clone(&barrier);
+    let third = async move {
+        third_barrier.wait().await;
+        third_jobs.enqueue_source_refresh_if_idle(source_id).await
+    };
+    let fourth_jobs = jobs.clone();
+    let fourth = async move {
+        barrier.wait().await;
+        fourth_jobs.enqueue_source_refresh_if_idle(source_id).await
+    };
+    let (first, second, third, fourth) = tokio::join!(first, second, third, fourth);
+    let created_count = [first, second, third, fourth]
+        .into_iter()
+        .filter_map(Result::unwrap)
+        .count();
+    assert_eq!(created_count, 1, "one concurrent request creates one job");
+
+    let open_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs \
+         WHERE kind = 'refresh-source' AND payload->>'sourceId' = $1 \
+           AND status IN ('queued', 'running')",
+    )
+    .bind(source_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(open_count, 1, "source has one open refresh job");
+
+    sources.delete(source_id, "integration-test").await.unwrap();
+    drop(jobs);
+    drop(sources);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn scheduler_workers_create_one_due_source_refresh_job() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([58_u8; 32]));
+    let jobs = JobRepository::new(pool.clone());
+    let created = sources
+        .create(
+            &NewSource {
+                name: format!("Scheduled refresh source {}", uuid::Uuid::now_v7()),
+                kind: SourceKind::M3u,
+                endpoint: "https://provider.test/scheduled.m3u".to_owned(),
+            },
+            "integration-test",
+        )
+        .await
+        .unwrap();
+    let source_id = created.source.id;
+    jobs.cancel(created.refresh_job.id).await.unwrap();
+    sources.update_refresh_interval(source_id, 1).await.unwrap();
+    sources
+        .mark_source_refreshed(source_id, Utc::now() - Duration::seconds(2))
+        .await
+        .unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let first_jobs = jobs.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first = async move {
+        first_barrier.wait().await;
+        first_jobs.enqueue_due_source_refreshes().await
+    };
+    let second_jobs = jobs.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second = async move {
+        second_barrier.wait().await;
+        second_jobs.enqueue_due_source_refreshes().await
+    };
+    let third_jobs = jobs.clone();
+    let third_barrier = Arc::clone(&barrier);
+    let third = async move {
+        third_barrier.wait().await;
+        third_jobs.enqueue_due_source_refreshes().await
+    };
+    let fourth_jobs = jobs.clone();
+    let fourth = async move {
+        barrier.wait().await;
+        fourth_jobs.enqueue_due_source_refreshes().await
+    };
+    let (first, second, third, fourth) = tokio::join!(first, second, third, fourth);
+    let enqueued: u64 = [first, second, third, fourth]
+        .into_iter()
+        .map(Result::unwrap)
+        .map(|result| result.enqueued)
+        .sum();
+    assert_eq!(enqueued, 1, "four schedulers create one refresh job");
+
+    let open_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs \
+         WHERE kind = 'refresh-source' AND payload->>'sourceId' = $1 \
+           AND status IN ('queued', 'running')",
+    )
+    .bind(source_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(open_count, 1, "only one due refresh job is open");
+
+    let index_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+         WHERE schemaname = current_schema() \
+           AND indexname = 'jobs_open_source_refresh_unique_idx')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(index_exists, "the refresh unique index is available");
+
+    sources.delete(source_id, "integration-test").await.unwrap();
+    drop(jobs);
+    drop(sources);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn stale_recovery_does_not_requeue_a_healthy_job() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let jobs = JobRepository::new(pool.clone());
+    let job = jobs
+        .enqueue(&NewJob::immediate("healthy-lease", json!({})))
+        .await
+        .unwrap();
+    let claimed = jobs.claim("healthy-worker").await.unwrap().unwrap();
+    assert_eq!(claimed.id, job.id);
+
+    assert_eq!(jobs.recover_stale_jobs(300).await.unwrap(), 0);
+    let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+        .bind(job.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "running", "a healthy worker retains its lease");
+
+    sqlx::query("UPDATE jobs SET heartbeat_at = now() - interval '6 minutes' WHERE id = $1")
+        .bind(job.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs.recover_stale_jobs(300).await.unwrap(), 1);
+    let status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+        .bind(job.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "queued", "an expired worker lease is requeued");
+
+    drop(jobs);
+    drop(pool);
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
 }

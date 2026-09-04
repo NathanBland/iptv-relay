@@ -3587,36 +3587,22 @@ async fn trigger_source_sync(
         return not_found();
     }
 
-    // Check for an existing queued or running refresh job for this source.
-    let existing_jobs = match job_repository.list_recent(500).await {
-        Ok(jobs) => jobs,
-        Err(error) => return persistence_error_response(error),
-    };
-    let already_active = existing_jobs.iter().any(|job| {
-        job.kind == "refresh-source"
-            && job.payload.get("sourceId").and_then(|v| v.as_str()) == Some(&source_id.to_string())
-            && (job.status == "queued" || job.status == "running")
-    });
-    if already_active {
-        return ProblemDetails::new(
+    match job_repository
+        .enqueue_source_refresh_if_idle(source_id)
+        .await
+    {
+        Ok(Some(record)) => Json(SourceSyncResponse {
+            job_id: record.id.to_string(),
+            message: "Source refresh job enqueued.".to_owned(),
+        })
+        .into_response(),
+        Ok(None) => ProblemDetails::new(
             StatusCode::CONFLICT,
             "refresh-already-active",
             "A refresh job is already queued or running",
             "wait for the current refresh to complete before you trigger a new one",
         )
-        .response();
-    }
-
-    let job = iptv_persistence::NewJob::immediate(
-        "refresh-source",
-        serde_json::json!({ "sourceId": source_id.to_string() }),
-    );
-    match job_repository.enqueue(&job).await {
-        Ok(record) => Json(SourceSyncResponse {
-            job_id: record.id.to_string(),
-            message: "Source refresh job enqueued.".to_owned(),
-        })
-        .into_response(),
+        .response(),
         Err(error) => persistence_error_response(error),
     }
 }

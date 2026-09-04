@@ -6,12 +6,14 @@
 
 use chrono::{Duration, Utc};
 use iptv_ingest::{
-    IngestError, IngestFormat, PreparedEpgChannel, PreparedProgramme, PreparedProviderStream,
-    PreparedSnapshot, ProtectedEndpoint, SnapshotOwner, StagedRows, XtreamPayloadKind,
+    ActivationProgress, IngestError, IngestFormat, PreparedEpgChannel, PreparedProgramme,
+    PreparedProviderStream, PreparedSnapshot, ProtectedEndpoint, SnapshotOwner, StagedRows,
+    XtreamPayloadKind,
 };
 use iptv_persistence::Database;
 use serde_json::json;
 use sqlx::PgPool;
+use std::{future::Future, pin::Pin, sync::Mutex};
 use uuid::Uuid;
 
 const DATABASE_URL_ENV: &str = "IPTV_TEST_DATABASE_URL";
@@ -441,6 +443,57 @@ async fn activate_batches_provider_streams_across_the_batch_boundary() {
             .await
             .expect("count streams");
     assert_eq!(count, 750);
+
+    cleanup_provider(&pool, account_id).await;
+}
+
+#[derive(Default)]
+struct RecordingActivationProgress {
+    checkpoints: Mutex<Vec<(u64, u64)>>,
+}
+
+impl ActivationProgress for RecordingActivationProgress {
+    fn checkpoint(
+        &self,
+        records_staged: u64,
+        records_total: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(), IngestError>> + '_>> {
+        Box::pin(async move {
+            self.checkpoints
+                .lock()
+                .expect("lock")
+                .push((records_staged, records_total));
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn activate_reports_durable_progress_after_each_database_batch() {
+    let Some(pool) = pool().await else {
+        eprintln!("{DATABASE_URL_ENV} is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let account_id = create_provider_account(&pool).await;
+    let store = iptv_ingest::PgSnapshotStore::new(pool.clone());
+    let mut streams = Vec::new();
+    for index in 0..750 {
+        streams.push(provider_stream(&format!("progress-{index}")));
+    }
+    let mut snapshot = provider_snapshot(account_id, IngestFormat::M3u, streams);
+    snapshot.record_count = 750;
+    let progress = RecordingActivationProgress::default();
+
+    let snapshot_id = store
+        .activate_with_progress(&snapshot, &progress)
+        .await
+        .expect("activate");
+
+    assert_eq!(snapshot_status(&pool, snapshot_id).await, "active");
+    assert_eq!(
+        progress.checkpoints.lock().expect("lock").as_slice(),
+        [(500, 750), (750, 750)]
+    );
 
     cleanup_provider(&pool, account_id).await;
 }

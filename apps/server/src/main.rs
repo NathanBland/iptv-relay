@@ -15,9 +15,13 @@ use iptv_ingest::{
 use iptv_media::{
     ProviderSlotBroker, StreamProbe, StreamProbeFailure, StreamProbeOutcome, StreamProbeSpec,
 };
+#[cfg(test)]
+use iptv_persistence::NewJob;
 use iptv_persistence::{
-    CatalogRepository, Database, EpgMappingStats, JobRecord, JobRepository, MasterKey, NewJob,
-    ReconcileStats, SourceKind, SourceRepository, StreamHealthUpdate, StreamProbeTargetRow,
+    CatalogRepository, DEFAULT_RECONCILIATION_BATCH_SIZE, Database, EpgMappingStats, JobRecord,
+    JobRepository, MasterKey, ProviderReconciliationPhase, ProviderReconciliationProgress,
+    ProviderReconciliationUpdate, ReconcileStats, SourceKind, SourceRepository, StreamHealthUpdate,
+    StreamProbeTargetRow,
 };
 use reqwest::{Client, Url, header::HeaderMap};
 use sha2::{Digest, Sha256};
@@ -314,7 +318,7 @@ where
 /// Runs every 60 seconds. Sources with `refresh_interval_seconds > 0` that
 /// have not been refreshed within their interval get a new `refresh-source`
 /// job enqueued.
-async fn refresh_scheduler(sources: &SourceRepository, jobs: &JobRepository) {
+async fn refresh_scheduler(jobs: &JobRepository) {
     let interval = Duration::from_mins(1);
     info!("source refresh scheduler started");
     loop {
@@ -325,30 +329,18 @@ async fn refresh_scheduler(sources: &SourceRepository, jobs: &JobRepository) {
             }
             () = tokio::time::sleep(interval) => {}
         }
-        match sources.list_due_sources().await {
-            Ok(due) => {
-                if due.is_empty() {
+        match jobs.enqueue_due_source_refreshes().await {
+            Ok(result) => {
+                if !result.is_leader || result.enqueued == 0 {
                     continue;
                 }
                 info!(
-                    due_count = due.len(),
+                    enqueued = result.enqueued,
                     "enqueuing scheduled source refreshes"
                 );
-                for source in due {
-                    let job = NewJob {
-                        kind: "refresh-source".to_owned(),
-                        priority: 0,
-                        payload: serde_json::json!({ "sourceId": source.id.to_string() }),
-                        max_attempts: 3,
-                        available_at: chrono::Utc::now(),
-                    };
-                    if let Err(error) = jobs.enqueue(&job).await {
-                        warn!(source_id = %source.id, error = %error, "failed to enqueue scheduled refresh");
-                    }
-                }
             }
             Err(error) => {
-                warn!(error = %error, "scheduler failed to list due sources");
+                warn!(error = %error, "source refresh scheduler failed");
             }
         }
     }
@@ -366,12 +358,11 @@ async fn worker() -> Result<()> {
     let worker_id = worker_id_from(|name| env::var(name));
     info!(%worker_id, "job worker started");
 
-    // Recover jobs and streams stranded by a previous worker that restarted
-    // mid-job. Run this before the job loop begins so a fresh worker reclaims
-    // work that the prior process left in `running` or `checking` status.
-    match repository.recover_stranded_jobs().await {
-        Ok(count) => info!("Recovered {count} stranded jobs on startup"),
-        Err(error) => warn!(%error, "stranded job recovery failed on startup"),
+    // Recover only expired job leases. A new worker must not requeue a job
+    // that another active worker owns.
+    match repository.recover_stale_jobs(300).await {
+        Ok(count) => info!("Recovered {count} stale jobs on startup"),
+        Err(error) => warn!(%error, "stale job recovery failed on startup"),
     }
     match catalog.reset_stranded_checking_streams().await {
         Ok(count) => info!("Reset {count} stranded checking streams on startup"),
@@ -379,10 +370,9 @@ async fn worker() -> Result<()> {
     }
 
     // Spawn the scheduler that enqueues refresh jobs for due sources.
-    let scheduler_sources = sources.clone();
     let scheduler_jobs = repository.clone();
     let scheduler_handle = tokio::spawn(async move {
-        refresh_scheduler(&scheduler_sources, &scheduler_jobs).await;
+        refresh_scheduler(&scheduler_jobs).await;
     });
 
     // Spawn the scheduler that enqueues low-priority health probe jobs.
@@ -415,7 +405,7 @@ async fn worker() -> Result<()> {
         interval.tick().await; // skip the first immediate tick
         loop {
             interval.tick().await;
-            match reaper_repository.reap_stale_jobs(300).await {
+            match reaper_repository.recover_stale_jobs(300).await {
                 Ok(count) if count > 0 => {
                     info!(reaped = count, "stale job reaper reset orphaned jobs");
                 }
@@ -661,7 +651,19 @@ async fn run_source_refresh(
             .await
             .map_err(RefreshError::Ingest)?
     };
-    run_post_refresh_catalog(source.kind, source.id, catalog, &control, &result)
+    let reconciliation_progress = WorkerProviderReconciliationProgress {
+        control: &control,
+        result: &result,
+    };
+    run_post_refresh_catalog(
+        source.kind,
+        source.id,
+        catalog,
+        &control,
+        &result,
+        &reconciliation_progress,
+        reconciliation_batch_size(),
+    )
         .await
         .map_err(|error| {
             warn!(job_id = %job.id, source_id = %source.id, error = ?error, "catalog post-refresh work failed");
@@ -863,6 +865,10 @@ async fn run_xtream_short_epg_refresh(
             records_seen: snapshot.record_count,
             records_prepared: 0,
         })
+        .await
+        .map_err(RefreshError::Ingest)?;
+    control
+        .begin_activation()
         .await
         .map_err(RefreshError::Ingest)?;
     let staging_progress = WorkerStagingProgress {
@@ -1522,16 +1528,29 @@ type EventReconcileFuture<'a> =
     Pin<Box<dyn Future<Output = Result<u64, iptv_persistence::PersistenceError>> + Send + 'a>>;
 
 trait PostRefreshCatalog {
-    fn reconcile_provider_account(&self, source_id: Uuid) -> ProviderReconcileFuture<'_>;
+    fn reconcile_provider_account_with_progress<'a>(
+        &'a self,
+        source_id: Uuid,
+        progress: &'a dyn ProviderReconciliationProgress,
+        batch_size: i64,
+    ) -> ProviderReconcileFuture<'a>;
     fn reconcile_epg_mappings(&self) -> EpgReconcileFuture<'_>;
     fn scan_all_event_channels(&self) -> EventReconcileFuture<'_>;
 }
 
 impl PostRefreshCatalog for CatalogRepository {
-    fn reconcile_provider_account(&self, source_id: Uuid) -> ProviderReconcileFuture<'_> {
-        Box::pin(
-            async move { CatalogRepository::reconcile_provider_account(self, source_id).await },
-        )
+    fn reconcile_provider_account_with_progress<'a>(
+        &'a self,
+        source_id: Uuid,
+        progress: &'a dyn ProviderReconciliationProgress,
+        batch_size: i64,
+    ) -> ProviderReconcileFuture<'a> {
+        Box::pin(async move {
+            CatalogRepository::reconcile_provider_account_with_progress_and_batch(
+                self, source_id, progress, batch_size,
+            )
+            .await
+        })
     }
 
     fn reconcile_epg_mappings(&self) -> EpgReconcileFuture<'_> {
@@ -1549,12 +1568,14 @@ async fn run_post_refresh_catalog<C: PostRefreshCatalog>(
     catalog: &C,
     control: &impl JobControl,
     result: &IngestResult,
+    provider_progress: &dyn ProviderReconciliationProgress,
+    batch_size: i64,
 ) -> std::result::Result<(), RefreshError> {
     match source_kind {
         SourceKind::M3u | SourceKind::Xtream => {
             checkpoint_reconciliation(control, result, "reconciling-channels", 0).await?;
             let channel_stats = catalog
-                .reconcile_provider_account(source_id)
+                .reconcile_provider_account_with_progress(source_id, provider_progress, batch_size)
                 .await
                 .map_err(|_| RefreshError::Catalog)?;
             checkpoint_reconciliation(
@@ -1598,6 +1619,14 @@ async fn run_post_refresh_catalog<C: PostRefreshCatalog>(
         SourceKind::NetworkTuner => {}
     }
     Ok(())
+}
+
+fn reconciliation_batch_size() -> i64 {
+    env::var("IPTV_RECONCILIATION_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_RECONCILIATION_BATCH_SIZE)
+        .clamp(1, 10_000)
 }
 
 async fn checkpoint_reconciliation(
@@ -1686,6 +1715,76 @@ impl JobControl for WorkerJobControl {
             .await
             .map_err(|_| IngestError::OwnershipLost)
     }
+
+    async fn begin_activation(&self) -> std::result::Result<(), IngestError> {
+        match self
+            .repository
+            .begin_activation(self.job_id, &self.worker_id)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(_)
+                if self
+                    .repository
+                    .is_cancelled(self.job_id)
+                    .await
+                    .unwrap_or(false) =>
+            {
+                Err(IngestError::Cancelled)
+            }
+            Err(_) => Err(IngestError::OwnershipLost),
+        }
+    }
+}
+
+impl WorkerJobControl {
+    async fn checkpoint_after_activation(
+        &self,
+        progress: &IngestProgress,
+    ) -> std::result::Result<(), iptv_persistence::PersistenceError> {
+        let progress = refresh_progress_json(progress);
+        self.repository
+            .heartbeat(self.job_id, &self.worker_id, &progress)
+            .await
+    }
+}
+
+#[derive(Debug)]
+struct WorkerProviderReconciliationProgress<'a> {
+    control: &'a WorkerJobControl,
+    result: &'a IngestResult,
+}
+
+impl ProviderReconciliationProgress for WorkerProviderReconciliationProgress<'_> {
+    fn checkpoint(
+        &self,
+        update: ProviderReconciliationUpdate,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = std::result::Result<(), iptv_persistence::PersistenceError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            let phase = match update.phase {
+                ProviderReconciliationPhase::Snapshot => "reconciling-snapshot",
+                ProviderReconciliationPhase::Channels => "reconciling-channel-batch",
+                ProviderReconciliationPhase::StreamLinks => "reconciling-link-batch",
+                ProviderReconciliationPhase::Orphans => "reconciling-orphan-batch",
+                ProviderReconciliationPhase::Revision => "reconciling-revision",
+            };
+            self.control
+                .checkpoint_after_activation(&IngestProgress {
+                    phase: phase.to_owned(),
+                    downloaded_bytes: self.result.downloaded_bytes,
+                    decoded_bytes: self.result.decoded_bytes,
+                    records_seen: update.keys_total,
+                    records_prepared: update.keys_completed,
+                })
+                .await
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1724,6 +1823,7 @@ impl ActivationProgress for WorkerStagingProgress<'_> {
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss
 )]
+#[allow(clippy::too_many_lines)]
 fn refresh_progress_json(progress: &IngestProgress) -> serde_json::Value {
     let (stage, percent, records_processed, message): (&'static str, u8, u64, String) =
         match progress.phase.as_str() {
@@ -1788,15 +1888,70 @@ fn refresh_progress_json(progress: &IngestProgress) -> serde_json::Value {
                 progress.records_prepared,
                 "Reconciling channels".to_owned(),
             ),
+            "reconciling-snapshot" => (
+                "reconciling",
+                86,
+                progress.records_prepared,
+                format!(
+                    "Captured reconciliation state for {} source streams",
+                    progress.records_seen
+                ),
+            ),
+            "reconciling-channel-batch" => (
+                "reconciling",
+                reconciliation_batch_percent(
+                    86,
+                    90,
+                    progress.records_prepared,
+                    progress.records_seen,
+                ),
+                progress.records_prepared,
+                format!(
+                    "Reconciled {} of {} canonical channels",
+                    progress.records_prepared, progress.records_seen
+                ),
+            ),
+            "reconciling-link-batch" => (
+                "reconciling",
+                reconciliation_batch_percent(
+                    91,
+                    94,
+                    progress.records_prepared,
+                    progress.records_seen,
+                ),
+                progress.records_prepared,
+                format!(
+                    "Reconciled stream links for {} of {} canonical channels",
+                    progress.records_prepared, progress.records_seen
+                ),
+            ),
+            "reconciling-orphan-batch" => (
+                "reconciling",
+                95,
+                progress.records_prepared,
+                format!(
+                    "Orphan query affected {} rows from {} source streams",
+                    progress.records_prepared, progress.records_seen
+                ),
+            ),
+            "reconciling-revision" => (
+                "reconciling",
+                96,
+                progress.records_prepared,
+                format!(
+                    "Recorded reconciliation revision for {} source streams",
+                    progress.records_seen
+                ),
+            ),
             "reconciling-epg" => (
                 "reconciling",
-                90,
+                97,
                 progress.records_prepared,
                 format!("Reconciled {} channels", progress.records_prepared),
             ),
             "reconciling-events" => (
                 "reconciling",
-                95,
+                98,
                 progress.records_prepared,
                 format!("Reconciled {} guide mappings", progress.records_prepared),
             ),
@@ -1823,6 +1978,15 @@ fn refresh_progress_json(progress: &IngestProgress) -> serde_json::Value {
         "recordsProcessed": records_processed,
         "message": message,
     })
+}
+
+fn reconciliation_batch_percent(start: u8, end: u8, completed: u64, total: u64) -> u8 {
+    let span = u64::from(end.saturating_sub(start));
+    let increment = completed
+        .saturating_mul(span)
+        .checked_div(total)
+        .unwrap_or(0);
+    start.saturating_add(u8::try_from(increment.min(span)).unwrap_or(u8::MAX))
 }
 
 #[derive(Clone, Debug)]
@@ -2159,9 +2323,34 @@ mod tests {
     }
 
     impl PostRefreshCatalog for TestPostRefreshCatalog {
-        fn reconcile_provider_account(&self, _: Uuid) -> ProviderReconcileFuture<'_> {
+        fn reconcile_provider_account_with_progress<'a>(
+            &'a self,
+            _: Uuid,
+            progress: &'a dyn ProviderReconciliationProgress,
+            _batch_size: i64,
+        ) -> ProviderReconcileFuture<'a> {
             Box::pin(async move {
                 self.call("provider")?;
+                for (phase, rows_affected) in [
+                    (ProviderReconciliationPhase::Snapshot, 0),
+                    (ProviderReconciliationPhase::Channels, 4),
+                    (ProviderReconciliationPhase::StreamLinks, 6),
+                    (ProviderReconciliationPhase::Orphans, 1),
+                    (ProviderReconciliationPhase::Revision, 1),
+                ] {
+                    progress
+                        .checkpoint(ProviderReconciliationUpdate {
+                            phase,
+                            rows_affected,
+                            active_streams: 6,
+                            keys_completed: match phase {
+                                ProviderReconciliationPhase::Snapshot => 0,
+                                _ => 2,
+                            },
+                            keys_total: 2,
+                        })
+                        .await?;
+                }
                 Ok(ReconcileStats {
                     channels: 4,
                     orphaned_channels_removed: 1,
@@ -2192,6 +2381,29 @@ mod tests {
     #[derive(Default)]
     struct RecordingJobControl {
         progress: Mutex<Vec<IngestProgress>>,
+    }
+
+    #[derive(Default)]
+    struct RecordingProviderProgress {
+        updates: Mutex<Vec<ProviderReconciliationUpdate>>,
+    }
+
+    impl ProviderReconciliationProgress for RecordingProviderProgress {
+        fn checkpoint(
+            &self,
+            update: ProviderReconciliationUpdate,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = std::result::Result<(), iptv_persistence::PersistenceError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                self.updates.lock().expect("lock").push(update);
+                Ok(())
+            })
+        }
     }
 
     impl JobControl for RecordingJobControl {
@@ -2367,16 +2579,59 @@ mod tests {
     async fn m3u_post_refresh_scans_events_after_reconciliation() {
         let catalog = TestPostRefreshCatalog::default();
         let control = RecordingJobControl::default();
+        let provider_progress = RecordingProviderProgress::default();
         run_post_refresh_catalog(
             SourceKind::M3u,
             Uuid::now_v7(),
             &catalog,
             &control,
             &ingest_result(),
+            &provider_progress,
+            DEFAULT_RECONCILIATION_BATCH_SIZE,
         )
         .await
         .expect("post-refresh work");
         assert_eq!(catalog.calls(), ["provider", "epg", "events"]);
+        assert_eq!(
+            provider_progress.updates.lock().expect("lock").as_slice(),
+            [
+                ProviderReconciliationUpdate {
+                    phase: ProviderReconciliationPhase::Snapshot,
+                    rows_affected: 0,
+                    active_streams: 6,
+                    keys_completed: 0,
+                    keys_total: 2,
+                },
+                ProviderReconciliationUpdate {
+                    phase: ProviderReconciliationPhase::Channels,
+                    rows_affected: 4,
+                    active_streams: 6,
+                    keys_completed: 2,
+                    keys_total: 2,
+                },
+                ProviderReconciliationUpdate {
+                    phase: ProviderReconciliationPhase::StreamLinks,
+                    rows_affected: 6,
+                    active_streams: 6,
+                    keys_completed: 2,
+                    keys_total: 2,
+                },
+                ProviderReconciliationUpdate {
+                    phase: ProviderReconciliationPhase::Orphans,
+                    rows_affected: 1,
+                    active_streams: 6,
+                    keys_completed: 2,
+                    keys_total: 2,
+                },
+                ProviderReconciliationUpdate {
+                    phase: ProviderReconciliationPhase::Revision,
+                    rows_affected: 1,
+                    active_streams: 6,
+                    keys_completed: 2,
+                    keys_total: 2,
+                },
+            ]
+        );
         let progress = control
             .progress
             .lock()
@@ -2396,12 +2651,15 @@ mod tests {
 
         let xtream = TestPostRefreshCatalog::default();
         let control = RecordingJobControl::default();
+        let provider_progress = RecordingProviderProgress::default();
         run_post_refresh_catalog(
             SourceKind::Xtream,
             Uuid::now_v7(),
             &xtream,
             &control,
             &ingest_result(),
+            &provider_progress,
+            DEFAULT_RECONCILIATION_BATCH_SIZE,
         )
         .await
         .expect("Xtream post-refresh work");
@@ -2415,6 +2673,7 @@ mod tests {
             ..TestPostRefreshCatalog::default()
         };
         let failed_control = RecordingJobControl::default();
+        let failed_provider_progress = RecordingProviderProgress::default();
         assert!(
             run_post_refresh_catalog(
                 SourceKind::M3u,
@@ -2422,6 +2681,8 @@ mod tests {
                 &failed,
                 &failed_control,
                 &ingest_result(),
+                &failed_provider_progress,
+                DEFAULT_RECONCILIATION_BATCH_SIZE,
             )
             .await
             .is_err()
@@ -2430,12 +2691,15 @@ mod tests {
 
         let xmltv = TestPostRefreshCatalog::default();
         let control = RecordingJobControl::default();
+        let provider_progress = RecordingProviderProgress::default();
         run_post_refresh_catalog(
             SourceKind::Xmltv,
             Uuid::now_v7(),
             &xmltv,
             &control,
             &ingest_result(),
+            &provider_progress,
+            DEFAULT_RECONCILIATION_BATCH_SIZE,
         )
         .await
         .expect("XMLTV post-refresh work");
@@ -3230,13 +3494,13 @@ mod tests {
             (
                 "reconciling-epg",
                 "reconciling",
-                90,
+                97,
                 "Reconciled 0 channels",
             ),
             (
                 "reconciling-events",
                 "reconciling",
-                95,
+                98,
                 "Reconciled 0 guide mappings",
             ),
             (
@@ -3265,6 +3529,35 @@ mod tests {
             assert_eq!(progress["recordsProcessed"], expected_records);
             assert_eq!(progress["message"], message);
         }
+    }
+
+    #[test]
+    fn reconciliation_batch_progress_is_monotonic_after_activation() {
+        let phases = [
+            ("reconciling-snapshot", 0, 10),
+            ("reconciling-channel-batch", 10, 10),
+            ("reconciling-link-batch", 10, 10),
+            ("reconciling-orphan-batch", 10, 10),
+            ("reconciling-revision", 10, 10),
+            ("reconciling-epg", 0, 10),
+            ("reconciling-events", 0, 10),
+            ("reconciling-complete", 0, 10),
+        ];
+        let percents: Vec<u64> = phases
+            .into_iter()
+            .map(|(phase, prepared, seen)| {
+                refresh_progress_json(&IngestProgress {
+                    phase: phase.to_owned(),
+                    downloaded_bytes: 0,
+                    decoded_bytes: 0,
+                    records_seen: seen,
+                    records_prepared: prepared,
+                })["percent"]
+                    .as_u64()
+                    .expect("progress percent")
+            })
+            .collect();
+        assert!(percents.windows(2).all(|window| window[0] <= window[1]));
     }
 
     #[test]
@@ -3550,7 +3843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_stranded_jobs_requeues_running_jobs_with_attempts_left() {
+    async fn recover_stale_jobs_requeues_expired_jobs_with_attempts_left() {
         let Some(database) = integration_database().await else {
             eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
             return;
@@ -3561,10 +3854,10 @@ mod tests {
         let mut new_job = iptv_persistence::NewJob::immediate("noop", serde_json::json!({}));
         new_job.max_attempts = 3;
         let job = jobs.enqueue(&new_job).await.expect("enqueue job");
-        // Simulate a worker that claimed the job once, then died mid-job.
+        // Simulate a worker that claimed the job, then stopped its heartbeat.
         sqlx::query(
             "UPDATE jobs SET status = 'running', locked_by = $2, locked_at = now(), \
-             attempts = 1, heartbeat_at = now() WHERE id = $1",
+             attempts = 1, heartbeat_at = now() - interval '6 minutes' WHERE id = $1",
         )
         .bind(job.id)
         .bind("dead-worker")
@@ -3573,16 +3866,16 @@ mod tests {
         .expect("force job to running");
 
         let recovered = jobs
-            .recover_stranded_jobs()
+            .recover_stale_jobs(300)
             .await
-            .expect("recover stranded jobs");
+            .expect("recover stale jobs");
         assert!(recovered >= 1);
         assert_eq!(job_status(&pool, job.id).await, "queued");
         delete_job(&pool, job.id).await;
     }
 
     #[tokio::test]
-    async fn recover_stranded_jobs_fails_running_jobs_at_max_attempts() {
+    async fn recover_stale_jobs_fails_expired_jobs_at_max_attempts() {
         let Some(database) = integration_database().await else {
             eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
             return;
@@ -3593,10 +3886,11 @@ mod tests {
         let mut new_job = iptv_persistence::NewJob::immediate("noop", serde_json::json!({}));
         new_job.max_attempts = 1;
         let job = jobs.enqueue(&new_job).await.expect("enqueue job");
-        // Simulate a worker that exhausted all attempts, then died mid-job.
+        // Simulate a worker that exhausted all attempts and lost its lease.
         sqlx::query(
             "UPDATE jobs SET status = 'running', locked_by = $2, locked_at = now(), \
-             attempts = 1, max_attempts = 1, heartbeat_at = now() WHERE id = $1",
+             attempts = 1, max_attempts = 1, \
+             heartbeat_at = now() - interval '6 minutes' WHERE id = $1",
         )
         .bind(job.id)
         .bind("dead-worker")
@@ -3605,15 +3899,15 @@ mod tests {
         .expect("force job to running at max attempts");
 
         let recovered = jobs
-            .recover_stranded_jobs()
+            .recover_stale_jobs(300)
             .await
-            .expect("recover stranded jobs");
+            .expect("recover stale jobs");
         assert!(recovered >= 1);
         assert_eq!(job_status(&pool, job.id).await, "failed");
         let error = job_last_error(&pool, job.id)
             .await
             .expect("error was persisted");
-        assert_eq!(error, "worker restarted mid-job");
+        assert_eq!(error, "worker lease expired");
         delete_job(&pool, job.id).await;
     }
 
@@ -4664,7 +4958,7 @@ mod tests {
 
         fixture.set_phase(XTREAM_PHASE_RENAMED);
         let renamed_job = jobs
-            .enqueue(&NewJob::immediate(
+            .enqueue(&iptv_persistence::NewJob::immediate(
                 "refresh-source",
                 serde_json::json!({"sourceId": source_id}),
             ))

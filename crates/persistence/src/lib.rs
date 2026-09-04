@@ -22,17 +22,19 @@ pub use catalog::{
     ChannelPlaybackCandidateRow, ChannelPlaybackPlan, ChannelQuery, ChannelRow,
     ChannelStreamCandidateRow, ChannelStreamSourceRow, CreateChannelAliasInput,
     CreateEventTemplate, CreateRecordingInput, CreateRecordingRuleInput, CreateStreamProfileInput,
-    CreateUserInput, ENVIRONMENT_OUTPUT_PROFILE_ID, ENVIRONMENT_OUTPUT_PROFILE_NAME,
-    EpgChannelSearchRow, EpgMappingPage, EpgMappingRow, EpgMappingStats, EventChannelRow,
-    EventTemplateQuery, EventTemplateRow, EventTemplateSuggestion, EventTemplateUpdate,
-    LineupApplyStats, LineupCategoryRow, LineupChannelRow, LineupTemplateRow,
-    OperatorSettingOverrideRow, OperatorSettingOverrides, OperatorSettingRevisionRow,
-    OperatorSettingScopeState, OutputProfileRow, OutputProfileTokenHash, ProgrammePage,
-    ProgrammeQuery, ProgrammeRow, ReconcileStats, ReconciliationRevisionRow,
-    ReconciliationRollbackStats, RecordingRow, RecordingRuleRow, RecordingStats, RegionFilterStats,
-    RegionPrefixRow, RegionSettingsRow, ReviewCandidateRow, StreamHealthPage, StreamHealthRow,
-    StreamHealthStats, StreamHealthUpdate, StreamProbeTargetRow, StreamProfileRow, SystemCounts,
-    UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput, UserRow,
+    CreateUserInput, DEFAULT_RECONCILIATION_BATCH_SIZE, ENVIRONMENT_OUTPUT_PROFILE_ID,
+    ENVIRONMENT_OUTPUT_PROFILE_NAME, EpgChannelSearchRow, EpgMappingPage, EpgMappingRow,
+    EpgMappingStats, EventChannelRow, EventTemplateQuery, EventTemplateRow,
+    EventTemplateSuggestion, EventTemplateUpdate, LineupApplyStats, LineupCategoryRow,
+    LineupChannelRow, LineupTemplateRow, OperatorSettingOverrideRow, OperatorSettingOverrides,
+    OperatorSettingRevisionRow, OperatorSettingScopeState, OutputProfileRow,
+    OutputProfileTokenHash, ProgrammePage, ProgrammeQuery, ProgrammeRow,
+    ProviderReconciliationPhase, ProviderReconciliationProgress, ProviderReconciliationUpdate,
+    ReconcileStats, ReconciliationRevisionRow, ReconciliationRollbackStats, RecordingRow,
+    RecordingRuleRow, RecordingStats, RegionFilterStats, RegionPrefixRow, RegionSettingsRow,
+    ReviewCandidateRow, StreamHealthPage, StreamHealthRow, StreamHealthStats, StreamHealthUpdate,
+    StreamProbeTargetRow, StreamProfileRow, SystemCounts, UnmappedChannelPage, UnmappedChannelRow,
+    UpdateUserInput, UserRow,
 };
 
 /// Embedded database migrations for the service schema.
@@ -1432,6 +1434,15 @@ pub struct NewJob {
     pub available_at: DateTime<Utc>,
 }
 
+/// Result data from one database-elected source refresh scheduler cycle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SourceRefreshScheduleResult {
+    /// True when this worker acquired the scheduler lock for this cycle.
+    pub is_leader: bool,
+    /// The number of source refresh jobs that this cycle created.
+    pub enqueued: u64,
+}
+
 impl NewJob {
     pub fn immediate(kind: impl Into<String>, payload: Value) -> Self {
         Self {
@@ -1520,6 +1531,120 @@ impl JobRepository {
         .fetch_one(&self.pool)
         .await?;
         Ok(record)
+    }
+
+    /// Enqueues one source refresh when no refresh for the source is open.
+    ///
+    /// The database unique index makes this operation safe for concurrent API
+    /// requests and scheduler workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the insert fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn enqueue_source_refresh_if_idle(
+        &self,
+        source_id: Uuid,
+    ) -> Result<Option<JobRecord>, PersistenceError> {
+        let source_id_text = source_id.to_string();
+        let record = sqlx::query_as::<_, JobRecord>(
+            r"
+            INSERT INTO jobs (id, kind, payload, available_at)
+            VALUES ($1, 'refresh-source', $2, now())
+            ON CONFLICT ((payload->>'sourceId'))
+                WHERE kind = 'refresh-source' AND status IN ('queued', 'running')
+                DO NOTHING
+            RETURNING *
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(serde_json::json!({ "sourceId": source_id_text }))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
+    }
+
+    /// Elects one scheduler for this cycle and enqueues due source refreshes.
+    ///
+    /// The transaction advisory lock elects one worker while the query checks
+    /// due sources. The partial unique index guards against an outside insert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the transaction fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn enqueue_due_source_refreshes(
+        &self,
+    ) -> Result<SourceRefreshScheduleResult, PersistenceError> {
+        const SOURCE_REFRESH_SCHEDULER_LOCK: i64 = 7_283_912_042;
+
+        let mut transaction = self.pool.begin().await?;
+        let is_leader: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(SOURCE_REFRESH_SCHEDULER_LOCK)
+            .fetch_one(&mut *transaction)
+            .await?;
+        if !is_leader {
+            transaction.rollback().await?;
+            return Ok(SourceRefreshScheduleResult::default());
+        }
+
+        let due_source_ids = sqlx::query_scalar::<_, Uuid>(
+            r"
+            SELECT id
+            FROM (
+                SELECT id
+                FROM provider_accounts
+                WHERE enabled = true
+                  AND refresh_interval_seconds > 0
+                  AND (
+                      last_refreshed_at IS NULL
+                      OR last_refreshed_at
+                         + (refresh_interval_seconds || ' seconds')::interval <= now()
+                  )
+                UNION ALL
+                SELECT id
+                FROM epg_sources
+                WHERE enabled = true
+                  AND refresh_interval_seconds > 0
+                  AND (
+                      last_refreshed_at IS NULL
+                      OR last_refreshed_at
+                         + (refresh_interval_seconds || ' seconds')::interval <= now()
+                  )
+            ) AS due_sources
+            ORDER BY id
+            ",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+
+        let mut enqueued = 0;
+        for source_id in due_source_ids {
+            let source_id_text = source_id.to_string();
+            let inserted = sqlx::query_scalar::<_, Uuid>(
+                r"
+                INSERT INTO jobs (id, kind, payload, available_at)
+                VALUES ($1, 'refresh-source', $2, now())
+                ON CONFLICT ((payload->>'sourceId'))
+                    WHERE kind = 'refresh-source' AND status IN ('queued', 'running')
+                    DO NOTHING
+                RETURNING id
+                ",
+            )
+            .bind(Uuid::now_v7())
+            .bind(serde_json::json!({ "sourceId": source_id_text }))
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if inserted.is_some() {
+                enqueued += 1;
+            }
+        }
+
+        transaction.commit().await?;
+        Ok(SourceRefreshScheduleResult {
+            is_leader: true,
+            enqueued,
+        })
     }
 
     /// Enqueues one short EPG job when the source has no queued or running job.
@@ -1628,7 +1753,9 @@ impl JobRepository {
             UPDATE jobs
             SET status = 'cancelled', completed_at = now(), updated_at = now(),
                 locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
-            WHERE id = $1 AND status IN ('queued', 'running')
+            WHERE id = $1
+              AND status IN ('queued', 'running')
+              AND coalesce(progress->>'activationLocked', 'false') <> 'true'
             RETURNING status
             ",
         )
@@ -1663,6 +1790,37 @@ impl JobRepository {
         status
             .map(|status| status == "cancelled")
             .ok_or(PersistenceError::JobNotFound(job_id))
+    }
+
+    /// Prevents cancellation before one source snapshot transaction commits.
+    ///
+    /// Call this after the final cancellable staging checkpoint. The update
+    /// and [`Self::cancel`] race on one row, so either cancellation wins
+    /// before activation or the activation lock wins before the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::JobOwnership`] when cancellation or lease
+    /// loss occurred before the lock.
+    pub async fn begin_activation(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+    ) -> Result<(), PersistenceError> {
+        let result = sqlx::query(
+            r"
+            UPDATE jobs
+            SET heartbeat_at = now(),
+                progress = progress || jsonb_build_object('activationLocked', true),
+                updated_at = now()
+            WHERE id = $1 AND status = 'running' AND locked_by = $2
+            ",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&self.pool)
+        .await?;
+        ensure_owned(result.rows_affected(), job_id, worker_id)
     }
 
     /// Atomically claims the next available job without blocking other workers.
@@ -1714,7 +1872,13 @@ impl JobRepository {
         let result = sqlx::query(
             r"
             UPDATE jobs
-            SET heartbeat_at = now(), progress = $3, updated_at = now()
+            SET heartbeat_at = now(),
+                progress = CASE
+                    WHEN coalesce(progress->>'activationLocked', 'false') = 'true'
+                    THEN $3 || jsonb_build_object('activationLocked', true)
+                    ELSE $3
+                END,
+                updated_at = now()
             WHERE id = $1 AND status = 'running' AND locked_by = $2
             ",
         )
@@ -1821,7 +1985,7 @@ impl JobRepository {
         ensure_owned(result.rows_affected(), job_id, worker_id)
     }
 
-    /// Resets stale running jobs back to queued so they can be reclaimed.
+    /// Recovers stale running jobs so another worker can claim them.
     ///
     /// A job is stale when its `heartbeat_at` is older than the lease timeout.
     /// It is also stale when `heartbeat_at` is null and `locked_at` is old.
@@ -1830,27 +1994,40 @@ impl JobRepository {
     ///
     /// Returns [`PersistenceError::Database`] when the query fails.
     #[allow(clippy::missing_errors_doc)]
-    pub async fn reap_stale_jobs(
+    pub async fn recover_stale_jobs(
         &self,
         lease_timeout_seconds: i64,
     ) -> Result<u64, PersistenceError> {
         let result = sqlx::query(
             r"
             UPDATE jobs
-            SET status = 'queued',
+            SET status = CASE
+                    WHEN attempts < max_attempts THEN 'queued'
+                    ELSE 'failed'
+                END,
+                last_error = CASE
+                    WHEN attempts >= max_attempts THEN 'worker lease expired'
+                    ELSE last_error
+                END,
+                completed_at = CASE
+                    WHEN attempts >= max_attempts THEN now()
+                    ELSE NULL
+                END,
                 locked_by = NULL,
                 locked_at = NULL,
                 heartbeat_at = NULL,
                 updated_at = now()
             WHERE status = 'running'
               AND (
-                heartbeat_at IS NOT NULL
-                AND heartbeat_at < now() - make_interval(secs => $1)
-              )
-              OR (
-                heartbeat_at IS NULL
-                AND locked_at IS NOT NULL
-                AND locked_at < now() - make_interval(secs => $1)
+                    (
+                        heartbeat_at IS NOT NULL
+                        AND heartbeat_at < now() - make_interval(secs => $1)
+                    )
+                    OR (
+                        heartbeat_at IS NULL
+                        AND locked_at IS NOT NULL
+                        AND locked_at < now() - make_interval(secs => $1)
+                    )
               )
             ",
         )
@@ -1858,47 +2035,6 @@ impl JobRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
-    }
-
-    /// Recovers jobs left in `running` status by a worker that restarted
-    /// mid-job. Jobs with remaining attempts return to `queued`. Jobs at or
-    /// above `max_attempts` move to `failed` with a `worker restarted
-    /// mid-job` error. Call this on worker startup before the job loop begins.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PersistenceError::Database`] when either update fails.
-    #[allow(clippy::missing_errors_doc)]
-    pub async fn recover_stranded_jobs(&self) -> Result<u64, PersistenceError> {
-        let requeued = sqlx::query(
-            r"
-            UPDATE jobs
-            SET status = 'queued',
-                locked_by = NULL,
-                locked_at = NULL,
-                heartbeat_at = NULL,
-                updated_at = now()
-            WHERE status = 'running' AND attempts < max_attempts
-            ",
-        )
-        .execute(&self.pool)
-        .await?;
-        let failed = sqlx::query(
-            r"
-            UPDATE jobs
-            SET status = 'failed',
-                last_error = 'worker restarted mid-job',
-                completed_at = now(),
-                locked_by = NULL,
-                locked_at = NULL,
-                heartbeat_at = NULL,
-                updated_at = now()
-            WHERE status = 'running' AND attempts >= max_attempts
-            ",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(requeued.rows_affected() + failed.rows_affected())
     }
 
     /// Lists failed jobs for operator inspection (dead-letter queue).

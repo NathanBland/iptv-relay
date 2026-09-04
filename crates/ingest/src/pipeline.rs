@@ -86,6 +86,14 @@ pub trait EndpointProtector: Send + Sync {
 #[allow(async_fn_in_trait)]
 pub trait JobControl: Send + Sync {
     async fn checkpoint(&self, progress: &IngestProgress) -> Result<(), IngestError>;
+
+    /// Disables cancellation before a snapshot can become active.
+    ///
+    /// The activation transaction must remain atomic after this method
+    /// succeeds. The default suits stores without durable job ownership.
+    async fn begin_activation(&self) -> Result<(), IngestError> {
+        Ok(())
+    }
 }
 
 #[allow(async_fn_in_trait)]
@@ -452,6 +460,7 @@ where
         let records = snapshot.record_count;
         self.checkpoint("staging", byte_count, byte_count, records_seen, 0)
             .await?;
+        self.control.begin_activation().await?;
 
         let staging_progress = IngestStagingProgress {
             control: &self.control,
@@ -635,6 +644,7 @@ where
         let records = snapshot.record_count;
         self.checkpoint("staging", downloaded_bytes, decoded_bytes, records_seen, 0)
             .await?;
+        self.control.begin_activation().await?;
         let staging_progress = IngestStagingProgress {
             control: &self.control,
             downloaded_bytes,
