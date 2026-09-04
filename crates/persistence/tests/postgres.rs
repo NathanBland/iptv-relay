@@ -677,6 +677,68 @@ async fn activation_lock_prevents_post_commit_cancellation_and_preserves_progres
 }
 
 #[tokio::test]
+async fn staged_refresh_cancellation_remains_open_until_activation_lock() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let repository = JobRepository::new(database.pool().clone());
+
+    let staged = repository
+        .enqueue(&NewJob::immediate(
+            "refresh-source",
+            json!({"sourceId": "staged-source"}),
+        ))
+        .await
+        .unwrap();
+    let worker = "staged-refresh-worker";
+    repository
+        .claim(worker)
+        .await
+        .unwrap()
+        .expect("claim staged job");
+    assert!(repository.cancel_source_sync(staged.id).await.unwrap());
+    let staged_state: (String, Value) =
+        sqlx::query_as("SELECT status, progress FROM jobs WHERE id = $1")
+            .bind(staged.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(staged_state.0, "cancelled");
+    assert_ne!(staged_state.1["activationLocked"], true);
+
+    let publishing = repository
+        .enqueue(&NewJob::immediate(
+            "refresh-source",
+            json!({"sourceId": "publishing-source"}),
+        ))
+        .await
+        .unwrap();
+    repository
+        .claim("publishing-worker")
+        .await
+        .unwrap()
+        .expect("claim publishing job");
+    repository
+        .begin_activation(publishing.id, "publishing-worker")
+        .await
+        .unwrap();
+    assert!(!repository.cancel_source_sync(publishing.id).await.unwrap());
+    let publishing_state: (String, Value) =
+        sqlx::query_as("SELECT status, progress FROM jobs WHERE id = $1")
+            .bind(publishing.id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(publishing_state.0, "running");
+    assert_eq!(publishing_state.1["activationLocked"], true);
+
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
 async fn bootstrap_bearer_state_is_durable_and_idempotent() {
     let Some(database_url) = database_url() else {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");

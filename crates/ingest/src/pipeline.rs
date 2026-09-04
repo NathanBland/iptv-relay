@@ -119,6 +119,11 @@ pub trait SnapshotActivator: Send + Sync {
     fn completion_phase(&self) -> &'static str {
         "activated"
     }
+
+    /// Returns whether a later finalizer publishes the snapshot.
+    fn defers_activation(&self) -> bool {
+        false
+    }
 }
 
 impl SnapshotActivator for PgSnapshotStore {
@@ -468,7 +473,9 @@ where
         let records = snapshot.record_count;
         self.checkpoint("staging", byte_count, byte_count, records_seen, 0)
             .await?;
-        self.control.begin_activation().await?;
+        if !self.store.defers_activation() {
+            self.control.begin_activation().await?;
+        }
 
         let staging_progress = IngestStagingProgress {
             control: &self.control,
@@ -658,7 +665,9 @@ where
         let records = snapshot.record_count;
         self.checkpoint("staging", downloaded_bytes, decoded_bytes, records_seen, 0)
             .await?;
-        self.control.begin_activation().await?;
+        if !self.store.defers_activation() {
+            self.control.begin_activation().await?;
+        }
         let staging_progress = IngestStagingProgress {
             control: &self.control,
             downloaded_bytes,
@@ -1600,6 +1609,7 @@ mod tests {
     struct TestControl {
         phases: Mutex<Vec<String>>,
         progress: Mutex<Vec<IngestProgress>>,
+        activation_count: Mutex<u32>,
         cancel_at: Option<&'static str>,
     }
 
@@ -1615,6 +1625,11 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        async fn begin_activation(&self) -> Result<(), IngestError> {
+            *self.activation_count.lock().expect("lock") += 1;
+            Ok(())
         }
     }
 
@@ -1657,6 +1672,23 @@ mod tests {
             progress.checkpoint(1, total).await?;
             progress.checkpoint(total, total).await?;
             self.activate(snapshot).await
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct DeferredTestStore;
+
+    impl SnapshotActivator for DeferredTestStore {
+        async fn activate(&self, snapshot: &PreparedSnapshot) -> Result<Uuid, IngestError> {
+            Ok(snapshot.id)
+        }
+
+        fn completion_phase(&self) -> &'static str {
+            "staged"
+        }
+
+        fn defers_activation(&self) -> bool {
+            true
         }
     }
 
@@ -1733,6 +1765,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_staging_does_not_lock_activation() {
+        let ingestor = Ingestor::new(TestProtector, TestControl::default(), DeferredTestStore);
+        ingestor
+            .run_downloaded(
+                &request(IngestFormat::M3u),
+                downloaded(b"#EXTM3U\n#EXTINF:-1,One\nhttps://example.test/one\n"),
+            )
+            .await
+            .expect("ingest");
+
+        assert_eq!(*ingestor.control.activation_count.lock().expect("lock"), 0);
+    }
+
+    #[tokio::test]
     async fn cancellation_before_staging_never_activates() {
         let ingestor = Ingestor::new(
             TestProtector,
@@ -1740,6 +1786,7 @@ mod tests {
                 phases: Mutex::default(),
                 progress: Mutex::default(),
                 cancel_at: Some("parsed"),
+                ..Default::default()
             },
             TestStore::default(),
         );
@@ -1762,6 +1809,7 @@ mod tests {
                 phases: Mutex::default(),
                 progress: Mutex::default(),
                 cancel_at: Some("downloading"),
+                ..Default::default()
             },
             TestStore::default(),
         );

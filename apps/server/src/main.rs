@@ -2279,6 +2279,10 @@ impl SnapshotActivator for StagedSnapshotActivator {
     fn completion_phase(&self) -> &'static str {
         "staged"
     }
+
+    fn defers_activation(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
