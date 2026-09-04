@@ -2082,6 +2082,66 @@ impl JobRepository {
         Ok(run_failed || parent_failed)
     }
 
+    /// Fails the source refresh when any reconciliation child exhausts retries.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn fail_reconciliation_parent_for_terminal_child(
+        &self,
+        parent_job_id: Uuid,
+        progress: &Value,
+    ) -> Result<bool, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let parent_status: Option<String> = sqlx::query_scalar(
+            r"
+            SELECT status
+            FROM jobs
+            WHERE id = $1 AND kind = 'refresh-source'
+            FOR UPDATE
+            ",
+        )
+        .bind(parent_job_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(parent_status) = parent_status else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        if matches!(parent_status.as_str(), "cancelled" | "succeeded") {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+
+        let run_failed = sqlx::query(
+            r"
+            UPDATE provider_reconciliation_runs
+            SET status = 'failed', updated_at = now()
+            WHERE parent_job_id = $1 AND status = 'processing'
+            ",
+        )
+        .bind(parent_job_id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            > 0;
+        let parent_failed = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'failed', completed_at = now(), heartbeat_at = NULL,
+                locked_by = NULL, locked_at = NULL, progress = $2,
+                last_error = 'reconciliation child exhausted retries', updated_at = now()
+            WHERE id = $1 AND kind = 'refresh-source'
+              AND status IN ('queued', 'running')
+            ",
+        )
+        .bind(parent_job_id)
+        .bind(progress)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            == 1;
+        transaction.commit().await?;
+        Ok(run_failed || parent_failed)
+    }
+
     /// Cancels a queued or running job. Workers observe cancellation through
     /// [`Self::is_cancelled`] or a failed ownership-checked heartbeat.
     ///

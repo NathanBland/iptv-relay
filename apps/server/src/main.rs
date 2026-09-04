@@ -817,6 +817,19 @@ async fn run_provider_reconciliation_partition_job(
     let Some((run_id, partition_number, source_id, parent_job_id)) =
         provider_reconciliation_partition_from_payload(&job.payload)
     else {
+        if job.attempts >= job.max_attempts
+            && let Some(parent_job_id) = reconciliation_parent_from_payload(&job.payload)
+        {
+            jobs.fail_reconciliation_parent_for_terminal_child(
+                parent_job_id,
+                &serde_json::json!({
+                    "stage": "failed",
+                    "percent": 85,
+                    "message": "Reconciliation partition payload remained invalid after retries",
+                }),
+            )
+            .await?;
+        }
         jobs.fail(
             job.id,
             worker_id,
@@ -936,6 +949,19 @@ async fn run_provider_reconciliation_finalizer_job(
     let Some((run_id, _source_id, parent_job_id)) =
         provider_reconciliation_finalizer_from_payload(&job.payload)
     else {
+        if job.attempts >= job.max_attempts
+            && let Some(parent_job_id) = reconciliation_parent_from_payload(&job.payload)
+        {
+            jobs.fail_reconciliation_parent_for_terminal_child(
+                parent_job_id,
+                &serde_json::json!({
+                    "stage": "failed",
+                    "percent": 99,
+                    "message": "Reconciliation finalizer payload remained invalid after retries",
+                }),
+            )
+            .await?;
+        }
         jobs.fail(
             job.id,
             worker_id,
@@ -1096,6 +1122,18 @@ async fn run_provider_reconciliation_finalizer_job(
         }
         Err(error) => {
             warn!(job_id = %job.id, run_id = %run_id, error = %error, "reconciliation finalizer failed");
+            if job.attempts >= job.max_attempts {
+                jobs.fail_reconciliation_parent_for_terminal_child(
+                    parent_job_id,
+                    &serde_json::json!({
+                        "stage": "failed",
+                        "percent": 99,
+                        "runId": run_id,
+                        "message": "Reconciliation finalizer exhausted retries",
+                    }),
+                )
+                .await?;
+            }
             jobs.fail(
                 job.id,
                 worker_id,
@@ -1111,6 +1149,10 @@ async fn run_provider_reconciliation_finalizer_job(
 
 fn provider_reconciliation_run_from_payload(payload: &serde_json::Value) -> Option<Uuid> {
     payload.get("runId")?.as_str()?.parse().ok()
+}
+
+fn reconciliation_parent_from_payload(payload: &serde_json::Value) -> Option<Uuid> {
+    payload.get("parentJobId")?.as_str()?.parse().ok()
 }
 
 fn provider_reconciliation_partition_from_payload(
@@ -4232,6 +4274,24 @@ mod tests {
         ] {
             assert!(provider_reconciliation_partition_from_payload(&payload).is_none());
         }
+    }
+
+    #[test]
+    fn malformed_reconciliation_payload_can_still_fail_its_parent() {
+        let parent_job_id = Uuid::now_v7();
+        assert_eq!(
+            reconciliation_parent_from_payload(&serde_json::json!({
+                "parentJobId": parent_job_id.to_string(),
+                "runId": "invalid",
+            })),
+            Some(parent_job_id)
+        );
+        assert_eq!(
+            reconciliation_parent_from_payload(&serde_json::json!({
+                "parentJobId": "invalid",
+            })),
+            None
+        );
     }
 
     #[test]
