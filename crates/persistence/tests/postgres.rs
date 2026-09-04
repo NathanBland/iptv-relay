@@ -263,7 +263,7 @@ async fn provider_reconciliation_partitions_conserve_canonical_key_counts() {
     assert_eq!(run.partition_count, 64);
     assert_eq!(run.total_keys, 3);
     let (partition_count, key_sum): (i64, i64) = sqlx::query_as(
-        "SELECT count(*), coalesce(sum(key_count), 0)
+        "SELECT count(*), coalesce(sum(key_count), 0)::bigint
          FROM provider_reconciliation_partitions WHERE run_id = $1",
     )
     .bind(run.id)
