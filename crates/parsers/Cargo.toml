@@ -14,7 +14,7 @@ scale = []
 base64.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
-iptv-domain = { path = "../domain", version = "0.2.5" }
+iptv-domain = { path = "../domain", version = "0.2.6" }
 quick-xml.workspace = true
 regex.workspace = true
 serde.workspace = true

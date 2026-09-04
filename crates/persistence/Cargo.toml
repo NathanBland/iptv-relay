@@ -11,8 +11,8 @@ chacha20poly1305.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 getrandom.workspace = true
-iptv-domain = { path = "../domain", version = "0.2.5" }
-iptv-parsers = { path = "../parsers", version = "0.2.5" }
+iptv-domain = { path = "../domain", version = "0.2.6" }
+iptv-parsers = { path = "../parsers", version = "0.2.6" }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
