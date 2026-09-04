@@ -153,7 +153,15 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
   })
 
   const form = useForm({
-    defaultValues: { name: '', kind: 'M3U' as SourceKind, endpoint: '', timezone: 'UTC' },
+    defaultValues: {
+      name: '',
+      kind: 'M3U' as SourceKind,
+      endpoint: '',
+      serverUrl: '',
+      username: '',
+      password: '',
+      timezone: 'UTC',
+    },
     validators: { onSubmit: sourceSchema },
     onSubmit: async ({ value }) => {
       await mutation.mutateAsync(value)
@@ -182,7 +190,7 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
           <CardHeader><h2 className="font-semibold text-white">Connect a source</h2></CardHeader>
           <CardContent>
             <form
-              className="grid gap-4 lg:grid-cols-[1fr_13rem_1.5fr_12rem_auto] lg:items-start"
+              className="grid gap-4 lg:grid-cols-4 lg:items-start"
               onSubmit={(event) => { event.preventDefault(); event.stopPropagation(); void form.handleSubmit() }}
             >
               <form.Field
@@ -214,26 +222,108 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
                   </label>
                 )}
               </form.Field>
-              <form.Field
-                name="endpoint"
-                validators={{ onChange: sourceSchema.shape.endpoint }}
-              >
-                {(field) => (
-                  <label className="text-xs font-medium text-slate-300">
-                    Endpoint
-                    <Input
-                      className="mt-1"
-                      type="url"
-                      placeholder="https://provider.example/playlist.m3u"
-                      value={field.state.value}
-                      onBlur={field.handleBlur}
-                      onChange={(event) => field.handleChange(event.target.value)}
-                      aria-invalid={field.state.meta.errors.length > 0}
-                    />
-                    <FieldMessage>{field.state.meta.errors[0]}</FieldMessage>
-                  </label>
+              <form.Subscribe selector={(state) => state.values.kind}>
+                {(kind) => kind === 'Xtream' ? (
+                  <>
+                    <form.Field name="serverUrl" validators={{ onChange: sourceSchema.shape.serverUrl }}>
+                      {(field) => (
+                        <label className="text-xs font-medium text-slate-300">
+                          Server URL
+                          <Input
+                            className="mt-1"
+                            type="url"
+                            placeholder="https://provider.example:8080"
+                            value={field.state.value}
+                            onBlur={field.handleBlur}
+                            onChange={(event) => field.handleChange(event.target.value)}
+                            aria-invalid={field.state.meta.errors.length > 0}
+                          />
+                          <FieldMessage>{field.state.meta.errors[0]}</FieldMessage>
+                          <span className="mt-1 block text-[0.68rem] text-slate-500">
+                            The API adds player_api.php and your credentials.
+                          </span>
+                        </label>
+                      )}
+                    </form.Field>
+                    <form.Field name="username" validators={{ onChange: sourceSchema.shape.username }}>
+                      {(field) => (
+                        <label className="text-xs font-medium text-slate-300">
+                          Username
+                          <Input
+                            className="mt-1"
+                            autoComplete="off"
+                            value={field.state.value}
+                            onBlur={field.handleBlur}
+                            onChange={(event) => field.handleChange(event.target.value)}
+                            aria-invalid={field.state.meta.errors.length > 0}
+                          />
+                          <FieldMessage>{field.state.meta.errors[0]}</FieldMessage>
+                        </label>
+                      )}
+                    </form.Field>
+                    <form.Field name="password" validators={{ onChange: sourceSchema.shape.password }}>
+                      {(field) => (
+                        <label className="text-xs font-medium text-slate-300">
+                          Password
+                          <Input
+                            className="mt-1"
+                            type="password"
+                            autoComplete="new-password"
+                            value={field.state.value}
+                            onBlur={field.handleBlur}
+                            onChange={(event) => field.handleChange(event.target.value)}
+                            aria-invalid={field.state.meta.errors.length > 0}
+                          />
+                          <FieldMessage>{field.state.meta.errors[0]}</FieldMessage>
+                        </label>
+                      )}
+                    </form.Field>
+                    <details className="lg:col-span-4">
+                      <summary className="cursor-pointer text-xs font-medium text-slate-300">
+                        Advanced: use a complete player_api.php endpoint
+                      </summary>
+                      <form.Field name="endpoint" validators={{ onChange: sourceSchema.shape.endpoint }}>
+                        {(field) => (
+                          <label className="mt-3 block text-xs font-medium text-slate-300">
+                            Advanced endpoint
+                            <Input
+                              className="mt-1"
+                              type="url"
+                              placeholder="https://provider.example/player_api.php?username=…&password=…"
+                              value={field.state.value}
+                              onBlur={field.handleBlur}
+                              onChange={(event) => field.handleChange(event.target.value)}
+                              aria-invalid={field.state.meta.errors.length > 0}
+                            />
+                            <FieldMessage>{field.state.meta.errors[0]}</FieldMessage>
+                            <span className="mt-1 block text-[0.68rem] text-slate-500">
+                              Use this field only when the provider needs custom endpoint parameters.
+                            </span>
+                          </label>
+                        )}
+                      </form.Field>
+                    </details>
+                  </>
+                ) : (
+                  <form.Field name="endpoint" validators={{ onChange: sourceSchema.shape.endpoint }}>
+                    {(field) => (
+                      <label className="text-xs font-medium text-slate-300 lg:col-span-2">
+                        Endpoint
+                        <Input
+                          className="mt-1"
+                          type="url"
+                          placeholder="https://provider.example/playlist.m3u"
+                          value={field.state.value}
+                          onBlur={field.handleBlur}
+                          onChange={(event) => field.handleChange(event.target.value)}
+                          aria-invalid={field.state.meta.errors.length > 0}
+                        />
+                        <FieldMessage>{field.state.meta.errors[0]}</FieldMessage>
+                      </label>
+                    )}
+                  </form.Field>
                 )}
-              </form.Field>
+              </form.Subscribe>
               <form.Field
                 name="timezone"
                 validators={{ onChange: sourceSchema.shape.timezone }}

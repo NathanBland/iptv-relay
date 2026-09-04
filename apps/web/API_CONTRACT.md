@@ -121,13 +121,19 @@ Request:
 {
   "name": "Prime IPTV",
   "kind": "Xtream",
-  "endpoint": "https://provider.invalid/player_api.php"
+  "serverUrl": "https://provider.invalid",
+  "username": "provider-user",
+  "password": "provider-password"
 }
 ```
 
 Return `201 Created` with one complete source object in the same shape used by `GET /api/v1/sources`.
 
 The server encrypts the complete endpoint before storage, persists only a credential-free display endpoint alongside it, and transactionally enqueues a `refresh-source` job plus an audit event. The response `endpoint` is therefore redacted and may use `/…` in place of a sensitive path.
+
+For M3U, XMLTV, and network-tuner sources, send `endpoint` instead of the
+Xtream fields. For advanced Xtream setup, send one complete
+`player_api.php` URL in `endpoint`. Do not send both forms.
 
 ## GET `/api/v1/jobs`
 

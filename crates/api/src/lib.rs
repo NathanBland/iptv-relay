@@ -363,7 +363,13 @@ struct SystemInfo {
 struct CreateSourceRequest {
     name: String,
     kind: String,
-    endpoint: String,
+    /// Use `endpoint` for M3U, XMLTV, and network-tuner sources.
+    endpoint: Option<String>,
+    /// Use `serverUrl`, `username`, and `password` for a standard Xtream source.
+    /// Keep `endpoint` for an advanced, complete `player_api.php` URL.
+    server_url: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
     timezone: Option<String>,
 }
 
@@ -3149,10 +3155,14 @@ async fn create_source(
         Ok(kind) => kind,
         Err(error) => return persistence_error_response(error),
     };
+    let endpoint = match canonical_source_endpoint(&request, kind) {
+        Ok(endpoint) => endpoint,
+        Err(error) => return persistence_error_response(error),
+    };
     let source = NewSource {
         name: request.name,
         kind,
-        endpoint: request.endpoint,
+        endpoint,
     };
     match repository
         .create_with_timezone(&source, "operator", request.timezone.as_deref())
@@ -3176,6 +3186,167 @@ async fn create_source(
         }
         Err(error) => persistence_error_response(error),
     }
+}
+
+/// Selects the endpoint representation that the source repository stores.
+///
+/// Standard Xtream input uses separate fields so the UI does not require the
+/// operator to build a credential-bearing URL. The advanced endpoint remains
+/// available for providers that need a complete `player_api.php` URL.
+fn canonical_source_endpoint(
+    request: &CreateSourceRequest,
+    kind: SourceKind,
+) -> Result<String, PersistenceError> {
+    let has_credentials = [
+        request.server_url.as_deref(),
+        request.username.as_deref(),
+        request.password.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty());
+
+    if kind != SourceKind::Xtream {
+        if has_credentials {
+            return Err(PersistenceError::InvalidSource(
+                "Xtream credentials require an Xtream source".to_owned(),
+            ));
+        }
+        return request.endpoint.clone().ok_or_else(|| {
+            PersistenceError::InvalidSource("endpoint is required for this source type".to_owned())
+        });
+    }
+
+    if has_credentials {
+        let server_url = request.server_url.as_deref().ok_or_else(|| {
+            PersistenceError::InvalidSource(
+                "Xtream server URL, username, and password are required together".to_owned(),
+            )
+        })?;
+        let username = request.username.as_deref().ok_or_else(|| {
+            PersistenceError::InvalidSource(
+                "Xtream server URL, username, and password are required together".to_owned(),
+            )
+        })?;
+        let password = request.password.as_deref().ok_or_else(|| {
+            PersistenceError::InvalidSource(
+                "Xtream server URL, username, and password are required together".to_owned(),
+            )
+        })?;
+        if request.endpoint.is_some() {
+            return Err(PersistenceError::InvalidSource(
+                "use either Xtream credentials or an advanced endpoint".to_owned(),
+            ));
+        }
+        return build_xtream_player_api_endpoint(server_url, username, password);
+    }
+
+    let endpoint = request.endpoint.as_deref().ok_or_else(|| {
+        PersistenceError::InvalidSource(
+            "Xtream requires server URL credentials or an advanced player_api.php endpoint"
+                .to_owned(),
+        )
+    })?;
+    validate_xtream_player_api_endpoint(endpoint)?;
+    Ok(endpoint.to_owned())
+}
+
+fn build_xtream_player_api_endpoint(
+    server_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, PersistenceError> {
+    let mut url = parse_http_url(server_url, "Xtream server URL")?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(PersistenceError::InvalidSource(
+            "Xtream server URL must not include a query or fragment".to_owned(),
+        ));
+    }
+    let username = nonblank_secret(username, "username")?;
+    let password = nonblank_secret(password, "password")?;
+    let path = url.path().trim_end_matches('/');
+    let player_api_path = if path.is_empty() {
+        "/player_api.php".to_owned()
+    } else if path.rsplit('/').next() == Some("player_api.php") {
+        path.to_owned()
+    } else {
+        format!("{path}/player_api.php")
+    };
+    url.set_path(&player_api_path);
+    url.query_pairs_mut()
+        .append_pair("username", username)
+        .append_pair("password", password);
+    Ok(url.into())
+}
+
+fn validate_xtream_player_api_endpoint(endpoint: &str) -> Result<(), PersistenceError> {
+    let url = parse_http_url(endpoint, "Xtream endpoint")?;
+    if url.fragment().is_some() {
+        return Err(PersistenceError::InvalidSource(
+            "Xtream endpoint must not include a fragment".to_owned(),
+        ));
+    }
+    if url.path_segments().and_then(Iterator::last) != Some("player_api.php") {
+        return Err(PersistenceError::InvalidSource(
+            "Xtream endpoint path must end with player_api.php".to_owned(),
+        ));
+    }
+    let mut username = 0_u8;
+    let mut password = 0_u8;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "username" => {
+                username = username.saturating_add(1);
+                if value.is_empty() {
+                    return Err(PersistenceError::InvalidSource(
+                        "Xtream endpoint requires a nonempty username".to_owned(),
+                    ));
+                }
+            }
+            "password" => {
+                password = password.saturating_add(1);
+                if value.is_empty() {
+                    return Err(PersistenceError::InvalidSource(
+                        "Xtream endpoint requires a nonempty password".to_owned(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if username != 1 || password != 1 {
+        return Err(PersistenceError::InvalidSource(
+            "Xtream endpoint requires one username and one password".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_http_url(value: &str, label: &str) -> Result<url::Url, PersistenceError> {
+    let url = url::Url::parse(value.trim()).map_err(|_| {
+        PersistenceError::InvalidSource(format!("{label} must be an absolute HTTP(S) URL"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(PersistenceError::InvalidSource(format!(
+            "{label} must be an absolute HTTP(S) URL"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(PersistenceError::InvalidSource(format!(
+            "{label} must not include user info"
+        )));
+    }
+    Ok(url)
+}
+
+fn nonblank_secret<'a>(value: &'a str, label: &str) -> Result<&'a str, PersistenceError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(PersistenceError::InvalidSource(format!(
+            "Xtream {label} must not be blank"
+        )));
+    }
+    Ok(value)
 }
 
 #[utoipa::path(
@@ -12451,6 +12622,12 @@ mod tests {
             "name": "Source", "kind": "M3U", "endpoint": "https://provider.test/list.m3u",
             "timezone": "America/Denver"
         }));
+        assert_deserializes::<CreateSourceRequest>(serde_json::json!({
+            "name": "Xtream source", "kind": "Xtream",
+            "serverUrl": "https://provider.test:8443/panel",
+            "username": "operator", "password": "secret",
+            "timezone": "UTC"
+        }));
         assert_deserializes::<UpdateSourceRequest>(serde_json::json!({
             "maxConnections": 2, "timezone": "America/Denver", "enabled": true
         }));
@@ -12521,6 +12698,88 @@ mod tests {
         assert_deserializes::<AssignStreamProfileRequest>(
             serde_json::json!({"stream_profile_id": id}),
         );
+    }
+
+    #[test]
+    fn standard_xtream_fields_build_a_canonical_player_api_endpoint() {
+        let request = CreateSourceRequest {
+            name: "Provider".to_owned(),
+            kind: "Xtream".to_owned(),
+            endpoint: None,
+            server_url: Some("https://provider.test:8443/panel/".to_owned()),
+            username: Some("user/name".to_owned()),
+            password: Some("p?a#ss".to_owned()),
+            timezone: None,
+        };
+        let endpoint = canonical_source_endpoint(&request, SourceKind::Xtream)
+            .expect("Xtream credentials should build an endpoint");
+        assert_eq!(
+            endpoint,
+            "https://provider.test:8443/panel/player_api.php?username=user%2Fname&password=p%3Fa%23ss"
+        );
+    }
+
+    #[test]
+    fn xtream_endpoint_validation_rejects_partial_credentials_and_secret_url_conflicts() {
+        let partial = CreateSourceRequest {
+            name: "Provider".to_owned(),
+            kind: "Xtream".to_owned(),
+            endpoint: None,
+            server_url: Some("https://provider.test".to_owned()),
+            username: Some("user".to_owned()),
+            password: None,
+            timezone: None,
+        };
+        let partial_error = canonical_source_endpoint(&partial, SourceKind::Xtream)
+            .expect_err("partial Xtream credentials must fail");
+        assert!(partial_error.to_string().contains("required together"));
+
+        let mixed = CreateSourceRequest {
+            endpoint: Some("https://provider.test/player_api.php?username=u&password=p".to_owned()),
+            server_url: Some("https://provider.test".to_owned()),
+            password: Some("password".to_owned()),
+            ..partial
+        };
+        let mixed_error = canonical_source_endpoint(&mixed, SourceKind::Xtream)
+            .expect_err("advanced and standard Xtream inputs must not mix");
+        assert!(
+            mixed_error
+                .to_string()
+                .contains("either Xtream credentials")
+        );
+
+        let invalid_advanced = CreateSourceRequest {
+            endpoint: Some("https://provider.test/playlist.m3u".to_owned()),
+            server_url: None,
+            username: None,
+            password: None,
+            ..mixed
+        };
+        assert!(canonical_source_endpoint(&invalid_advanced, SourceKind::Xtream).is_err());
+    }
+
+    #[test]
+    fn non_xtream_sources_require_one_endpoint_and_reject_credentials() {
+        let missing = CreateSourceRequest {
+            name: "M3U".to_owned(),
+            kind: "M3U".to_owned(),
+            endpoint: None,
+            server_url: None,
+            username: None,
+            password: None,
+            timezone: None,
+        };
+        assert!(canonical_source_endpoint(&missing, SourceKind::M3u).is_err());
+
+        let credentials = CreateSourceRequest {
+            server_url: Some("https://provider.test".to_owned()),
+            username: Some("user".to_owned()),
+            password: Some("password".to_owned()),
+            ..missing
+        };
+        let error = canonical_source_endpoint(&credentials, SourceKind::M3u)
+            .expect_err("non-Xtream credentials must fail");
+        assert!(error.to_string().contains("require an Xtream source"));
     }
 
     #[tokio::test]

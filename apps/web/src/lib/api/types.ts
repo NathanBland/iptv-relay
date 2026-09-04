@@ -34,7 +34,10 @@ export interface SourceUpdateInput {
 export interface SourceInput {
   name: string
   kind: SourceKind
-  endpoint: string
+  endpoint?: string
+  serverUrl?: string
+  username?: string
+  password?: string
   timezone?: string
 }
 

@@ -47,6 +47,39 @@ curl -X POST http://localhost:8080/api/v1/sources \
 
 The `kind` value is case-sensitive. Use `M3U`, `Xtream`, `XMLTV`, or `Network tuner`.
 
+For an Xtream source, send `serverUrl`, `username`, and `password` as separate
+fields. The API builds and encrypts the `player_api.php` URL. The API never
+returns these credentials.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/sources \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "kind": "Xtream",
+    "name": "My Xtream source",
+    "serverUrl": "https://example.com:8080",
+    "username": "provider-user",
+    "password": "provider-password"
+  }'
+```
+
+For an advanced Xtream source, send one complete `player_api.php` URL in
+`endpoint`. Include one nonempty `username` and one nonempty `password`.
+
+```bash
+curl -X POST http://localhost:8080/api/v1/sources \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "kind": "Xtream",
+    "name": "Advanced Xtream source",
+    "endpoint": "https://example.com/player_api.php?username=provider-user&password=provider-password"
+  }'
+```
+
+Use either the three Xtream fields or `endpoint`. Do not send both forms.
+
 The API accepts `Network tuner` records for catalog planning. The refresh worker does not ingest network tuners. A manual or scheduled sync for this kind fails with `source type is not supported by the refresh worker`.
 
 Set `timezone` in the request when the XMLTV source uses local wall-clock values without offsets:

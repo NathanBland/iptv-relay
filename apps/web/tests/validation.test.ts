@@ -16,12 +16,46 @@ describe('management form schemas', () => {
     ])
   })
 
-  it('accepts supported source kinds and absolute HTTP URLs', () => {
-    expect(sourceSchema.safeParse({ name: 'Prime IPTV', kind: 'Xtream', endpoint: 'https://provider.example/live', timezone: 'UTC' }).success).toBe(true)
+  it('accepts standard Xtream credentials', () => {
+    expect(sourceSchema.safeParse({
+      name: 'Prime IPTV',
+      kind: 'Xtream',
+      endpoint: '',
+      serverUrl: 'https://provider.example:8080',
+      username: 'operator',
+      password: 'secret',
+      timezone: 'UTC',
+    }).success).toBe(true)
+  })
+
+  it('accepts a complete advanced Xtream endpoint', () => {
+    expect(sourceSchema.safeParse({
+      name: 'Prime IPTV',
+      kind: 'Xtream',
+      endpoint: 'https://provider.example/player_api.php?username=operator&password=secret',
+      serverUrl: '',
+      username: '',
+      password: '',
+      timezone: 'UTC',
+    }).success).toBe(true)
+  })
+
+  it('requires all standard Xtream credential fields', () => {
+    const result = sourceSchema.safeParse({
+      name: 'Prime IPTV',
+      kind: 'Xtream',
+      endpoint: '',
+      serverUrl: 'https://provider.example',
+      username: 'operator',
+      timezone: 'UTC',
+    })
+    expect(result.success).toBe(false)
+    if (result.success) return
+    expect(result.error.issues.some((issue) => issue.path[0] === 'password')).toBe(true)
   })
 
   it('rejects source values that could not reach a provider', () => {
-    const result = sourceSchema.safeParse({ name: 'X', kind: 'M3U', endpoint: 'file:///playlist.m3u', timezone: 'UTC' })
+    const result = sourceSchema.safeParse({ name: 'X', kind: 'M3U', endpoint: 'file:///playlist.m3u', serverUrl: '', username: '', password: '', timezone: 'UTC' })
     expect(result.success).toBe(false)
     if (result.success) return
     expect(result.error.issues.map((issue) => issue.message)).toEqual([
@@ -31,7 +65,7 @@ describe('management form schemas', () => {
   })
 
   it('rejects whitespace in provider URLs', () => {
-    expect(sourceSchema.safeParse({ name: 'Prime IPTV', kind: 'M3U', endpoint: 'https://provider.example/list name.m3u', timezone: 'UTC' }).success).toBe(false)
+    expect(sourceSchema.safeParse({ name: 'Prime IPTV', kind: 'M3U', endpoint: 'https://provider.example/list name.m3u', serverUrl: '', username: '', password: '', timezone: 'UTC' }).success).toBe(false)
   })
 
   it('requires safe provider settings when a source is edited', () => {

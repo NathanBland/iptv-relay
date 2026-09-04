@@ -1164,15 +1164,27 @@ export class MockIptvApiClient implements IptvApiClient {
   }
 
   async createSource(input: SourceInput): Promise<Source> {
-    if (!input.name.trim() || !input.endpoint.trim()) {
-      throw new Error('Name and endpoint are required.')
+    const hasXtreamCredentials = Boolean(input.serverUrl?.trim() || input.username?.trim() || input.password?.trim())
+    const hasEndpoint = Boolean(input.endpoint?.trim())
+    if (!input.name.trim() || (!hasEndpoint && !hasXtreamCredentials)) {
+      throw new Error('Name and source connection details are required.')
+    }
+    if (input.kind === 'Xtream' && hasXtreamCredentials
+      && (!input.serverUrl?.trim() || !input.username?.trim() || !input.password?.trim())) {
+      throw new Error('Xtream server URL, username, and password are required together.')
+    }
+    if (input.kind === 'Xtream' && hasXtreamCredentials && hasEndpoint) {
+      throw new Error('Use either Xtream credentials or an advanced endpoint.')
+    }
+    if (input.kind !== 'Xtream' && hasXtreamCredentials) {
+      throw new Error('Xtream credentials require an Xtream source.')
     }
 
     const source: Source = {
       id: `source-${this.sources.length + 1}`,
       name: input.name.trim(),
       kind: input.kind,
-      endpoint: input.endpoint.trim(),
+      endpoint: input.endpoint?.trim() || input.serverUrl?.trim() || 'https://provider.invalid/player_api.php',
       state: 'syncing',
       channels: 0,
       lastSync: '2026-08-19T18:00:00Z',

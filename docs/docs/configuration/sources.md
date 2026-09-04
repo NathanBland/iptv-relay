@@ -30,6 +30,32 @@ curl -X POST http://localhost:8080/api/v1/sources \
 
 The endpoint returns the created source with its ID. The worker enqueues a `refresh-source` job.
 
+### Add an Xtream source
+
+Enter the server URL, username, and password in separate fields.
+The API creates the `player_api.php` endpoint.
+The API stores the endpoint in encrypted form.
+The source list shows a redacted endpoint.
+
+Use this request:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/sources \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "kind": "Xtream",
+    "name": "My Xtream source",
+    "serverUrl": "https://example.com:8080",
+    "username": "provider-user",
+    "password": "provider-password"
+  }'
+```
+
+Use the advanced endpoint field when the provider requires a complete
+`player_api.php` URL with query parameters.
+Do not send an advanced endpoint with separate Xtream credential fields.
+
 Do not use `Network tuner` as an active ingestion source. The API stores this record, but the refresh worker marks its sync as unsupported.
 
 ### Set the XMLTV timezone
@@ -57,7 +83,7 @@ curl -X POST http://localhost:8080/api/v1/sources \
 1. Open the **Sources** page.
 2. Select **Add source**.
 3. Choose the source type.
-4. Enter the source name and endpoint URL.
+4. Enter the source name and connection details.
 5. Save the source.
 
 The sources page shows the source state, last refreshed time, and refresh interval.
