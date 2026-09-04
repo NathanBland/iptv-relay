@@ -211,7 +211,7 @@ where
             .gzip(false)
             .build()
             .map_err(|_error| {
-                debug!("HTTP client construction failed");
+                info!("HTTP client construction failed");
                 IngestError::HttpRequest
             })?;
         let response = client
@@ -220,7 +220,7 @@ where
             .send()
             .await
             .map_err(|error| {
-                debug!(
+                info!(
                     timeout = error.is_timeout(),
                     connect = error.is_connect(),
                     request = error.is_request(),
@@ -230,7 +230,7 @@ where
             })?;
         let status = response.status();
         if !status.is_success() {
-            debug!(status = status.as_u16(), "streaming: non-success status");
+            info!(status = status.as_u16(), "streaming: non-success status");
             return Err(IngestError::HttpStatus(status.as_u16()));
         }
 
@@ -240,7 +240,7 @@ where
             .await
             .ok_or(IngestError::HttpRequest)?
             .map_err(|_error| {
-                debug!("streaming: first chunk failed");
+                info!("streaming: first chunk failed");
                 IngestError::HttpRequest
             })?;
 
@@ -438,7 +438,7 @@ where
             .gzip(false)
             .build()
             .map_err(|_error| {
-                debug!("HTTP client construction failed");
+                info!("HTTP client construction failed");
                 IngestError::HttpRequest
             })?;
         let response = client
@@ -447,7 +447,7 @@ where
             .send()
             .await
             .map_err(|error| {
-                debug!(
+                info!(
                     timeout = error.is_timeout(),
                     connect = error.is_connect(),
                     request = error.is_request(),
@@ -458,7 +458,7 @@ where
             })?;
         let status = response.status();
         if !status.is_success() {
-            debug!(
+            info!(
                 status = status.as_u16(),
                 content_length = ?response.content_length(),
                 "HTTP source returned an unsuccessful status"

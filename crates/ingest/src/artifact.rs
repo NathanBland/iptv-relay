@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-use tracing::debug;
+use tracing::info;
 use url::Url;
 use xz2::read::XzDecoder;
 use zip::ZipArchive;
@@ -179,7 +179,7 @@ pub async fn download_http(
         .gzip(false)
         .build()
         .map_err(|_error| {
-            debug!("HTTP client construction failed");
+            info!("HTTP client construction failed");
             IngestError::HttpRequest
         })?;
     let response = client
@@ -188,7 +188,7 @@ pub async fn download_http(
         .send()
         .await
         .map_err(|error| {
-            debug!(
+            info!(
                 timeout = error.is_timeout(),
                 connect = error.is_connect(),
                 request = error.is_request(),
@@ -199,7 +199,7 @@ pub async fn download_http(
         })?;
     let status = response.status();
     if !status.is_success() {
-        debug!(
+        info!(
             status = status.as_u16(),
             content_length = ?response.content_length(),
             "HTTP source returned an unsuccessful status"
@@ -255,7 +255,7 @@ where
     loop {
         let elapsed = start.elapsed();
         if elapsed >= max_timeout {
-            debug!(
+            info!(
                 byte_count,
                 elapsed = ?elapsed,
                 max_timeout = ?max_timeout,
@@ -267,12 +267,12 @@ where
         let chunk_timeout = stall_timeout.min(remaining);
         let chunk = match tokio::time::timeout(chunk_timeout, stream.next()).await {
             Ok(Some(result)) => result.map_err(|_error| {
-                debug!(bytes_so_far = byte_count, "download stream chunk failed");
+                info!(bytes_so_far = byte_count, "download stream chunk failed");
                 IngestError::HttpRequest
             })?,
             Ok(None) => break,
             Err(_) => {
-                debug!(
+                info!(
                     bytes_so_far = byte_count,
                     stall_timeout = ?stall_timeout,
                     elapsed = ?start.elapsed(),

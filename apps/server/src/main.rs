@@ -423,6 +423,7 @@ async fn worker() -> Result<()> {
             result = repository.claim(&worker_id) => {
                 match result {
                     Ok(Some(job)) => {
+                        info!(job_id = %job.id, kind = %job.kind, "job claimed");
                         if let Err(error) = process_job(
                             &repository,
                             &sources,
@@ -462,6 +463,7 @@ async fn process_job(
     worker_id: &str,
     job: JobRecord,
 ) -> Result<()> {
+    info!(job_id = %job.id, kind = %job.kind, attempts = job.attempts, "job started");
     if job.kind == "noop" {
         jobs.succeed(job.id, worker_id).await?;
         return Ok(());
@@ -579,8 +581,7 @@ async fn run_refresh_job(
                 return Ok(());
             }
             let summary = error.persisted_summary();
-            warn!(job_id = %job.id, error = summary, "source refresh failed");
-            debug!(job_id = %job.id, error = ?error, "source refresh failure detail");
+            info!(job_id = %job.id, error = ?error, summary, "source refresh failed");
             jobs.fail(job.id, worker_id, job.attempts, job.max_attempts, summary)
                 .await?;
         }
@@ -603,7 +604,7 @@ async fn run_source_refresh(
         RefreshError::SourceLoad
     })?;
     let endpoint = Url::parse(&source.endpoint).map_err(|_| {
-        debug!(source_id = %source_id, endpoint_len = source.endpoint.len(), "source endpoint is not a valid URL");
+        info!(source_id = %source_id, endpoint_len = source.endpoint.len(), "source endpoint is not a valid URL");
         RefreshError::InvalidEndpoint
     })?;
     let control = WorkerJobControl {
@@ -616,6 +617,7 @@ async fn run_source_refresh(
         associated_data: format!("iptv-provider-stream:v1:{}", source.id),
     };
     let result = if source.kind == SourceKind::Xtream {
+        info!(job_id = %job.id, source_id = %source_id, "starting Xtream source refresh");
         run_xtream_refresh(
             endpoint,
             source.id,
@@ -627,12 +629,10 @@ async fn run_source_refresh(
         .await?
     } else {
         let (owner, format) = refresh_target(source.kind, source.id)?;
-        debug!(
+        info!(
             job_id = %job.id,
             source_id = %source_id,
             format = ?format,
-            stall_timeout = ?Duration::from_mins(1),
-            max_timeout = ?Duration::from_mins(10),
             "starting source download"
         );
         let request = IngestRequest {
@@ -703,7 +703,10 @@ async fn run_xtream_short_epg_refresh(
     }
     let endpoint = Url::parse(&source.endpoint).map_err(|_| RefreshError::InvalidEndpoint)?;
     let endpoints =
-        XtreamEndpoints::from_player_api_url(endpoint.as_str()).map_err(RefreshError::Ingest)?;
+        XtreamEndpoints::from_player_api_url(endpoint.as_str()).map_err(|error| {
+            info!(source_id = %source.id, error = %error, "Xtream short EPG endpoint validation failed");
+            RefreshError::Ingest(error)
+        })?;
     let control = WorkerJobControl {
         repository: jobs.clone(),
         job_id: job.id,
@@ -717,6 +720,11 @@ async fn run_xtream_short_epg_refresh(
         .await
         .map_err(RefreshError::Ingest)?;
 
+    info!(
+        source_id = %source.id,
+        request = ?endpoints.authentication_request(),
+        "Xtream short EPG auth request started"
+    );
     let authentication = fetch_xtream_payload(
         endpoints.authentication_request(),
         XtreamPayloadKind::Auth,
@@ -726,13 +734,18 @@ async fn run_xtream_short_epg_refresh(
     .map_err(RefreshError::Ingest)?;
     match authentication.parsed {
         ParsedArtifact::XtreamAuth(document)
-            if document.records.iter().any(|record| record.authenticated) => {}
+            if document.records.iter().any(|record| record.authenticated) =>
+        {
+            info!(source_id = %source.id, "Xtream short EPG auth succeeded");
+        }
         ParsedArtifact::XtreamAuth(_) => {
+            info!(source_id = %source.id, "Xtream short EPG auth rejected the credentials");
             return Err(RefreshError::Ingest(IngestError::InvalidRequest(
                 "Xtream authentication was rejected",
             )));
         }
         _ => {
+            info!(source_id = %source.id, "Xtream short EPG auth response had an unexpected payload");
             return Err(RefreshError::Ingest(IngestError::InvalidRequest(
                 "Xtream authentication response has an unexpected payload",
             )));
@@ -1309,6 +1322,7 @@ fn metrics_report_active_sessions(body: &str) -> bool {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_xtream_refresh(
     endpoint: Url,
     source_id: Uuid,
@@ -1317,8 +1331,15 @@ async fn run_xtream_refresh(
     protector: StreamEndpointProtector,
     snapshots: &PgSnapshotStore,
 ) -> std::result::Result<IngestResult, RefreshError> {
-    let endpoints =
-        XtreamEndpoints::from_player_api_url(endpoint.as_str()).map_err(RefreshError::Ingest)?;
+    let endpoints = XtreamEndpoints::from_player_api_url(endpoint.as_str()).map_err(|error| {
+        info!(source_id = %source_id, error = %error, "Xtream endpoint validation failed");
+        RefreshError::Ingest(error)
+    })?;
+    info!(
+        source_id = %source_id,
+        endpoints = ?endpoints,
+        "Xtream endpoints derived"
+    );
 
     control
         .checkpoint(&IngestProgress {
@@ -1327,6 +1348,11 @@ async fn run_xtream_refresh(
         })
         .await
         .map_err(RefreshError::Ingest)?;
+    info!(
+        source_id = %source_id,
+        request = ?endpoints.authentication_request(),
+        "Xtream auth request started"
+    );
     let authentication = fetch_xtream_payload(
         endpoints.authentication_request(),
         XtreamPayloadKind::Auth,
@@ -1336,19 +1362,29 @@ async fn run_xtream_refresh(
     .map_err(RefreshError::Ingest)?;
     match authentication.parsed {
         ParsedArtifact::XtreamAuth(document)
-            if document.records.iter().any(|record| record.authenticated) => {}
+            if document.records.iter().any(|record| record.authenticated) =>
+        {
+            info!(source_id = %source_id, "Xtream auth succeeded");
+        }
         ParsedArtifact::XtreamAuth(_) => {
+            info!(source_id = %source_id, "Xtream auth rejected the credentials");
             return Err(RefreshError::Ingest(IngestError::InvalidRequest(
                 "Xtream authentication was rejected",
             )));
         }
         _ => {
+            info!(source_id = %source_id, "Xtream auth response had an unexpected payload");
             return Err(RefreshError::Ingest(IngestError::InvalidRequest(
                 "Xtream authentication response has an unexpected payload",
             )));
         }
     }
 
+    info!(
+        source_id = %source_id,
+        request = ?endpoints.live_categories_request(),
+        "Xtream live categories request started"
+    );
     let category_names = match fetch_xtream_payload(
         endpoints.live_categories_request(),
         XtreamPayloadKind::LiveCategories,
@@ -1359,21 +1395,33 @@ async fn run_xtream_refresh(
         Ok(XtreamPayload {
             parsed: ParsedArtifact::XtreamCategories(document),
             ..
-        }) => document
-            .records
-            .into_iter()
-            .map(|category| (category.id, category.name))
-            .collect(),
+        }) => {
+            info!(source_id = %source_id, categories = document.records.len(), "Xtream live categories succeeded");
+            document
+                .records
+                .into_iter()
+                .map(|category| (category.id, category.name))
+                .collect()
+        }
         Ok(_) => {
+            info!(source_id = %source_id, "Xtream category response had an unexpected payload");
             return Err(RefreshError::Ingest(IngestError::InvalidRequest(
                 "Xtream category response has an unexpected payload",
             )));
         }
-        Err(IngestError::EmptySnapshot { .. }) => HashMap::new(),
+        Err(IngestError::EmptySnapshot { .. }) => {
+            info!(source_id = %source_id, "Xtream live categories returned no records");
+            HashMap::new()
+        }
         Err(error) => return Err(RefreshError::Ingest(error)),
     };
 
     let live_streams_request = endpoints.live_streams_request();
+    info!(
+        source_id = %source_id,
+        request = ?live_streams_request,
+        "Xtream live streams request started"
+    );
     let request = IngestRequest {
         owner: SnapshotOwner::ProviderAccount(source_id),
         format: IngestFormat::Xtream(XtreamPayloadKind::LiveStreams),
@@ -1393,7 +1441,10 @@ async fn fetch_xtream_payload(
     kind: XtreamPayloadKind,
     source_timezone: &str,
 ) -> std::result::Result<XtreamPayload, IngestError> {
-    let downloaded = download_http(&request, ArtifactLimits::default()).await?;
+    let downloaded = download_http(&request, ArtifactLimits::default()).await.map_err(|error| {
+        info!(kind = ?kind, request = ?request, error = %error, "Xtream payload download failed");
+        error
+    })?;
     let downloaded_bytes = downloaded.byte_count;
     let decoded =
         tokio::task::spawn_blocking(move || unpack_artifact(downloaded, ArtifactLimits::default()))
@@ -1412,11 +1463,21 @@ async fn fetch_xtream_payload(
     })
     .await
     .map_err(|_| IngestError::ArtifactIo(std::io::Error::other("parse task failed")))?
-    .map(|parsed| XtreamPayload {
-        parsed,
-        downloaded_bytes,
-        decoded_bytes,
-        checksum_sha256,
+    .map(|parsed| {
+        info!(
+            kind = ?kind,
+            request = ?request,
+            downloaded_bytes,
+            decoded_bytes,
+            records = parsed.usable_record_count(),
+            "Xtream payload fetched"
+        );
+        XtreamPayload {
+            parsed,
+            downloaded_bytes,
+            decoded_bytes,
+            checksum_sha256,
+        }
     })
 }
 
