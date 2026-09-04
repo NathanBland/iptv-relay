@@ -12,7 +12,8 @@ use iptv_persistence::{
     EventTemplateUpdate, JobRepository, MasterKey, NewJob, NewSource, OperatorSettingOverrides,
     OutputProfileTokenHash, PersistenceError, ProgrammeQuery, ProviderReconciliationFinalization,
     ProviderReconciliationPhase, ProviderReconciliationProgress, ProviderReconciliationUpdate,
-    SourceKind, SourceRepository, SourceUpdate, StreamHealthUpdate, UpdateUserInput,
+    SourceKind, SourceRefreshScheduleResult, SourceRepository, SourceUpdate, StreamHealthUpdate,
+    UpdateUserInput,
 };
 use serde_json::{Value, json};
 
@@ -6072,6 +6073,349 @@ async fn skipped_probe_does_not_persist_an_invalid_health_check_status() {
 
     delete_probe_stream(&pool, account_id, snapshot_id, stream_id).await;
     drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+/// Inserts one schedulable provider account for circuit-breaker tests.
+///
+/// The refresh interval is enabled so the scheduler treats the source as due.
+/// The name embeds the random ID, which keeps the unique name constraint safe.
+async fn insert_schedulable_provider_account(pool: &sqlx::PgPool) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) \
+         VALUES ($1, $2, 'm3u', 'https://provider.test/circuit.m3u')",
+    )
+    .bind(id)
+    .bind(format!("Circuit breaker provider {id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE provider_accounts SET refresh_interval_seconds = 60 WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    id
+}
+
+/// Inserts one schedulable XMLTV source for circuit-breaker tests.
+async fn insert_schedulable_epg_source(pool: &sqlx::PgPool) -> uuid::Uuid {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO epg_sources (id, name, url_template, enabled) \
+         VALUES ($1, $2, 'https://guide.test/circuit.xml', true)",
+    )
+    .bind(id)
+    .bind(format!("Circuit breaker EPG source {id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE epg_sources SET refresh_interval_seconds = 60 WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    id
+}
+
+/// Runs one scheduler election cycle, retrying when another worker holds the
+/// election lock. The advisory lock is database-wide and other tests can hold
+/// it concurrently, so leadership is not guaranteed on the first attempt.
+async fn run_scheduler_cycle(
+    jobs: &JobRepository,
+    cb_cooldown_seconds: i64,
+) -> SourceRefreshScheduleResult {
+    for _ in 0..40 {
+        let result = jobs
+            .enqueue_due_source_refreshes(cb_cooldown_seconds)
+            .await
+            .unwrap();
+        if result.is_leader {
+            return result;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("scheduler leadership was not acquired within the retry budget");
+}
+
+/// Returns the circuit state of one provider account as `(failures, opened_at)`.
+async fn provider_circuit_state(
+    pool: &sqlx::PgPool,
+    source_id: uuid::Uuid,
+) -> (i32, Option<chrono::DateTime<Utc>>) {
+    sqlx::query_as(
+        "SELECT cb_consecutive_failures, cb_opened_at \
+         FROM provider_accounts WHERE id = $1",
+    )
+    .bind(source_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Returns the circuit state of one XMLTV source as `(failures, opened_at)`.
+async fn epg_circuit_state(
+    pool: &sqlx::PgPool,
+    source_id: uuid::Uuid,
+) -> (i32, Option<chrono::DateTime<Utc>>) {
+    sqlx::query_as(
+        "SELECT cb_consecutive_failures, cb_opened_at \
+         FROM epg_sources WHERE id = $1",
+    )
+    .bind(source_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Reports whether an open queued refresh job exists for the source.
+async fn refresh_job_is_queued(pool: &sqlx::PgPool, source_id: uuid::Uuid) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM jobs \
+            WHERE kind = 'refresh-source' AND status = 'queued' \
+              AND payload->>'sourceId' = $1 \
+         )",
+    )
+    .bind(source_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn circuit_breaker_opens_after_threshold_consecutive_failures() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([61_u8; 32]));
+    let source_id = insert_schedulable_provider_account(&pool).await;
+
+    // Failures below the threshold keep the circuit closed.
+    for _ in 0..4 {
+        assert!(
+            !sources.record_refresh_failure(source_id, 5).await.unwrap(),
+            "the circuit stays closed below the failure threshold"
+        );
+    }
+    let (count, opened_at) = provider_circuit_state(&pool, source_id).await;
+    assert_eq!(count, 4);
+    assert!(
+        opened_at.is_none(),
+        "no cooldown starts below the threshold"
+    );
+
+    // The fifth consecutive failure opens the circuit.
+    assert!(
+        sources.record_refresh_failure(source_id, 5).await.unwrap(),
+        "the threshold failure opens the circuit"
+    );
+    let (count, opened_at) = provider_circuit_state(&pool, source_id).await;
+    assert_eq!(count, 5);
+    assert!(
+        opened_at.is_some(),
+        "the open transition records the opening time"
+    );
+
+    drop(sources);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn circuit_breaker_skips_open_sources_until_cooldown_expiry_then_probes() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([62_u8; 32]));
+    let jobs = JobRepository::new(pool.clone());
+    let source_id = insert_schedulable_provider_account(&pool).await;
+
+    // Open the circuit with five consecutive failures.
+    for _ in 0..5 {
+        sources.record_refresh_failure(source_id, 5).await.unwrap();
+    }
+    let (count, opened_at) = provider_circuit_state(&pool, source_id).await;
+    assert_eq!(count, 5);
+    assert!(opened_at.is_some());
+
+    // The scheduler skips the source while the cooldown is unexpired.
+    let result = run_scheduler_cycle(&jobs, 3_600).await;
+    assert_eq!(result.enqueued, 0, "an open circuit is skipped");
+    assert!(!refresh_job_is_queued(&pool, source_id).await);
+
+    // After the cooldown expires the scheduler enqueues one probe refresh.
+    let result = run_scheduler_cycle(&jobs, 0).await;
+    assert_eq!(result.enqueued, 1, "an expired circuit gets one probe");
+    assert!(refresh_job_is_queued(&pool, source_id).await);
+
+    // A second scheduler cycle does not stack a second probe.
+    let result = run_scheduler_cycle(&jobs, 0).await;
+    assert_eq!(result.enqueued, 0, "only one probe stays open");
+
+    drop(sources);
+    drop(jobs);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn circuit_breaker_probe_success_closes_circuit_and_resumes_scheduling() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([63_u8; 32]));
+    let jobs = JobRepository::new(pool.clone());
+    let source_id = insert_schedulable_provider_account(&pool).await;
+
+    for _ in 0..5 {
+        sources.record_refresh_failure(source_id, 5).await.unwrap();
+    }
+    let result = run_scheduler_cycle(&jobs, 0).await;
+    assert_eq!(result.enqueued, 1, "the expired circuit enqueues a probe");
+
+    // The worker claims the probe and completes it successfully.
+    let claimed = jobs.claim("cb-worker").await.unwrap().unwrap();
+    assert_eq!(claimed.kind, "refresh-source");
+    sources.record_refresh_success(source_id).await.unwrap();
+    jobs.succeed(claimed.id, "cb-worker").await.unwrap();
+
+    // Success closes the circuit: counters reset and no cooldown remains.
+    let (count, opened_at) = provider_circuit_state(&pool, source_id).await;
+    assert_eq!(count, 0, "a successful probe resets the failure count");
+    assert!(opened_at.is_none(), "a successful probe closes the circuit");
+
+    // Normal scheduling resumes: the due source is refreshed again even when
+    // a long cooldown is configured, because the circuit is closed.
+    let result = run_scheduler_cycle(&jobs, 3_600).await;
+    assert_eq!(result.enqueued, 1, "closed circuits are scheduled normally");
+    assert!(refresh_job_is_queued(&pool, source_id).await);
+
+    drop(sources);
+    drop(jobs);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn circuit_breaker_probe_failure_reopens_circuit_for_a_fresh_cooldown() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([64_u8; 32]));
+    let jobs = JobRepository::new(pool.clone());
+    let source_id = insert_schedulable_provider_account(&pool).await;
+
+    for _ in 0..5 {
+        sources.record_refresh_failure(source_id, 5).await.unwrap();
+    }
+    let (_, first_opened_at) = provider_circuit_state(&pool, source_id).await;
+    let result = run_scheduler_cycle(&jobs, 0).await;
+    assert_eq!(result.enqueued, 1, "the expired circuit enqueues a probe");
+
+    // The worker claims the probe and the probe's final attempt fails.
+    // Scheduler jobs retry up to their max attempts; advance the row to its
+    // final attempt so the failure is terminal, as the worker would report.
+    let claimed = jobs.claim("cb-worker").await.unwrap().unwrap();
+    assert_eq!(claimed.kind, "refresh-source");
+    sqlx::query("UPDATE jobs SET attempts = max_attempts WHERE id = $1")
+        .bind(claimed.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    jobs.fail(
+        claimed.id,
+        "cb-worker",
+        claimed.max_attempts,
+        claimed.max_attempts,
+        "half-open probe failed",
+    )
+    .await
+    .unwrap();
+    assert!(
+        sources.record_refresh_failure(source_id, 5).await.unwrap(),
+        "a failed probe reopens the circuit"
+    );
+
+    // The circuit is open again with a fresh cooldown window.
+    let (count, second_opened_at) = provider_circuit_state(&pool, source_id).await;
+    assert_eq!(count, 6, "the probe failure increments the counter again");
+    let first_opened_at = first_opened_at.expect("circuit was open before the probe");
+    let second_opened_at = second_opened_at.expect("circuit reopened after the probe");
+    assert!(
+        second_opened_at > first_opened_at,
+        "the reopened circuit starts a fresh cooldown window"
+    );
+
+    // The scheduler skips the source again until the new cooldown expires.
+    let result = run_scheduler_cycle(&jobs, 3_600).await;
+    assert_eq!(result.enqueued, 0, "the reopened circuit is skipped again");
+    assert!(!refresh_job_is_queued(&pool, source_id).await);
+    let result = run_scheduler_cycle(&jobs, 0).await;
+    assert_eq!(result.enqueued, 1, "the new probe arrives after cooldown");
+
+    drop(sources);
+    drop(jobs);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn circuit_breaker_guards_epg_sources_through_the_same_transitions() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let sources = SourceRepository::new(pool.clone(), MasterKey::from_bytes([65_u8; 32]));
+    let jobs = JobRepository::new(pool.clone());
+    let source_id = insert_schedulable_epg_source(&pool).await;
+
+    // Closed to open.
+    for _ in 0..4 {
+        assert!(!sources.record_refresh_failure(source_id, 5).await.unwrap());
+    }
+    assert!(sources.record_refresh_failure(source_id, 5).await.unwrap());
+    let (count, opened_at) = epg_circuit_state(&pool, source_id).await;
+    assert_eq!(count, 5);
+    assert!(opened_at.is_some());
+
+    // Open to half-open: skipped during cooldown, probed after expiry.
+    let result = run_scheduler_cycle(&jobs, 3_600).await;
+    assert_eq!(result.enqueued, 0);
+    let result = run_scheduler_cycle(&jobs, 0).await;
+    assert_eq!(result.enqueued, 1);
+
+    // Half-open to closed on a successful probe.
+    let claimed = jobs.claim("cb-worker").await.unwrap().unwrap();
+    sources.record_refresh_success(source_id).await.unwrap();
+    jobs.succeed(claimed.id, "cb-worker").await.unwrap();
+    let (count, opened_at) = epg_circuit_state(&pool, source_id).await;
+    assert_eq!(count, 0);
+    assert!(opened_at.is_none());
+
+    drop(sources);
+    drop(jobs);
     drop(pool);
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
