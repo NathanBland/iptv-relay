@@ -354,6 +354,7 @@ struct SystemInfo {
     guide_coverage: f64,
     provider_connections: usize,
     provider_limit: usize,
+    dead_letter_count: usize,
     uptime_seconds: u64,
     versions: RuntimeVersions,
 }
@@ -2319,6 +2320,13 @@ async fn system_info_value(state: &AppState) -> SystemInfo {
                 coverage,
             )
         };
+    let dead_letter_count = match &state.job_repository {
+        Some(repository) => match repository.dead_letter_count().await {
+            Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
+            Err(_) => 0,
+        },
+        None => 0,
+    };
     SystemInfo {
         channels: usize::try_from(channels).unwrap_or(usize::MAX),
         healthy_streams: usize::try_from(healthy_streams).unwrap_or(usize::MAX),
@@ -2326,6 +2334,7 @@ async fn system_info_value(state: &AppState) -> SystemInfo {
         guide_coverage,
         provider_connections,
         provider_limit,
+        dead_letter_count,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         versions: state.runtime_versions.clone(),
     }
@@ -10302,6 +10311,124 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn dead_letter_routes_and_system_count_work_end_to_end() {
+        if std::env::var("IPTV_TEST_DATABASE_URL").is_err() {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL API integration test");
+            return;
+        }
+        let (admin, database, schema) = isolated_database().await;
+        let pool = database.pool().clone();
+        let app = router(state_with_database(Some(database.clone())));
+        let jobs = JobRepository::new(pool.clone());
+
+        // Enqueue and terminally fail a job so it archives to the dead-letter
+        // table through the same repository the worker uses.
+        let mut job = iptv_persistence::NewJob::immediate(
+            "refresh-source",
+            serde_json::json!({"sourceId": "api-source"}),
+        );
+        job.max_attempts = 1;
+        let enqueued = jobs.enqueue(&job).await.unwrap();
+        let claimed = jobs.claim("api-worker").await.unwrap().unwrap();
+        assert_eq!(claimed.id, enqueued.id);
+        jobs.fail(
+            claimed.id,
+            "api-worker",
+            claimed.attempts,
+            claimed.max_attempts,
+            "request?username=alice&password=secret failed",
+        )
+        .await
+        .unwrap();
+
+        // The system endpoint reports the unresolved dead-letter count.
+        let system = app
+            .clone()
+            .oneshot(admin_request("GET", "/api/v1/system", None))
+            .await
+            .unwrap();
+        assert_eq!(system.status(), StatusCode::OK);
+        let system_body: serde_json::Value =
+            serde_json::from_str(&response_text(system).await).unwrap();
+        assert_eq!(system_body["deadLetterCount"], 1);
+
+        // The list endpoint returns the archived entry with redacted error.
+        let list = app
+            .clone()
+            .oneshot(admin_request("GET", "/api/v1/dead-letters", None))
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_body: serde_json::Value =
+            serde_json::from_str(&response_text(list).await).unwrap();
+        assert_eq!(list_body.as_array().unwrap().len(), 1);
+        let entry = &list_body[0];
+        assert_eq!(entry["kind"], "refresh-source");
+        assert_eq!(entry["original_job_id"], enqueued.id.to_string());
+        assert!(!entry["error_message"].as_str().unwrap().contains("alice"));
+        assert!(!entry["error_message"].as_str().unwrap().contains("secret"));
+        let dead_letter_id = entry["id"].as_str().unwrap().to_owned();
+
+        // The single-entry endpoint returns the same record.
+        let single = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                format!("/api/v1/dead-letters/{dead_letter_id}"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(single.status(), StatusCode::OK);
+        let single_body: serde_json::Value =
+            serde_json::from_str(&response_text(single).await).unwrap();
+        assert_eq!(single_body["id"], dead_letter_id);
+
+        // Replay creates a new queued job and resolves the archive.
+        let replay = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                format!("/api/v1/dead-letters/{dead_letter_id}/replay"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay_body: serde_json::Value =
+            serde_json::from_str(&response_text(replay).await).unwrap();
+        assert!(replay_body["ok"].as_bool().unwrap());
+        let new_job_id = Uuid::parse_str(
+            replay_body["message"]
+                .as_str()
+                .unwrap()
+                .trim_start_matches("Replayed as job ")
+                .trim_end_matches('.'),
+        )
+        .unwrap();
+        let queued: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE id = $1 AND status = 'queued'")
+                .bind(new_job_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(queued, 1, "replay enqueues a fresh job");
+
+        // The system count drops to zero once the archive is resolved.
+        let system_after = app
+            .clone()
+            .oneshot(admin_request("GET", "/api/v1/system", None))
+            .await
+            .unwrap();
+        let system_after_body: serde_json::Value =
+            serde_json::from_str(&response_text(system_after).await).unwrap();
+        assert_eq!(system_after_body["deadLetterCount"], 0);
+
+        drop_isolated_database(&admin, database, schema).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn output_routes_enforce_database_profile_tokens_and_channel_selection() {
         let Ok(database_url) = std::env::var("IPTV_TEST_DATABASE_URL") else {
             eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL API integration test");
@@ -11361,6 +11488,7 @@ mod tests {
                 assert_eq!(body["channels"], 1);
                 assert_eq!(body["providerLimit"], 3);
                 assert_eq!(body["guideCoverage"], 100.0);
+                assert_eq!(body["deadLetterCount"], 0);
             } else if path == "/api/v1/channels" {
                 assert_eq!(body["total"], 1);
                 assert_eq!(body["items"][0]["tvgId"], channel_id.to_string());
@@ -12595,6 +12723,7 @@ mod tests {
             guide_coverage: 100.0,
             provider_connections: 1,
             provider_limit: 3,
+            dead_letter_count: 0,
             uptime_seconds: 1,
             versions: RuntimeVersions::default(),
         });
