@@ -807,6 +807,7 @@ async fn schedule_provider_reconciliation(
 }
 
 /// Prepares one source-snapshot partition and schedules its atomic finalizer.
+#[allow(clippy::too_many_lines)]
 async fn run_provider_reconciliation_partition_job(
     jobs: &JobRepository,
     catalog: &CatalogRepository,
@@ -897,6 +898,20 @@ async fn run_provider_reconciliation_partition_job(
         }
         Err(error) => {
             warn!(job_id = %job.id, run_id = %run_id, partition_number, error = %error, "reconciliation partition failed");
+            if job.attempts >= job.max_attempts {
+                jobs.fail_reconciliation_parent_if_exhausted(
+                    parent_job_id,
+                    run_id,
+                    &serde_json::json!({
+                        "stage": "failed",
+                        "percent": 85,
+                        "runId": run_id,
+                        "partitionNumber": partition_number,
+                        "message": "Reconciliation partition exhausted retries",
+                    }),
+                )
+                .await?;
+            }
             jobs.fail(
                 job.id,
                 worker_id,
@@ -986,6 +1001,7 @@ async fn run_provider_reconciliation_finalizer_job(
             catalog.scan_all_event_channels().await?;
             jobs.complete_reconciliation_parent(
                 parent_job_id,
+                run_id,
                 &serde_json::json!({
                     "stage": "completed",
                     "percent": 100,
@@ -1027,6 +1043,7 @@ async fn run_provider_reconciliation_finalizer_job(
             catalog.scan_all_event_channels().await?;
             jobs.complete_reconciliation_parent(
                 parent_job_id,
+                run_id,
                 &serde_json::json!({
                     "stage": "completed",
                     "percent": 100,
@@ -1053,6 +1070,7 @@ async fn run_provider_reconciliation_finalizer_job(
         Ok(ProviderReconciliationFinalization::Superseded) => {
             jobs.complete_reconciliation_parent(
                 parent_job_id,
+                run_id,
                 &serde_json::json!({
                     "stage": "completed",
                     "percent": 100,

@@ -1781,6 +1781,23 @@ impl JobRepository {
         parent_job_id: Uuid,
     ) -> Result<(), PersistenceError> {
         let mut transaction = self.pool.begin().await?;
+        let parent_status: Option<String> = sqlx::query_scalar(
+            r"
+            SELECT status
+            FROM jobs
+            WHERE id = $1 AND kind = 'refresh-source'
+            FOR UPDATE
+            ",
+        )
+        .bind(parent_job_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if parent_status.is_none() {
+            return Err(PersistenceError::JobNotFound(parent_job_id));
+        }
+
+        // Lock the parent before the child. Cancellation uses this same order
+        // before it updates all child jobs for the source refresh.
         let updated = sqlx::query(
             r"
             UPDATE jobs
@@ -1805,7 +1822,6 @@ impl JobRepository {
             WHERE NOT EXISTS (
                 SELECT 1 FROM jobs
                 WHERE id = $3 AND status = 'cancelled'
-                FOR UPDATE
             )
             ON CONFLICT ((payload->>'runId'))
                 WHERE kind = 'finalize-provider-reconciliation'
@@ -1958,21 +1974,112 @@ impl JobRepository {
     pub async fn complete_reconciliation_parent(
         &self,
         parent_job_id: Uuid,
+        run_id: Uuid,
         progress: &Value,
     ) -> Result<bool, PersistenceError> {
-        let result = sqlx::query(
+        let mut transaction = self.pool.begin().await?;
+        let run_id_text = run_id.to_string();
+        let parent: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            r"
+            SELECT status, locked_by, progress->>'runId'
+            FROM jobs
+            WHERE id = $1 AND kind = 'refresh-source'
+            FOR UPDATE
+            ",
+        )
+        .bind(parent_job_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some((status, locked_by, parent_run_id)) = parent else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        if !can_complete_reconciliation_parent(
+            &status,
+            locked_by.as_deref(),
+            parent_run_id.as_deref(),
+            &run_id_text,
+        ) {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query(
             r"
             UPDATE jobs
             SET status = 'succeeded', completed_at = now(), heartbeat_at = NULL,
-                locked_by = NULL, locked_at = NULL, progress = $2, updated_at = now()
-            WHERE id = $1 AND kind = 'refresh-source' AND status = 'running'
+                locked_by = NULL, locked_at = NULL, last_error = NULL,
+                progress = $2, updated_at = now()
+            WHERE id = $1
             ",
         )
         .bind(parent_job_id)
         .bind(progress)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
-        Ok(result.rows_affected() == 1)
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    /// Fails the source refresh when a reconciliation partition exhausts its retries.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn fail_reconciliation_parent_if_exhausted(
+        &self,
+        parent_job_id: Uuid,
+        run_id: Uuid,
+        progress: &Value,
+    ) -> Result<bool, PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let parent_status: Option<String> = sqlx::query_scalar(
+            r"
+            SELECT status
+            FROM jobs
+            WHERE id = $1 AND kind = 'refresh-source'
+            FOR UPDATE
+            ",
+        )
+        .bind(parent_job_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(parent_status) = parent_status else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        if matches!(parent_status.as_str(), "cancelled" | "succeeded") {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+
+        let run_failed = sqlx::query(
+            r"
+            UPDATE provider_reconciliation_runs
+            SET status = 'failed', updated_at = now()
+            WHERE id = $1 AND parent_job_id = $2 AND status = 'processing'
+            ",
+        )
+        .bind(run_id)
+        .bind(parent_job_id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            == 1;
+        let parent_failed = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'failed', completed_at = now(), heartbeat_at = NULL,
+                locked_by = NULL, locked_at = NULL, progress = $2,
+                last_error = 'reconciliation partition exhausted retries', updated_at = now()
+            WHERE id = $1 AND kind = 'refresh-source'
+              AND status IN ('queued', 'running')
+            ",
+        )
+        .bind(parent_job_id)
+        .bind(progress)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            == 1;
+        transaction.commit().await?;
+        Ok(run_failed || parent_failed)
     }
 
     /// Cancels a queued or running job. Workers observe cancellation through
@@ -2357,6 +2464,17 @@ fn ensure_owned(rows: u64, job_id: Uuid, worker_id: &str) -> Result<(), Persiste
     }
 }
 
+fn can_complete_reconciliation_parent(
+    status: &str,
+    locked_by: Option<&str>,
+    parent_run_id: Option<&str>,
+    run_id: &str,
+) -> bool {
+    parent_run_id == Some(run_id)
+        && matches!(status, "running" | "queued" | "failed")
+        && (status == "running" || locked_by.is_none())
+}
+
 /// Prevents common URL credentials from entering a persisted job error.
 pub fn redact_error(error: &str) -> String {
     let mut redacted = error.chars().take(2_048).collect::<String>();
@@ -2622,6 +2740,47 @@ mod tests {
         assert_eq!(job.kind, "refresh-m3u");
         assert_eq!(job.priority, 0);
         assert_eq!(job.max_attempts, 3);
+    }
+
+    #[test]
+    fn reconciliation_parent_completion_requires_matching_run_and_safe_lease() {
+        let run_id = "0192f3a8-7b6c-7d5e-8f4a-123456789abc";
+        assert!(can_complete_reconciliation_parent(
+            "running",
+            Some("stale-worker"),
+            Some(run_id),
+            run_id
+        ));
+        assert!(can_complete_reconciliation_parent(
+            "queued",
+            None,
+            Some(run_id),
+            run_id
+        ));
+        assert!(can_complete_reconciliation_parent(
+            "failed",
+            None,
+            Some(run_id),
+            run_id
+        ));
+        assert!(!can_complete_reconciliation_parent(
+            "queued",
+            Some("new-worker"),
+            Some(run_id),
+            run_id
+        ));
+        assert!(!can_complete_reconciliation_parent(
+            "failed",
+            None,
+            Some("0192f3a8-7b6c-7d5e-8f4a-123456789abd"),
+            run_id
+        ));
+        assert!(!can_complete_reconciliation_parent(
+            "cancelled",
+            None,
+            Some(run_id),
+            run_id
+        ));
     }
 
     #[test]
