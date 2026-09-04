@@ -317,8 +317,9 @@ where
 ///
 /// Runs every 60 seconds. Sources with `refresh_interval_seconds > 0` that
 /// have not been refreshed within their interval get a new `refresh-source`
-/// job enqueued.
-async fn refresh_scheduler(jobs: &JobRepository) {
+/// job enqueued. Sources with an open circuit breaker are skipped until the
+/// cooldown expires.
+async fn refresh_scheduler(jobs: &JobRepository, cb_cooldown_seconds: i64) {
     let interval = Duration::from_mins(1);
     info!("source refresh scheduler started");
     loop {
@@ -329,7 +330,7 @@ async fn refresh_scheduler(jobs: &JobRepository) {
             }
             () = tokio::time::sleep(interval) => {}
         }
-        match jobs.enqueue_due_source_refreshes().await {
+        match jobs.enqueue_due_source_refreshes(cb_cooldown_seconds).await {
             Ok(result) => {
                 if !result.is_leader || result.enqueued == 0 {
                     continue;
@@ -346,6 +347,7 @@ async fn refresh_scheduler(jobs: &JobRepository) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn worker() -> Result<()> {
     let database = database().await?;
     let master_key = MasterKey::from_base64(&required_env("IPTV_MASTER_KEY")?)
@@ -369,10 +371,23 @@ async fn worker() -> Result<()> {
         Err(error) => warn!(%error, "stranded checking stream reset failed on startup"),
     }
 
+    let cb_failure_threshold: i32 = env::var("IPTV_CB_FAILURE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let cb_cooldown_seconds: i64 = env::var("IPTV_CB_COOLDOWN_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900);
+    info!(
+        cb_failure_threshold,
+        cb_cooldown_seconds, "circuit breaker config loaded"
+    );
+
     // Spawn the scheduler that enqueues refresh jobs for due sources.
     let scheduler_jobs = repository.clone();
     let scheduler_handle = tokio::spawn(async move {
-        refresh_scheduler(&scheduler_jobs).await;
+        refresh_scheduler(&scheduler_jobs, cb_cooldown_seconds).await;
     });
 
     // Spawn the scheduler that enqueues low-priority health probe jobs.
@@ -435,6 +450,7 @@ async fn worker() -> Result<()> {
                             &master_key,
                             &worker_id,
                             job,
+                            cb_failure_threshold,
                         ).await {
                             error!(%error, "job processing failed");
                             sleep(Duration::from_secs(2)).await;
@@ -457,6 +473,7 @@ async fn worker() -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_job(
     jobs: &JobRepository,
     sources: &SourceRepository,
@@ -465,6 +482,7 @@ async fn process_job(
     master_key: &MasterKey,
     worker_id: &str,
     job: JobRecord,
+    cb_failure_threshold: i32,
 ) -> Result<()> {
     info!(job_id = %job.id, kind = %job.kind, attempts = job.attempts, "job started");
     if job.kind == "noop" {
@@ -494,14 +512,21 @@ async fn process_job(
     }
 
     run_refresh_job(
-        jobs, sources, snapshots, catalog, master_key, worker_id, job,
+        jobs,
+        sources,
+        snapshots,
+        catalog,
+        master_key,
+        worker_id,
+        job,
+        cb_failure_threshold,
     )
     .await
 }
 
 /// Runs one source or Xtream short-EPG refresh job with a heartbeat task and
 /// persists the typed result.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_refresh_job(
     jobs: &JobRepository,
     sources: &SourceRepository,
@@ -510,6 +535,7 @@ async fn run_refresh_job(
     master_key: &MasterKey,
     worker_id: &str,
     job: JobRecord,
+    cb_failure_threshold: i32,
 ) -> Result<()> {
     // Spawn a heartbeat task that keeps the job lease fresh during long
     // downloads. The ingest pipeline reports progress through checkpoints,
@@ -556,12 +582,16 @@ async fn run_refresh_job(
         Ok(execution) => {
             let result = execution.result;
             if execution.deferred {
-                if let Some(source_id) = source_id_from_payload(&job.payload)
-                    && let Err(error) = sources
+                if let Some(source_id) = source_id_from_payload(&job.payload) {
+                    if let Err(error) = sources
                         .mark_source_refreshed(source_id, chrono::Utc::now())
                         .await
-                {
-                    warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
+                    {
+                        warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
+                    }
+                    if let Err(error) = sources.record_refresh_success(source_id).await {
+                        warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to reset circuit breaker");
+                    }
                 }
                 info!(
                     job_id = %job.id,
@@ -578,13 +608,16 @@ async fn run_refresh_job(
                 }
             }
             jobs.succeed(job.id, worker_id).await?;
-            if source_refresh
-                && let Some(source_id) = source_id_from_payload(&job.payload)
-                && let Err(error) = sources
+            if source_refresh && let Some(source_id) = source_id_from_payload(&job.payload) {
+                if let Err(error) = sources
                     .mark_source_refreshed(source_id, chrono::Utc::now())
                     .await
-            {
-                warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
+                {
+                    warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
+                }
+                if let Err(error) = sources.record_refresh_success(source_id).await {
+                    warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to reset circuit breaker");
+                }
             }
             info!(
                 job_id = %job.id,
@@ -608,6 +641,25 @@ async fn run_refresh_job(
             jobs.fail(job.id, worker_id, job.attempts, job.max_attempts, summary)
                 .await?;
             if source_refresh && job.attempts >= job.max_attempts {
+                if let Some(source_id) = source_id_from_payload(&job.payload) {
+                    match sources
+                        .record_refresh_failure(source_id, cb_failure_threshold)
+                        .await
+                    {
+                        Ok(true) => {
+                            warn!(
+                                job_id = %job.id,
+                                source_id = %source_id,
+                                threshold = cb_failure_threshold,
+                                "circuit breaker opened after consecutive failures"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to record circuit breaker failure");
+                        }
+                    }
+                }
                 jobs.fail_reconciliation_parent_for_terminal_child(
                     job.id,
                     &serde_json::json!({
@@ -3174,7 +3226,7 @@ mod tests {
         force_running(pool, job_id, worker_id).await;
         let job = fetch_job(pool, job_id).await;
         process_job(
-            jobs, sources, snapshots, catalog, master_key, worker_id, job,
+            jobs, sources, snapshots, catalog, master_key, worker_id, job, 5,
         )
         .await
         .expect("process refresh job");
@@ -3204,7 +3256,7 @@ mod tests {
             force_running(pool, child.id, worker_id).await;
             let child = fetch_job(pool, child.id).await;
             process_job(
-                jobs, sources, snapshots, catalog, master_key, worker_id, child,
+                jobs, sources, snapshots, catalog, master_key, worker_id, child, 5,
             )
             .await
             .expect("process reconciliation child job");
@@ -4490,6 +4542,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process noop job");
@@ -4524,6 +4577,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process unsupported job");
@@ -4563,6 +4617,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process refresh with bad payload");
@@ -4767,6 +4822,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process refresh for missing source");
@@ -4863,6 +4919,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process health-probe with bad payload");
@@ -4903,6 +4960,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process health-probe for missing stream");
@@ -5073,6 +5131,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process health-probe for checking stream");
@@ -5493,6 +5552,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process health-probe for decrypt fail");
@@ -5554,6 +5614,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process cancelled refresh");
@@ -5937,6 +5998,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("stage M3U refresh");
@@ -5980,6 +6042,7 @@ mod tests {
                 &master_key,
                 worker_id,
                 child,
+                5,
             )
             .await
             .expect("process M3U reconciliation child job");
@@ -6105,6 +6168,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process cancelled ingest");
@@ -6164,6 +6228,7 @@ mod tests {
             &master_key,
             worker_id,
             record,
+            5,
         )
         .await
         .expect("process XMLTV refresh");
@@ -6369,6 +6434,7 @@ mod tests {
             &master_key,
             worker_id,
             short_epg_record,
+            5,
         )
         .await
         {

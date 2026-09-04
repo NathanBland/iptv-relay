@@ -644,6 +644,8 @@ pub struct SourceSummary {
     pub max_connections: i32,
     pub timezone: String,
     pub enabled: bool,
+    pub cb_consecutive_failures: i32,
+    pub cb_opened_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -692,6 +694,8 @@ struct SourceSummaryRow {
     max_connections: i32,
     timezone: String,
     enabled: bool,
+    cb_consecutive_failures: i32,
+    cb_opened_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, FromRow)]
@@ -766,13 +770,15 @@ impl SourceRepository {
             WITH source_rows AS (
                 SELECT id, name, source_type AS kind, base_url_template AS endpoint,
                        revision, updated_at, refresh_interval_seconds, last_refreshed_at,
-                       max_connections, source_timezone AS timezone, enabled
+                       max_connections, source_timezone AS timezone, enabled,
+                       cb_consecutive_failures, cb_opened_at
                 FROM provider_accounts
                 WHERE enabled = true
                 UNION ALL
                 SELECT id, name, 'xmltv' AS kind, url_template AS endpoint,
                        revision, updated_at, refresh_interval_seconds, last_refreshed_at,
-                       1 AS max_connections, timezone, enabled
+                       1 AS max_connections, timezone, enabled,
+                       cb_consecutive_failures, cb_opened_at
                 FROM epg_sources
                 WHERE enabled = true
             )
@@ -785,7 +791,9 @@ impl SourceRepository {
                    sources.last_refreshed_at,
                    sources.max_connections,
                    sources.timezone,
-                   sources.enabled
+                   sources.enabled,
+                   sources.cb_consecutive_failures,
+                   sources.cb_opened_at
             FROM source_rows AS sources
             LEFT JOIN LATERAL (
                 SELECT activated_at, record_count
@@ -959,6 +967,8 @@ impl SourceRepository {
                 max_connections: 1,
                 timezone,
                 enabled: true,
+                cb_consecutive_failures: 0,
+                cb_opened_at: None,
             },
             refresh_job,
         })
@@ -1107,6 +1117,98 @@ impl SourceRepository {
             .bind(refreshed_at)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Resets the circuit breaker for a source after a successful refresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the update fails.
+    pub async fn record_refresh_success(&self, source_id: Uuid) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "UPDATE provider_accounts SET cb_consecutive_failures = 0, cb_opened_at = NULL WHERE id = $1",
+        )
+        .bind(source_id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE epg_sources SET cb_consecutive_failures = 0, cb_opened_at = NULL WHERE id = $1",
+        )
+        .bind(source_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Increments the failure counter and opens the circuit when the threshold
+    /// is reached. Returns `true` when the circuit just opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the update fails.
+    pub async fn record_refresh_failure(
+        &self,
+        source_id: Uuid,
+        failure_threshold: i32,
+    ) -> Result<bool, PersistenceError> {
+        let provider_result = sqlx::query_scalar::<_, Option<i32>>(
+            r"
+            UPDATE provider_accounts
+            SET cb_consecutive_failures = cb_consecutive_failures + 1,
+                cb_opened_at = CASE
+                    WHEN cb_consecutive_failures + 1 >= $2 THEN now()
+                    ELSE cb_opened_at
+                END
+            WHERE id = $1
+            RETURNING cb_consecutive_failures
+            ",
+        )
+        .bind(source_id)
+        .bind(failure_threshold)
+        .fetch_optional(&self.pool)
+        .await?;
+        let epg_result = sqlx::query_scalar::<_, Option<i32>>(
+            r"
+            UPDATE epg_sources
+            SET cb_consecutive_failures = cb_consecutive_failures + 1,
+                cb_opened_at = CASE
+                    WHEN cb_consecutive_failures + 1 >= $2 THEN now()
+                    ELSE cb_opened_at
+                END
+            WHERE id = $1
+            RETURNING cb_consecutive_failures
+            ",
+        )
+        .bind(source_id)
+        .bind(failure_threshold)
+        .fetch_optional(&self.pool)
+        .await?;
+        let new_count = provider_result
+            .flatten()
+            .or(epg_result.flatten())
+            .unwrap_or(0);
+        Ok(new_count >= failure_threshold)
+    }
+
+    /// Manually resets the circuit breaker for a source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the update fails.
+    pub async fn reset_circuit_breaker(&self, source_id: Uuid) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "UPDATE provider_accounts SET cb_consecutive_failures = 0, cb_opened_at = NULL WHERE id = $1",
+        )
+        .bind(source_id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE epg_sources SET cb_consecutive_failures = 0, cb_opened_at = NULL WHERE id = $1",
+        )
+        .bind(source_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1445,11 +1547,15 @@ fn redact_source_endpoint(endpoint: &str) -> Result<String, PersistenceError> {
 
 fn source_summary_from_row(row: SourceSummaryRow) -> Result<SourceSummary, PersistenceError> {
     let kind = SourceKind::from_database(&row.kind)?;
-    let state = match row.job_status.as_deref() {
-        Some("queued" | "running") => "syncing",
-        Some("failed") => "degraded",
-        Some("cancelled") => "offline",
-        _ => "healthy",
+    let state = if row.cb_opened_at.is_some() {
+        "circuit-open"
+    } else {
+        match row.job_status.as_deref() {
+            Some("queued" | "running") => "syncing",
+            Some("failed") => "degraded",
+            Some("cancelled") => "offline",
+            _ => "healthy",
+        }
     };
     Ok(SourceSummary {
         id: row.id,
@@ -1465,6 +1571,8 @@ fn source_summary_from_row(row: SourceSummaryRow) -> Result<SourceSummary, Persi
         max_connections: row.max_connections,
         timezone: row.timezone,
         enabled: row.enabled,
+        cb_consecutive_failures: row.cb_consecutive_failures,
+        cb_opened_at: row.cb_opened_at,
     })
 }
 
@@ -1638,6 +1746,7 @@ impl JobRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn enqueue_due_source_refreshes(
         &self,
+        cb_cooldown_seconds: i64,
     ) -> Result<SourceRefreshScheduleResult, PersistenceError> {
         const SOURCE_REFRESH_SCHEDULER_LOCK: i64 = 7_283_912_042;
 
@@ -1651,6 +1760,7 @@ impl JobRepository {
             return Ok(SourceRefreshScheduleResult::default());
         }
 
+        let cooldown_interval = format!("{cb_cooldown_seconds} seconds");
         let due_source_ids = sqlx::query_scalar::<_, Uuid>(
             r"
             SELECT id
@@ -1664,6 +1774,10 @@ impl JobRepository {
                       OR last_refreshed_at
                          + (refresh_interval_seconds || ' seconds')::interval <= now()
                   )
+                  AND (
+                      cb_opened_at IS NULL
+                      OR cb_opened_at + $1::interval <= now()
+                  )
                 UNION ALL
                 SELECT id
                 FROM epg_sources
@@ -1674,10 +1788,15 @@ impl JobRepository {
                       OR last_refreshed_at
                          + (refresh_interval_seconds || ' seconds')::interval <= now()
                   )
+                  AND (
+                      cb_opened_at IS NULL
+                      OR cb_opened_at + $1::interval <= now()
+                  )
             ) AS due_sources
             ORDER BY id
             ",
         )
+        .bind(&cooldown_interval)
         .fetch_all(&mut *transaction)
         .await?;
 
@@ -3218,12 +3337,35 @@ mod tests {
                 max_connections: 3,
                 timezone: "UTC".to_owned(),
                 enabled: true,
+                cb_consecutive_failures: 0,
+                cb_opened_at: None,
             })
             .unwrap();
             assert_eq!(summary.state, expected);
             assert_eq!(summary.channels, 0);
             assert_eq!(summary.last_sync, now);
         }
+
+        let circuit_open_summary = source_summary_from_row(SourceSummaryRow {
+            id: Uuid::nil(),
+            name: "Source".to_owned(),
+            kind: "m3u".to_owned(),
+            endpoint: "https://provider.test/".to_owned(),
+            revision: 2,
+            updated_at: now,
+            activated_at: None,
+            record_count: 0,
+            job_status: Some("failed".to_owned()),
+            refresh_interval_seconds: 60,
+            last_refreshed_at: None,
+            max_connections: 3,
+            timezone: "UTC".to_owned(),
+            enabled: true,
+            cb_consecutive_failures: 5,
+            cb_opened_at: Some(now),
+        })
+        .unwrap();
+        assert_eq!(circuit_open_summary.state, "circuit-open");
 
         let refreshed_at = now - chrono::Duration::minutes(5);
         let due = DueSource::try_from_row(&DueSourceRow {

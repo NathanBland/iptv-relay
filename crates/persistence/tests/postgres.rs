@@ -4196,24 +4196,24 @@ async fn scheduler_workers_create_one_due_source_refresh_job() {
     let first_barrier = Arc::clone(&barrier);
     let first = async move {
         first_barrier.wait().await;
-        first_jobs.enqueue_due_source_refreshes().await
+        first_jobs.enqueue_due_source_refreshes(900).await
     };
     let second_jobs = jobs.clone();
     let second_barrier = Arc::clone(&barrier);
     let second = async move {
         second_barrier.wait().await;
-        second_jobs.enqueue_due_source_refreshes().await
+        second_jobs.enqueue_due_source_refreshes(900).await
     };
     let third_jobs = jobs.clone();
     let third_barrier = Arc::clone(&barrier);
     let third = async move {
         third_barrier.wait().await;
-        third_jobs.enqueue_due_source_refreshes().await
+        third_jobs.enqueue_due_source_refreshes(900).await
     };
     let fourth_jobs = jobs.clone();
     let fourth = async move {
         barrier.wait().await;
-        fourth_jobs.enqueue_due_source_refreshes().await
+        fourth_jobs.enqueue_due_source_refreshes(900).await
     };
     let (first, second, third, fourth) = tokio::join!(first, second, third, fourth);
     let enqueued: u64 = [first, second, third, fourth]
