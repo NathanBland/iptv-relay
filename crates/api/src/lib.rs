@@ -10208,14 +10208,13 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn durable_source_and_job_routes_use_postgres_when_available() {
-        let Ok(database_url) = std::env::var("IPTV_TEST_DATABASE_URL") else {
+        if std::env::var("IPTV_TEST_DATABASE_URL").is_err() {
             eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL API integration test");
             return;
-        };
-        let database = Database::connect(&database_url, 4).await.unwrap();
-        database.migrate().await.unwrap();
+        }
+        let (admin, database, schema) = isolated_database().await;
         let pool = database.pool().clone();
-        let app = router(state_with_database(Some(database)));
+        let app = router(state_with_database(Some(database.clone())));
         let suffix = Uuid::now_v7();
         let endpoint =
             "https://alice:password@provider.test/live/alice/secret/list.m3u?token=value";
@@ -10298,23 +10297,7 @@ mod tests {
             serde_json::json!({"ok": true, "message": "Cancellation requested."})
         );
 
-        let mut transaction = pool.begin().await.unwrap();
-        sqlx::query("DELETE FROM jobs WHERE payload->>'sourceId' = $1")
-            .bind(source_id.to_string())
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM audit_events WHERE resource_id = $1")
-            .bind(source_id)
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM provider_accounts WHERE id = $1")
-            .bind(source_id)
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
+        drop_isolated_database(&admin, database, schema).await;
     }
 
     #[tokio::test]
