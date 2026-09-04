@@ -351,6 +351,13 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
         ProviderReconciliationFinalization::Cancelled
     );
     assert!(jobs.cancel(parent.id).await.unwrap());
+    let canceled_run_status: String =
+        sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(canceled_run_status, "cancelled");
 
     let retry_finalizer = jobs
         .enqueue(&NewJob::immediate(
@@ -370,6 +377,19 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
             .unwrap(),
         ProviderReconciliationFinalization::Cancelled
     );
+    let replacement_parent = jobs
+        .enqueue(&NewJob::immediate(
+            "refresh-source",
+            json!({"sourceId": account_id}),
+        ))
+        .await
+        .unwrap();
+    let replacement_run = catalog
+        .create_or_load_provider_reconciliation_run(snapshot_id, replacement_parent.id, 1)
+        .await
+        .unwrap()
+        .expect("canceled runs create a fresh reconciliation run");
+    assert_ne!(replacement_run.id, run_id);
     let snapshot_status: String =
         sqlx::query_scalar("SELECT status FROM source_snapshots WHERE id = $1")
             .bind(snapshot_id)

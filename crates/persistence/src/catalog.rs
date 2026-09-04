@@ -242,7 +242,14 @@ impl CatalogRepository {
         .fetch_optional(&mut *transaction)
         .await?
         {
-            if run.status != "processing" {
+            if run.status == "cancelled" {
+                // Cancellation is terminal for this run. Delete its private
+                // work so a later refresh creates a new run identifier.
+                sqlx::query("DELETE FROM provider_reconciliation_runs WHERE id = $1")
+                    .bind(run.id)
+                    .execute(&mut *transaction)
+                    .await?;
+            } else if run.status != "processing" {
                 // A checksum-equivalent snapshot can become staging again
                 // after a newer snapshot supersedes it. Rebuild its durable
                 // run so terminal state does not strand the staged snapshot.

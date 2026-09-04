@@ -2260,6 +2260,16 @@ impl JobRepository {
         .execute(&mut *transaction)
         .await?
         .rows_affected();
+        sqlx::query(
+            r"
+            UPDATE provider_reconciliation_runs
+            SET status = 'cancelled', updated_at = now()
+            WHERE parent_job_id = $1 AND status IN ('queued', 'processing')
+            ",
+        )
+        .bind(parent_job_id)
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(parent_cancelled || child_count > 0)
     }
