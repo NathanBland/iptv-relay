@@ -147,6 +147,8 @@ type ProviderReconciliationSnapshotRow =
 pub enum ProviderReconciliationFinalization {
     /// One or more partitions still need work. Public output is unchanged.
     Pending(ProviderReconciliationRunProgress),
+    /// The parent refresh was canceled before publication began.
+    Cancelled,
     /// The staged snapshot and its catalog became public in one transaction.
     Published(ReconcileStats),
     /// A previous finalizer already published the run.
@@ -576,11 +578,30 @@ impl CatalogRepository {
     pub async fn finalize_provider_reconciliation(
         &self,
         run_id: Uuid,
+        parent_job_id: Uuid,
     ) -> Result<ProviderReconciliationFinalization, PersistenceError> {
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SET LOCAL statement_timeout = '300s'")
             .execute(&mut *transaction)
             .await?;
+        let parent_status: Option<String> = sqlx::query_scalar(
+            r"
+            SELECT status
+            FROM jobs
+            WHERE id = $1 AND kind = 'refresh-source'
+            FOR UPDATE
+            ",
+        )
+        .bind(parent_job_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(parent_status) = parent_status else {
+            return Err(PersistenceError::JobNotFound(parent_job_id));
+        };
+        if parent_status == "cancelled" {
+            transaction.commit().await?;
+            return Ok(ProviderReconciliationFinalization::Cancelled);
+        }
         let run: Option<(Uuid, Uuid, String)> = sqlx::query_as(
             r"
             SELECT provider_account_id, source_snapshot_id, status
@@ -628,6 +649,20 @@ impl CatalogRepository {
                 self.provider_reconciliation_progress(run_id).await?,
             ));
         }
+        // Serialize cancellation with publication. The lock is set only after
+        // all partitions finish, so cancellation remains available while work
+        // is still pending and wins before this transaction acquires the row.
+        sqlx::query(
+            r"
+            UPDATE jobs
+            SET progress = progress || jsonb_build_object('activationLocked', true),
+                updated_at = now()
+            WHERE id = $1 AND status <> 'cancelled'
+            ",
+        )
+        .bind(parent_job_id)
+        .execute(&mut *transaction)
+        .await?;
         let snapshot: Option<ProviderReconciliationSnapshotRow> = sqlx::query_as(
             r"
             SELECT kind, status, staged_at, fetched_at, record_count

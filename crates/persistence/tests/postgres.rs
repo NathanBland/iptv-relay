@@ -10,9 +10,9 @@ use iptv_persistence::{
     CreateRecordingRuleInput, CreateStreamProfileInput, CreateUserInput, Database,
     ENVIRONMENT_OUTPUT_PROFILE_ID, ENVIRONMENT_OUTPUT_PROFILE_NAME, EventTemplateQuery,
     EventTemplateUpdate, JobRepository, MasterKey, NewJob, NewSource, OperatorSettingOverrides,
-    OutputProfileTokenHash, PersistenceError, ProgrammeQuery, ProviderReconciliationPhase,
-    ProviderReconciliationProgress, ProviderReconciliationUpdate, SourceKind, SourceRepository,
-    SourceUpdate, StreamHealthUpdate, UpdateUserInput,
+    OutputProfileTokenHash, PersistenceError, ProgrammeQuery, ProviderReconciliationFinalization,
+    ProviderReconciliationPhase, ProviderReconciliationProgress, ProviderReconciliationUpdate,
+    SourceKind, SourceRepository, SourceUpdate, StreamHealthUpdate, UpdateUserInput,
 };
 use serde_json::{Value, json};
 
@@ -229,6 +229,124 @@ async fn provider_reconciliation_partitions_conserve_canonical_key_counts() {
         .expect("retry returns the existing run");
     assert_eq!(same_run.id, run.id);
     assert_eq!(same_run.partition_count, 64);
+
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn canceled_parent_cannot_publish_provider_reconciliation() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let jobs = JobRepository::new(pool.clone());
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    let run_id = uuid::Uuid::now_v7();
+    let stream_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template)
+         VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("cancel-publication-{account_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots
+            (id, provider_account_id, kind, status, checksum_sha256, byte_count,
+             record_count, staged_at)
+         VALUES ($1, $2, 'm3u', 'staging', $3, 1, 1, now())",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(format!("cancel-publication-{snapshot_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams
+            (id, snapshot_id, provider_account_id, stable_key, name, tvg_id,
+             url_template, attributes, directives, supported)
+         VALUES ($1, $2, $3, 'stable', 'Channel', 'channel',
+                 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(stream_id)
+    .bind(snapshot_id)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let parent = jobs
+        .enqueue(&NewJob::immediate(
+            "refresh-source",
+            json!({"sourceId": account_id}),
+        ))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_reconciliation_runs
+            (id, provider_account_id, source_snapshot_id, parent_job_id,
+             status, partition_count, total_keys, completed_keys)
+         VALUES ($1, $2, $3, $4, 'processing', 1, 1, 1)",
+    )
+    .bind(run_id)
+    .bind(account_id)
+    .bind(snapshot_id)
+    .bind(parent.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_reconciliation_partitions
+            (run_id, partition_number, status, key_count, completed_keys)
+         VALUES ($1, 0, 'succeeded', 1, 1)",
+    )
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_reconciliation_candidates
+            (run_id, canonical_key, name)
+         VALUES ($1, 'channel', 'Channel')",
+    )
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_reconciliation_candidate_streams
+            (run_id, canonical_key, provider_stream_id)
+         VALUES ($1, 'channel', $2)",
+    )
+    .bind(run_id)
+    .bind(stream_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(jobs.cancel(parent.id).await.unwrap());
+
+    assert_eq!(
+        catalog
+            .finalize_provider_reconciliation(run_id, parent.id)
+            .await
+            .unwrap(),
+        ProviderReconciliationFinalization::Cancelled
+    );
+    let snapshot_status: String =
+        sqlx::query_scalar("SELECT status FROM source_snapshots WHERE id = $1")
+            .bind(snapshot_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(snapshot_status, "staging");
 
     drop(database);
     drop_isolated_schema(&admin, &schema).await;

@@ -975,7 +975,11 @@ async fn run_provider_reconciliation_finalizer_job(
     if jobs.is_cancelled(parent_job_id).await.unwrap_or(true) {
         return Ok(());
     }
-    match catalog.finalize_provider_reconciliation(run_id).await {
+    match catalog
+        .finalize_provider_reconciliation(run_id, parent_job_id)
+        .await
+    {
+        Ok(ProviderReconciliationFinalization::Cancelled) => Ok(()),
         Ok(ProviderReconciliationFinalization::Pending(progress)) => {
             jobs.heartbeat_reconciliation_parent(
                 parent_job_id,
