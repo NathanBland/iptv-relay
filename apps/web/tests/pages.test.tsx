@@ -111,6 +111,27 @@ describe('management pages', () => {
     expect(screen.getByText('Backup feed')).toBeInTheDocument()
   })
 
+  it('shows separate Xtream credentials and submits them without a provider URL', async () => {
+    const client = new MockIptvApiClient()
+    const createSource = vi.spyOn(client, 'createSource')
+    renderWithQuery(<SourcesPage client={client} />)
+    await screen.findByText('Prime IPTV')
+    await userEvent.click(screen.getByRole('button', { name: /Add source/ }))
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Source type' }), 'Xtream')
+    await userEvent.type(screen.getByLabelText('Display name'), 'Provider account')
+    await userEvent.type(screen.getByPlaceholderText('https://provider.example:8080'), 'https://provider.example:8080')
+    await userEvent.type(screen.getByLabelText('Username'), 'operator')
+    await userEvent.type(screen.getByLabelText('Password'), 'secret')
+    await userEvent.click(screen.getAllByRole('button', { name: 'Add source' })[1]!)
+    await waitFor(() => expect(createSource).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'Xtream',
+      serverUrl: 'https://provider.example:8080',
+      username: 'operator',
+      password: 'secret',
+      endpoint: '',
+    })))
+  })
+
   it('filters and sorts the TanStack channel table', async () => {
     renderWithQuery(<ChannelsPage client={new MockIptvApiClient()} />)
     expect(await screen.findByText('KWGN Denver')).toBeInTheDocument()
