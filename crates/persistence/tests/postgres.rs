@@ -331,11 +331,41 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
     .execute(&pool)
     .await
     .unwrap();
-    assert!(jobs.cancel(parent.id).await.unwrap());
-
+    let finalizer = jobs
+        .enqueue(&NewJob::immediate(
+            "finalize-provider-reconciliation",
+            json!({
+                "runId": run_id,
+                "sourceId": account_id,
+                "parentJobId": parent.id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(jobs.cancel(finalizer.id).await.unwrap());
     assert_eq!(
         catalog
-            .finalize_provider_reconciliation(run_id, parent.id)
+            .finalize_provider_reconciliation(run_id, parent.id, finalizer.id)
+            .await
+            .unwrap(),
+        ProviderReconciliationFinalization::Cancelled
+    );
+    assert!(jobs.cancel(parent.id).await.unwrap());
+
+    let retry_finalizer = jobs
+        .enqueue(&NewJob::immediate(
+            "finalize-provider-reconciliation",
+            json!({
+                "runId": run_id,
+                "sourceId": account_id,
+                "parentJobId": parent.id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .finalize_provider_reconciliation(run_id, parent.id, retry_finalizer.id)
             .await
             .unwrap(),
         ProviderReconciliationFinalization::Cancelled

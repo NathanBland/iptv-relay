@@ -1001,7 +1001,7 @@ async fn run_provider_reconciliation_finalizer_job(
         return Ok(());
     }
     match catalog
-        .finalize_provider_reconciliation(run_id, parent_job_id)
+        .finalize_provider_reconciliation(run_id, parent_job_id, job.id)
         .await
     {
         Ok(ProviderReconciliationFinalization::Cancelled) => Ok(()),

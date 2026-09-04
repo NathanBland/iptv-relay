@@ -579,6 +579,7 @@ impl CatalogRepository {
         &self,
         run_id: Uuid,
         parent_job_id: Uuid,
+        finalizer_job_id: Uuid,
     ) -> Result<ProviderReconciliationFinalization, PersistenceError> {
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SET LOCAL statement_timeout = '300s'")
@@ -599,6 +600,24 @@ impl CatalogRepository {
             return Err(PersistenceError::JobNotFound(parent_job_id));
         };
         if parent_status == "cancelled" {
+            transaction.commit().await?;
+            return Ok(ProviderReconciliationFinalization::Cancelled);
+        }
+        let finalizer_status: Option<String> = sqlx::query_scalar(
+            r"
+            SELECT status
+            FROM jobs
+            WHERE id = $1 AND kind = 'finalize-provider-reconciliation'
+            FOR UPDATE
+            ",
+        )
+        .bind(finalizer_job_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(finalizer_status) = finalizer_status else {
+            return Err(PersistenceError::JobNotFound(finalizer_job_id));
+        };
+        if finalizer_status == "cancelled" {
             transaction.commit().await?;
             return Ok(ProviderReconciliationFinalization::Cancelled);
         }
@@ -661,6 +680,17 @@ impl CatalogRepository {
             ",
         )
         .bind(parent_job_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r"
+            UPDATE jobs
+            SET progress = progress || jsonb_build_object('activationLocked', true),
+                updated_at = now()
+            WHERE id = $1 AND status <> 'cancelled'
+            ",
+        )
+        .bind(finalizer_job_id)
         .execute(&mut *transaction)
         .await?;
         let snapshot: Option<ProviderReconciliationSnapshotRow> = sqlx::query_as(
