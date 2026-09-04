@@ -12,7 +12,7 @@ import { FieldMessage, Input, Select } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
-import type { IptvApiClient, Source, SourceInput, SourceKind, SourceSyncStatus, SourceUpdateInput } from '@/lib/api/types'
+import type { IptvApiClient, Job, Source, SourceInput, SourceKind, SourceSyncStatus, SourceUpdateInput } from '@/lib/api/types'
 import { formatRelativeTime } from '@/lib/utils'
 import { sourceSchema, sourceUpdateSchema } from '@/lib/validation'
 
@@ -67,17 +67,24 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
     })),
     combine: (results) => {
       const activeIds = new Set<string>()
+      const statusById = new Map<string, SourceSyncStatus>()
       for (let i = 0; i < results.length; i++) {
         const data = results[i]?.data
         const id = sourceIds[i]
-        if (data && id && (data.status === 'running' || data.status === 'queued')) {
-          activeIds.add(id)
+        if (data && id) {
+          statusById.set(id, data)
+          if (data.status === 'running' || data.status === 'queued') {
+            activeIds.add(id)
+          }
         }
       }
-      return { activeSyncIds: activeIds }
+      return { activeSyncIds: activeIds, statusById }
     },
   })
   const syncingSourceIds = syncStatusQueries.activeSyncIds
+  const syncStatusById = syncStatusQueries.statusById
+  const hasDegradedSource = sourcesQuery.data?.some((source) => source.state === 'degraded') ?? false
+  const jobsQuery = useQuery({ ...apiQueries(client).jobs, enabled: hasDegradedSource })
 
   const removeSyncing = useCallback((id: string) => {
     queryClient.removeQueries({ queryKey: ['source-sync-status', id] })
@@ -135,6 +142,7 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
     onSuccess: (data, id) => {
       queryClient.invalidateQueries({ queryKey: ['sources'] })
       queryClient.invalidateQueries({ queryKey: ['overview'] })
+      queryClient.invalidateQueries({ queryKey: ['jobs'] })
       queryClient.refetchQueries({ queryKey: ['source-sync-status', id] })
       setNotice(data.message)
     },
@@ -279,7 +287,18 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
                         <span className="text-xs font-medium text-cyan-200">Starting…</span>
                       </div>
                     ) : (
-                      <HealthBadge state={source.state} />
+                      <div className="flex flex-col items-start gap-1">
+                        <HealthBadge state={source.state} />
+                        {source.state === 'degraded' ? (
+                          <SourceSyncFailure
+                            sourceName={source.name}
+                            status={syncStatusById.get(source.id)}
+                            jobs={jobsQuery.data}
+                            onRetry={() => syncMutation.mutate(source.id)}
+                            retryPending={syncMutation.isPending && syncMutation.variables === source.id}
+                          />
+                        ) : null}
+                      </div>
                     )}
                   </TableCell>
                   <TableCell className="font-mono text-slate-200">{source.channels.toLocaleString()}</TableCell>
@@ -392,6 +411,41 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
   )
 }
 
+function SourceSyncFailure({
+  sourceName,
+  status,
+  jobs,
+  onRetry,
+  retryPending,
+}: {
+  sourceName: string
+  status: SourceSyncStatus | undefined
+  jobs: Job[] | undefined
+  onRetry: () => void
+  retryPending: boolean
+}) {
+  if (status?.status !== 'failed') return null
+  const lastError = jobs?.find((job) => job.id === status.jobId)?.lastError
+  const reason = lastError ?? (status.message || 'The error detail is not available.')
+  return (
+    <div className="mt-1 flex max-w-xs flex-col items-start gap-1" role="alert">
+      <p className="text-[0.68rem] leading-4 text-red-200">
+        <span className="font-semibold">Last sync failed.</span> {reason}
+      </p>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 min-h-7 px-2 text-red-200 hover:text-red-100"
+        aria-label={`Retry sync ${sourceName}`}
+        disabled={retryPending}
+        onClick={onRetry}
+      >
+        <RefreshCw aria-hidden="true" className="size-3.5" /> Retry sync
+      </Button>
+    </div>
+  )
+}
+
 function SourceSyncProgress({
   client,
   sourceId,
@@ -429,10 +483,11 @@ function SourceSyncProgress({
   })
 
   useEffect(() => {
-    if ((syncStatus.data?.status === 'succeeded' || syncStatus.data?.status === 'cancelled') && !didInvalidate.current) {
+    if ((syncStatus.data?.status === 'succeeded' || syncStatus.data?.status === 'failed' || syncStatus.data?.status === 'cancelled') && !didInvalidate.current) {
       didInvalidate.current = true
       queryClient.invalidateQueries({ queryKey: ['sources'] })
       queryClient.invalidateQueries({ queryKey: ['overview'] })
+      queryClient.invalidateQueries({ queryKey: ['jobs'] })
     }
   }, [syncStatus.data, queryClient])
 

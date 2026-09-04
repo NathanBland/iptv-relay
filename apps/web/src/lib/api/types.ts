@@ -50,6 +50,19 @@ export interface SourceSyncStatus {
   updatedAt?: string
 }
 
+export interface Job {
+  id: string
+  kind: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | string
+  progress: Record<string, unknown>
+  attempts: number
+  maxAttempts: number
+  lastError: string | null
+  createdAt: string
+  updatedAt: string
+  completedAt: string | null
+}
+
 export interface Channel {
   id: string
   number: string
@@ -559,6 +572,33 @@ export interface LoginInput {
   password: string
 }
 
+export interface OperatorApiToken {
+  id: string
+  name: string
+  scopes: string[]
+  expiresAt: string | null
+  revokedAt: string | null
+  createdBy: string
+  createdAt: string
+  lastUsedAt: string | null
+}
+
+export interface IssuedOperatorApiToken extends OperatorApiToken {
+  token: string
+}
+
+export interface CreateOperatorApiTokenInput {
+  name: string
+  scopes: string[]
+  expiresAt?: string
+}
+
+export interface RotateOperatorApiTokenInput {
+  name?: string
+  scopes?: string[]
+  expiresAt?: string | null
+}
+
 export interface ProblemDetails {
   type: string
   title: string
@@ -664,6 +704,10 @@ export interface IptvApiClient {
   getAuthStatus(): Promise<AuthStatus>
   login(input: LoginInput): Promise<AuthStatus>
   logout(): Promise<SaveResult>
+  getOperatorApiTokens(): Promise<OperatorApiToken[]>
+  createOperatorApiToken(input: CreateOperatorApiTokenInput): Promise<IssuedOperatorApiToken>
+  rotateOperatorApiToken(id: string, input?: RotateOperatorApiTokenInput): Promise<IssuedOperatorApiToken>
+  revokeOperatorApiToken(id: string): Promise<void>
   getOverview(): Promise<Overview>
   getSources(): Promise<Source[]>
   createSource(input: SourceInput): Promise<Source>
@@ -706,6 +750,7 @@ export interface IptvApiClient {
   deleteLineupTemplate(id: string): Promise<void>
   applyLineupTemplate(id: string): Promise<SaveResult>
   getSessions(): Promise<Session[]>
+  getJobs(): Promise<Job[]>
   getSupportBundle(): Promise<SupportBundle>
   getSupportLogs(): Promise<SupportLogEntry[]>
   getJellyfinSetup(): Promise<JellyfinSetup>

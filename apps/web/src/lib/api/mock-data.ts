@@ -2,6 +2,8 @@ import type {
   Channel,
   EffectiveSetting,
   EventChannel,
+  Job,
+  OperatorApiToken,
   OperatorOverridesResponse,
   OperatorRevisionResponse,
   OperatorScopeResponse,
@@ -158,6 +160,44 @@ export const mockProgrammes: Programme[] = [
     source: index % 2 === 0 ? 'North America guide' : 'Prime IPTV EPG',
     confidence: 90 + (index % 10),
   })),
+]
+
+export const mockJobs: Job[] = [
+  {
+    id: 'job-source-guide-failed',
+    kind: 'refresh-source',
+    status: 'failed',
+    progress: { stage: 'downloading', percent: 38, message: 'Download source data' },
+    attempts: 3,
+    maxAttempts: 3,
+    lastError: 'the provider closed the connection before the download completed',
+    createdAt: '2026-08-19T16:45:00Z',
+    updatedAt: '2026-08-19T16:47:12Z',
+    completedAt: '2026-08-19T16:47:12Z',
+  },
+]
+
+export const mockOperatorApiTokens: OperatorApiToken[] = [
+  {
+    id: 'token-backup-automation',
+    name: 'Backup automation',
+    scopes: ['read'],
+    expiresAt: null,
+    revokedAt: null,
+    createdBy: 'admin',
+    createdAt: '2026-08-10T09:00:00Z',
+    lastUsedAt: '2026-08-20T11:55:00Z',
+  },
+  {
+    id: 'token-legacy-export',
+    name: 'Legacy export',
+    scopes: ['read', 'output'],
+    expiresAt: '2026-09-01T00:00:00Z',
+    revokedAt: '2026-08-15T14:30:00Z',
+    createdBy: 'admin',
+    createdAt: '2026-07-20T09:00:00Z',
+    lastUsedAt: '2026-08-14T18:20:00Z',
+  },
 ]
 
 export const mockEvents: EventChannel[] = []

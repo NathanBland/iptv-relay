@@ -1,6 +1,8 @@
 import {
   mockChannels,
   mockEffectiveSettings,
+  mockJobs,
+  mockOperatorApiTokens,
   mockOperatorOverrides,
   mockOperatorRevisions,
   mockOperatorScope,
@@ -26,8 +28,13 @@ import type {
   EventTemplateSuggestion,
   Group,
   IptvApiClient,
+  IssuedOperatorApiToken,
   JellyfinSetup,
+  Job,
   LineupTemplate,
+  OperatorApiToken,
+  CreateOperatorApiTokenInput,
+  RotateOperatorApiTokenInput,
   OperatorOverridesResponse,
   OperatorOverrideMap,
   OperatorRevisionResponse,
@@ -95,6 +102,7 @@ const API_PATHS = {
   authStatus: '/api/v1/auth/status',
   login: '/api/v1/auth/login',
   logout: '/api/v1/auth/logout',
+  operatorApiTokens: '/api/v1/auth/tokens',
   system: '/api/v1/system',
   settingsSchema: '/api/v1/settings/schema',
   settingsEffective: '/api/v1/settings/effective',
@@ -107,6 +115,7 @@ const API_PATHS = {
   eventChannels: '/api/v1/event-channels',
   lineupTemplates: '/api/v1/lineup-templates',
   sessions: '/api/v1/sessions',
+  jobs: '/api/v1/jobs',
   supportBundle: '/api/v1/support/bundle',
   supportLogs: '/api/v1/support/logs',
   jellyfinSetup: '/api/v1/jellyfin/setup',
@@ -337,7 +346,7 @@ export class FetchIptvApiClient implements IptvApiClient {
 
     let payload: unknown
     try {
-      payload = await response.json()
+      payload = response.status === 204 ? undefined : await response.json()
     } catch {
       throw invalidResponse('The server did not return valid JSON.')
     }
@@ -359,6 +368,30 @@ export class FetchIptvApiClient implements IptvApiClient {
     return this.request(API_PATHS.logout, (value) => asObject<SaveResult>(value, 'Logout response'), {
       method: 'POST',
       body: JSON.stringify({}),
+    })
+  }
+
+  async getOperatorApiTokens(): Promise<OperatorApiToken[]> {
+    return this.request(API_PATHS.operatorApiTokens, (value) => asObjectArray<OperatorApiToken>(value, 'Operator API tokens response'))
+  }
+
+  async createOperatorApiToken(input: CreateOperatorApiTokenInput): Promise<IssuedOperatorApiToken> {
+    return this.request(API_PATHS.operatorApiTokens, (value) => asObject<IssuedOperatorApiToken>(value, 'Operator API token create response'), {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+  }
+
+  async rotateOperatorApiToken(id: string, input?: RotateOperatorApiTokenInput): Promise<IssuedOperatorApiToken> {
+    return this.request(`${API_PATHS.operatorApiTokens}/${encodeURIComponent(id)}/rotate`, (value) => asObject<IssuedOperatorApiToken>(value, 'Operator API token rotate response'), {
+      method: 'POST',
+      body: JSON.stringify(input ?? {}),
+    })
+  }
+
+  async revokeOperatorApiToken(id: string): Promise<void> {
+    return this.request(`${API_PATHS.operatorApiTokens}/${encodeURIComponent(id)}/revoke`, () => undefined, {
+      method: 'POST',
     })
   }
 
@@ -817,6 +850,10 @@ export class FetchIptvApiClient implements IptvApiClient {
     return this.request(API_PATHS.sessions, (value) => asObjectArray<Session>(value, 'Sessions response'))
   }
 
+  async getJobs(): Promise<Job[]> {
+    return this.request(API_PATHS.jobs, (value) => asObjectArray<Job>(value, 'Jobs response'))
+  }
+
   async getSupportBundle(): Promise<SupportBundle> {
     return this.request(API_PATHS.supportBundle, (value) => asObject<SupportBundle>(value, 'Support bundle response'))
   }
@@ -1026,6 +1063,7 @@ export class MockIptvApiClient implements IptvApiClient {
   private readonly operatorScopes = new Map<string, OperatorScopeResponse>()
   private readonly operatorRevisions = new Map<string, OperatorRevisionResponse[]>()
   private readonly reconciliationRevisions = new Map<string, ReconciliationRevision[]>()
+  private readonly operatorTokens: OperatorApiToken[] = mockOperatorApiTokens.map((token) => ({ ...token, scopes: [...token.scopes] }))
   private authenticated = false
 
   async getAuthStatus(): Promise<AuthStatus> {
@@ -1043,6 +1081,72 @@ export class MockIptvApiClient implements IptvApiClient {
   async logout(): Promise<SaveResult> {
     this.authenticated = false
     return { ok: true, message: 'Signed out.' }
+  }
+
+  async getOperatorApiTokens(): Promise<OperatorApiToken[]> {
+    return this.operatorTokens.map((token) => ({ ...token, scopes: [...token.scopes] }))
+  }
+
+  async createOperatorApiToken(input: CreateOperatorApiTokenInput): Promise<IssuedOperatorApiToken> {
+    const name = input.name.trim()
+    if (!name || input.scopes.length === 0) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:invalid-operator-api-token',
+        title: 'Invalid operator API token',
+        status: 400,
+        detail: 'A name and at least one scope are required.',
+      })
+    }
+    const token: OperatorApiToken = {
+      id: `token-${this.operatorTokens.length + 1}`,
+      name,
+      scopes: [...input.scopes],
+      expiresAt: input.expiresAt ?? null,
+      revokedAt: null,
+      createdBy: 'demo',
+      createdAt: new Date().toISOString(),
+      lastUsedAt: null,
+    }
+    this.operatorTokens.push(token)
+    return { ...token, scopes: [...token.scopes], token: `iptv-mock-${token.id}` }
+  }
+
+  async rotateOperatorApiToken(id: string, input?: RotateOperatorApiTokenInput): Promise<IssuedOperatorApiToken> {
+    const index = this.operatorTokens.findIndex((token) => token.id === id && !token.revokedAt)
+    if (index < 0) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:operator-api-token-not-found',
+        title: 'Operator API token not found',
+        status: 404,
+        detail: 'No active operator API token with that ID exists.',
+      })
+    }
+    const existing = this.operatorTokens[index]!
+    const rotated: OperatorApiToken = {
+      ...existing,
+      id: `token-${this.operatorTokens.length + 1}`,
+      name: input?.name ?? existing.name,
+      scopes: input?.scopes ? [...input.scopes] : [...existing.scopes],
+      expiresAt: input && input.expiresAt !== undefined ? input.expiresAt : existing.expiresAt,
+      createdAt: new Date().toISOString(),
+      lastUsedAt: null,
+    }
+    this.operatorTokens[index] = { ...existing, revokedAt: new Date().toISOString() }
+    this.operatorTokens.push(rotated)
+    return { ...rotated, scopes: [...rotated.scopes], token: `iptv-mock-${rotated.id}` }
+  }
+
+  async revokeOperatorApiToken(id: string): Promise<void> {
+    const token = this.operatorTokens.find((token) => token.id === id && !token.revokedAt)
+    if (!token) {
+      throw new IptvApiError({
+        type: 'urn:iptv:error:operator-api-token-not-found',
+        title: 'Operator API token not found',
+        status: 404,
+        detail: 'No active operator API token with that ID exists.',
+      })
+    }
+    token.revokedAt = new Date().toISOString()
   }
 
   async getOverview(): Promise<Overview> {
@@ -1388,6 +1492,10 @@ export class MockIptvApiClient implements IptvApiClient {
 
   async getSessions(): Promise<Session[]> {
     return mockSessions.map((session) => ({ ...session }))
+  }
+
+  async getJobs(): Promise<Job[]> {
+    return mockJobs.map((job) => ({ ...job, progress: { ...job.progress } }))
   }
 
   async getSupportBundle(): Promise<SupportBundle> {
