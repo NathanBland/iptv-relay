@@ -112,21 +112,26 @@ grep -F 'provenance: mode=max' "$WORKFLOW_FILE" >/dev/null || fail "workflow mus
 grep -F 'sigstore/cosign-installer@v3' "$WORKFLOW_FILE" >/dev/null || fail "workflow must install Cosign"
 grep -F 'cosign sign --yes' "$WORKFLOW_FILE" >/dev/null || fail "workflow must sign image digests"
 grep -F 'cosign verify' "$WORKFLOW_FILE" >/dev/null || fail "workflow must verify image signatures"
-grep -F 'type=semver,pattern={{version}}' "$WORKFLOW_FILE" >/dev/null || fail "workflow must emit semantic version tags"
-grep -F 'type=sha,format=short' "$WORKFLOW_FILE" >/dev/null || fail "workflow must emit SHA tags"
-grep -F 'type=raw,value=latest' "$WORKFLOW_FILE" >/dev/null || fail "workflow must emit a latest tag"
-grep -F 'platforms: linux/amd64,linux/arm64' "$WORKFLOW_FILE" >/dev/null || fail "workflow must build linux/amd64 and linux/arm64"
 
-# 6. Latest-tag gating: the raw latest tag must be gated so that only stable
+# The workflow must build both linux/amd64 and linux/arm64 platforms.
+grep -F 'linux/amd64' "$WORKFLOW_FILE" >/dev/null || fail "workflow must build linux/amd64"
+grep -F 'linux/arm64' "$WORKFLOW_FILE" >/dev/null || fail "workflow must build linux/arm64"
+
+# The workflow must use native arm64 runners (not QEMU emulation).
+grep -F 'ubuntu-24.04-arm' "$WORKFLOW_FILE" >/dev/null || fail "workflow must use native arm64 runners"
+
+# The workflow must emit semantic version tags in the manifest job.
+grep -F 'VERSION="${REF_TAG#v}"' "$WORKFLOW_FILE" >/dev/null || fail "workflow must extract semver version from tag"
+grep -F 'MAJOR_MINOR' "$WORKFLOW_FILE" >/dev/null || fail "workflow must emit major.minor tags"
+grep -F 'MAJOR' "$WORKFLOW_FILE" >/dev/null || fail "workflow must emit major version tags"
+
+# 6. Latest-tag gating: the latest tag must be gated so that only stable
 #    tag pushes publish latest. Prerelease tags (hyphenated) and manual
 #    workflow_dispatch runs must not publish latest.
-latest_enable_line=$(grep -F 'type=raw,value=latest' "$WORKFLOW_FILE")
-printf '%s' "$latest_enable_line" | grep -F "github.event_name == 'push'" >/dev/null || \
-  fail "latest tag must enable only on push events"
-printf '%s' "$latest_enable_line" | grep -F '!contains(github.ref_name' >/dev/null || \
-  fail "latest tag must be disabled for hyphenated prerelease tags"
-printf '%s' "$latest_enable_line" | grep -F "'-'" >/dev/null || \
-  fail "latest tag must test the ref name for a hyphen"
+grep -F 'IS_STABLE' "$WORKFLOW_FILE" >/dev/null || fail "workflow must define IS_STABLE variable"
+grep -F "github.event_name == 'push'" "$WORKFLOW_FILE" >/dev/null || fail "latest tag must enable only on push events"
+grep -F '!contains(github.ref_name' "$WORKFLOW_FILE" >/dev/null || fail "latest tag must be disabled for hyphenated prerelease tags"
+grep -F "'-'" "$WORKFLOW_FILE" >/dev/null || fail "latest tag must test the ref name for a hyphen"
 
 # Least-privilege: the v1-gates job must not request packages or id-token
 # permissions.

@@ -91,27 +91,38 @@ jobs:
       - name: Run release compose regression tests
         run: ./scripts/test-release-compose.sh
 
-  image:
-    name: Build and sign ${{ matrix.target }} image
+  # Build core and gateway images per-platform in parallel.
+  # Each platform pushes a tagged image with a -amd64 or -arm64 suffix.
+  # The manifest job merges these into a single multi-arch image.
+  build-image:
+    name: Build ${{ matrix.target }} (${{ matrix.platform }})
     needs: v1-gates
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        target: [core, gateway]
+        platform: [amd64, arm64]
         include:
+          - platform: amd64
+            runner: ubuntu-latest
+            arch: linux/amd64
+            suffix: -amd64
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            arch: linux/arm64
+            suffix: -arm64
           - target: core
             context: .
             file: ./Dockerfile
-            suffix: ''
+            image_suffix: ''
           - target: gateway
             context: .
             file: ./Dockerfile.gateway
-            suffix: -gateway
+            image_suffix: -gateway
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -119,9 +130,6 @@ jobs:
       - name: Set lowercase image prefix
         id: prefix
         run: echo "prefix=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -137,14 +145,11 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.prefix.outputs.prefix }}${{ matrix.suffix }}
+          images: ${{ steps.prefix.outputs.prefix }}${{ matrix.image_suffix }}
           tags: |
             type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,format=short
-            type=raw,value=latest,enable=${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
+          flavor: |
+            suffix=${{ matrix.suffix }}
 
       - name: Build and push image
         id: build
@@ -152,44 +157,41 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.arch }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: mode=max
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,ref=${{ matrix.target }}-${{ matrix.platform }}
+          cache-to: type=gha,ref=${{ matrix.target }}-${{ matrix.platform }},mode=max
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
+      - name: Export digest
+        id: digest
+        run: echo "digest=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
 
-      - name: Sign image digest
-        env:
-          IMAGE_NAME: ${{ steps.prefix.outputs.prefix }}${{ matrix.suffix }}
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
-
-      - name: Verify image signature
-        env:
-          IMAGE_NAME: ${{ steps.prefix.outputs.prefix }}${{ matrix.suffix }}
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}
-        run: |
-          cosign verify \
-            --certificate-identity="${COSIGN_CERTIFICATE_IDENTITY}" \
-            --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-            "${IMAGE_NAME}@${IMAGE_DIGEST}"
-
-  web-image:
-    name: Build and sign web image
+  # Build web assets natively on the runner, then build the prebuilt image
+  # per-platform. The .output directory is platform-independent JavaScript.
+  build-web:
+    name: Build web (${{ matrix.platform }})
     needs: v1-gates
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64]
+        include:
+          - platform: amd64
+            runner: ubuntu-latest
+            arch: linux/amd64
+            suffix: -amd64
+          - platform: arm64
+            runner: ubuntu-24.04-arm
+            arch: linux/arm64
+            suffix: -arm64
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -210,14 +212,11 @@ jobs:
           cache: pnpm
           cache-dependency-path: apps/web/pnpm-lock.yaml
 
-      - name: Build web assets natively
+      - name: Build web assets
         working-directory: apps/web
         run: |
           pnpm install --frozen-lockfile
           CI=true pnpm run build
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -236,11 +235,8 @@ jobs:
           images: ${{ steps.prefix.outputs.prefix }}-web
           tags: |
             type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,format=short
-            type=raw,value=latest,enable=${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
+          flavor: |
+            suffix=${{ matrix.suffix }}
 
       - name: Build and push web image
         id: build
@@ -248,31 +244,93 @@ jobs:
         with:
           context: ./apps/web
           file: ./apps/web/Dockerfile.prebuilt
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.arch }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: mode=max
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,ref=web-${{ matrix.platform }}
+          cache-to: type=gha,ref=web-${{ matrix.platform }},mode=max
+
+  # Merge per-platform images into multi-arch manifests, tag with latest
+  # for stable releases, and sign with Cosign.
+  manifest:
+    name: Merge and sign manifests
+    needs: [build-image, build-web]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set lowercase image prefix
+        id: prefix
+        run: echo "prefix=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign image digest
+      - name: Create multi-arch manifests and sign
         env:
-          IMAGE_NAME: ${{ steps.prefix.outputs.prefix }}-web
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
-
-      - name: Verify image signature
-        env:
-          IMAGE_NAME: ${{ steps.prefix.outputs.prefix }}-web
-          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
-          COSIGN_CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}
+          IMAGE_PREFIX: ${{ steps.prefix.outputs.prefix }}
+          IS_STABLE: ${{ github.event_name == 'push' && !contains(github.ref_name, '-') }}
+          REF_TAG: ${{ github.ref_name }}
         run: |
-          cosign verify \
-            --certificate-identity="${COSIGN_CERTIFICATE_IDENTITY}" \
-            --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-            "${IMAGE_NAME}@${IMAGE_DIGEST}"
+          set -euo pipefail
+
+          # The per-platform images are tagged with the git ref (e.g. v0.1.4)
+          # plus a -amd64 or -arm64 suffix from the metadata flavor.
+          # We merge these into multi-arch manifests with clean tags.
+
+          # Extract semver components from the ref tag (v0.1.4 -> 0.1.4)
+          VERSION="${REF_TAG#v}"
+          MAJOR_MINOR="$(echo ${VERSION} | cut -d. -f1-2)"
+          MAJOR="$(echo ${VERSION} | cut -d. -f1)"
+
+          # Tags to create on the multi-arch manifest
+          TAGS=("${REF_TAG}" "${VERSION}" "${MAJOR_MINOR}" "${MAJOR}")
+
+          if [ "${IS_STABLE}" = "true" ]; then
+            TAGS+=("latest")
+          fi
+
+          IMAGES=("${IMAGE_PREFIX}" "${IMAGE_PREFIX}-web" "${IMAGE_PREFIX}-gateway")
+
+          for image in "${IMAGES[@]}"; do
+            echo "Creating multi-arch manifest for ${image}"
+
+            for tag in "${TAGS[@]}"; do
+              echo "  Merging ${tag} from ${REF_TAG}-amd64 and ${REF_TAG}-arm64"
+              docker buildx imagetools create \
+                -t "${image}:${tag}" \
+                "${image}:${REF_TAG}-amd64" \
+                "${image}:${REF_TAG}-arm64"
+            done
+
+            # Get the digest of the multi-arch manifest
+            DIGEST=$(docker buildx imagetools inspect "${image}:${REF_TAG}" --format '{{.Manifest.Digest}}')
+
+            echo "Signing ${image}@${DIGEST}"
+            cosign sign --yes "${image}@${DIGEST}"
+
+            echo "Verifying ${image}@${DIGEST}"
+            cosign verify \
+              --certificate-identity="https://github.com/${{ github.repository }}/.github/workflows/container.yml@${{ github.ref }}" \
+              --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
+              "${image}@${DIGEST}"
+          done

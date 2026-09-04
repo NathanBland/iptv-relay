@@ -30,12 +30,25 @@ COPY --from=planner /build/recipe.json recipe.json
 # the local 2 vCPU / 1.9 GiB Docker Desktop limit and prevents SIGKILL during
 # cold cache builds. The cached layer makes the slower one-job cook a one-time
 # cost that is paid only when the dependency set changes.
-RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo chef cook --release -j 1 --recipe-path recipe.json
+# BuildKit mount caches persist Rust registry and build artifacts across
+# builds even when Docker layers are invalidated, speeding up rebuilds.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo chef cook --release -j 1 --recipe-path recipe.json
 COPY . .
 # Build every runtime and test binary in one Cargo invocation. The scale-gate
 # feature also builds the normal binaries, so one invocation avoids a second
 # full release compilation. Keep one job to stay below the local memory limit.
-RUN CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 1 -p iptv-gateway --features scale-gate --bins
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    CARGO_PROFILE_RELEASE_LTO=off CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256 cargo build --release --locked -j 1 -p iptv-gateway --features scale-gate --bins && \
+    cp /build/target/release/iptv-gateway /tmp/iptv-gateway && \
+    cp /build/target/release/test-provider /tmp/test-provider && \
+    cp /build/target/release/media-acceptance /tmp/media-acceptance && \
+    cp /build/target/release/fault-acceptance /tmp/fault-acceptance && \
+    cp /build/target/release/live-acceptance /tmp/live-acceptance && \
+    cp /build/target/release/jellyfin-acceptance /tmp/jellyfin-acceptance && \
+    cp /build/target/release/scale-gate /tmp/scale-gate
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -44,13 +57,13 @@ RUN apt-get update \
 
 RUN useradd --create-home --uid 10001 iptv
 WORKDIR /app
-COPY --from=builder /build/target/release/iptv-gateway /usr/local/bin/iptv-gateway
-COPY --from=builder /build/target/release/test-provider /usr/local/bin/test-provider
-COPY --from=builder /build/target/release/media-acceptance /usr/local/bin/media-acceptance
-COPY --from=builder /build/target/release/fault-acceptance /usr/local/bin/fault-acceptance
-COPY --from=builder /build/target/release/live-acceptance /usr/local/bin/live-acceptance
-COPY --from=builder /build/target/release/jellyfin-acceptance /usr/local/bin/jellyfin-acceptance
-COPY --from=builder /build/target/release/scale-gate /usr/local/bin/scale-gate
+COPY --from=builder /tmp/iptv-gateway /usr/local/bin/iptv-gateway
+COPY --from=builder /tmp/test-provider /usr/local/bin/test-provider
+COPY --from=builder /tmp/media-acceptance /usr/local/bin/media-acceptance
+COPY --from=builder /tmp/fault-acceptance /usr/local/bin/fault-acceptance
+COPY --from=builder /tmp/live-acceptance /usr/local/bin/live-acceptance
+COPY --from=builder /tmp/jellyfin-acceptance /usr/local/bin/jellyfin-acceptance
+COPY --from=builder /tmp/scale-gate /usr/local/bin/scale-gate
 COPY tests/fixtures/scale-gate-baseline.json /app/tests/fixtures/scale-gate-baseline.json
 COPY LICENSE THIRD_PARTY_NOTICES.md /app/
 USER iptv
