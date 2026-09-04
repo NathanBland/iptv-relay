@@ -97,6 +97,44 @@ Do not add `Co-Authored-By` tags or `Generated with [Devin]` lines to commit mes
 
 Do not claim authorship or co-authorship for commits that other tools or agents wrote.
 
+## Database migrations
+
+All migrations must be idempotent.
+
+Write each migration so that it can run more than one time without error.
+
+Use `CREATE INDEX IF NOT EXISTS` for all index creation.
+
+Use `CREATE TABLE IF NOT EXISTS` for all table creation.
+
+Use `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for all column additions.
+
+Use `DROP TABLE IF EXISTS` and `DROP INDEX IF EXISTS` for all drop operations.
+
+Do not change an existing migration file after it is deployed.
+
+Create a new migration file for every schema change.
+
+Number each new migration file sequentially.
+
+Do not delete or rename a migration file that was already deployed.
+
+Do not reorder migration files.
+
+The database records applied migrations by number.
+
+A missing migration number causes a startup failure.
+
+The deployed binary must always contain every migration that the database has applied.
+
+Run `cargo fmt --all --check` and `cargo clippy --workspace --all-targets --all-features -- -D warnings` before each commit.
+
+Run `CI=true pnpm run typecheck` in `apps/web` before each commit that changes web code.
+
+Run `CI=true pnpm run lint` in `apps/web` before each commit that changes web code.
+
+Run `pnpm run test` in `apps/web` before each commit that changes web code.
+
 ## Rust safety
 
 Prefer safe Rust in all code.
