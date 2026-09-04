@@ -1768,6 +1768,64 @@ impl JobRepository {
         Ok(record)
     }
 
+    /// Completes one partition and queues its finalizer in one transaction.
+    ///
+    /// A failed finalizer insert leaves the partition running so lease recovery retries both steps.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn complete_provider_reconciliation_partition(
+        &self,
+        job_id: Uuid,
+        worker_id: &str,
+        run_id: Uuid,
+        source_id: Uuid,
+        parent_job_id: Uuid,
+    ) -> Result<(), PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        let updated = sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'succeeded', completed_at = now(), updated_at = now(),
+                locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+            WHERE id = $1 AND status = 'running' AND locked_by = $2
+            ",
+        )
+        .bind(job_id)
+        .bind(worker_id)
+        .execute(&mut *transaction)
+        .await?;
+        ensure_owned(updated.rows_affected(), job_id, worker_id)?;
+
+        let run_id_text = run_id.to_string();
+        let source_id_text = source_id.to_string();
+        let parent_job_id_text = parent_job_id.to_string();
+        sqlx::query(
+            r"
+            INSERT INTO jobs (id, kind, payload, available_at)
+            SELECT $1, 'finalize-provider-reconciliation', $2, now()
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs
+                WHERE id = $3 AND status = 'cancelled'
+                FOR UPDATE
+            )
+            ON CONFLICT ((payload->>'runId'))
+                WHERE kind = 'finalize-provider-reconciliation'
+                  AND status IN ('queued', 'running')
+                DO NOTHING
+            ",
+        )
+        .bind(Uuid::now_v7())
+        .bind(serde_json::json!({
+            "runId": run_id_text,
+            "sourceId": source_id_text,
+            "parentJobId": parent_job_id_text,
+        }))
+        .bind(parent_job_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Enqueues one low-priority `health-probe` job only when no queued or
     /// running `health-probe` job already targets the stream.
     ///
@@ -1979,6 +2037,10 @@ impl JobRepository {
         .fetch_optional(&mut *transaction)
         .await?
         .unwrap_or(false);
+        if !parent_cancelled {
+            transaction.commit().await?;
+            return Ok(false);
+        }
         let child_count = sqlx::query(
             r"
             UPDATE jobs

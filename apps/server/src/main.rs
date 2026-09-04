@@ -885,8 +885,9 @@ async fn run_provider_reconciliation_partition_job(
                 }),
             )
             .await?;
-            jobs.succeed(job.id, worker_id).await?;
-            jobs.enqueue_provider_reconciliation_finalizer_if_idle(
+            jobs.complete_provider_reconciliation_partition(
+                job.id,
+                worker_id,
                 run_id,
                 source_id,
                 parent_job_id,
