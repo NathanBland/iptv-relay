@@ -283,8 +283,12 @@ impl CatalogRepository {
                 transaction.commit().await?;
                 return Ok(Some(run));
             }
-            transaction.commit().await?;
-            return Ok(Some(run));
+            if run.status != "cancelled" {
+                transaction.commit().await?;
+                return Ok(Some(run));
+            }
+            // Canceled runs remain immutable audit records. The snapshot can
+            // be reconciled again by inserting a new run below.
         }
 
         let total_keys: i64 = sqlx::query_scalar(

@@ -513,6 +513,26 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
             .unwrap();
     assert_eq!(canceled_partition_status, "cancelled");
 
+    let orphan_partition = jobs
+        .enqueue(&NewJob::immediate(
+            "reconcile-provider-partition",
+            json!({
+                "runId": uuid::Uuid::now_v7(),
+                "partitionNumber": "0",
+                "sourceId": account_id,
+                "parentJobId": uuid::Uuid::now_v7(),
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(jobs.cancel(orphan_partition.id).await.unwrap());
+    let orphan_status: String = sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+        .bind(orphan_partition.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(orphan_status, "cancelled");
+
     let retry_finalizer = jobs
         .enqueue(&NewJob::immediate(
             "finalize-provider-reconciliation",

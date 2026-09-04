@@ -2291,8 +2291,22 @@ impl JobRepository {
         .fetch_optional(&mut *transaction)
         .await?;
         let Some((parent_status, parent_activation_locked)) = parent else {
+            let canceled = sqlx::query(
+                r"
+                UPDATE jobs
+                SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                    locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+                WHERE id = $1 AND status IN ('queued', 'running')
+                  AND coalesce(progress->>'activationLocked', 'false') <> 'true'
+                ",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected()
+                == 1;
             transaction.commit().await?;
-            return Ok(false);
+            return Ok(canceled);
         };
         if parent_activation_locked {
             transaction.commit().await?;
