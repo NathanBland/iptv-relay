@@ -3836,6 +3836,13 @@ async fn source_configuration_and_job_management_work() {
         ))
         .await
         .unwrap();
+    let short_epg_for_deleted_source = jobs
+        .enqueue(&NewJob::immediate(
+            "refresh-xtream-short-epg",
+            json!({"sourceId": provider.source.id}),
+        ))
+        .await
+        .unwrap();
     let partition_for_deleted_source = jobs
         .enqueue(&NewJob::immediate(
             "reconcile-provider-partition",
@@ -3866,6 +3873,13 @@ async fn source_configuration_and_job_management_work() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(
+        "UPDATE jobs SET status = 'running', locked_by = 'delete-test-worker', locked_at = now(), heartbeat_at = now() WHERE id = $1",
+    )
+    .bind(short_epg_for_deleted_source.id)
+    .execute(&pool)
+    .await
+    .unwrap();
     sources
         .delete(provider.source.id, "integration-test")
         .await
@@ -3876,6 +3890,7 @@ async fn source_configuration_and_job_management_work() {
             .unwrap()
     );
     for job_id in [
+        short_epg_for_deleted_source.id,
         partition_for_deleted_source.id,
         finalizer_for_deleted_source.id,
     ] {

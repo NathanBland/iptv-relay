@@ -1261,6 +1261,19 @@ impl SourceRepository {
         .bind(&source_id_text)
         .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            r"
+            UPDATE jobs
+            SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+            WHERE kind = 'refresh-xtream-short-epg'
+              AND payload->>'sourceId' = $1
+              AND status IN ('queued', 'running')
+            ",
+        )
+        .bind(&source_id_text)
+        .execute(&mut *transaction)
+        .await?;
         // Update parents first, then children, to match the reconciliation
         // cancellation lock order and avoid deadlocks with active workers.
         sqlx::query(
