@@ -2184,7 +2184,8 @@ impl JobRepository {
     /// Returns [`PersistenceError::JobNotFound`] if no job exists and a
     /// database error if cancellation cannot be persisted.
     pub async fn cancel(&self, job_id: Uuid) -> Result<bool, PersistenceError> {
-        let status: Option<String> = sqlx::query_scalar(
+        let mut transaction = self.pool.begin().await?;
+        let kind: Option<String> = sqlx::query_scalar(
             r"
             UPDATE jobs
             SET status = 'cancelled', completed_at = now(), updated_at = now(),
@@ -2192,24 +2193,56 @@ impl JobRepository {
             WHERE id = $1
               AND status IN ('queued', 'running')
               AND coalesce(progress->>'activationLocked', 'false') <> 'true'
-            RETURNING status
+            RETURNING kind
             ",
         )
         .bind(job_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?;
-        if status.is_some() {
-            return Ok(true);
-        }
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)")
-            .bind(job_id)
-            .fetch_one(&self.pool)
+        let Some(kind) = kind else {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)")
+                    .bind(job_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            transaction.commit().await?;
+            return if exists {
+                Ok(false)
+            } else {
+                Err(PersistenceError::JobNotFound(job_id))
+            };
+        };
+        if kind == "refresh-source" {
+            sqlx::query(
+                r"
+                UPDATE jobs
+                SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                    locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+                WHERE payload->>'parentJobId' = $1
+                  AND kind IN (
+                      'reconcile-provider-partition',
+                      'finalize-provider-reconciliation'
+                  )
+                  AND status IN ('queued', 'running')
+                  AND coalesce(progress->>'activationLocked', 'false') <> 'true'
+                ",
+            )
+            .bind(job_id.to_string())
+            .execute(&mut *transaction)
             .await?;
-        if exists {
-            Ok(false)
-        } else {
-            Err(PersistenceError::JobNotFound(job_id))
+            sqlx::query(
+                r"
+                UPDATE provider_reconciliation_runs
+                SET status = 'cancelled', updated_at = now()
+                WHERE parent_job_id = $1 AND status IN ('queued', 'processing')
+                ",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await?;
         }
+        transaction.commit().await?;
+        Ok(true)
     }
 
     /// Cancels one source refresh and its queued or running child jobs.

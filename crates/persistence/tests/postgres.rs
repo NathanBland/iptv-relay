@@ -331,6 +331,17 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
     .execute(&pool)
     .await
     .unwrap();
+    let partition_job = jobs
+        .enqueue(&NewJob::immediate(
+            "reconcile-provider-partition",
+            json!({
+                "runId": run_id,
+                "partition": 0,
+                "parentJobId": parent.id,
+            }),
+        ))
+        .await
+        .unwrap();
     let finalizer = jobs
         .enqueue(&NewJob::immediate(
             "finalize-provider-reconciliation",
@@ -358,6 +369,13 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
             .await
             .unwrap();
     assert_eq!(canceled_run_status, "cancelled");
+    let canceled_partition_status: String =
+        sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1")
+            .bind(partition_job.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(canceled_partition_status, "cancelled");
 
     let retry_finalizer = jobs
         .enqueue(&NewJob::immediate(
@@ -390,6 +408,13 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
         .unwrap()
         .expect("canceled runs create a fresh reconciliation run");
     assert_ne!(replacement_run.id, run_id);
+    let preserved_run_status: String =
+        sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")
+            .bind(run_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(preserved_run_status, "cancelled");
     let snapshot_status: String =
         sqlx::query_scalar("SELECT status FROM source_snapshots WHERE id = $1")
             .bind(snapshot_id)

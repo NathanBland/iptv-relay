@@ -235,6 +235,8 @@ impl CatalogRepository {
                    partition_count, total_keys, completed_keys
             FROM provider_reconciliation_runs
             WHERE source_snapshot_id = $1
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
             FOR UPDATE
             ",
         )
@@ -243,12 +245,8 @@ impl CatalogRepository {
         .await?
         {
             if run.status == "cancelled" {
-                // Cancellation is terminal for this run. Delete its private
-                // work so a later refresh creates a new run identifier.
-                sqlx::query("DELETE FROM provider_reconciliation_runs WHERE id = $1")
-                    .bind(run.id)
-                    .execute(&mut *transaction)
-                    .await?;
+                // Cancellation is terminal for this run. Keep its record for
+                // audit, then create a new run for a later refresh.
             } else if run.status != "processing" {
                 // A checksum-equivalent snapshot can become staging again
                 // after a newer snapshot supersedes it. Rebuild its durable
