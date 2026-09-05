@@ -57,6 +57,7 @@ nav:
       - Testing: development/testing.md
       - OpenAPI Drift Check: development/openapi-drift-check.md
       - Architecture: development/architecture.md
+      - Live Job Diagnostics: development/live-job-diagnostics.md
       - Release Images: development/releasing.md
 plugins:
   - search

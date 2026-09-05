@@ -375,6 +375,116 @@ describe('FetchIptvApiClient', () => {
     await expect(managementClient.removeStreamProfile('channel')).resolves.toBeUndefined()
   })
 
+  it('covers settings, support, reconciliation, and operator token endpoints', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      if (path.endsWith('/revoke')) return new Response(null, { status: 204 })
+      if (path === '/api/v1/auth/tokens') return init?.method === 'POST' ? jsonResponse({ token: 'issued' }) : jsonResponse([])
+      if (path.endsWith('/rotate')) return jsonResponse({ token: 'issued' })
+      if (
+        path === '/api/v1/settings/schema'
+        || path.endsWith('/reconcile/revisions')
+        || path.endsWith('/revisions')
+        || path === '/api/v1/event-templates/suggestions'
+        || path === '/api/v1/jobs'
+        || path === '/api/v1/support/logs'
+      ) return jsonResponse([])
+      return jsonResponse({ ok: true, enabled: 1, disabled: 0, queued: 2, ranked: 3 })
+    })
+    const client = new FetchIptvApiClient(fetcher, { readCsrfToken: () => 'coverage-token' })
+
+    await client.getOperatorApiTokens()
+    await client.createOperatorApiToken({ name: 'coverage', scopes: ['read'] })
+    await client.rotateOperatorApiToken('token / one')
+    await client.rotateOperatorApiToken('token / two', { name: 'rotated', scopes: ['write'], expiresAt: null })
+    await client.revokeOperatorApiToken('token / one')
+
+    await client.getRegionSettings()
+    await client.updateRegionSettings({ timezone: 'UTC', enabledPrefixes: ['US'] })
+    await client.applyRegionFilter({ enabledPrefixes: ['US'] })
+    await client.listReconciliationRevisions('source / one')
+    await client.rollbackReconciliation('source / one', { revision: 2 })
+    await client.suggestEventTemplates()
+    await client.getJobs()
+    await client.getSupportBundle()
+    await client.getSupportLogs()
+
+    await client.getSettingSchema()
+    await client.getEffectiveSettings()
+    await client.getEffectiveSettings('provider / one', 'group / one')
+    await client.getOperatorOverrides()
+    await client.getOperatorScope('global', '')
+    await client.getOperatorScope('provider', 'provider / one')
+    await client.getOperatorScope('group', 'group / one')
+    await client.replaceOperatorScope('global', '', { overrides: {} })
+    await client.replaceOperatorScope('provider', 'provider / one', { overrides: {}, ifMatch: '"1"' })
+    await client.listOperatorRevisions('group', 'group / one')
+    await client.rollbackOperatorScope('group', 'group / one', { revision: 2 })
+
+    expect(fetcher.mock.calls.some(([path]) => String(path) === '/api/v1/settings/effective?providerId=provider+%2F+one&groupId=group+%2F+one')).toBe(true)
+    expect(fetcher.mock.calls.some(([, request]) => new Headers(request?.headers).get('x-csrf-token') === 'coverage-token')).toBe(true)
+  })
+
+  it('covers empty optional filters and Jellyfin response validation', async () => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input)
+      if (path === '/api/v1/streams/health') return jsonResponse({ items: [] })
+      if (path === '/api/v1/event-channels') return jsonResponse([])
+      if (path === '/api/v1/channel-aliases' || path === '/api/v1/recordings') return jsonResponse({ items: [] })
+      return jsonResponse({ status: 'available', guideDaysMax: 7 })
+    })
+    const client = new FetchIptvApiClient(fetcher, { readCsrfToken: () => 'coverage-token' })
+    await expect(client.getStreamHealth()).resolves.toEqual({ total: 0, items: [], estimated: false })
+    await expect(client.getChannelAliases()).resolves.toMatchObject({ total: 0, items: [] })
+    await expect(client.getRecordings()).resolves.toMatchObject({ total: 0, items: [] })
+    await expect(client.getEventChannels()).resolves.toEqual([])
+    await expect(client.rotateJellyfinToken()).resolves.toMatchObject({ status: 'available', guideDaysMax: 7 })
+
+    const invalidStatus = new FetchIptvApiClient(async () => jsonResponse({ status: 'unknown', guideDaysMax: 7 }))
+    await expect(invalidStatus.getJellyfinSetup()).rejects.toThrow('valid status')
+    const missingGuideDays = new FetchIptvApiClient(async () => jsonResponse({ status: 'available' }))
+    await expect(missingGuideDays.getJellyfinSetup()).rejects.toThrow('guideDaysMax')
+  })
+
+  it('preserves token settings on rotation and rejects inactive token mutations in demo mode', async () => {
+    const client = new MockIptvApiClient()
+    await expect(client.createOperatorApiToken({ name: ' ', scopes: ['read'] })).rejects.toMatchObject({ problem: { status: 400 } })
+    await expect(client.createOperatorApiToken({ name: 'empty', scopes: [] })).rejects.toMatchObject({ problem: { status: 400 } })
+    const expiresAt = '2030-01-01T00:00:00Z'
+    const created = await client.createOperatorApiToken({ name: ' original ', scopes: ['read'], expiresAt })
+    expect(created).toMatchObject({ name: 'original', scopes: ['read'], expiresAt })
+    const inherited = await client.rotateOperatorApiToken(created.id)
+    expect(inherited).toMatchObject({ name: 'original', scopes: ['read'], expiresAt })
+    await expect(client.rotateOperatorApiToken(created.id)).rejects.toMatchObject({ problem: { status: 404 } })
+    const changed = await client.rotateOperatorApiToken(inherited.id, { name: 'changed', scopes: ['write'], expiresAt: null })
+    expect(changed).toMatchObject({ name: 'changed', scopes: ['write'], expiresAt: null })
+    const unchanged = await client.rotateOperatorApiToken(changed.id, {})
+    expect(unchanged).toMatchObject({ name: 'changed', scopes: ['write'], expiresAt: null })
+    const listed = await client.getOperatorApiTokens()
+    const listedToken = listed.find((token) => token.id === unchanged.id)!
+    listedToken.scopes.push('read')
+    expect((await client.getOperatorApiTokens()).find((token) => token.id === unchanged.id)?.scopes).toEqual(['write'])
+    await client.revokeOperatorApiToken(unchanged.id)
+    await expect(client.revokeOperatorApiToken(unchanged.id)).rejects.toMatchObject({ problem: { status: 404 } })
+    await expect(client.revokeOperatorApiToken('missing')).rejects.toMatchObject({ problem: { status: 404 } })
+    await expect(client.rotateOperatorApiToken('missing')).rejects.toMatchObject({ problem: { status: 404 } })
+  })
+
+  it('rejects mixed and incomplete demo source credentials', async () => {
+    const client = new MockIptvApiClient()
+    await expect(client.createSource({ name: '', kind: 'M3U', endpoint: 'https://provider.test/list' })).rejects.toThrow('Name and source')
+    await expect(client.createSource({ name: 'Missing', kind: 'M3U' })).rejects.toThrow('Name and source')
+    for (const missing of ['serverUrl', 'username', 'password'] as const) {
+      const input = { name: 'Incomplete', kind: 'Xtream' as const, serverUrl: 'https://provider.test', username: 'demo', password: 'demo' }
+      input[missing] = ''
+      await expect(client.createSource(input)).rejects.toThrow('required together')
+    }
+    await expect(client.createSource({ name: 'Mixed', kind: 'Xtream', endpoint: 'https://provider.test/list', serverUrl: 'https://provider.test', username: 'demo', password: 'demo' })).rejects.toThrow('either Xtream credentials')
+    await expect(client.createSource({ name: 'Wrong type', kind: 'M3U', serverUrl: 'https://provider.test', username: 'demo', password: 'demo' })).rejects.toThrow('require an Xtream source')
+    const created = await client.createSource({ name: 'Credentials', kind: 'Xtream', serverUrl: 'https://provider.test', username: 'demo', password: 'demo', timezone: 'America/Denver' })
+    expect(created).toMatchObject({ endpoint: 'https://provider.test', timezone: 'America/Denver', state: 'syncing' })
+  })
+
   it('advances mock sync stages and applies optional mock filters', async () => {
     const client = new MockIptvApiClient()
     await expect(client.getSourceSyncStatus('missing')).rejects.toMatchObject({ problem: { status: 404 } })

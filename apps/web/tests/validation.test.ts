@@ -68,6 +68,17 @@ describe('management form schemas', () => {
     expect(sourceSchema.safeParse({ name: 'Prime IPTV', kind: 'M3U', endpoint: 'https://provider.example/list name.m3u', serverUrl: '', username: '', password: '', timezone: 'UTC' }).success).toBe(false)
   })
 
+  it('covers alternate source connection validation branches', () => {
+    const noConnection = sourceSchema.safeParse({ name: 'Prime IPTV', kind: 'Xtream', endpoint: '', serverUrl: '', username: '', password: '', timezone: 'UTC' })
+    expect(noConnection.success).toBe(false)
+    const invalidCredentialsUrl = sourceSchema.safeParse({ name: 'Prime IPTV', kind: 'Xtream', endpoint: '', serverUrl: 'not-a-url', username: 'operator', password: 'secret', timezone: 'UTC' })
+    expect(invalidCredentialsUrl.success).toBe(false)
+    const nonXtreamCredentials = sourceSchema.safeParse({ name: 'Prime IPTV', kind: 'M3U', endpoint: '', serverUrl: 'https://provider.example', username: 'operator', password: 'secret', timezone: 'UTC' })
+    expect(nonXtreamCredentials.success).toBe(false)
+    const nonXtreamInvalidEndpoint = sourceSchema.safeParse({ name: 'Prime IPTV', kind: 'M3U', endpoint: 'relative/path', serverUrl: '', username: '', password: '', timezone: 'UTC' })
+    expect(nonXtreamInvalidEndpoint.success).toBe(false)
+  })
+
   it('requires safe provider settings when a source is edited', () => {
     expect(sourceUpdateSchema.safeParse({ maxConnections: 3, timezone: 'America/Denver', enabled: true }).success).toBe(true)
     expect(sourceUpdateSchema.safeParse({ maxConnections: 0, timezone: ' ', enabled: true }).success).toBe(false)

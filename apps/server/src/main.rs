@@ -347,6 +347,23 @@ async fn refresh_scheduler(jobs: &JobRepository, cb_cooldown_seconds: i64) {
     }
 }
 
+async fn forward_job_notifications(
+    listener: &mut sqlx::postgres::PgListener,
+    notify: &Notify,
+) -> std::result::Result<(), sqlx::Error> {
+    loop {
+        listener.recv().await?;
+        notify.notify_one();
+    }
+}
+
+async fn wait_for_job(notify: &Notify) {
+    tokio::select! {
+        () = notify.notified() => {}
+        () = sleep(Duration::from_secs(5)) => {}
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn worker() -> Result<()> {
     let database = database().await?;
@@ -452,19 +469,12 @@ async fn worker() -> Result<()> {
                 continue;
             }
             info!("LISTEN job_available connected");
-            loop {
-                match listener.recv().await {
-                    Ok(_notification) => listener_notify.notify_one(),
-                    Err(error) => {
-                        warn!(%error, "LISTEN connection lost, reconnecting");
-                        break;
-                    }
-                }
+            if let Err(error) = forward_job_notifications(&mut listener, &listener_notify).await {
+                warn!(%error, "LISTEN connection lost, reconnecting");
             }
         }
     });
 
-    let fallback_interval = Duration::from_secs(5);
     loop {
         tokio::select! {
             () = shutdown_signal() => {
@@ -490,10 +500,7 @@ async fn worker() -> Result<()> {
                         }
                     }
                     Ok(None) => {
-                        tokio::select! {
-                            () = job_notify.notified() => {}
-                            () = sleep(fallback_interval) => {}
-                        }
+                        wait_for_job(&job_notify).await;
                     }
                     Err(error) => {
                         error!(%error, "job claim failed");
@@ -744,94 +751,179 @@ async fn run_source_refresh(
         master_key: master_key.clone(),
         associated_data: format!("iptv-provider-stream:v1:{}", source.id),
     };
-    let result = if source.kind == SourceKind::Xtream {
-        info!(job_id = %job.id, source_id = %source_id, "starting Xtream source refresh");
-        run_xtream_refresh(
+    source_refresher(source.kind)?
+        .refresh(RefreshContext {
+            source: &source,
             endpoint,
-            source.id,
-            source.timezone,
-            control.clone(),
+            control,
             protector,
             snapshots,
-        )
-        .await?
-    } else {
-        let (owner, format) = refresh_target(source.kind, source.id)?;
-        info!(
-            job_id = %job.id,
-            source_id = %source_id,
-            format = ?format,
-            "starting source download"
-        );
-        let request = IngestRequest {
-            owner,
-            format,
-            download: DownloadRequest::new(endpoint),
-            source_timezone: source.timezone,
-            xtream_stream_endpoint: None,
-            xtream_category_names: HashMap::new(),
-        };
-        if source.kind == SourceKind::M3u {
-            Ingestor::new(
-                protector,
-                control.clone(),
-                StagedSnapshotActivator::new(snapshots.clone()),
+            jobs,
+            catalog,
+            parent_job_id: job.id,
+        })
+        .await
+}
+
+struct RefreshContext<'a> {
+    source: &'a iptv_persistence::DecryptedSource,
+    endpoint: Url,
+    control: WorkerJobControl,
+    protector: StreamEndpointProtector,
+    snapshots: &'a PgSnapshotStore,
+    jobs: &'a JobRepository,
+    catalog: &'a CatalogRepository,
+    parent_job_id: Uuid,
+}
+
+type SourceRefreshFuture<'a> =
+    Pin<Box<dyn Future<Output = std::result::Result<RefreshExecution, RefreshError>> + 'a>>;
+
+trait SourceRefresher: Sync {
+    fn refresh<'a>(&self, context: RefreshContext<'a>) -> SourceRefreshFuture<'a>;
+}
+
+struct M3uRefresher;
+struct XmltvRefresher;
+struct XtreamRefresher;
+
+fn source_refresher(
+    kind: SourceKind,
+) -> std::result::Result<&'static dyn SourceRefresher, RefreshError> {
+    match kind {
+        SourceKind::M3u => Ok(&M3uRefresher),
+        SourceKind::Xmltv => Ok(&XmltvRefresher),
+        SourceKind::Xtream => Ok(&XtreamRefresher),
+        SourceKind::NetworkTuner => Err(RefreshError::UnsupportedSource),
+    }
+}
+
+fn source_ingest_request(
+    context: &RefreshContext<'_>,
+    owner: SnapshotOwner,
+    format: IngestFormat,
+) -> IngestRequest {
+    info!(
+        job_id = %context.parent_job_id,
+        source_id = %context.source.id,
+        format = ?format,
+        "starting source download"
+    );
+    IngestRequest {
+        owner,
+        format,
+        download: DownloadRequest::new(context.endpoint.clone()),
+        source_timezone: context.source.timezone.clone(),
+        xtream_stream_endpoint: None,
+        xtream_category_names: HashMap::new(),
+    }
+}
+
+impl SourceRefresher for M3uRefresher {
+    fn refresh<'a>(&self, context: RefreshContext<'a>) -> SourceRefreshFuture<'a> {
+        Box::pin(async move {
+            let request = source_ingest_request(
+                &context,
+                SnapshotOwner::ProviderAccount(context.source.id),
+                IngestFormat::M3u,
+            );
+            let result = Ingestor::new(
+                context.protector,
+                context.control.clone(),
+                StagedSnapshotActivator::new(context.snapshots.clone()),
             )
             .run(&request)
             .await
-        } else {
-            // XMLTV has no deferred provider reconciliation. Publish its
-            // snapshot before mapping the guide against active rows.
-            Ingestor::new(protector, control.clone(), snapshots.clone())
-                .run(&request)
-                .await
-        }
-        .map_err(RefreshError::Ingest)?
-    };
-    let deferred = if matches!(source.kind, SourceKind::M3u | SourceKind::Xtream) {
-        schedule_provider_reconciliation(
-            jobs,
-            catalog,
-            &control,
-            &result,
-            source.id,
-            job.id,
-            reconciliation_partition_count(),
-        )
-        .await?
-    } else {
-        let reconciliation_progress = WorkerProviderReconciliationProgress {
-            control: &control,
-            result: &result,
-        };
-        run_post_refresh_catalog(
-            source.kind,
-            source.id,
-            catalog,
-            &control,
-            &result,
-            &reconciliation_progress,
-            reconciliation_batch_size(),
-        )
-        .await
-        .map_err(|error| {
-            warn!(job_id = %job.id, source_id = %source.id, error = ?error, "catalog post-refresh work failed");
-            error
-        })?;
-        false
-    };
-    if source.kind == SourceKind::Xtream {
-        match jobs.enqueue_xtream_short_epg(source.id).await {
-            Ok(Some(guide_job)) => {
-                info!(job_id = %guide_job.id, source_id = %source.id, "scheduled Xtream short EPG refresh");
-            }
-            Ok(None) => {}
-            Err(error) => {
-                warn!(source_id = %source.id, error = %error, "failed to schedule Xtream short EPG refresh");
-            }
-        }
+            .map_err(RefreshError::Ingest)?;
+            let deferred = schedule_provider_reconciliation(
+                context.jobs,
+                context.catalog,
+                &context.control,
+                &result,
+                context.source.id,
+                context.parent_job_id,
+                reconciliation_partition_count(),
+            )
+            .await?;
+            Ok(RefreshExecution { result, deferred })
+        })
     }
-    Ok(RefreshExecution { result, deferred })
+}
+
+impl SourceRefresher for XmltvRefresher {
+    fn refresh<'a>(&self, context: RefreshContext<'a>) -> SourceRefreshFuture<'a> {
+        Box::pin(async move {
+            let request = source_ingest_request(
+                &context,
+                SnapshotOwner::EpgSource(context.source.id),
+                IngestFormat::Xmltv,
+            );
+            let result = Ingestor::new(
+                context.protector,
+                context.control.clone(),
+                context.snapshots.clone(),
+            )
+            .run(&request)
+            .await
+            .map_err(RefreshError::Ingest)?;
+            let reconciliation_progress = WorkerProviderReconciliationProgress {
+                control: &context.control,
+                result: &result,
+            };
+            run_post_refresh_catalog(
+                SourceKind::Xmltv, context.source.id, context.catalog, &context.control,
+                &result, &reconciliation_progress, reconciliation_batch_size(),
+            ).await.map_err(|error| {
+                warn!(job_id = %context.parent_job_id, source_id = %context.source.id, error = ?error, "catalog post-refresh work failed");
+                error
+            })?;
+            Ok(RefreshExecution {
+                result,
+                deferred: false,
+            })
+        })
+    }
+}
+
+impl SourceRefresher for XtreamRefresher {
+    fn refresh<'a>(&self, context: RefreshContext<'a>) -> SourceRefreshFuture<'a> {
+        Box::pin(async move {
+            info!(job_id = %context.parent_job_id, source_id = %context.source.id, "starting Xtream source refresh");
+            let result = run_xtream_refresh(
+                context.endpoint,
+                context.source.id,
+                context.source.timezone.clone(),
+                context.control.clone(),
+                context.protector,
+                context.snapshots,
+            )
+            .await?;
+            let deferred = schedule_provider_reconciliation(
+                context.jobs,
+                context.catalog,
+                &context.control,
+                &result,
+                context.source.id,
+                context.parent_job_id,
+                reconciliation_partition_count(),
+            )
+            .await?;
+            match context
+                .jobs
+                .enqueue_xtream_short_epg(context.source.id)
+                .await
+            {
+                Ok(Some(guide_job)) => {
+                    info!(job_id = %guide_job.id, source_id = %context.source.id, "scheduled Xtream short EPG refresh");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(source_id = %context.source.id, error = %error, "failed to schedule Xtream short EPG refresh");
+                }
+            }
+            Ok(RefreshExecution { result, deferred })
+        })
+    }
 }
 
 fn completed_refresh_progress(source_refresh: bool, result: &IngestResult) -> serde_json::Value {
@@ -2294,6 +2386,7 @@ fn source_id_from_payload(payload: &serde_json::Value) -> Option<Uuid> {
         .and_then(|value| Uuid::parse_str(value).ok())
 }
 
+#[cfg(test)]
 fn refresh_target(
     kind: SourceKind,
     source_id: Uuid,
@@ -4444,6 +4537,248 @@ mod tests {
         }
         let error = database().await.expect_err("missing database URL");
         assert!(error.to_string().contains("DATABASE_URL"));
+    }
+
+    #[test]
+    fn source_refresher_factory_rejects_network_tuners() {
+        for kind in [SourceKind::M3u, SourceKind::Xmltv, SourceKind::Xtream] {
+            assert!(source_refresher(kind).is_ok());
+        }
+        assert!(matches!(
+            source_refresher(SourceKind::NetworkTuner),
+            Err(RefreshError::UnsupportedSource)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_wait_uses_five_second_fallback_without_notifications() {
+        let notify = Notify::new();
+        let start = tokio::time::Instant::now();
+        wait_for_job(&notify).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        wait_for_job(&notify).await;
+        assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn job_wait_preserves_notifications_received_before_wait() {
+        let notify = Notify::new();
+        notify.notify_one();
+        let start = tokio::time::Instant::now();
+        wait_for_job(&notify).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn job_notifications_claim_immediately_and_fallback_after_disconnect() {
+        let Some((admin, database, schema)) = isolated_integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        for _ in 0..2 {
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0060_job_notify_trigger.sql"
+            ))
+            .execute(database.pool())
+            .await
+            .expect("repeat notification migration");
+        }
+        let jobs = JobRepository::new(database.pool().clone());
+        let mut listener = sqlx::postgres::PgListener::connect_with(database.pool())
+            .await
+            .expect("connect listener");
+        listener.listen("job_available").await.expect("subscribe");
+        let notify = std::sync::Arc::new(Notify::new());
+        let listener_notify = notify.clone();
+        let listener_task = tokio::spawn(async move {
+            forward_job_notifications(&mut listener, &listener_notify).await
+        });
+        assert!(jobs.claim("notify-test").await.unwrap().is_none());
+        let mut transaction = database.pool().begin().await.unwrap();
+        sqlx::query("INSERT INTO jobs (id, kind, payload) VALUES ($1, 'noop', '{}')")
+            .bind(Uuid::now_v7())
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        transaction.rollback().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), notify.notified())
+                .await
+                .is_err()
+        );
+
+        let job = jobs
+            .enqueue(&NewJob::immediate("noop", serde_json::json!({})))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let claimed = tokio::time::timeout(Duration::from_millis(50), async {
+            wait_for_job(&notify).await;
+            jobs.claim("notify-test")
+                .await
+                .unwrap()
+                .expect("claim notified job")
+        })
+        .await
+        .expect("notification must claim within 50ms");
+        assert_eq!(claimed.id, job.id);
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        listener_task.abort();
+        let _ = listener_task.await;
+        let job = jobs
+            .enqueue(&NewJob::immediate("noop", serde_json::json!({})))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        wait_for_job(&notify).await;
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        let claimed = jobs
+            .claim("fallback-test")
+            .await
+            .unwrap()
+            .expect("fallback claim");
+        assert_eq!(claimed.id, job.id);
+        database.pool().close().await;
+        drop_isolated_schema(&admin, &schema).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn three_workers_build_candidates_before_atomic_publication() {
+        let Some((admin, database, schema)) = isolated_integration_database().await else {
+            eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping integration test");
+            return;
+        };
+        let mut playlist = String::from("#EXTM3U\n");
+        for index in 0..1500 {
+            use std::fmt::Write;
+            writeln!(playlist, "#EXTINF:-1 tvg-id=\"parallel-{index}\",Channel {index}\nhttp://provider.test/{index}.ts").unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let source_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/list.m3u",
+                    get(move || {
+                        let playlist = playlist.clone();
+                        async move { playlist }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let pool = database.pool().clone();
+        let key = MasterKey::from_bytes([29_u8; 32]);
+        let sources = SourceRepository::new(pool.clone(), key.clone());
+        let jobs = JobRepository::new(pool.clone());
+        let snapshots = PgSnapshotStore::new(pool.clone());
+        let catalog = CatalogRepository::new(pool.clone());
+        let created = sources
+            .create(
+                &iptv_persistence::NewSource {
+                    name: "Parallel acceptance".to_owned(),
+                    kind: SourceKind::M3u,
+                    endpoint: format!("http://{address}/list.m3u"),
+                },
+                "integration-test",
+            )
+            .await
+            .unwrap();
+        force_running(&pool, created.refresh_job.id, "coordinator").await;
+        let parent = fetch_job(&pool, created.refresh_job.id).await;
+        let start = std::time::Instant::now();
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &key,
+            "coordinator",
+            parent,
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(job_status(&pool, created.refresh_job.id).await, "running");
+        let children: Vec<JobRecord> = sqlx::query_as(
+            "SELECT * FROM jobs WHERE kind = 'reconcile-provider-partition' AND payload->>'parentJobId' = $1 ORDER BY id"
+        ).bind(created.refresh_job.id.to_string()).fetch_all(&pool).await.unwrap();
+        assert_eq!(children.len(), 3);
+        let mut claims = Vec::new();
+        for (index, child) in children.iter().enumerate() {
+            let worker = format!("partition-worker-{index}");
+            force_running(&pool, child.id, &worker).await;
+            claims.push((worker, fetch_job(&pool, child.id).await));
+        }
+        let results =
+            futures_util::future::join_all(claims.into_iter().map(|(worker, child)| {
+                let jobs = &jobs;
+                let sources = &sources;
+                let snapshots = &snapshots;
+                let catalog = &catalog;
+                let key = &key;
+                async move {
+                    process_job(jobs, sources, snapshots, catalog, key, &worker, child, 5).await
+                }
+            }))
+            .await;
+        for result in results {
+            result.unwrap();
+        }
+        let preparation = start.elapsed();
+        let public_channels: i64 = sqlx::query_scalar("SELECT count(*) FROM channels")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(public_channels, 0, "candidates must remain invisible");
+        let workers: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT worker_id) FROM provider_reconciliation_partitions",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(workers, 3);
+        let finalizer: JobRecord = sqlx::query_as(
+            "SELECT * FROM jobs WHERE kind = 'finalize-provider-reconciliation' AND status = 'queued' AND payload->>'parentJobId' = $1"
+        ).bind(created.refresh_job.id.to_string()).fetch_one(&pool).await.unwrap();
+        force_running(&pool, finalizer.id, "finalizer").await;
+        let finalizer = fetch_job(&pool, finalizer.id).await;
+        process_job(
+            &jobs,
+            &sources,
+            &snapshots,
+            &catalog,
+            &key,
+            "finalizer",
+            finalizer,
+            5,
+        )
+        .await
+        .unwrap();
+        let public_channels: i64 = sqlx::query_scalar("SELECT count(*) FROM channels")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(public_channels, 1500);
+        assert_eq!(job_status(&pool, created.refresh_job.id).await, "succeeded");
+        let progress: serde_json::Value =
+            sqlx::query_scalar("SELECT progress FROM jobs WHERE id = $1")
+                .bind(created.refresh_job.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(progress["percent"], 100);
+        eprintln!(
+            "1500 records, 3 workers: preparation {preparation:?}, total {:?}",
+            start.elapsed()
+        );
+        source_server.abort();
+        database.pool().close().await;
+        drop_isolated_schema(&admin, &schema).await;
     }
 
     async fn integration_database() -> Option<Database> {

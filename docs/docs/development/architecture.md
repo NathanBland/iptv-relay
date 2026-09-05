@@ -72,3 +72,10 @@ All migrations use idempotent SQL constructs such as `CREATE TABLE IF NOT EXISTS
 The `/api/v1/catalog-events` endpoint publishes `overview` events with system counts every five seconds. The `/api/v1/session-events` endpoint publishes session lifecycle events.
 
 The frontend subscribes to SSE streams from authenticated sessions and invalidates React Query caches when events arrive.
+
+
+## Job notifications
+
+Workers subscribe to the PostgreSQL `job_available` channel. Each committed job insert sends its job UUID through this channel. A transaction rollback sends no notification.
+
+An idle worker attempts a claim when a notification arrives. A five-second fallback checks for jobs if notifications are absent or the listener disconnects. Each listener uses one database connection and reconnects after a connection failure.
