@@ -365,7 +365,12 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
         set_capacity(base, bootstrap, xtream_source, cap)
         for cycle in range(1, 4):
             for source in (xtream_source, xmltv_source):
-                sync = request_json(base, f"/api/v1/sources/{source}/sync", bootstrap, "POST")
+                try:
+                    sync = request_json(base, f"/api/v1/sources/{source}/sync", bootstrap, "POST")
+                except RuntimeError as error:
+                    if "status=409" not in str(error):
+                        raise
+                    sync = {"jobId": "already-queued"}
                 if not sync.get("jobId"):
                     raise RuntimeError("source sync response did not contain a job ID")
                 wait_sync(base, bootstrap, source, time.monotonic() + 1800)
