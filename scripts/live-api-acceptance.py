@@ -447,6 +447,13 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
         if identities[0] != identities[1] or identities[1] != identities[2]:
             raise RuntimeError("shared channel identities changed between sync cycles")
         final = storage_metrics(env_file, project)
+        if any(final.get(key, 0) != 0 for key in ("pendingJobs", "reconciliationCandidates", "stagingSnapshots")):
+            raise RuntimeError(
+                "terminal live acceptance state retained ingest resources: "
+                f"pendingJobs={final.get('pendingJobs', 0)}, "
+                f"reconciliationCandidates={final.get('reconciliationCandidates', 0)}, "
+                f"stagingSnapshots={final.get('stagingSnapshots', 0)}"
+            )
         peak = max((item.get("databaseBytes", 0) for item in [baseline, *cycles, final]), default=0)
         report = {"identityMode": identity_mode, "sharedProviderIds": len(shared), "providerUnmatched": {"xtreamOnlyCount": len(provider_ids - xmltv), "xmltvOnlyCount": len(xmltv - provider_ids), "xtreamOnlySample": sorted(provider_ids - xmltv)[:10], "xmltvOnlySample": sorted(xmltv - provider_ids)[:10]}, "providerCap": cap, "cycles": 3, "gatewayOutput": "playlist verified", "sampleProgrammes": samples, "storage": {"baseline": baseline, "cycles": cycles, "peakDatabaseBytes": peak, "final": final}}
         print(json.dumps(report, sort_keys=True), flush=True)
