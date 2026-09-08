@@ -439,10 +439,13 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
                     raise RuntimeError(f"cycle {cycle} omitted gateway channel mapping for {selected_channel}")
                 if not any(programme_key(value) == programme_key(selected_tuple) for value in gateway_samples):
                     raise RuntimeError(f"cycle {cycle} did not map the current provider programme sample")
-            identities.append(tuple(sorted(ids)))
+            # Providers can add or remove non-guide streams while a run is
+            # active. Require stable identity for the shared guide set that
+            # this acceptance gate uses for EPG mapping.
+            identities.append(tuple(sorted(set(ids) & shared)))
             cycles.append(storage_metrics(env_file, project))
         if identities[0] != identities[1] or identities[1] != identities[2]:
-            raise RuntimeError("channel identities changed between sync cycles")
+            raise RuntimeError("shared channel identities changed between sync cycles")
         final = storage_metrics(env_file, project)
         peak = max((item.get("databaseBytes", 0) for item in [baseline, *cycles, final]), default=0)
         report = {"identityMode": identity_mode, "sharedProviderIds": len(shared), "providerUnmatched": {"xtreamOnlyCount": len(provider_ids - xmltv), "xmltvOnlyCount": len(xmltv - provider_ids), "xtreamOnlySample": sorted(provider_ids - xmltv)[:10], "xmltvOnlySample": sorted(xmltv - provider_ids)[:10]}, "providerCap": cap, "cycles": 3, "gatewayOutput": "playlist verified", "sampleProgrammes": samples, "storage": {"baseline": baseline, "cycles": cycles, "peakDatabaseBytes": peak, "final": final}}
