@@ -1414,9 +1414,13 @@ impl CatalogRepository {
         .execute(&mut *transaction)
         .await?;
 
-        // Remove automatic mappings that no longer have a matching EPG
-        // channel by tvg-id, normalized name, or channel alias. Manual
-        // mappings are preserved.
+        // Remove automatic mappings whose target EPG channel is no longer an
+        // active match. Each mapping stores its selected EPG channel ID, so
+        // evaluate identity against that one row instead of scanning every
+        // active EPG channel and re-running the name normalizer for every
+        // mapping. A replacement XMLTV snapshot gives its channels new IDs,
+        // which makes this check precise and bounded. Manual mappings remain
+        // preserved.
         let removed: i64 = sqlx::query(
             r"
             DELETE FROM channel_epg_mappings cem
@@ -1428,18 +1432,22 @@ impl CatalogRepository {
               AND NOT EXISTS (
                 SELECT 1
                 FROM epg_channels ec
-                JOIN source_snapshots ss
-                  ON ss.id = ec.source_snapshot_id AND ss.status = 'active'
-                WHERE lower(ec.xmltv_id) = lower(c.canonical_key)
-                   OR normalize_channel_name(ec.display_names->0->>'value')
-                    = normalize_channel_name(c.name)
-                   OR EXISTS (
+                JOIN source_snapshots ss ON ss.id = ec.source_snapshot_id
+                WHERE ec.id = cem.epg_channel_id
+                  AND ss.status = 'active'
+                  AND (
+                    lower(ec.xmltv_id) = lower(c.canonical_key)
+                    OR normalize_channel_name(ec.display_names->0->>'value')
+                      = normalize_channel_name(c.name)
+                    OR EXISTS (
                       SELECT 1
                       FROM channel_aliases ca
-                      WHERE normalize_channel_name(ca.alias) = normalize_channel_name(c.name)
+                      WHERE normalize_channel_name(ca.alias)
+                              = normalize_channel_name(c.name)
                         AND normalize_channel_name(ca.canonical_name)
-                          = normalize_channel_name(ec.display_names->0->>'value')
-                   )
+                              = normalize_channel_name(ec.display_names->0->>'value')
+                    )
+                  )
               )
             ",
         )
