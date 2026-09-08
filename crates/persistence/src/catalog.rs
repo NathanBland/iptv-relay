@@ -1147,15 +1147,22 @@ impl CatalogRepository {
         // Skips channels that already have a manual mapping.
         let tvg_applied: i64 = sqlx::query(
             r"
+            WITH active_epg_channels AS (
+                SELECT DISTINCT ON (lower(ec.xmltv_id)) ec.id, lower(ec.xmltv_id) AS xmltv_id
+                FROM epg_channels ec
+                JOIN source_snapshots ss
+                  ON ss.id = ec.source_snapshot_id
+                 AND ss.status = 'active'
+                ORDER BY lower(ec.xmltv_id), ss.activated_at DESC NULLS LAST, ec.id DESC
+            )
             INSERT INTO channel_epg_mappings
                 (channel_id, epg_channel_id, method, confidence, evidence,
                  review_status, revision)
-            SELECT c.id, ec.id, 'tvg-id', 0.99,
+            SELECT c.id, aec.id, 'tvg-id', 0.99,
                    jsonb_build_object('match', 'tvg-id-exact'), 'applied', 1
             FROM channels c
-            JOIN epg_channels ec ON lower(ec.xmltv_id) = lower(c.canonical_key)
-            JOIN source_snapshots ss
-              ON ss.id = ec.source_snapshot_id AND ss.status = 'active'
+            JOIN active_epg_channels aec
+              ON aec.xmltv_id = lower(c.canonical_key)
             WHERE c.canonical_key IS NOT NULL
               AND c.canonical_key NOT LIKE 'stream:%'
               AND NOT EXISTS (

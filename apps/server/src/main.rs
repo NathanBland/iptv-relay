@@ -1192,6 +1192,28 @@ async fn run_provider_reconciliation_finalizer_job(
     worker_id: &str,
     job: &JobRecord,
 ) -> Result<()> {
+    // Guide reconciliation can scan a large provider catalog. Keep the
+    // finalizer lease alive while that work runs so the stale-job reaper does
+    // not reclaim the job and start a competing publication attempt.
+    let heartbeat_repository = jobs.clone();
+    let heartbeat_job_id = job.id;
+    let heartbeat_worker_id = worker_id.to_owned();
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if heartbeat_repository
+                .touch_heartbeat(heartbeat_job_id, &heartbeat_worker_id)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let _heartbeat_guard = HeartbeatGuard(heartbeat_handle);
+
     let Some((run_id, _source_id, parent_job_id)) =
         provider_reconciliation_finalizer_from_payload(&job.payload)
     else {
