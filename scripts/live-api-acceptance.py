@@ -388,6 +388,11 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
                 if not sync.get("jobId"):
                     raise RuntimeError("source sync response did not contain a job ID")
                 wait_sync(base, bootstrap, source, time.monotonic() + 1800)
+            # Refresh the provider guide sample for each cycle because live
+            # schedules can advance while the three ingest cycles run.
+            cycle_xmltv_path = temp_root / f"provider-{cycle}.xmltv"
+            download_file(xmltv_url, cycle_xmltv_path)
+            _cycle_ids, cycle_provider_programmes, _cycle_names = xmltv_file(cycle_xmltv_path)
             channels = all_pages(base, bootstrap, "/api/v1/channels")
             mappings = all_pages(base, bootstrap, "/api/v1/epg/mappings")
             # Verify that the gateway exposes programme rows without copying
@@ -416,7 +421,7 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
             if not gateway_ids or not gateway_programmes:
                 raise RuntimeError(f"cycle {cycle} produced no gateway XMLTV records")
             selected_provider = next(
-                ((channel, values[0]) for channel, values in provider_programmes.items() if values and channel in shared),
+                ((channel, values[0]) for channel, values in cycle_provider_programmes.items() if values and channel in shared),
                 None,
             )
             if selected_provider:
@@ -433,7 +438,7 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
                 if not mapped_channel or mapped_channel not in gateway_ids:
                     raise RuntimeError(f"cycle {cycle} omitted gateway channel mapping for {selected_channel}")
                 if not any(programme_key(value) == programme_key(selected_tuple) for value in gateway_samples):
-                    raise RuntimeError(f"cycle {cycle} changed the selected programme sample")
+                    raise RuntimeError(f"cycle {cycle} did not map the current provider programme sample")
             identities.append(tuple(sorted(ids)))
             cycles.append(storage_metrics(env_file, project))
         if identities[0] != identities[1] or identities[1] != identities[2]:
