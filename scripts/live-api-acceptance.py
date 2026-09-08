@@ -421,7 +421,17 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
             )
             if selected_provider:
                 selected_channel, selected_tuple = selected_provider
-                gateway_samples = gateway_programmes.get(selected_channel, [])
+                mapped_channel = next(
+                    (
+                        str(item.get("channelId"))
+                        for item in mappings
+                        if str(item.get("canonicalKey") or "") == selected_channel
+                    ),
+                    "",
+                )
+                gateway_samples = gateway_programmes.get(mapped_channel, [])
+                if not mapped_channel or mapped_channel not in gateway_ids:
+                    raise RuntimeError(f"cycle {cycle} omitted gateway channel mapping for {selected_channel}")
                 if not any(programme_key(value) == programme_key(selected_tuple) for value in gateway_samples):
                     raise RuntimeError(f"cycle {cycle} changed the selected programme sample")
             identities.append(tuple(sorted(ids)))
