@@ -564,6 +564,36 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
             .unwrap(),
         ProviderReconciliationFinalization::Cancelled
     );
+    let failed_parent = jobs
+        .enqueue(&NewJob::immediate(
+            "refresh-source",
+            json!({"sourceId": account_id}),
+        ))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET status = 'failed', completed_at = now() WHERE id = $1")
+        .bind(failed_parent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let failed_finalizer = jobs
+        .enqueue(&NewJob::immediate(
+            "finalize-provider-reconciliation",
+            json!({
+                "runId": run_id,
+                "sourceId": account_id,
+                "parentJobId": failed_parent.id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .finalize_provider_reconciliation(run_id, failed_parent.id, failed_finalizer.id)
+            .await
+            .unwrap(),
+        ProviderReconciliationFinalization::Cancelled
+    );
     let replacement_parent = jobs
         .enqueue(&NewJob::immediate(
             "refresh-source",

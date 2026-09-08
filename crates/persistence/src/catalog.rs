@@ -698,7 +698,10 @@ impl CatalogRepository {
         let Some(parent_status) = parent_status else {
             return Err(PersistenceError::JobNotFound(parent_job_id));
         };
-        if parent_status == "cancelled" {
+        // A finalizer is part of the parent refresh operation. Once the
+        // parent reaches any terminal state, child work must stop and leave
+        // the active catalog unchanged.
+        if parent_status != "running" {
             transaction.commit().await?;
             return Ok(ProviderReconciliationFinalization::Cancelled);
         }
