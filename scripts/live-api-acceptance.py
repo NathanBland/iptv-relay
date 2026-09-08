@@ -71,8 +71,11 @@ def request_json(base: str, path: str, token: str, method: str = "GET", body: An
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-        raise RuntimeError(f"gateway request failed: {method} {path}") from None
+    except urllib.error.HTTPError as error:
+        detail = error.read(512).decode("utf-8", errors="replace").replace("\n", " ")
+        raise RuntimeError(f"gateway request failed: {method} {path} status={error.code} detail={detail}") from None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"gateway request failed: {method} {path} detail={type(error).__name__}") from None
 
 
 def download_file(url: str, destination: Path) -> None:
@@ -266,7 +269,14 @@ def ensure_source(base: str, token: str, name: str, kind: str, endpoint: str) ->
 
 
 def set_capacity(base: str, token: str, source: str, cap: int) -> None:
-    request_json(base, f"/api/v1/sources/{source}", token, "PATCH", {"maxConnections": cap})
+    for attempt in range(3):
+        try:
+            request_json(base, f"/api/v1/sources/{source}", token, "PATCH", {"maxConnections": cap})
+            return
+        except RuntimeError:
+            if attempt == 2:
+                raise
+            time.sleep(3)
 
 
 def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
