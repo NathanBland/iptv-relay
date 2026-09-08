@@ -376,7 +376,10 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
                 wait_sync(base, bootstrap, source, time.monotonic() + 1800)
             channels = all_pages(base, bootstrap, "/api/v1/channels")
             mappings = all_pages(base, bootstrap, "/api/v1/epg/mappings")
-            programmes = all_pages(base, bootstrap, "/api/v1/programmes")
+            # Verify that the gateway exposes programme rows without copying
+            # the entire provider guide through the management API. The XMLTV
+            # export below performs the complete programme sample comparison.
+            programmes = page_items(request_json(base, "/api/v1/programmes?limit=500&offset=0", bootstrap))
             ids = [str(item.get("canonicalKey") or item.get("epgXmltvId") or "") for item in mappings]
             ids = [item for item in ids if item]
             if len(ids) != len(set(ids)):
