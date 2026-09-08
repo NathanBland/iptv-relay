@@ -19,12 +19,16 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-ALLOWED_ENV = {"IPTV_TEST_M3U_URL", "IPTV_TEST_XMLTV_URL", "IPTV_TEST_PROVIDER_MAX_CONNECTIONS", "LIVE_ACCEPTANCE_PROVIDER_CAP"}
+ALLOWED_ENV = {
+    "URL", "USER", "PWD", "XMLTV_URL",
+    "IPTV_TEST_XMLTV_URL", "IPTV_TEST_PROVIDER_MAX_CONNECTIONS", "LIVE_ACCEPTANCE_PROVIDER_CAP",
+}
 TERMINAL = {"succeeded", "failed", "cancelled", "dead"}
 
 
@@ -82,6 +86,41 @@ def download_file(url: str, destination: Path) -> None:
         raise RuntimeError("provider download failed") from None
 
 
+def xtream_endpoint(base: str, username: str, password: str, filename: str, action: str | None = None) -> str:
+    """Build an Xtream endpoint without exposing credentials in diagnostics."""
+    root = base.rstrip("/")
+    if root.endswith("/player_api.php"):
+        root = root[:-len("/player_api.php")]
+    if root.endswith("/xmltv.php"):
+        root = root[:-len("/xmltv.php")]
+    query = {"username": username, "password": password}
+    if action:
+        query["action"] = action
+    return f"{root}/{filename}?{urllib.parse.urlencode(query)}"
+
+
+def xtream_live_streams(base: str, username: str, password: str) -> list[dict[str, Any]]:
+    """Authenticate and fetch live streams from a standard Xtream Codes API."""
+    endpoint = xtream_endpoint(base, username, password, "player_api.php")
+    try:
+        with urllib.request.urlopen(endpoint, timeout=45) as response:
+            auth = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        raise RuntimeError("Xtream authentication request failed") from None
+    user_info = auth.get("user_info", {}) if isinstance(auth, dict) else {}
+    if not isinstance(user_info, dict) or str(user_info.get("auth", "0")) not in {"1", "true", "True"}:
+        raise RuntimeError("Xtream authentication was rejected")
+    streams_url = xtream_endpoint(base, username, password, "player_api.php", "get_live_streams")
+    try:
+        with urllib.request.urlopen(streams_url, timeout=90) as response:
+            streams = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        raise RuntimeError("Xtream get_live_streams request failed") from None
+    if not isinstance(streams, list) or not all(isinstance(item, dict) for item in streams):
+        raise RuntimeError("Xtream get_live_streams returned an invalid payload")
+    return streams
+
+
 def output_playlist(base: str, token: str) -> bytes:
     request = urllib.request.Request(f"{base}/out/{token}/playlist.m3u", headers={"Accept": "audio/x-mpegurl"})
     try:
@@ -106,7 +145,7 @@ def m3u_ids_file(path: Path) -> set[str]:
     with path.open("r", encoding="utf-8-sig", errors="replace") as stream:
         for line in stream:
             if line.startswith("#EXTINF:"):
-                match = re.search(r'(?:tvg-id|tvgid)=["\']?([^"\' ,]+)', line, re.I)
+                match = re.search(r'(?:tvg-id|tvgid|tvg-chno|channel-number|channel_number|number)=["\']?([^"\' ,]+)', line, re.I)
                 if match and match.group(1):
                     ids.add(match.group(1))
     return ids
@@ -226,9 +265,13 @@ def run_gate(values: dict[str, str]) -> dict[str, Any]:
 
     signal.signal(signal.SIGTERM, stop_handler)
     signal.signal(signal.SIGINT, stop_handler)
-    m3u_url, xmltv_url = values.get("IPTV_TEST_M3U_URL", "").strip(), values.get("IPTV_TEST_XMLTV_URL", "").strip()
-    if not m3u_url or not xmltv_url:
-        raise RuntimeError(".env.live must define IPTV_TEST_M3U_URL and IPTV_TEST_XMLTV_URL")
+    provider_url = values.get("URL", "").strip()
+    username = values.get("USER", "")
+    password = values.get("PWD", "")
+    if not provider_url or not username or not password:
+        raise RuntimeError("the Xtream environment file must define URL, USER, and PWD")
+    xmltv_url = values.get("XMLTV_URL", values.get("IPTV_TEST_XMLTV_URL", "")).strip()
+    xmltv_url = xmltv_url or xtream_endpoint(provider_url, username, password, "xmltv.php")
     try:
         cap = int(values.get("IPTV_TEST_PROVIDER_MAX_CONNECTIONS", values.get("LIVE_ACCEPTANCE_PROVIDER_CAP", "3")))
     except ValueError:
@@ -236,37 +279,32 @@ def run_gate(values: dict[str, str]) -> dict[str, Any]:
     if cap < 1:
         raise RuntimeError("provider max connections must be positive")
     temp_root = Path(tempfile.mkdtemp(prefix="iptv-live-input-"))
-    m3u_path, xmltv_path = temp_root / "provider.m3u", temp_root / "provider.xmltv"
+    xmltv_path = temp_root / "provider.xmltv"
     try:
-        download_file(m3u_url, m3u_path)
+        streams = xtream_live_streams(provider_url, username, password)
         download_file(xmltv_url, xmltv_path)
     except BaseException:
         shutil.rmtree(temp_root, ignore_errors=True)
         raise
     try:
-        m3u, m3u_names = m3u_ids_file(m3u_path), m3u_names_file(m3u_path)
         xmltv, provider_programmes, xmltv_names = xmltv_file(xmltv_path)
+        provider_ids = {str(item.get("epg_channel_id", "")).strip() for item in streams if str(item.get("epg_channel_id", "")).strip()}
+        if not provider_ids:
+            raise RuntimeError("Xtream get_live_streams returned no epg_channel_id values")
         samples = [{"channel": channel, "title": values[0][0], "start": values[0][1], "stop": values[0][2]} for channel, values in provider_programmes.items() if values][:3]
-        identity_mode = "provider-id"
-        if not m3u:
-            identity_mode = "tvg-name-fallback"
-            shared = {name.casefold() for name in m3u_names} & {name.casefold() for name in xmltv_names}
-        else:
-            shared = m3u & xmltv
+        identity_mode = "xtream-epg-channel-id"
+        shared = provider_ids & xmltv
         if not shared:
-            raise RuntimeError(
-                f"M3U and XMLTV have zero shared identities (m3uIds={len(m3u)}, "
-                f"m3uNames={len(m3u_names)}, xmltvIds={len(xmltv)}, xmltvNames={len(xmltv_names)}, mode={identity_mode})"
-            )
+            raise RuntimeError(f"Xtream and XMLTV have zero shared identities (xtreamEpgIds={len(provider_ids)}, xmltvIds={len(xmltv)}, xmltvNames={len(xmltv_names)}, mode={identity_mode})")
     except BaseException:
         shutil.rmtree(temp_root, ignore_errors=True)
         raise
 
     project = f"iptv-live-api-{secrets.token_hex(4)}"
-    bootstrap, output_token, password = secret(), secret(), secret(24)
+    bootstrap, output_token, db_password = secret(), secret(), secret(24)
     master_key = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     gateway_port, postgres_port = free_port(), free_port()
-    env = {"POSTGRES_PASSWORD": password, "IPTV_GATEWAY_PORT": str(gateway_port), "IPTV_POSTGRES_PORT": str(postgres_port), "IPTV_PUBLIC_BASE_URL": f"http://127.0.0.1:{gateway_port}", "IPTV_OUTPUT_TOKEN": output_token, "IPTV_ADMIN_BOOTSTRAP_TOKEN": bootstrap, "IPTV_ADMIN_PASSWORD": "", "IPTV_MASTER_KEY": master_key, "IPTV_WORKER_COUNT": "2"}
+    env = {"POSTGRES_PASSWORD": db_password, "IPTV_GATEWAY_PORT": str(gateway_port), "IPTV_POSTGRES_PORT": str(postgres_port), "IPTV_PUBLIC_BASE_URL": f"http://127.0.0.1:{gateway_port}", "IPTV_OUTPUT_TOKEN": output_token, "IPTV_ADMIN_BOOTSTRAP_TOKEN": bootstrap, "IPTV_ADMIN_PASSWORD": "", "IPTV_MASTER_KEY": master_key, "IPTV_WORKER_COUNT": "2"}
     handle, env_name = tempfile.mkstemp(prefix="iptv-live-api-", suffix=".env")
     Path(env_name).write_text("\n".join(f"{key}={value}" for key, value in env.items()) + "\n", encoding="utf-8")
     os.close(handle)
@@ -279,11 +317,12 @@ def run_gate(values: dict[str, str]) -> dict[str, Any]:
         compose(env_file, project, "up", "--build", "-d", "--wait", "postgres", "core", "worker", "web", "gateway")
         request_json(base, "/health/ready", bootstrap)
         baseline = storage_metrics(env_file, project)
-        m3u_source = ensure_source(base, bootstrap, "live-api-acceptance-m3u", "M3U", m3u_url)
+        xtream_source_endpoint = xtream_endpoint(provider_url, username, password, "player_api.php")
+        xtream_source = ensure_source(base, bootstrap, "live-api-acceptance-xtream", "Xtream", xtream_source_endpoint)
         xmltv_source = ensure_source(base, bootstrap, "live-api-acceptance-xmltv", "XMLTV", xmltv_url)
-        set_capacity(base, bootstrap, m3u_source, cap)
+        set_capacity(base, bootstrap, xtream_source, cap)
         for cycle in range(1, 4):
-            for source in (m3u_source, xmltv_source):
+            for source in (xtream_source, xmltv_source):
                 sync = request_json(base, f"/api/v1/sources/{source}/sync", bootstrap, "POST")
                 if not sync.get("jobId"):
                     raise RuntimeError("source sync response did not contain a job ID")
@@ -291,13 +330,8 @@ def run_gate(values: dict[str, str]) -> dict[str, Any]:
             channels = all_pages(base, bootstrap, "/api/v1/channels")
             mappings = all_pages(base, bootstrap, "/api/v1/epg/mappings")
             programmes = all_pages(base, bootstrap, "/api/v1/programmes")
-            if identity_mode == "tvg-name-fallback":
-                ids = [str(item.get("channelName") or "") for item in mappings]
-            else:
-                ids = [str(item.get("canonicalKey") or item.get("epgXmltvId") or "") for item in mappings]
+            ids = [str(item.get("canonicalKey") or item.get("epgXmltvId") or "") for item in mappings]
             ids = [item for item in ids if item]
-            if identity_mode == "tvg-name-fallback":
-                ids = [item.casefold() for item in ids]
             if len(ids) != len(set(ids)):
                 raise RuntimeError(f"cycle {cycle} produced duplicate channel identities")
             missing = shared - set(ids)
@@ -328,7 +362,7 @@ def run_gate(values: dict[str, str]) -> dict[str, Any]:
             raise RuntimeError("channel identities changed between sync cycles")
         final = storage_metrics(env_file, project)
         peak = max((item.get("databaseBytes", 0) for item in [baseline, *cycles, final]), default=0)
-        report = {"identityMode": identity_mode, "sharedProviderIds": len(shared), "providerUnmatched": {"m3uOnlyCount": len(m3u - xmltv), "xmltvOnlyCount": len(xmltv - m3u), "m3uOnlySample": sorted(m3u - xmltv)[:10], "xmltvOnlySample": sorted(xmltv - m3u)[:10]}, "providerCap": cap, "cycles": 3, "gatewayOutput": "playlist verified", "sampleProgrammes": samples, "storage": {"baseline": baseline, "cycles": cycles, "peakDatabaseBytes": peak, "final": final}}
+        report = {"identityMode": identity_mode, "sharedProviderIds": len(shared), "providerUnmatched": {"xtreamOnlyCount": len(provider_ids - xmltv), "xmltvOnlyCount": len(xmltv - provider_ids), "xtreamOnlySample": sorted(provider_ids - xmltv)[:10], "xmltvOnlySample": sorted(xmltv - provider_ids)[:10]}, "providerCap": cap, "cycles": 3, "gatewayOutput": "playlist verified", "sampleProgrammes": samples, "storage": {"baseline": baseline, "cycles": cycles, "peakDatabaseBytes": peak, "final": final}}
         print(json.dumps(report, sort_keys=True))
         return report
     finally:
@@ -343,7 +377,7 @@ def run_gate(values: dict[str, str]) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run real-provider API acceptance")
-    parser.add_argument("--env-file", default=str(ROOT / ".env.live"))
+    parser.add_argument("--env-file", default=str(ROOT / ".env.xtreme"))
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     try:
