@@ -70,7 +70,8 @@ def request_json(base: str, path: str, token: str, method: str = "GET", body: An
     request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            payload = response.read()
+            return None if not payload else json.loads(payload.decode("utf-8"))
     except urllib.error.HTTPError as error:
         detail = error.read(512).decode("utf-8", errors="replace").replace("\n", " ")
         raise RuntimeError(f"gateway request failed: {method} {path} status={error.code} detail={detail}") from None
