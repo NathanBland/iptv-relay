@@ -321,7 +321,7 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
     bootstrap, output_token, db_password = secret(), secret(), secret(24)
     master_key = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     gateway_port, postgres_port, core_port = free_port(), free_port(), free_port()
-    env = {"POSTGRES_PASSWORD": db_password, "IPTV_GATEWAY_PORT": str(gateway_port), "IPTV_POSTGRES_PORT": str(postgres_port), "IPTV_PUBLIC_BASE_URL": f"http://127.0.0.1:{gateway_port}", "IPTV_OUTPUT_TOKEN": output_token, "IPTV_ADMIN_BOOTSTRAP_TOKEN": bootstrap, "IPTV_ADMIN_PASSWORD": "", "IPTV_MASTER_KEY": master_key, "IPTV_WORKER_COUNT": "1"}
+    env = {"POSTGRES_PASSWORD": db_password, "IPTV_GATEWAY_PORT": str(gateway_port), "IPTV_POSTGRES_PORT": str(postgres_port), "IPTV_PUBLIC_BASE_URL": f"http://127.0.0.1:{gateway_port}", "IPTV_OUTPUT_TOKEN": output_token, "IPTV_ADMIN_BOOTSTRAP_TOKEN": bootstrap, "IPTV_ADMIN_PASSWORD": secret(24), "IPTV_MASTER_KEY": master_key, "IPTV_WORKER_COUNT": "1"}
     handle, env_name = tempfile.mkstemp(prefix="iptv-live-api-", suffix=".env")
     Path(env_name).write_text("\n".join(f"{key}={value}" for key, value in env.items()) + "\n", encoding="utf-8")
     os.close(handle)
