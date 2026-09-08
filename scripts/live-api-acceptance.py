@@ -449,6 +449,11 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
         print(json.dumps(report, sort_keys=True), flush=True)
         return report
     finally:
+        # Ignore a second interrupt while runner-owned resources are removed.
+        # The first signal already stopped the acceptance loop; cleanup must
+        # finish so containers, volumes, and temporary files cannot linger.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         time.sleep(10)
         cleanup = compose(env_file, project, "down", "--volumes", "--remove-orphans", check=False)
         remaining = compose(env_file, project, "ps", "-q", check=False)
