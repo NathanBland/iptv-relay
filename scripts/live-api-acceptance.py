@@ -269,7 +269,7 @@ def set_capacity(base: str, token: str, source: str, cap: int) -> None:
     request_json(base, f"/api/v1/sources/{source}", token, "PATCH", {"maxConnections": cap})
 
 
-def run_gate(values: dict[str, str]) -> dict[str, Any]:
+def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
     def stop_handler(signum: int, _frame: Any) -> None:
         raise KeyboardInterrupt(f"received signal {signum}")
 
@@ -341,7 +341,10 @@ def run_gate(values: dict[str, str]) -> dict[str, Any]:
     identities: list[tuple[str, ...]] = []
 
     try:
-        compose(env_file, project, "up", "--build", "-d", "--wait", "postgres", "core", "worker")
+        start_args = ["up", "-d", "--wait", "postgres", "core", "worker"]
+        if build:
+            start_args.insert(1, "--build")
+        compose(env_file, project, *start_args)
         request_json(base, "/health/ready", bootstrap)
         baseline = storage_metrics(env_file, project)
         xtream_source_endpoint = xtream_endpoint(provider_url, username, password, "player_api.php")
@@ -417,13 +420,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run real-provider API acceptance")
     parser.add_argument("--env-file", default=str(ROOT / ".env.xtreme"))
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--no-build", action="store_true", help="use the existing local core image")
     args = parser.parse_args()
     try:
         if args.self_test:
             assert m3u_ids(b'#EXTINF:-1 tvg-id="ABC",Test\nurl\n') == {"ABC"}
             print("live API acceptance self-test passed")
         else:
-            run_gate(parse_env(Path(args.env_file)))
+            run_gate(parse_env(Path(args.env_file)), build=not args.no_build)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"live API acceptance failed: {exc}", file=sys.stderr)
         return 1
