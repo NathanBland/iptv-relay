@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime as dt
 import gzip
 import json
 import os
@@ -193,6 +194,19 @@ def page_items(body: Any) -> list[dict[str, Any]]:
     if isinstance(body, dict) and isinstance(body.get("items"), list):
         return body["items"]
     raise RuntimeError("gateway page response has no items")
+
+
+def programme_key(value: tuple[str, str, str]) -> tuple[str, str, str]:
+    """Normalize XMLTV timestamps so equivalent UTC offsets compare equal."""
+    title, start, stop = value
+    normalized: list[str] = []
+    for timestamp in (start, stop):
+        try:
+            parsed = dt.datetime.strptime(timestamp, "%Y%m%d%H%M%S %z")
+            normalized.append(str(int(parsed.timestamp())))
+        except ValueError:
+            normalized.append(timestamp)
+    return title, normalized[0], normalized[1]
 
 
 def all_pages(base: str, token: str, path: str) -> list[dict[str, Any]]:
@@ -401,10 +415,14 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
             gateway_ids, gateway_programmes, _gateway_names = xmltv_file(gateway_xmltv)
             if not gateway_ids or not gateway_programmes:
                 raise RuntimeError(f"cycle {cycle} produced no gateway XMLTV records")
-            selected_provider = next((item for item in provider_programmes.items() if item[1]), None)
+            selected_provider = next(
+                ((channel, values[0]) for channel, values in provider_programmes.items() if values and channel in shared),
+                None,
+            )
             if selected_provider:
-                selected_tuple = selected_provider[1][0]
-                if not any(values and values[0] == selected_tuple for values in gateway_programmes.values()):
+                selected_channel, selected_tuple = selected_provider
+                gateway_samples = gateway_programmes.get(selected_channel, [])
+                if not any(programme_key(value) == programme_key(selected_tuple) for value in gateway_samples):
                     raise RuntimeError(f"cycle {cycle} changed the selected programme sample")
             identities.append(tuple(sorted(ids)))
             cycles.append(storage_metrics(env_file, project))
