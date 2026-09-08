@@ -287,6 +287,7 @@ async fn provider_reconciliation_partitions_conserve_canonical_key_counts() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() {
     let Some(database_url) = database_url() else {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
@@ -299,6 +300,7 @@ async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() 
     let account_id = uuid::Uuid::now_v7();
     let snapshot_id = uuid::Uuid::now_v7();
     let run_id = uuid::Uuid::now_v7();
+    let stream_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO provider_accounts (id, name, source_type, base_url_template)
          VALUES ($1, $2, 'm3u', 'https://provider.test/')",
@@ -312,11 +314,24 @@ async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() 
         "INSERT INTO source_snapshots
             (id, provider_account_id, kind, status, checksum_sha256, byte_count,
              record_count, staged_at)
-         VALUES ($1, $2, 'm3u', 'staging', $3, 0, 0, now())",
+         VALUES ($1, $2, 'm3u', 'staging', $3, 1, 1, now())",
     )
     .bind(snapshot_id)
     .bind(account_id)
     .bind(format!("lock-order-{snapshot_id}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams
+            (id, snapshot_id, provider_account_id, stable_key, name, tvg_id,
+             url_template, attributes, directives, supported)
+         VALUES ($1, $2, $3, 'stable', 'Channel', 'channel',
+                 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(stream_id)
+    .bind(snapshot_id)
+    .bind(account_id)
     .execute(&pool)
     .await
     .unwrap();
@@ -327,11 +342,16 @@ async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() 
         ))
         .await
         .unwrap();
+    sqlx::query("UPDATE jobs SET status = 'running' WHERE id = $1")
+        .bind(parent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO provider_reconciliation_runs
             (id, provider_account_id, source_snapshot_id, parent_job_id,
              status, partition_count, total_keys, completed_keys)
-         VALUES ($1, $2, $3, $4, 'processing', 1, 0, 0)",
+         VALUES ($1, $2, $3, $4, 'processing', 1, 1, 1)",
     )
     .bind(run_id)
     .bind(account_id)
@@ -343,9 +363,28 @@ async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() 
     sqlx::query(
         "INSERT INTO provider_reconciliation_partitions
             (run_id, partition_number, status, key_count, completed_keys)
-         VALUES ($1, 0, 'succeeded', 0, 0)",
+         VALUES ($1, 0, 'succeeded', 1, 1)",
     )
     .bind(run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_reconciliation_candidates
+            (run_id, canonical_key, name)
+         VALUES ($1, 'channel', 'Channel')",
+    )
+    .bind(run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_reconciliation_candidate_streams
+            (run_id, canonical_key, provider_stream_id)
+         VALUES ($1, 'channel', $2)",
+    )
+    .bind(run_id)
+    .bind(stream_id)
     .execute(&pool)
     .await
     .unwrap();
@@ -378,6 +417,14 @@ async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() 
         .expect("reconciliation transactions should complete without a deadlock");
     assert!(create_result.is_ok());
     assert!(finalize_result.is_ok());
+    let remaining_candidates: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM provider_reconciliation_candidates WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining_candidates, 0);
 
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
@@ -510,6 +557,14 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
             .unwrap(),
         ProviderReconciliationFinalization::Cancelled
     );
+    let canceled_candidate_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM provider_reconciliation_candidates WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(canceled_candidate_count, 0);
     assert!(!jobs.cancel(parent.id).await.unwrap());
     let canceled_run_status: String =
         sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")

@@ -715,6 +715,14 @@ impl CatalogRepository {
             .bind(finalizer_job_id)
             .execute(&mut *transaction)
             .await?;
+            sqlx::query("DELETE FROM provider_reconciliation_candidate_streams WHERE run_id = $1")
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("DELETE FROM provider_reconciliation_candidates WHERE run_id = $1")
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
             transaction.commit().await?;
             return Ok(ProviderReconciliationFinalization::Cancelled);
         }
@@ -892,6 +900,14 @@ impl CatalogRepository {
             .bind(run_id)
             .execute(&mut *transaction)
             .await?;
+            sqlx::query("DELETE FROM provider_reconciliation_candidate_streams WHERE run_id = $1")
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("DELETE FROM provider_reconciliation_candidates WHERE run_id = $1")
+                .bind(run_id)
+                .execute(&mut *transaction)
+                .await?;
             transaction.commit().await?;
             return Ok(ProviderReconciliationFinalization::Superseded);
         }
@@ -973,6 +989,17 @@ impl CatalogRepository {
             after_snapshot,
         )
         .await?;
+        // Publication and revision capture have consumed the candidates. Drop
+        // both candidate tables before the run becomes terminal so retries
+        // cannot observe half-published reconciliation state.
+        sqlx::query("DELETE FROM provider_reconciliation_candidate_streams WHERE run_id = $1")
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM provider_reconciliation_candidates WHERE run_id = $1")
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query(
             r"
             UPDATE provider_reconciliation_runs
