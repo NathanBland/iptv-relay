@@ -215,7 +215,13 @@ def compose(env_file: Path, project: str, *args: str, check: bool = True) -> sub
     inherited = {key: value for key, value in os.environ.items() if not (key.startswith("IPTV_") or key in {"POSTGRES_PASSWORD", "COMPOSE_PROJECT_NAME", "COMPOSE_PARALLEL_LIMIT", "CARGO_BUILD_JOBS"})}
     inherited["COMPOSE_PARALLEL_LIMIT"] = "1"
     inherited["CARGO_BUILD_JOBS"] = "1"
-    return subprocess.run(command, cwd=ROOT, env=inherited, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+    inherited["DOCKER_BUILDKIT"] = "1"
+    result = subprocess.run(command, cwd=ROOT, env=inherited, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if check and result.returncode:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        tail = "\\n".join(detail[-12:])
+        raise RuntimeError(f"Compose command failed ({' '.join(args)}): {tail}")
+    return result
 
 
 def storage_metrics(env_file: Path, project: str) -> dict[str, int]:
@@ -282,12 +288,19 @@ def run_gate(values: dict[str, str]) -> dict[str, Any]:
     xmltv_path = temp_root / "provider.xmltv"
     try:
         streams = xtream_live_streams(provider_url, username, password)
-        download_file(xmltv_url, xmltv_path)
+        for attempt in range(3):
+            download_file(xmltv_url, xmltv_path)
+            try:
+                xmltv, provider_programmes, xmltv_names = xmltv_file(xmltv_path)
+                break
+            except RuntimeError:
+                if attempt == 2:
+                    raise
+                time.sleep(2)
     except BaseException:
         shutil.rmtree(temp_root, ignore_errors=True)
         raise
     try:
-        xmltv, provider_programmes, xmltv_names = xmltv_file(xmltv_path)
         provider_ids = {str(item.get("epg_channel_id", "")).strip() for item in streams if str(item.get("epg_channel_id", "")).strip()}
         if not provider_ids:
             raise RuntimeError("Xtream get_live_streams returned no epg_channel_id values")
@@ -363,16 +376,26 @@ def run_gate(values: dict[str, str]) -> dict[str, Any]:
         final = storage_metrics(env_file, project)
         peak = max((item.get("databaseBytes", 0) for item in [baseline, *cycles, final]), default=0)
         report = {"identityMode": identity_mode, "sharedProviderIds": len(shared), "providerUnmatched": {"xtreamOnlyCount": len(provider_ids - xmltv), "xmltvOnlyCount": len(xmltv - provider_ids), "xtreamOnlySample": sorted(provider_ids - xmltv)[:10], "xmltvOnlySample": sorted(xmltv - provider_ids)[:10]}, "providerCap": cap, "cycles": 3, "gatewayOutput": "playlist verified", "sampleProgrammes": samples, "storage": {"baseline": baseline, "cycles": cycles, "peakDatabaseBytes": peak, "final": final}}
-        print(json.dumps(report, sort_keys=True))
+        print(json.dumps(report, sort_keys=True), flush=True)
         return report
     finally:
-        time.sleep(2)
+        time.sleep(10)
         cleanup = compose(env_file, project, "down", "--volumes", "--remove-orphans", check=False)
         remaining = compose(env_file, project, "ps", "-q", check=False)
+        for _attempt in range(24):
+            if cleanup.returncode == 0 and remaining.returncode == 0 and not remaining.stdout.strip():
+                break
+            time.sleep(5)
+            cleanup = compose(env_file, project, "down", "--volumes", "--remove-orphans", check=False)
+            remaining = compose(env_file, project, "ps", "-q", check=False)
         env_file.unlink(missing_ok=True)
         shutil.rmtree(temp_root, ignore_errors=True)
-        if cleanup.returncode or remaining.stdout.strip():
-            raise RuntimeError("live acceptance cleanup failed")
+        if cleanup.returncode or remaining.returncode or remaining.stdout.strip():
+            detail = (cleanup.stderr or cleanup.stdout or remaining.stderr or remaining.stdout).strip().splitlines()
+            message = f"live acceptance cleanup failed: {'\\n'.join(detail[-12:])}"
+            if sys.exc_info()[1] is None:
+                raise RuntimeError(message)
+            print(message, file=sys.stderr)
 
 
 def main() -> int:
