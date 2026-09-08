@@ -101,6 +101,7 @@ cleanup() {
   else
     printf 'kept Compose project: %s\n' "$COMPOSE_PROJECT_NAME" >&2
   fi
+  # Keep shared Cargo caches intact. Remove only runner-owned resources.
   exit "$exit_code"
 }
 trap cleanup EXIT
@@ -156,7 +157,7 @@ run_stage scale-database make postgres-test
 run_stage scale-smoke make scale-gate-smoke
 
 if ((RUN_LIVE == 1)); then
-  run_stage live-acceptance make live-acceptance
+  run_stage live-api-acceptance make live-acceptance
 else
   printf '\nCredentialed live acceptance: skipped (use --live to enable).\n'
 fi

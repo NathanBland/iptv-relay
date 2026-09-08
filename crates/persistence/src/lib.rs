@@ -1,6 +1,8 @@
 //! `PostgreSQL` persistence and durable job coordination.
 
 mod catalog;
+mod cleanup;
+mod outbox;
 
 use std::{fmt, str::FromStr};
 
@@ -38,6 +40,7 @@ pub use catalog::{
     StreamProfileRow, SystemCounts, UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput,
     UserRow,
 };
+pub use cleanup::{IngestCleanupRepository, IngestCleanupStats};
 
 /// Embedded database migrations for the service schema.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -2059,16 +2062,13 @@ impl JobRepository {
         let parent_job_id_text = parent_job_id.to_string();
         sqlx::query(
             r"
-            INSERT INTO jobs (id, kind, payload, available_at)
-            SELECT $1, 'finalize-provider-reconciliation', $2, now()
+            INSERT INTO job_outbox (id, parent_job_id, kind, payload, dedup_key)
+            SELECT $1, $3, 'finalize-provider-reconciliation', $2, $4
             WHERE NOT EXISTS (
                 SELECT 1 FROM jobs
                 WHERE id = $3 AND status = 'cancelled'
             )
-            ON CONFLICT ((payload->>'runId'))
-                WHERE kind = 'finalize-provider-reconciliation'
-                  AND status IN ('queued', 'running')
-                DO NOTHING
+            ON CONFLICT (dedup_key) DO NOTHING
             ",
         )
         .bind(Uuid::now_v7())
@@ -2078,6 +2078,7 @@ impl JobRepository {
             "parentJobId": parent_job_id_text,
         }))
         .bind(parent_job_id)
+        .bind(format!("finalizer:{run_id}"))
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;

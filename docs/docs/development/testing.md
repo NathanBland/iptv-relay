@@ -158,6 +158,20 @@ Run the live-provider gate separately because it needs provider credentials:
 make live-acceptance
 ```
 
+The live gate reads only the M3U URL, XMLTV URL, and provider capacity from `.env.live`.
+
+The gate creates a disposable local Compose project with generated credentials and host ports.
+
+The gate verifies all shared provider IDs, programme samples, gateway output, terminal jobs, and three stable sync cycles.
+
+The gate reports redacted storage metrics and removes its containers, volumes, and temporary environment file after every result.
+
+Run its parser self-test without Docker:
+
+```bash
+make test-live-api-acceptance
+```
+
 ## Isolated test runner
 
 Run the root test runner when you need one command for all non-credentialed gates:
@@ -237,3 +251,5 @@ Remove test and reconciliation sources:
 ```bash
 make cleanup-test-data
 ```
+
+The repository test runner preserves shared Cargo caches. Run `make clean-debug` only when you need to remove debug and test artifacts manually.

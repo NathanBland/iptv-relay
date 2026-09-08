@@ -714,3 +714,92 @@ async fn activate_rejects_epg_channels_without_an_epg_source_owner() {
 
     cleanup_provider(&pool, account_id).await;
 }
+
+#[tokio::test]
+async fn staged_outbox_survives_coordinator_restart_without_duplicate_jobs() {
+    let Some(pool) = pool().await else {
+        return;
+    };
+    let account = create_provider_account(&pool).await;
+    let jobs = iptv_persistence::JobRepository::new(pool.clone());
+    let parent = jobs
+        .enqueue(&iptv_persistence::NewJob::immediate(
+            "refresh-source",
+            json!({"sourceId": account}),
+        ))
+        .await
+        .expect("parent");
+    let store =
+        iptv_ingest::PgSnapshotStore::new(pool.clone()).with_reconciliation_parent(parent.id, 3);
+    let snapshot = provider_snapshot(account, IngestFormat::M3u, vec![provider_stream("outbox")]);
+    store.stage(&snapshot).await.expect("stage commits intent");
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM job_outbox WHERE parent_job_id = $1 AND dispatched_at IS NULL",
+    )
+    .bind(parent.id)
+    .fetch_one(&pool)
+    .await
+    .expect("pending intent");
+    assert_eq!(pending, 1);
+    // A new repository simulates dispatch after coordinator termination.
+    let recovered = iptv_persistence::JobRepository::new(pool.clone());
+    recovered.dispatch_outbox().await.expect("restart dispatch");
+    recovered
+        .dispatch_outbox()
+        .await
+        .expect("idempotent dispatch");
+    store.stage(&snapshot).await.expect("idempotent staging");
+    recovered.dispatch_outbox().await.expect("repeat dispatch");
+    let children: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE payload->>'parentJobId' = $1")
+            .bind(parent.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("children");
+    assert_eq!(children, 3);
+    sqlx::query("DELETE FROM jobs WHERE payload->>'parentJobId' = $1 OR id = $2")
+        .bind(parent.id.to_string())
+        .bind(parent.id)
+        .execute(&pool)
+        .await
+        .expect("remove jobs");
+    cleanup_provider(&pool, account).await;
+}
+
+#[tokio::test]
+async fn rejected_staging_rolls_back_dispatch_intent() {
+    let Some(pool) = pool().await else {
+        return;
+    };
+    let account = create_provider_account(&pool).await;
+    let jobs = iptv_persistence::JobRepository::new(pool.clone());
+    let parent = jobs
+        .enqueue(&iptv_persistence::NewJob::immediate(
+            "refresh-source",
+            json!({"sourceId": account}),
+        ))
+        .await
+        .expect("parent");
+    let store =
+        iptv_ingest::PgSnapshotStore::new(pool.clone()).with_reconciliation_parent(parent.id, 3);
+    let mut snapshot = provider_snapshot(
+        account,
+        IngestFormat::M3u,
+        vec![provider_stream("rollback")],
+    );
+    snapshot.record_count = 2;
+    assert!(store.stage(&snapshot).await.is_err());
+    let pending: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM job_outbox WHERE parent_job_id = $1")
+            .bind(parent.id)
+            .fetch_one(&pool)
+            .await
+            .expect("no intent");
+    assert_eq!(pending, 0);
+    sqlx::query("DELETE FROM jobs WHERE id = $1")
+        .bind(parent.id)
+        .execute(&pool)
+        .await
+        .expect("remove parent");
+    cleanup_provider(&pool, account).await;
+}

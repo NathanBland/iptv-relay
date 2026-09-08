@@ -39,11 +39,44 @@ impl ActivationProgress for NoopActivationProgress {
 #[derive(Clone, Debug)]
 pub struct PgSnapshotStore {
     pool: PgPool,
+    reconciliation_parent: Option<(Uuid, i32)>,
 }
 
 impl PgSnapshotStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            reconciliation_parent: None,
+        }
+    }
+
+    /// Attaches durable reconciliation dispatch to the snapshot transaction.
+    #[must_use]
+    pub fn with_reconciliation_parent(mut self, parent_job_id: Uuid, partitions: i32) -> Self {
+        self.reconciliation_parent = Some((parent_job_id, partitions.clamp(1, 64)));
+        self
+    }
+
+    async fn stage_dispatch(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Postgres>,
+        snapshot_id: Uuid,
+    ) -> Result<(), IngestError> {
+        let Some((parent_job_id, partitions)) = self.reconciliation_parent else {
+            return Ok(());
+        };
+        sqlx::query(
+            "INSERT INTO job_outbox (id, parent_job_id, kind, payload, dedup_key) \
+             VALUES ($1, $2, 'prepare-provider-reconciliation', $3, $4) \
+             ON CONFLICT (dedup_key) DO NOTHING",
+        )
+        .bind(Uuid::now_v7())
+        .bind(parent_job_id)
+        .bind(serde_json::json!({"snapshotId": snapshot_id, "partitionCount": partitions}))
+        .bind(format!("stage:{parent_job_id}:{snapshot_id}"))
+        .execute(&mut **transaction)
+        .await?;
+        Ok(())
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -111,6 +144,7 @@ impl PgSnapshotStore {
             if status == "staging" {
                 let complete = staged_row_count(&mut transaction, existing_id).await?;
                 if complete == snapshot.record_count {
+                    self.stage_dispatch(&mut transaction, existing_id).await?;
                     transaction.commit().await?;
                     progress
                         .checkpoint(snapshot.record_count, snapshot.record_count)
@@ -134,6 +168,7 @@ impl PgSnapshotStore {
                 .bind(existing_id)
                 .execute(&mut *transaction)
                 .await?;
+                self.stage_dispatch(&mut transaction, existing_id).await?;
                 transaction.commit().await?;
                 progress
                     .checkpoint(snapshot.record_count, snapshot.record_count)
@@ -197,6 +232,7 @@ impl PgSnapshotStore {
             .bind(snapshot.id)
             .execute(&mut *transaction)
             .await?;
+        self.stage_dispatch(&mut transaction, snapshot.id).await?;
         transaction.commit().await?;
         Ok(snapshot.id)
     }

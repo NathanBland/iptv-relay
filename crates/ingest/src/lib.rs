@@ -60,6 +60,8 @@ pub enum IngestError {
     Storage(#[from] sqlx::Error),
     #[error("ingestion job was cancelled")]
     Cancelled,
+    #[error("ingestion job exceeded its execution deadline")]
+    Deadline,
     #[error("ingestion job ownership was lost")]
     OwnershipLost,
     #[error("ingestion request is invalid: {0}")]
@@ -83,6 +85,7 @@ impl IngestError {
             Self::EndpointProtection => "source stream endpoint could not be protected",
             Self::Storage(_) => "source snapshot transaction failed",
             Self::Cancelled => "ingestion job was cancelled",
+            Self::Deadline => "ingestion job exceeded its execution deadline",
             Self::OwnershipLost => "ingestion job ownership was lost",
             Self::InvalidRequest(_) => "ingestion request was invalid",
         }

@@ -280,10 +280,12 @@ impl CatalogRepository {
                 .bind(parent_job_id)
                 .fetch_one(&mut *transaction)
                 .await?;
+                crate::outbox::queue_reconciliation(&mut transaction, &run).await?;
                 transaction.commit().await?;
                 return Ok(Some(run));
             }
             if run.status != "cancelled" {
+                crate::outbox::queue_reconciliation(&mut transaction, &run).await?;
                 transaction.commit().await?;
                 return Ok(Some(run));
             }
@@ -375,6 +377,7 @@ impl CatalogRepository {
         .bind(run_id)
         .execute(&mut *transaction)
         .await?;
+        crate::outbox::queue_reconciliation(&mut transaction, &run).await?;
         transaction.commit().await?;
         Ok(Some(run))
     }
@@ -399,7 +402,62 @@ impl CatalogRepository {
         partition_number: i32,
         worker_id: &str,
     ) -> Result<ProviderReconciliationPartitionResult, PersistenceError> {
+        self.process_provider_reconciliation_partition_inner(
+            run_id,
+            partition_number,
+            worker_id,
+            None,
+        )
+        .await
+    }
+
+    /// Processes a partition only while its claimed job remains owned by the worker.
+    ///
+    /// # Errors
+    /// Returns an error when the database operation fails or the worker does not own the job.
+    pub async fn process_provider_reconciliation_partition_owned(
+        &self,
+        run_id: Uuid,
+        partition_number: i32,
+        worker_id: &str,
+        job_id: Uuid,
+    ) -> Result<ProviderReconciliationPartitionResult, PersistenceError> {
+        self.process_provider_reconciliation_partition_inner(
+            run_id,
+            partition_number,
+            worker_id,
+            Some(job_id),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn process_provider_reconciliation_partition_inner(
+        &self,
+        run_id: Uuid,
+        partition_number: i32,
+        worker_id: &str,
+        job_id: Option<Uuid>,
+    ) -> Result<ProviderReconciliationPartitionResult, PersistenceError> {
         let mut transaction = self.pool.begin().await?;
+        sqlx::query("SET LOCAL statement_timeout = '300s'")
+            .execute(&mut *transaction)
+            .await?;
+        if let Some(job_id) = job_id {
+            let owned: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1 AND status = 'running' AND locked_by = $2 FOR UPDATE)",
+            )
+            .bind(job_id)
+            .bind(worker_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            if !owned {
+                return Err(PersistenceError::JobOwnership {
+                    job_id,
+                    worker_id: worker_id.to_owned(),
+                });
+            }
+        }
         let row: Option<ProviderReconciliationPartitionRow> = sqlx::query_as(
             r"
                 SELECT p.status, r.status, r.source_snapshot_id, r.partition_count,
@@ -590,6 +648,38 @@ impl CatalogRepository {
         parent_job_id: Uuid,
         finalizer_job_id: Uuid,
     ) -> Result<ProviderReconciliationFinalization, PersistenceError> {
+        self.finalize_provider_reconciliation_inner(run_id, parent_job_id, finalizer_job_id, None)
+            .await
+    }
+
+    /// Publishes only while the finalizer job remains owned by `worker_id`.
+    ///
+    /// # Errors
+    /// Returns an error when the database operation fails or the worker does not own the job.
+    pub async fn finalize_provider_reconciliation_owned(
+        &self,
+        run_id: Uuid,
+        parent_job_id: Uuid,
+        finalizer_job_id: Uuid,
+        worker_id: &str,
+    ) -> Result<ProviderReconciliationFinalization, PersistenceError> {
+        self.finalize_provider_reconciliation_inner(
+            run_id,
+            parent_job_id,
+            finalizer_job_id,
+            Some(worker_id),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn finalize_provider_reconciliation_inner(
+        &self,
+        run_id: Uuid,
+        parent_job_id: Uuid,
+        finalizer_job_id: Uuid,
+        worker_id: Option<&str>,
+    ) -> Result<ProviderReconciliationFinalization, PersistenceError> {
         let mut transaction = self.pool.begin().await?;
         sqlx::query("SET LOCAL statement_timeout = '300s'")
             .execute(&mut *transaction)
@@ -617,10 +707,12 @@ impl CatalogRepository {
             SELECT status
             FROM jobs
             WHERE id = $1 AND kind = 'finalize-provider-reconciliation'
+              AND ($2::text IS NULL OR (status = 'running' AND locked_by = $2))
             FOR UPDATE
             ",
         )
         .bind(finalizer_job_id)
+        .bind(worker_id)
         .fetch_optional(&mut *transaction)
         .await?;
         let Some(finalizer_status) = finalizer_status else {

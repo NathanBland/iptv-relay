@@ -18,8 +18,9 @@ use iptv_media::{
 #[cfg(test)]
 use iptv_persistence::NewJob;
 use iptv_persistence::{
-    CatalogRepository, DEFAULT_RECONCILIATION_BATCH_SIZE, Database, EpgMappingStats, JobRecord,
-    JobRepository, MasterKey, ProviderReconciliationFinalization, ProviderReconciliationPhase,
+    CatalogRepository, DEFAULT_RECONCILIATION_BATCH_SIZE, Database, EpgMappingStats,
+    IngestCleanupRepository, JobRecord, JobRepository, MasterKey,
+    ProviderReconciliationFinalization, ProviderReconciliationPhase,
     ProviderReconciliationProgress, ProviderReconciliationUpdate, ReconcileStats, SourceKind,
     SourceRepository, StreamHealthUpdate, StreamProbeTargetRow,
 };
@@ -387,6 +388,11 @@ async fn worker() -> Result<()> {
         Ok(count) => info!("Reset {count} stranded checking streams on startup"),
         Err(error) => warn!(%error, "stranded checking stream reset failed on startup"),
     }
+    let cleanup = IngestCleanupRepository::new(database.pool().clone());
+    match cleanup.cleanup_batch(60, 5_000).await {
+        Ok(stats) => info!(?stats, "ingest cleanup completed on startup"),
+        Err(error) => warn!(%error, "ingest cleanup failed on startup"),
+    }
 
     let cb_failure_threshold: i32 = env::var("IPTV_CB_FAILURE_THRESHOLD")
         .ok()
@@ -445,6 +451,37 @@ async fn worker() -> Result<()> {
                 Err(error) => {
                     warn!(%error, "stale job reaper failed");
                 }
+            }
+        }
+    });
+
+    let cleanup_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            for _ in 0..20 {
+                match cleanup.cleanup_batch(60, 5_000).await {
+                    Ok(stats) if stats.rows_removed > 0 => {
+                        info!(?stats, "ingest cleanup removed stale state");
+                    }
+                    Ok(_) => break,
+                    Err(error) => {
+                        warn!(%error, "periodic ingest cleanup failed");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let dispatch_jobs = repository.clone();
+    let dispatch_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            if let Err(error) = dispatch_jobs.dispatch_outbox().await {
+                warn!(%error, "durable job dispatch failed; retry on next pass");
             }
         }
     });
@@ -511,11 +548,13 @@ async fn worker() -> Result<()> {
         }
     }
 
+    dispatch_handle.abort();
     listener_handle.abort();
 
     scheduler_handle.abort();
     probe_scheduler_handle.abort();
     reaper_handle.abort();
+    cleanup_handle.abort();
     info!(%worker_id, "worker stopped");
     Ok(())
 }
@@ -606,24 +645,28 @@ async fn run_refresh_job(
             }
         }
     });
+    let _heartbeat_guard = HeartbeatGuard(heartbeat_handle);
 
     let source_refresh = job.kind == "refresh-source";
-    let refresh_result = if source_refresh {
-        run_source_refresh(
-            jobs, sources, snapshots, catalog, master_key, worker_id, &job,
-        )
-        .await
-    } else {
-        run_xtream_short_epg_refresh(
-            jobs, sources, snapshots, catalog, master_key, worker_id, &job,
-        )
-        .await
-        .map(|result| RefreshExecution {
-            result,
-            deferred: false,
-        })
-    };
-    heartbeat_handle.abort();
+    let refresh_result = tokio::time::timeout(REFRESH_EXECUTION_TIMEOUT, async {
+        if source_refresh {
+            run_source_refresh(
+                jobs, sources, snapshots, catalog, master_key, worker_id, &job,
+            )
+            .await
+        } else {
+            run_xtream_short_epg_refresh(
+                jobs, sources, snapshots, catalog, master_key, worker_id, &job,
+            )
+            .await
+            .map(|result| RefreshExecution {
+                result,
+                deferred: false,
+            })
+        }
+    })
+    .await
+    .unwrap_or(Err(RefreshError::Ingest(IngestError::Deadline)));
 
     match refresh_result {
         Ok(execution) => {
@@ -721,6 +764,17 @@ async fn run_refresh_job(
         }
     }
     Ok(())
+}
+
+const REFRESH_EXECUTION_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// Stops the lease heartbeat when a refresh returns, is canceled, or unwinds.
+struct HeartbeatGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -830,7 +884,10 @@ impl SourceRefresher for M3uRefresher {
             let result = Ingestor::new(
                 context.protector,
                 context.control.clone(),
-                StagedSnapshotActivator::new(context.snapshots.clone()),
+                StagedSnapshotActivator::new(context.snapshots.clone().with_reconciliation_parent(
+                    context.parent_job_id,
+                    reconciliation_partition_count(),
+                )),
             )
             .run(&request)
             .await
@@ -949,7 +1006,7 @@ async fn schedule_provider_reconciliation(
     catalog: &CatalogRepository,
     control: &impl JobControl,
     result: &IngestResult,
-    source_id: Uuid,
+    _source_id: Uuid,
     parent_job_id: Uuid,
     partition_count: i32,
 ) -> std::result::Result<bool, RefreshError> {
@@ -972,37 +1029,10 @@ async fn schedule_provider_reconciliation(
     };
 
     checkpoint_reconciliation(control, result, "reconciling-partitions", 0).await?;
-    for partition_number in 0..run.partition_count {
-        jobs.enqueue_provider_reconciliation_partition_if_idle(
-            run.id,
-            partition_number,
-            source_id,
-            parent_job_id,
-        )
-            .await
-            .map_err(|error| {
-                warn!(run_id = %run.id, partition_number, error = %error, "could not enqueue reconciliation partition");
-                RefreshError::Catalog
-            })?;
-    }
-    if !jobs
-        .reconciliation_partition_jobs_are_present(run.id)
-        .await
-        .map_err(|error| {
-            warn!(run_id = %run.id, error = %error, "could not verify reconciliation partition jobs");
-            RefreshError::Catalog
-        })?
-    {
-        return Err(RefreshError::Catalog);
-    }
-    // A first finalizer can return `Pending` before worker jobs complete. The
-    // final completed partition schedules another attempt.
-    jobs.enqueue_provider_reconciliation_finalizer_if_idle(run.id, source_id, parent_job_id)
-        .await
-        .map_err(|error| {
-            warn!(run_id = %run.id, error = %error, "could not enqueue reconciliation finalizer");
-            RefreshError::Catalog
-        })?;
+    jobs.dispatch_outbox().await.map_err(|error| {
+        warn!(run_id = %run.id, error = %error, "durable reconciliation dispatch deferred");
+        RefreshError::Catalog
+    })?;
     info!(
         run_id = %run.id,
         snapshot_id = %result.snapshot_id,
@@ -1064,7 +1094,12 @@ async fn run_provider_reconciliation_partition_job(
         return Ok(());
     }
     match catalog
-        .process_provider_reconciliation_partition(run_id, partition_number, worker_id)
+        .process_provider_reconciliation_partition_owned(
+            run_id,
+            partition_number,
+            worker_id,
+            job.id,
+        )
         .await
     {
         Ok(result) => {
@@ -1115,6 +1150,9 @@ async fn run_provider_reconciliation_partition_job(
                 parent_job_id,
             )
             .await?;
+            if let Err(error) = jobs.dispatch_outbox().await {
+                warn!(%error, "finalizer dispatch deferred to periodic recovery");
+            }
             Ok(())
         }
         Err(error) => {
@@ -1185,7 +1223,7 @@ async fn run_provider_reconciliation_finalizer_job(
         return Ok(());
     }
     match catalog
-        .finalize_provider_reconciliation(run_id, parent_job_id, job.id)
+        .finalize_provider_reconciliation_owned(run_id, parent_job_id, job.id, worker_id)
         .await
     {
         Ok(ProviderReconciliationFinalization::Cancelled) => Ok(()),
@@ -2169,10 +2207,13 @@ async fn run_xtream_refresh(
         xtream_stream_endpoint: Some(endpoints.into_stream_template()),
         xtream_category_names: category_names,
     };
+    let staged_store = snapshots
+        .clone()
+        .with_reconciliation_parent(control.job_id, reconciliation_partition_count());
     Ingestor::new(
         protector,
         control,
-        StagedSnapshotActivator::new(snapshots.clone()),
+        StagedSnapshotActivator::new(staged_store),
     )
     .run(&request)
     .await

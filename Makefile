@@ -1,4 +1,4 @@
-.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-runner test-openapi-drift-check test-caddy-security test-release-compose postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-release-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned dev
+.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-runner test-openapi-drift-check test-caddy-security test-release-compose postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-release-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance test-live-api-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned clean-debug dev
 
 DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
 
@@ -90,6 +90,11 @@ coverage-changed: postgres-test
 cleanup-test-data:
 	./scripts/cleanup-test-data.sh
 
+# Remove debug and test Cargo artifacts while keeping release binaries.
+clean-debug:
+	cargo clean --profile dev
+	cargo clean --profile test
+
 fuzz-smoke:
 	cargo +nightly fuzz run m3u -- -max_total_time=60
 	cargo +nightly fuzz run xmltv -- -max_total_time=60
@@ -155,8 +160,11 @@ fault-acceptance:
 	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from fault-acceptance fault-acceptance
 
 live-acceptance:
-	docker-compose --env-file .env.test build core
-	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from live-acceptance live-acceptance
+	python3 scripts/live-api-acceptance.py --env-file .env.live
+
+test-live-api-acceptance:
+	python3 scripts/live-api-acceptance.py --self-test
+	python3 scripts/test-live-api-acceptance.py
 
 jellyfin-acceptance:
 	trap 'IPTV_PUBLIC_BASE_URL=http://gateway:8080 docker-compose --project-name iptv-jellyfin-acceptance --env-file .env.test --profile test down --volumes --remove-orphans' EXIT; \

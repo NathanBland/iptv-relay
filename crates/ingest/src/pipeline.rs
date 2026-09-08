@@ -24,11 +24,10 @@ use std::{
     io::{BufReader, Read},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::io::{AsyncWriteExt, BufWriter};
 use tracing::{debug, info};
 use url::Url;
 use uuid::Uuid;
@@ -43,20 +42,25 @@ struct ChannelReader {
     receiver: tokio::sync::mpsc::Receiver<Bytes>,
     current: Bytes,
     pos: usize,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl ChannelReader {
-    fn new(receiver: tokio::sync::mpsc::Receiver<Bytes>) -> Self {
+    fn new(receiver: tokio::sync::mpsc::Receiver<Bytes>, cancelled: Arc<AtomicBool>) -> Self {
         Self {
             receiver,
             current: Bytes::new(),
             pos: 0,
+            cancelled,
         }
     }
 }
 
 impl Read for ChannelReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("ingest parser cancelled"));
+        }
         if self.pos >= self.current.len() {
             if let Some(chunk) = self.receiver.blocking_recv() {
                 debug!(
@@ -75,6 +79,15 @@ impl Read for ChannelReader {
         buf[..n].copy_from_slice(&available[..n]);
         self.pos += n;
         Ok(n)
+    }
+}
+
+/// Stops a detached blocking parser after the async ingest is dropped.
+struct ParserCancellation(Arc<AtomicBool>);
+
+impl Drop for ParserCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -278,6 +291,8 @@ where
         let client = Client::builder()
             .redirect(Policy::none())
             .gzip(false)
+            .connect_timeout(download.stall_timeout)
+            .timeout(download.max_timeout)
             .build()
             .map_err(|_error| {
                 info!("HTTP client construction failed");
@@ -326,7 +341,9 @@ where
 
         // Set up the parser channel and task.
         let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(256);
-        let reader = ChannelReader::new(rx);
+        let parser_cancelled = Arc::new(AtomicBool::new(false));
+        let _parser_guard = ParserCancellation(Arc::clone(&parser_cancelled));
+        let reader = ChannelReader::new(rx, parser_cancelled);
 
         let format = request.format;
         let owner = request.owner;
@@ -349,12 +366,7 @@ where
             )
         });
 
-        // Download loop: write to tempfile, hash, enforce limits, and feed
-        // chunks to the parser channel. The parser runs concurrently in
-        // spawn_blocking, pulling from the channel as chunks arrive.
-        let file = tempfile::tempfile()?;
-        let file = tokio::fs::File::from_std(file);
-        let mut file = BufWriter::with_capacity(512 * 1024, file);
+        // Hash the stream directly. The parser owns the bounded staging spool.
         let mut hasher = Sha256::new();
         let mut byte_count = 0_u64;
         let mut last_checkpoint = std::time::Instant::now();
@@ -389,8 +401,8 @@ where
                     })?,
                     Ok(None) => break, // EOF
                     Err(_) => {
-                        debug!(byte_count, stall_timeout = ?stall_timeout, "streaming: stalled, attempting partial activation");
-                        break;
+                        debug!(byte_count, stall_timeout = ?stall_timeout, "streaming: download stalled");
+                        return Err(IngestError::HttpRequest);
                     }
                 }
             };
@@ -408,8 +420,6 @@ where
                 });
             }
 
-            // Write to tempfile for the audit trail / checksum.
-            file.write_all(&chunk).await?;
             hasher.update(&chunk);
 
             // Feed to parser. If the parser task died (error), send fails.
@@ -422,12 +432,8 @@ where
             if last_checkpoint.elapsed() >= Duration::from_secs(2) {
                 last_checkpoint = std::time::Instant::now();
                 let records = records_counter.load(Ordering::Relaxed);
-                if let Err(error) = self
-                    .checkpoint("downloading", byte_count, 0, records, 0)
-                    .await
-                {
-                    debug!(error = ?error, "streaming: checkpoint failed");
-                }
+                self.checkpoint("downloading", byte_count, 0, records, 0)
+                    .await?;
             }
         }
 
@@ -436,12 +442,10 @@ where
 
         // Report download completion with records parsed so far.
         let records_so_far = records_counter.load(Ordering::Relaxed);
-        let _ = self
-            .checkpoint("downloaded", byte_count, 0, records_so_far, 0)
-            .await;
+        self.checkpoint("downloaded", byte_count, 0, records_so_far, 0)
+            .await?;
 
-        // Flush and finalize the tempfile (for checksum).
-        file.flush().await?;
+        // Finalize the checksum only after a complete response.
         let sha256 = format!("{:x}", hasher.finalize());
 
         // Wait for the parser to finish.
@@ -1579,6 +1583,19 @@ mod tests {
     use crate::{ArtifactLimits, DownloadedArtifact, XtreamEndpoints, XtreamPayloadKind};
     use chrono::TimeZone;
     use std::{io::Write, sync::Mutex};
+
+    #[test]
+    fn parser_cancellation_stops_buffer_consumption() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        sender
+            .try_send(Bytes::from_static(b"buffered input"))
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = ParserCancellation(Arc::clone(&cancelled));
+        let mut reader = ChannelReader::new(receiver, cancelled);
+        drop(guard);
+        assert!(reader.read(&mut [0; 8]).is_err());
+    }
 
     #[derive(Debug)]
     struct TestProtector;
