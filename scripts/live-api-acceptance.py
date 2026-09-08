@@ -398,7 +398,7 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
                     shutil.copyfileobj(response, output, length=1024 * 1024)
             except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
                 raise RuntimeError("gateway XMLTV request failed") from None
-            gateway_ids, gateway_programmes = xmltv_file(gateway_xmltv)
+            gateway_ids, gateway_programmes, _gateway_names = xmltv_file(gateway_xmltv)
             if not gateway_ids or not gateway_programmes:
                 raise RuntimeError(f"cycle {cycle} produced no gateway XMLTV records")
             selected_provider = next((item for item in provider_programmes.items() if item[1]), None)
