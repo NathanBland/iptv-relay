@@ -702,6 +702,19 @@ impl CatalogRepository {
         // parent reaches any terminal state, child work must stop and leave
         // the active catalog unchanged.
         if parent_status != "running" {
+            sqlx::query(
+                r"
+                UPDATE jobs
+                SET status = 'cancelled', completed_at = now(), updated_at = now(),
+                    locked_by = NULL, locked_at = NULL, heartbeat_at = NULL
+                WHERE id = $1
+                  AND kind = 'finalize-provider-reconciliation'
+                  AND status IN ('queued', 'running')
+                ",
+            )
+            .bind(finalizer_job_id)
+            .execute(&mut *transaction)
+            .await?;
             transaction.commit().await?;
             return Ok(ProviderReconciliationFinalization::Cancelled);
         }
