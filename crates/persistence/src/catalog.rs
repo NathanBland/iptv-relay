@@ -4563,20 +4563,29 @@ async fn upsert_candidate_channel_stream_links(
 ) -> Result<i64, PersistenceError> {
     let affected: i64 = sqlx::query(
         r"
+        WITH distinct_links AS (
+            SELECT DISTINCT c.id AS channel_id, rcs.provider_stream_id
+            FROM provider_reconciliation_candidate_streams rcs
+            JOIN channels c
+              ON c.provider_account_id = $1
+             AND c.managed_by = 'automatic'
+             AND c.canonical_key = rcs.canonical_key
+            WHERE rcs.run_id = $2
+        ), ranked_links AS (
+            SELECT channel_id,
+                   provider_stream_id,
+                   row_number() OVER (
+                       PARTITION BY channel_id
+                       ORDER BY provider_stream_id
+                   ) - 1 AS priority
+            FROM distinct_links
+        )
         INSERT INTO channel_streams (channel_id, provider_stream_id, priority, evidence)
-        SELECT c.id,
-               rcs.provider_stream_id,
-               row_number() OVER (
-                   PARTITION BY c.id
-                   ORDER BY rcs.provider_stream_id
-               ) - 1,
+        SELECT channel_id,
+               provider_stream_id,
+               priority,
                jsonb_build_object('reconciled', now(), 'runId', $2::text)
-        FROM provider_reconciliation_candidate_streams rcs
-        JOIN channels c
-          ON c.provider_account_id = $1
-         AND c.managed_by = 'automatic'
-         AND c.canonical_key = rcs.canonical_key
-        WHERE rcs.run_id = $2
+        FROM ranked_links
         ON CONFLICT (channel_id, provider_stream_id) DO UPDATE SET
             priority = EXCLUDED.priority,
             evidence = EXCLUDED.evidence
