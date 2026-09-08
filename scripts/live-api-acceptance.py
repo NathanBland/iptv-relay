@@ -341,10 +341,11 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
     identities: list[tuple[str, ...]] = []
 
     try:
-        start_args = ["up", "-d", "--wait", "postgres", "core", "worker"]
+        start_args = ["up", "-d", "--wait", "postgres", "core"]
         if build:
             start_args.insert(1, "--build")
         compose(env_file, project, *start_args)
+        compose(env_file, project, "up", "-d", "worker")
         request_json(base, "/health/ready", bootstrap)
         baseline = storage_metrics(env_file, project)
         xtream_source_endpoint = xtream_endpoint(provider_url, username, password, "player_api.php")
