@@ -1577,8 +1577,21 @@ async fn run_xtream_short_epg_refresh(
             XtreamPayloadKind::ShortEpg,
             &source.timezone,
         )
-        .await
-        .map_err(RefreshError::Ingest)?;
+        .await;
+        let payload = match payload {
+            // Xtream providers can expose a stream identity without guide
+            // records. Continue with streams that have guide data.
+            Err(IngestError::EmptySnapshot { .. }) => {
+                info!(
+                    source_id = %source.id,
+                    stream_id = stream.stream_id,
+                    "Xtream short EPG stream returned no guide records"
+                );
+                continue;
+            }
+            Err(error) => return Err(RefreshError::Ingest(error)),
+            Ok(payload) => payload,
+        };
         downloaded_bytes = downloaded_bytes.saturating_add(payload.downloaded_bytes);
         decoded_bytes = decoded_bytes.saturating_add(payload.decoded_bytes);
         checksum.update(payload.checksum_sha256.as_bytes());
@@ -1610,6 +1623,12 @@ async fn run_xtream_short_epg_refresh(
             );
         }
         records.extend(document.records);
+    }
+
+    if records.is_empty() {
+        return Err(RefreshError::Ingest(IngestError::EmptySnapshot {
+            format: "Xtream short EPG",
+        }));
     }
 
     let request = IngestRequest {
@@ -3283,6 +3302,7 @@ mod tests {
     const XTREAM_PHASE_RENAMED: u8 = 1;
     const XTREAM_PHASE_AUTH_FAILURE: u8 = 2;
     const XTREAM_PHASE_EMPTY_STREAMS: u8 = 3;
+    const XTREAM_PHASE_PARTIAL_SHORT_EPG: u8 = 4;
 
     #[derive(Default)]
     struct XtreamFixtureState {
@@ -3360,21 +3380,35 @@ mod tests {
                 } else {
                     "Worker Sports 7"
                 };
-                Json(serde_json::json!([
-                    {
-                        "stream_id": 7,
-                        "name": name,
+                let mut streams = vec![serde_json::json!({
+                    "stream_id": 7,
+                    "name": name,
+                    "category_id": "10",
+                    "epg_channel_id": "worker-epg-7",
+                    "num": 7,
+                    "stream_type": "live",
+                    "access_token": "stream-access-token-canary",
+                })];
+                if state.phase() == XTREAM_PHASE_PARTIAL_SHORT_EPG {
+                    streams.push(serde_json::json!({
+                        "stream_id": 8,
+                        "name": "Worker Sports 8",
                         "category_id": "10",
-                        "epg_channel_id": "worker-epg-7",
-                        "num": 7,
+                        "epg_channel_id": "worker-epg-8",
+                        "num": 8,
                         "stream_type": "live",
                         "access_token": "stream-access-token-canary",
-                    }
-                ]))
-                .into_response()
+                    }));
+                }
+                Json(streams).into_response()
             }
             Some("get_short_epg") => {
                 state.short_epg_requests.fetch_add(1, Ordering::SeqCst);
+                if state.phase() == XTREAM_PHASE_PARTIAL_SHORT_EPG
+                    && query.get("stream_id").is_some_and(|id| id == "8")
+                {
+                    return Json(serde_json::json!({"epg_listings": []})).into_response();
+                }
                 // The live-stream fixture exposes stream_id 7 with
                 // epg_channel_id "worker-epg-7". Return one programme whose
                 // channel_id matches that tvg-id so the catalog tvg-id
@@ -6773,7 +6807,7 @@ mod tests {
             .local_addr()
             .expect("Xtream short EPG fixture address");
         let fixture = Arc::new(XtreamFixtureState::default());
-        fixture.set_phase(XTREAM_PHASE_INITIAL);
+        fixture.set_phase(XTREAM_PHASE_PARTIAL_SHORT_EPG);
         let fixture_server = tokio::spawn({
             let fixture = Arc::clone(&fixture);
             async move {
