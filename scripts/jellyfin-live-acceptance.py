@@ -392,13 +392,12 @@ volumes:
         streams: list[dict[str, Any]] = []
         for channel_id, _, _ in ids:
             opened = request(
-                f"{jf}/LiveTv/LiveStreams/Open",
+                f"{jf}/Items/{urllib.parse.quote(channel_id, safe='')}/PlaybackInfo?UserId={urllib.parse.quote(user_id, safe='')}",
                 "POST",
                 {
-                    "OpenToken": secrets.token_urlsafe(18),
                     "UserId": user_id,
-                    "ItemId": channel_id,
                     "PlaySessionId": secrets.token_hex(8),
+                    "AutoOpenLiveStream": True,
                     "EnableDirectPlay": True,
                     "EnableDirectStream": True,
                 },
@@ -406,7 +405,10 @@ volumes:
             )
             if not isinstance(opened, dict):
                 raise RuntimeError("Jellyfin did not return a live stream record")
-            media_source = opened.get("MediaSource") if isinstance(opened.get("MediaSource"), dict) else opened
+            media_sources = opened.get("MediaSources") if isinstance(opened.get("MediaSources"), list) else []
+            media_source = next((item for item in media_sources if isinstance(item, dict)), None)
+            if media_source is None:
+                raise RuntimeError("Jellyfin playback info did not include a live media source")
             stream_id = str(media_source.get("Id") or "")
             stream_path = str(media_source.get("Path") or "")
             match = re.search(r"/LiveStreamFiles/([^/]+)/stream", stream_path)
