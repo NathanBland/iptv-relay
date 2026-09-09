@@ -433,10 +433,15 @@ volumes:
         gateway_numbers = set(gateway_by_number)
         eligible_numbers = {number for number, item in gateway_by_number.items() if int(item.get("streams", 0) or 0) > 0}
         provider_streams = provider_streams_by_number(stream_payload)
+        provider_records = provider_records_by_number(stream_payload)
         usable_numbers: set[str] = set()
         for item in channels:
             number = str(item.get("Number") or item.get("ChannelNumber") or "").strip()
             if number not in eligible_numbers or number in usable_numbers:
+                continue
+            record = provider_records.get(number, {})
+            provider_identity = str(record.get("epg_channel_id") or record.get("stream_id") or "").strip()
+            if provider_identity not in shared_source_ids:
                 continue
             stream_id = provider_streams.get(number)
             if stream_id and provider_stream_has_ts(xtream["URL"], xtream["USER"], xtream["PWD"], stream_id):
