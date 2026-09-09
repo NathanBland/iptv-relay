@@ -470,13 +470,16 @@ def run_gate(values: dict[str, str], build: bool = True, report_file: Path | Non
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         time.sleep(10)
         cleanup = compose(env_file, project, "down", "--volumes", "--remove-orphans", check=False)
-        remaining = compose(env_file, project, "ps", "-q", check=False)
+        # Include stopped and stopping containers. Plain `ps -q` can omit a
+        # container while Docker still removes it, which would hide cleanup
+        # failures from the acceptance gate.
+        remaining = compose(env_file, project, "ps", "-aq", check=False)
         for _attempt in range(24):
             if cleanup.returncode == 0 and remaining.returncode == 0 and not remaining.stdout.strip():
                 break
             time.sleep(5)
             cleanup = compose(env_file, project, "down", "--volumes", "--remove-orphans", check=False)
-            remaining = compose(env_file, project, "ps", "-q", check=False)
+            remaining = compose(env_file, project, "ps", "-aq", check=False)
         env_file.unlink(missing_ok=True)
         shutil.rmtree(temp_root, ignore_errors=True)
         COMPOSE_OVERRIDE = None
