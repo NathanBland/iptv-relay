@@ -9,6 +9,7 @@ RUN_ID="$(date +%s)-$$"
 COMPOSE_PROJECT_NAME="iptv-test-${RUN_ID}"
 KEEP_RESOURCES=0
 RUN_LIVE=0
+RUN_LIVE_JELLYFIN=0
 
 usage() {
   cat <<'EOF'
@@ -18,6 +19,8 @@ Run all noncredentialed repository gates in an isolated Compose project.
 
 Options:
   --live    Run the credentialed live-provider gate after noncredentialed gates.
+  --live-jellyfin
+            Run the opt-in real-provider acceptance through disposable Jellyfin.
   --keep    Keep runner-owned Compose resources after the run.
   --help    Show this help.
 
@@ -32,6 +35,7 @@ EOF
 while (($# > 0)); do
   case "$1" in
     --live) RUN_LIVE=1 ;;
+    --live-jellyfin) RUN_LIVE_JELLYFIN=1 ;;
     --keep) KEEP_RESOURCES=1 ;;
     --help|-h) usage; exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -160,6 +164,12 @@ if ((RUN_LIVE == 1)); then
   run_stage live-api-acceptance make live-acceptance
 else
   printf '\nCredentialed live acceptance: skipped (use --live to enable).\n'
+fi
+
+if ((RUN_LIVE_JELLYFIN == 1)); then
+  run_stage live-jellyfin-acceptance make live-jellyfin-acceptance
+else
+  printf 'Credentialed Jellyfin acceptance: skipped (use --live-jellyfin to enable).\n'
 fi
 
 printf '\nAll requested test stages passed.\n'

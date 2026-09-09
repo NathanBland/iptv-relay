@@ -1,4 +1,4 @@
-.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-runner test-openapi-drift-check test-caddy-security test-release-compose postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-release-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance provider-stream-compare test-provider-stream-compare test-live-api-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned clean-debug dev
+.PHONY: doctor fmt lint audit test test-rust test-web test-integration test-e2e test-e2e-ci test-coverage-script test-runner test-openapi-drift-check test-caddy-security test-release-compose postgres-test coverage coverage-rust coverage-web coverage-changed openapi-snapshot openapi-drift-check fuzz-smoke docs-build compose-health compose-e2e-ci ci build compose-config compose-release-config compose-up compose-down compose-dev-up compose-dev-down compose-dev-logs compose-dev-build media-acceptance fault-acceptance live-acceptance live-jellyfin-acceptance provider-stream-compare test-provider-stream-compare test-live-api-acceptance jellyfin-acceptance scale-gate scale-gate-build scale-gate-smoke scale-gate-pinned clean-debug dev
 
 DEV_COMPOSE = docker-compose --parallel 1 -f docker-compose.yml -f docker-compose.dev.yml
 
@@ -161,6 +161,12 @@ fault-acceptance:
 
 live-acceptance:
 	python3 scripts/live-api-acceptance.py --env-file .env.live --provider-env-file .env.xtreme
+
+# Run the opt-in provider acceptance through a disposable Jellyfin server.
+# The runner parses both credential files without shell evaluation and removes
+# its own Compose resources after every run.
+live-jellyfin-acceptance:
+	python3 scripts/jellyfin-live-acceptance.py --live-env .env.live --xtream-env .env.xtreme
 
 provider-stream-compare:
 	python3 scripts/provider-stream-compare.py
