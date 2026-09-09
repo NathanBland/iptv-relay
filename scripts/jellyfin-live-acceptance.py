@@ -444,17 +444,28 @@ volumes:
         selected_numbers = {number or fallback for _, number, fallback in ids if number or fallback}
         if not selected_numbers or not selected_numbers & gateway_numbers:
             raise RuntimeError("Jellyfin channel numbers do not overlap gateway channels")
+        mapping_items = list(mappings)
+        mapping_total = int(request(f"{core}/api/v1/epg/mappings?limit=1&offset=0", token=bootstrap).get("total", len(mapping_items)) or len(mapping_items))
+        for offset in range(5000, mapping_total, 5000):
+            mapping_items.extend(page_items(request(f"{core}/api/v1/epg/mappings?limit=5000&offset={offset}", token=bootstrap)))
+        mapping_by_channel = {
+            str(item.get("channelId", "")): item
+            for item in mapping_items
+            if str(item.get("channelId", "")).strip()
+        }
         provider_identity = []
         for item, (channel_id, number, fallback) in zip(selected, ids):
             provider_ids = item.get("ProviderIds") if isinstance(item.get("ProviderIds"), dict) else {}
-            identity = next((str(value).strip() for value in provider_ids.values() if str(value).strip()), "")
-            identity = identity or str(item.get("ExternalId") or item.get("ChannelId") or number or fallback).strip()
+            identity = next((str(value).strip() for value in provider_ids.values() if str(value).strip() in shared_ids), "")
+            gateway_channel = gateway_by_number.get(number or fallback, {})
+            mapping = mapping_by_channel.get(str(gateway_channel.get("id", "")), {})
+            identity = identity or str(mapping.get("canonicalKey") or mapping.get("epgXmltvId") or "").strip()
             if identity:
                 provider_identity.append(identity)
         if len(provider_identity) != 2:
-            raise RuntimeError("Jellyfin did not expose provider identity for both channels")
+            raise RuntimeError("Jellyfin channels did not resolve to provider identities")
         if not set(provider_identity).issubset(shared_ids):
-            raise RuntimeError("Jellyfin provider identities did not match reconciled provider identities")
+            raise RuntimeError("Jellyfin channel mappings did not match reconciled provider identities")
         selected_gateway_ids = {
             str(gateway_by_number[number].get("id", ""))
             for _, number, fallback in ids
