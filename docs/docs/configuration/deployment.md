@@ -102,6 +102,25 @@ Store backups outside the repository.
 Protect backups because they contain gateway configuration and catalog data.
 Test each restore on a separate PostgreSQL instance.
 
+## State and scaling
+
+Run one `core` replica per deployment.
+The core process owns the live media-session registry and provider-slot leases.
+Keep all worker replicas connected to the same PostgreSQL database.
+PostgreSQL stores jobs, leases, channel identity, source snapshots, and recovery state.
+
+Do not run multiple core replicas behind a load balancer.
+Multiple core replicas would keep separate session registries and could route termination to the wrong process.
+Add a shared session registry before you scale core horizontally.
+
+A core restart closes its local media sessions.
+Jellyfin reconnects through the catalog after the new core becomes healthy.
+Worker restarts recover queued and leased jobs from PostgreSQL.
+Concurrent session termination is idempotent at the core process.
+
+Valkey is not required for the supported single-core Compose topology.
+Re-evaluate this decision when core replicas or cross-host session ownership become deployment requirements.
+
 ## Cleanup
 
 Stop services and keep data:
