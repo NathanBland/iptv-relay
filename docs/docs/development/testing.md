@@ -175,6 +175,45 @@ It fails when the provider and XMLTV data have no shared IDs.
 The gate reports redacted storage metrics and removes its containers, volumes, and temporary environment file after every result.
 The report includes final pending jobs, reconciliation candidates, staging snapshots, temporary files, and cleanup status.
 
+## Compare M3U and Xtream streams
+
+Run the provider stream comparison when playback differs between source types:
+
+```bash
+make provider-stream-compare
+```
+
+The script reads `IPTV_TEST_M3U_URL` from `.env.live`.
+The script reads `URL`, `USER`, and `PWD` from `.env.xtreme`.
+The parser does not evaluate either file as shell code.
+
+The script compares the Altitude Sports and ESPN News records by stream ID.
+It uses normalized names only when the M3U record has no usable ID.
+It compares URL shapes and private digests without writing provider URLs to the report.
+
+The script probes both direct provider URLs.
+It then creates separate disposable M3U and Xtream stacks.
+Each stack tests two concurrent streams with the `auto`, `ffmpeg`, and `vlc` input adapters.
+The test sets each source `maxConnections` value to the provider capacity.
+
+The source default is one connection.
+Set the source value to at least two when the provider permits concurrent streams:
+
+```bash
+curl -X PATCH http://localhost:8080/api/v1/sources/{source_id} \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"maxConnections":3}'
+```
+
+The script removes its Compose containers, volumes, internal fixture, and temporary files after success or failure.
+Use `--no-build` when the local core image already contains the code under test.
+Run `make test-provider-stream-compare` for the credential-free helper checks.
+
+Treat `auto` as the baseline adapter for provider MPEG-TS URLs.
+Use FFmpeg or VLC only when their two-stream result is also successful for the provider.
+Provider adapter failures can be stream-specific even when the URL digest matches.
+
 Run its parser self-test without Docker:
 
 ```bash
