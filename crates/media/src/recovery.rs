@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use parking_lot::Mutex;
 use thiserror::Error;
 
-use crate::{HttpTsSessionKey, RingSnapshot};
+use crate::{HttpTsSessionKey, RingSnapshot, SessionInputAdapter};
 
 pub const MAX_RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 
@@ -134,6 +134,7 @@ pub struct HttpTsSessionSnapshot {
 pub(crate) struct SessionDiagnostics {
     key: HttpTsSessionKey,
     channel_name: Option<Arc<str>>,
+    adapter: Mutex<Option<SessionInputAdapter>>,
     inner: Mutex<DiagnosticsState>,
 }
 
@@ -163,6 +164,7 @@ impl SessionDiagnostics {
         Arc::new(Self {
             key,
             channel_name,
+            adapter: Mutex::new(None),
             inner: Mutex::new(DiagnosticsState {
                 state: SessionState::Idle,
                 next_viewer_id: 1,
@@ -189,6 +191,14 @@ impl SessionDiagnostics {
 
     pub(crate) fn channel_name(&self) -> Option<&str> {
         self.channel_name.as_deref()
+    }
+
+    pub(crate) fn set_adapter(&self, adapter: SessionInputAdapter) {
+        *self.adapter.lock() = Some(adapter);
+    }
+
+    pub(crate) fn adapter(&self) -> Option<SessionInputAdapter> {
+        *self.adapter.lock()
     }
 
     pub(crate) fn set_generation(&self, generation: u64) {

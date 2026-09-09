@@ -661,11 +661,14 @@ async fn start_http_ts_session(
     source: HttpTsSourceSpec,
 ) -> Result<HttpTsSession, SessionStartError> {
     let diagnostics = SessionDiagnostics::new(source.key.clone(), source.channel_name.clone());
+    let selected_adapter = source.adapter_policy.selected_adapter();
+    diagnostics.set_adapter(selected_adapter);
     info!(
         provider_pool_id = %source.key.provider_pool_id,
         source_id = %source.key.source_id,
         generation = source.key.generation,
         channel_name = source.channel_name.as_deref().unwrap_or(""),
+        adapter = ?selected_adapter,
         "media session starting"
     );
     diagnostics.set_state(SessionState::Reserving);
@@ -916,16 +919,31 @@ async fn pump_http_ts(
             source_id = %diagnostics.key().source_id,
             generation = diagnostics.key().generation,
             channel_name = diagnostics.channel_name().unwrap_or(""),
+            adapter = ?diagnostics.adapter(),
             failure = ?active_failure,
             viewers = diagnostics.has_viewers(),
             "media session upstream failure"
         );
         if diagnostics.is_stopping() {
+            info!(
+                provider_pool_id = %diagnostics.key().provider_pool_id,
+                source_id = %diagnostics.key().source_id,
+                generation = diagnostics.key().generation,
+                terminal = "operator-stop",
+                "media session reached terminal state"
+            );
             return;
         }
         if !diagnostics.has_viewers() {
             diagnostics.set_state(SessionState::Stopping);
             ring.close(RingCloseReason::Shutdown);
+            info!(
+                provider_pool_id = %diagnostics.key().provider_pool_id,
+                source_id = %diagnostics.key().source_id,
+                generation = diagnostics.key().generation,
+                terminal = "viewer-drained",
+                "media session reached terminal state"
+            );
             return;
         }
         resources.body.take();
@@ -948,6 +966,14 @@ async fn pump_http_ts(
         else {
             diagnostics.record_failure(SessionFailureKind::RecoveryExpired);
             diagnostics.set_state(SessionState::Failed);
+            warn!(
+                provider_pool_id = %diagnostics.key().provider_pool_id,
+                source_id = %diagnostics.key().source_id,
+                generation = diagnostics.key().generation,
+                attempts = diagnostics.reconnect_attempts(),
+                terminal = "recovery-expired",
+                "media session reached terminal state"
+            );
             ring.close(RingCloseReason::RecoveryExpired {
                 attempts: diagnostics.reconnect_attempts(),
             });
@@ -1068,6 +1094,7 @@ async fn recover_session(
             source_id = %diagnostics.key().source_id,
             generation = diagnostics.key().generation,
             channel_name = diagnostics.channel_name().unwrap_or(""),
+            adapter = ?diagnostics.adapter(),
             attempt,
             endpoint_index,
             failover = is_failover,
@@ -1092,6 +1119,7 @@ async fn recover_session(
                 provider_pool_id = %diagnostics.key().provider_pool_id,
                 source_id = %diagnostics.key().source_id,
                 generation = diagnostics.key().generation,
+                adapter = ?diagnostics.adapter(),
                 attempt,
                 "media session recovery attempt could not acquire provider capacity"
             );
@@ -1242,6 +1270,7 @@ async fn stream_until_failure(
                             source_id = %diagnostics.key().source_id,
                             generation = diagnostics.key().generation,
                             channel_name = diagnostics.channel_name().unwrap_or(""),
+                            adapter = ?diagnostics.adapter(),
                             "media session ring closed while publishing packets"
                         );
                         return SessionFailureKind::Packetization;
@@ -1253,6 +1282,7 @@ async fn stream_until_failure(
                         source_id = %diagnostics.key().source_id,
                         generation = diagnostics.key().generation,
                         channel_name = diagnostics.channel_name().unwrap_or(""),
+                        adapter = ?diagnostics.adapter(),
                         error = %error,
                         "media session rejected MPEG-TS input"
                     );
@@ -1265,6 +1295,7 @@ async fn stream_until_failure(
                     source_id = %diagnostics.key().source_id,
                     generation = diagnostics.key().generation,
                     channel_name = diagnostics.channel_name().unwrap_or(""),
+                    adapter = ?diagnostics.adapter(),
                     error = %error.without_url(),
                     "media session upstream read failed"
                 );
@@ -1276,6 +1307,7 @@ async fn stream_until_failure(
                     source_id = %diagnostics.key().source_id,
                     generation = diagnostics.key().generation,
                     channel_name = diagnostics.channel_name().unwrap_or(""),
+                    adapter = ?diagnostics.adapter(),
                     timeout_ms = u64::try_from(read_timeout.as_millis()).unwrap_or(u64::MAX),
                     "media session upstream read timed out"
                 );
@@ -1290,6 +1322,7 @@ async fn stream_until_failure(
                         source_id = %diagnostics.key().source_id,
                         generation = diagnostics.key().generation,
                         channel_name = diagnostics.channel_name().unwrap_or(""),
+                        adapter = ?diagnostics.adapter(),
                         pending_bytes = packetizer.pending_bytes(),
                         "media session upstream ended with an incomplete MPEG-TS packet"
                     );
