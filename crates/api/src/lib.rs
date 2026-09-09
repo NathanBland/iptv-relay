@@ -161,7 +161,7 @@ impl AppState {
         let catalog_repository = database
             .as_ref()
             .map(|database| CatalogRepository::new(database.pool().clone()));
-        if config.dev_auth_disabled {
+        if config.dev_mode && config.dev_auth_disabled {
             warn!("development authentication bypass is enabled; use only for local testing");
         }
         Self {
