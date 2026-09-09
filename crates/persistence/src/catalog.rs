@@ -251,6 +251,12 @@ impl CatalogRepository {
                 // A checksum-equivalent snapshot can become staging again
                 // after a newer snapshot supersedes it. Rebuild its durable
                 // run so terminal state does not strand the staged snapshot.
+                sqlx::query(
+                    "DELETE FROM provider_reconciliation_candidate_streams WHERE run_id = $1",
+                )
+                .bind(run.id)
+                .execute(&mut *transaction)
+                .await?;
                 sqlx::query("DELETE FROM provider_reconciliation_candidates WHERE run_id = $1")
                     .bind(run.id)
                     .execute(&mut *transaction)
@@ -713,6 +719,12 @@ impl CatalogRepository {
                 ",
             )
             .bind(finalizer_job_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE provider_reconciliation_runs SET status = 'cancelled', updated_at = now() WHERE id = $1 AND status IN ('queued', 'processing')",
+            )
+            .bind(run_id)
             .execute(&mut *transaction)
             .await?;
             sqlx::query("DELETE FROM provider_reconciliation_candidate_streams WHERE run_id = $1")
@@ -4518,6 +4530,11 @@ async fn upsert_candidate_channels(
                 rc.name,
                 rc.group_name,
                 rc.logo_url,
+                c.id AS existing_id,
+                c.name AS existing_name,
+                c.group_name AS existing_group_name,
+                c.logo_url AS existing_logo_url,
+                c.enabled AS existing_enabled,
                 CASE
                     WHEN rc.preferred_number IS NOT NULL
                          AND rc.preferred_rank = 1
@@ -4542,6 +4559,12 @@ async fn upsert_candidate_channels(
         SELECT id, channel_number, name, group_name, logo_url, true,
                'automatic', $1, canonical_key, 1
         FROM channel_rows
+        -- Most refreshes repeat the same provider catalog. Skip unchanged
+        -- rows before the conflict path so PostgreSQL does not recheck every
+        -- existing channel during a large reconciliation publication.
+        WHERE existing_id IS NULL
+           OR (existing_name, existing_group_name, existing_logo_url, existing_enabled)
+              IS DISTINCT FROM (name, group_name, logo_url, true)
         ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             group_name = EXCLUDED.group_name,

@@ -711,6 +711,35 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
             .await
             .unwrap();
     assert_eq!(canceled_sibling_status, "cancelled");
+    let terminal_failed_finalizer = jobs
+        .enqueue(&NewJob::immediate(
+            "finalize-provider-reconciliation",
+            json!({
+                "runId": replacement_run.id,
+                "sourceId": account_id,
+                "parentJobId": replacement_parent.id,
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog
+            .finalize_provider_reconciliation(
+                replacement_run.id,
+                replacement_parent.id,
+                terminal_failed_finalizer.id,
+            )
+            .await
+            .unwrap(),
+        ProviderReconciliationFinalization::Cancelled
+    );
+    let canceled_terminal_run_status: String =
+        sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")
+            .bind(replacement_run.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(canceled_terminal_run_status, "cancelled");
     let preserved_run_status: String =
         sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")
             .bind(run_id)
