@@ -160,7 +160,7 @@ fault-acceptance:
 	docker-compose --env-file .env.test --profile test up --abort-on-container-exit --exit-code-from fault-acceptance fault-acceptance
 
 live-acceptance:
-	python3 scripts/live-api-acceptance.py --env-file .env.xtreme
+	python3 scripts/live-api-acceptance.py --env-file .env.live --provider-env-file .env.xtreme
 
 provider-stream-compare:
 	python3 scripts/provider-stream-compare.py

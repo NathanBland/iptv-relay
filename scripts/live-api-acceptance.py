@@ -247,13 +247,13 @@ def compose(env_file: Path, project: str, *args: str, check: bool = True) -> sub
 
 
 def storage_metrics(env_file: Path, project: str) -> dict[str, int]:
-    query = "SELECT pg_database_size(current_database()), (SELECT temp_bytes FROM pg_stat_database WHERE datname=current_database()), (SELECT COALESCE(sum(size), 0) FROM pg_ls_tmpdir()), (SELECT count(*) FROM source_snapshots WHERE status='staging'), (SELECT count(*) FROM provider_reconciliation_candidates), (SELECT count(*) FROM jobs WHERE status IN ('queued','running'));"
+    query = "SELECT pg_database_size(current_database()), (SELECT temp_bytes FROM pg_stat_database WHERE datname=current_database()), (SELECT COALESCE(sum(size), 0) FROM pg_ls_tmpdir()), (SELECT count(*) FROM source_snapshots WHERE status='staging'), (SELECT count(*) FROM source_snapshots WHERE status='active'), (SELECT count(*) FROM source_snapshots WHERE status <> 'active'), (SELECT count(*) FROM provider_reconciliation_candidates), (SELECT count(*) FROM jobs WHERE status IN ('queued','running'));"
     result = compose(env_file, project, "exec", "-T", "postgres", "psql", "-U", "iptv", "-d", "iptv", "-At", "-c", query, check=False)
     fields = result.stdout.strip().split("|")
-    if result.returncode or len(fields) != 6:
+    if result.returncode or len(fields) != 8:
         raise RuntimeError("storage metrics unavailable")
     try:
-        return {"databaseBytes": int(fields[0]), "tempBytesCumulative": int(fields[1]), "tempFileBytes": int(fields[2]), "stagingSnapshots": int(fields[3]), "reconciliationCandidates": int(fields[4]), "pendingJobs": int(fields[5])}
+        return {"databaseBytes": int(fields[0]), "tempBytesCumulative": int(fields[1]), "tempFileBytes": int(fields[2]), "stagingSnapshots": int(fields[3]), "activeSnapshots": int(fields[4]), "nonActiveSnapshots": int(fields[5]), "reconciliationCandidates": int(fields[6]), "pendingJobs": int(fields[7])}
     except ValueError:
         raise RuntimeError("storage metrics unavailable") from None
 
@@ -526,7 +526,8 @@ def run_gate(values: dict[str, str], build: bool = True, report_file: Path | Non
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run real-provider API acceptance")
-    parser.add_argument("--env-file", default=str(ROOT / ".env.xtreme"))
+    parser.add_argument("--env-file", default=str(ROOT / ".env.live"), help="operational live environment file")
+    parser.add_argument("--provider-env-file", default=str(ROOT / ".env.xtreme"), help="Xtream provider credential file")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--no-build", action="store_true", help="use the existing local core image")
     parser.add_argument("--report-file", type=Path, help="write the redacted JSON acceptance report to this path")
@@ -537,7 +538,12 @@ def main() -> int:
             assert programme_key(("Show", "20260101000000 +0000", "20260101010000 +0000")) == programme_key(("Show", "20251231170000 -0700", "20251231180000 -0700"))
             print("live API acceptance self-test passed")
         else:
-            run_gate(parse_env(Path(args.env_file)), build=not args.no_build, report_file=args.report_file)
+            values = parse_env(Path(args.env_file))
+            provider_values = parse_env(Path(args.provider_env_file))
+            for key in ("URL", "USER", "PWD"):
+                if key in provider_values:
+                    values[key] = provider_values[key]
+            run_gate(values, build=not args.no_build, report_file=args.report_file)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"live API acceptance failed: {exc}", file=sys.stderr)
         return 1
