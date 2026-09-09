@@ -84,6 +84,23 @@ async fn migrations_and_job_lifecycle_are_transactionally_usable() {
         parent_job_index_exists,
         "the reconciliation parent-job lookup index is available"
     );
+    for index_name in [
+        "source_snapshots_active_owner_lookup_idx",
+        "jobs_refresh_source_latest_idx",
+    ] {
+        let index_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+             WHERE schemaname = current_schema() AND indexname = $1)",
+        )
+        .bind(index_name)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            index_exists,
+            "the {index_name} source list index is available"
+        );
+    }
 
     let repository = JobRepository::new(database.pool().clone());
     let mut first = NewJob::immediate("integration-success", json!({"fixture": true}));
