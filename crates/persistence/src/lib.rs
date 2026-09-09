@@ -4,7 +4,7 @@ mod catalog;
 mod cleanup;
 mod outbox;
 
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
@@ -85,6 +85,18 @@ pub enum PersistenceError {
 
 const ENCRYPTED_VALUE_VERSION: u8 = 1;
 const XNONCE_LENGTH: usize = 24;
+const MIGRATION_DEADLOCK_RETRIES: u32 = 3;
+
+fn is_migration_deadlock(error: &sqlx::migrate::MigrateError) -> bool {
+    let database_error = match error {
+        sqlx::migrate::MigrateError::Execute(error)
+        | sqlx::migrate::MigrateError::ExecuteMigration(error, _) => error.as_database_error(),
+        _ => None,
+    };
+    database_error
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "40P01")
+}
 
 #[derive(Clone)]
 pub struct MasterKey([u8; 32]);
@@ -253,14 +265,29 @@ impl Database {
         let mut connection = self.pool.acquire().await?;
         let lock_query = sqlx::query("SELECT pg_advisory_lock(7283912041)");
         lock_query.execute(&mut *connection).await?;
-        sqlx::query("CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public")
+        let extension_result =
+            sqlx::query("CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public")
+                .execute(&mut *connection)
+                .await;
+        let unlock_result = sqlx::query("SELECT pg_advisory_unlock(7283912041)")
             .execute(&mut *connection)
-            .await?;
-        let unlock_query = sqlx::query("SELECT pg_advisory_unlock(7283912041)");
-        unlock_query.execute(&mut *connection).await?;
+            .await;
+        extension_result?;
+        unlock_result?;
         drop(connection);
-        MIGRATOR.run(&self.pool).await?;
-        Ok(())
+
+        for attempt in 0..=MIGRATION_DEADLOCK_RETRIES {
+            match MIGRATOR.run(&self.pool).await {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if is_migration_deadlock(&error) && attempt < MIGRATION_DEADLOCK_RETRIES =>
+                {
+                    tokio::time::sleep(Duration::from_secs(1_u64 << attempt)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("the migration retry loop always returns")
     }
 
     /// Checks that the pool can execute a trivial query.

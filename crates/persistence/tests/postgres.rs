@@ -213,6 +213,33 @@ async fn migrations_and_job_lifecycle_are_transactionally_usable() {
 }
 
 #[tokio::test]
+async fn concurrent_migrations_are_serialized() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let admin = Database::connect(&database_url, 2).await.unwrap();
+    let schema = format!("iptv_test_{}", uuid::Uuid::now_v7().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(admin.pool())
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&database_url).unwrap();
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema},public"));
+    let first = Database::connect(url.as_str(), 4).await.unwrap();
+    let second = Database::connect(url.as_str(), 4).await.unwrap();
+
+    let (first_result, second_result) = tokio::join!(first.migrate(), second.migrate());
+    first_result.unwrap();
+    second_result.unwrap();
+
+    drop(first);
+    drop(second);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
 async fn provider_reconciliation_partitions_conserve_canonical_key_counts() {
     let Some(database_url) = database_url() else {
         eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
