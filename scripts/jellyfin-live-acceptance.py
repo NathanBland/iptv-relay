@@ -198,8 +198,15 @@ def storage_bytes(path: Path) -> int:
 
 def sessions_state(core: str, token: str) -> tuple[list[dict[str, Any]], int, int]:
     sessions = page_items(request(f"{core}/api/v1/sessions", token=token))
-    active = sum(int(item.get("providerActiveSessions", 0) or 0) for item in sessions)
-    available = sum(int(item.get("providerAvailableSlots", 0) or 0) for item in sessions)
+    pools: dict[str, tuple[int, int]] = {}
+    for item in sessions:
+        pool_id = str(item.get("providerPoolId") or item.get("sourceId") or "")
+        active = int(item.get("providerActiveSessions", 0) or 0)
+        available = int(item.get("providerAvailableSlots", 0) or 0)
+        previous = pools.get(pool_id, (0, 0))
+        pools[pool_id] = (max(previous[0], active), max(previous[1], available))
+    active = sum(value[0] for value in pools.values())
+    available = sum(value[1] for value in pools.values())
     return sessions, active, available
 
 
