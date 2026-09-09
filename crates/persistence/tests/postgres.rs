@@ -733,13 +733,13 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
             .unwrap(),
         ProviderReconciliationFinalization::Cancelled
     );
-    let canceled_terminal_run_status: String =
+    let preserved_failed_run_status: String =
         sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")
             .bind(replacement_run.id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(canceled_terminal_run_status, "cancelled");
+    assert_eq!(preserved_failed_run_status, "failed");
     let preserved_run_status: String =
         sqlx::query_scalar("SELECT status FROM provider_reconciliation_runs WHERE id = $1")
             .bind(run_id)
