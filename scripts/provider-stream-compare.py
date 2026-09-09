@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import gzip
+import hashlib
 import http.client
 import json
 import os
@@ -14,7 +15,6 @@ import secrets
 import shutil
 import socket
 import subprocess
-import hashlib
 import time
 import urllib.error
 import urllib.parse
@@ -23,10 +23,6 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = (
-    "USA: ALTITUDE SPORTS [720p]",
-    "USA: ESPN NEWS [720p]",
-)
 TERMINAL = {"succeeded", "failed", "cancelled", "dead"}
 MPEG_TS_PACKET = 188
 MPEG_TS_SAMPLE = MPEG_TS_PACKET * 50
@@ -54,6 +50,17 @@ def parse_env(path: Path, allowed: set[str]) -> dict[str, str]:
 def normalize_name(value: str) -> str:
     """Normalize a provider name for fallback matching."""
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+def parse_targets(values: dict[str, str]) -> tuple[str, ...]:
+    """Read the exact provider names to compare from the test environment."""
+    targets = tuple(item.strip() for item in values.get("IPTV_TEST_TARGETS", "").split("|") if item.strip())
+    normalized = tuple(normalize_name(item) for item in targets)
+    if len(targets) != 2:
+        raise RuntimeError("IPTV_TEST_TARGETS must contain exactly two pipe-separated provider names")
+    if any(not item for item in normalized) or len(set(normalized)) != len(normalized):
+        raise RuntimeError("IPTV_TEST_TARGETS must contain unique provider names")
+    return targets
 
 
 def safe_url_shape(value: str) -> str:
@@ -116,9 +123,9 @@ def fetch_json(url: str) -> Any:
         raise RuntimeError("Xtream API request failed") from None
 
 
-def parse_m3u(path: Path) -> dict[str, list[dict[str, str]]]:
-    records: dict[str, list[dict[str, str]]] = {target: [] for target in TARGETS}
-    target_keys = {normalize_name(target): target for target in TARGETS}
+def parse_m3u(path: Path, targets: tuple[str, ...]) -> dict[str, list[dict[str, str]]]:
+    records: dict[str, list[dict[str, str]]] = {target: [] for target in targets}
+    target_keys = {normalize_name(target): target for target in targets}
     pending: tuple[str, dict[str, str]] | None = None
     with path.open("r", encoding="utf-8-sig", errors="replace") as stream:
         for raw in stream:
@@ -141,7 +148,7 @@ def parse_m3u(path: Path) -> dict[str, list[dict[str, str]]]:
     return records
 
 
-def fetch_provider_data(values_live: dict[str, str], values_xtream: dict[str, str], temp_root: Path, m3u_cache: Path | None = None, xtream_cache: Path | None = None) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[dict[str, Any]]]]:
+def fetch_provider_data(values_live: dict[str, str], values_xtream: dict[str, str], targets: tuple[str, ...], temp_root: Path, m3u_cache: Path | None = None, xtream_cache: Path | None = None) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[dict[str, Any]]]]:
     m3u_url = values_live.get("IPTV_TEST_M3U_URL", "").strip()
     base = values_xtream.get("URL", "").strip()
     username = values_xtream.get("USER", "")
@@ -153,7 +160,7 @@ def fetch_provider_data(values_live: dict[str, str], values_xtream: dict[str, st
         shutil.copyfile(m3u_cache, m3u_path)
     else:
         download(m3u_url, m3u_path)
-    m3u = parse_m3u(m3u_path)
+    m3u = parse_m3u(m3u_path, targets)
     if xtream_cache:
         payload = json.loads(xtream_cache.read_text(encoding="utf-8-sig"))
     else:
@@ -164,8 +171,8 @@ def fetch_provider_data(values_live: dict[str, str], values_xtream: dict[str, st
         payload = fetch_json(xtream_endpoint(base, username, password, "get_live_streams"))
     if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
         raise RuntimeError("Xtream live-stream response was invalid")
-    xtream: dict[str, list[dict[str, Any]]] = {target: [] for target in TARGETS}
-    target_keys = {normalize_name(target): target for target in TARGETS}
+    xtream: dict[str, list[dict[str, Any]]] = {target: [] for target in targets}
+    target_keys = {normalize_name(target): target for target in targets}
     for item in payload:
         target = target_keys.get(normalize_name(str(item.get("name", ""))))
         if target:
@@ -190,9 +197,9 @@ def pair_record(m3u_record: dict[str, str], xtream_record: dict[str, Any], value
     }
 
 
-def choose_records(m3u: dict[str, list[dict[str, str]]], xtream: dict[str, list[dict[str, Any]]], values_xtream: dict[str, str]) -> dict[str, dict[str, Any]]:
+def choose_records(m3u: dict[str, list[dict[str, str]]], xtream: dict[str, list[dict[str, Any]]], targets: tuple[str, ...], values_xtream: dict[str, str]) -> dict[str, dict[str, Any]]:
     selected: dict[str, dict[str, Any]] = {}
-    for target in TARGETS:
+    for target in targets:
         if not m3u[target]:
             raise RuntimeError(f"M3U has no record for {target}")
         if not xtream[target]:
@@ -312,9 +319,9 @@ def create_source(base: str, token_value: str, kind: str, endpoint: str, values_
     return str(created["id"])
 
 
-def target_channels(base: str, token_value: str) -> dict[str, str]:
+def target_channels(base: str, token_value: str, targets: tuple[str, ...]) -> dict[str, str]:
     output: dict[str, str] = {}
-    for target in TARGETS:
+    for target in targets:
         query = urllib.parse.urlencode({"search": target, "limit": 50, "offset": 0})
         body = api_json(base, f"/api/v1/channels?{query}", token_value)
         items = body.get("items", []) if isinstance(body, dict) else []
@@ -366,18 +373,20 @@ def storage_metrics(env_file: Path, project: str, override: Path) -> dict[str, i
 
 def self_test() -> None:
     """Run credential-free checks for URL comparison helpers."""
+    targets = tuple(f"target-{index}" for index in range(2))
+    assert parse_targets({"IPTV_TEST_TARGETS": " | ".join(targets)}) == targets
     sample = "http://provider.test/live/user/password/13599.ts"
     assert stream_id_from_url(sample) == "13599"
     assert safe_url_shape(sample) == "http://<provider>/live/<username>/<password>/13599.ts"
     assert url_digest(sample) == hashlib.sha256(sample.encode("utf-8")).hexdigest()
-    m3u_record = {"title": TARGETS[0], "tvgId": "", "group": "Sports", "url": sample, "streamId": "13599"}
-    xtream_record = {"name": TARGETS[0], "stream_id": 13599}
+    m3u_record = {"title": targets[0], "tvgId": "", "group": "Sports", "url": sample, "streamId": "13599"}
+    xtream_record = {"name": targets[0], "stream_id": 13599}
     pair = pair_record(m3u_record, xtream_record, {"URL": "http://provider.test", "USER": "user", "PWD": "password"})
     assert pair["sameExactUrl"]
     print("provider stream comparison self-test passed")
 
 
-def run_stack(kind: str, selected: dict[str, dict[str, Any]], values_xtream: dict[str, str], capacity: int, root: Path, build: bool, stream_seconds: int) -> dict[str, Any]:
+def run_stack(kind: str, selected: dict[str, dict[str, Any]], targets: tuple[str, ...], values_xtream: dict[str, str], capacity: int, root: Path, build: bool, stream_seconds: int) -> dict[str, Any]:
     project = f"iptv-stream-compare-{kind.casefold()}-{secrets.token_hex(4)}"
     env_file = root / f"{kind.casefold()}.env"
     override = root / f"{kind.casefold()}.compose.yml"
@@ -402,7 +411,7 @@ def run_stack(kind: str, selected: dict[str, dict[str, Any]], values_xtream: dic
     if kind == "M3U":
         mini_path = root / "selected.m3u"
         lines = ["#EXTM3U"]
-        for target in TARGETS:
+        for target in targets:
             record = selected[target]["m3u"]
             lines.append(f'#EXTINF:-1 tvg-id="{record["tvgId"]}" tvg-name="{record["title"]}" group-title="{record["group"]}",{record["title"]}')
             lines.append(record["url"])
@@ -460,13 +469,13 @@ def run_stack(kind: str, selected: dict[str, dict[str, Any]], values_xtream: dic
         source_rows = api_json(base, "/api/v1/sources", admin)
         source_summary = next((item for item in source_rows if str(item.get("id")) == source_id), {})
         sync = wait_sync(base, admin, source_id)
-        channels = target_channels(base, admin)
+        channels = target_channels(base, admin, targets)
         adapters: dict[str, Any] = {}
         for adapter in ("auto", "ffmpeg", "vlc"):
             set_adapter(env_file, project, override, source_name, adapter)
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                futures = {target: executor.submit(stream_through_api, base, admin, channels[target], stream_seconds) for target in TARGETS}
-                adapters[adapter] = {target: futures[target].result() for target in TARGETS}
+                futures = {target: executor.submit(stream_through_api, base, admin, channels[target], stream_seconds) for target in targets}
+                adapters[adapter] = {target: futures[target].result() for target in targets}
         return {"source": kind, "sourceMaxConnections": source_summary.get("maxConnections"), "sync": {"status": sync.get("status"), "recordsProcessed": sync.get("recordsProcessed")}, "channels": channels, "adapters": adapters, "storage": storage_metrics(env_file, project, override)}
     finally:
         down = compose(env_file, project, override, "down", "--volumes", "--remove-orphans", check=False)
@@ -494,13 +503,15 @@ def main() -> int:
     temp_root = ROOT / f".provider-stream-compare-{secrets.token_hex(4)}"
     temp_root.mkdir()
     try:
-        live = parse_env(Path(args.live_env), {"IPTV_TEST_M3U_URL", "IPTV_TEST_PROVIDER_MAX_CONNECTIONS"})
+        live = parse_env(Path(args.live_env), {"IPTV_TEST_M3U_URL", "IPTV_TEST_PROVIDER_MAX_CONNECTIONS", "IPTV_TEST_TARGETS"})
         xtream = parse_env(Path(args.xtream_env), {"URL", "USER", "PWD"})
-        selected_data, xtream_data = fetch_provider_data(live, xtream, temp_root, args.m3u_cache, args.xtream_cache)
-        selected = choose_records(selected_data, xtream_data, xtream)
+        target_values = {"IPTV_TEST_TARGETS": live.get("IPTV_TEST_TARGETS", os.environ.get("IPTV_TEST_TARGETS", ""))}
+        targets = parse_targets(target_values)
+        selected_data, xtream_data = fetch_provider_data(live, xtream, targets, temp_root, args.m3u_cache, args.xtream_cache)
+        selected = choose_records(selected_data, xtream_data, targets, xtream)
         direct: dict[str, Any] = {}
         candidate_direct: dict[str, list[dict[str, Any]]] = {}
-        for target in TARGETS:
+        for target in targets:
             attempts: list[dict[str, Any]] = []
             working: dict[str, Any] | None = None
             for candidate in selected[target]["candidatePairs"]:
@@ -526,7 +537,7 @@ def main() -> int:
         build = not args.no_build
         kinds = ("M3U", "Xtream") if args.source == "both" else (args.source,)
         for kind in kinds:
-            reports.append(run_stack(kind, selected, xtream, capacity, temp_root, build, args.stream_seconds))
+            reports.append(run_stack(kind, selected, targets, xtream, capacity, temp_root, build, args.stream_seconds))
             build = False
         report: dict[str, Any] = {
             "targets": {
@@ -541,7 +552,7 @@ def main() -> int:
                     "direct": direct[target],
                     "candidateDirect": candidate_direct[target],
                 }
-                for target in TARGETS
+                for target in targets
             },
             "providerCapacity": capacity,
             "streamSeconds": args.stream_seconds,

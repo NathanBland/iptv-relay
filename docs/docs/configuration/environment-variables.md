@@ -74,6 +74,7 @@ Each worker replica derives its worker ID from the container hostname when `IPTV
 | `IPTV_TEST_M3U_URL` | _empty_ | M3U URL for the live-provider acceptance test. |
 | `IPTV_TEST_XMLTV_URL` | _empty_ | XMLTV URL for the live-provider acceptance test. |
 | `IPTV_TEST_PROVIDER_MAX_CONNECTIONS` | `3` | Maximum connections for the test provider. |
+| `IPTV_TEST_TARGETS` | _empty_ | Pipe-separated provider display names for stream comparison. |
 
 !!! warning
     Never commit real values for test inputs. Put live-provider URLs only in environment variables.

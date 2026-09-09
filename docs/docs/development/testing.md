@@ -185,9 +185,11 @@ make provider-stream-compare
 
 The script reads `IPTV_TEST_M3U_URL` from `.env.live`.
 The script reads `URL`, `USER`, and `PWD` from `.env.xtreme`.
+The script reads `IPTV_TEST_TARGETS` from `.env.live` or the process environment.
+Set that value to a pipe-separated list of exactly two exact provider display names.
 The parser does not evaluate either file as shell code.
 
-The script compares the Altitude Sports and ESPN News records by stream ID.
+The script compares the configured records by stream ID.
 It uses normalized names only when the M3U record has no usable ID.
 It compares URL shapes and private digests without writing provider URLs to the report.
 
