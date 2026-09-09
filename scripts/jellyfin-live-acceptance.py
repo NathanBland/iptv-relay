@@ -154,6 +154,15 @@ def provider_streams_by_number(payload: Any) -> dict[str, str]:
     return streams
 
 
+def provider_records_by_number(payload: Any) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for item in page_items(payload):
+        number = str(item.get("num") or item.get("channel_number") or "").strip()
+        if number:
+            records.setdefault(number, item)
+    return records
+
+
 def provider_stream_has_ts(base: str, user: str, password: str, stream_id: str) -> bool:
     """Check a provider stream without logging its URL or credentials."""
     root = base.rstrip("/")
@@ -259,6 +268,7 @@ def main() -> int:
         assert xtream_endpoint("https://provider.example/base", "user", "password", "player_api.php").endswith("/player_api.php?username=user&password=password")
         assert extract_provider_ids([{"epg_channel_id": "one"}, {"stream_id": 2}]) == {"one", "2"}
         assert provider_streams_by_number([{"num": 7, "stream_id": 42}]) == {"7": "42"}
+        assert provider_records_by_number([{"num": 7, "epg_channel_id": "seven"}])["7"]["epg_channel_id"] == "seven"
         print("live Jellyfin acceptance self-test passed")
         return 0
     live = parse_env(ROOT / args.live_env, LIVE_KEYS)
@@ -444,22 +454,13 @@ volumes:
         selected_numbers = {number or fallback for _, number, fallback in ids if number or fallback}
         if not selected_numbers or not selected_numbers & gateway_numbers:
             raise RuntimeError("Jellyfin channel numbers do not overlap gateway channels")
-        mapping_items = list(mappings)
-        mapping_total = int(request(f"{core}/api/v1/epg/mappings?limit=1&offset=0", token=bootstrap).get("total", len(mapping_items)) or len(mapping_items))
-        for offset in range(5000, mapping_total, 5000):
-            mapping_items.extend(page_items(request(f"{core}/api/v1/epg/mappings?limit=5000&offset={offset}", token=bootstrap)))
-        mapping_by_channel = {
-            str(item.get("channelId", "")): item
-            for item in mapping_items
-            if str(item.get("channelId", "")).strip()
-        }
+        provider_records = provider_records_by_number(stream_payload)
         provider_identity = []
         for item, (channel_id, number, fallback) in zip(selected, ids):
             provider_ids = item.get("ProviderIds") if isinstance(item.get("ProviderIds"), dict) else {}
             identity = next((str(value).strip() for value in provider_ids.values() if str(value).strip() in shared_ids), "")
-            gateway_channel = gateway_by_number.get(number or fallback, {})
-            mapping = mapping_by_channel.get(str(gateway_channel.get("id", "")), {})
-            identity = identity or str(mapping.get("canonicalKey") or mapping.get("epgXmltvId") or "").strip()
+            record = provider_records.get(number or fallback, {})
+            identity = identity or str(record.get("epg_channel_id") or record.get("stream_id") or "").strip()
             if identity:
                 provider_identity.append(identity)
         if len(provider_identity) != 2:
