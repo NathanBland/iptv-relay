@@ -37,7 +37,7 @@ The image build job requests `contents: read`, `packages: write`, `id-token: wri
 ## Release steps
 
 1. Confirm that the local test runner passes.
-2. Confirm that `.env.live` is not staged.
+2. Confirm that `.env.live`, `.env.xtreme`, and other credential files are not staged.
 3. Create and push a version tag.
 4. Wait for the container workflow to pass.
 5. Verify the image signature before deployment.

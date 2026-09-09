@@ -158,13 +158,22 @@ Run the live-provider gate separately because it needs provider credentials:
 make live-acceptance
 ```
 
-The live gate reads only the M3U URL, XMLTV URL, and provider capacity from `.env.live`.
+The live gate reads an Xtream base URL, username, password, XMLTV URL, and provider capacity from `.env.xtreme`.
+
+The parser accepts only allowlisted `KEY=value` records and does not evaluate shell syntax.
+Use `--env-file` when the credential file has another name, such as `.env.live`.
+
+The gate queries Xtream `player_api.php` for live streams and uses the provider `epg_channel_id` values.
+It compares those IDs with XMLTV `channel id` values.
+Channel names report unmatched data and do not define overlap.
 
 The gate creates a disposable local Compose project with generated credentials and host ports.
 
 The gate verifies all shared provider IDs, programme samples, gateway output, terminal jobs, and three stable sync cycles.
+It fails when the provider and XMLTV data have no shared IDs.
 
 The gate reports redacted storage metrics and removes its containers, volumes, and temporary environment file after every result.
+The report includes final pending jobs, reconciliation candidates, staging snapshots, temporary files, and cleanup status.
 
 Run its parser self-test without Docker:
 
