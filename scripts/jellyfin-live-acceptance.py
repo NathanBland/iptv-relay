@@ -424,7 +424,11 @@ volumes:
             time.sleep(3)
         if len(channels) < 2:
             raise RuntimeError("Jellyfin imported fewer than two channels")
-        core_channels = page_items(request(f"{core}/api/v1/channels?limit=5000&offset=0", token=bootstrap))
+        core_page = request(f"{core}/api/v1/channels?limit=500&offset=0", token=bootstrap)
+        core_channels = page_items(core_page)
+        core_total = int(core_page.get("total", len(core_channels)) or len(core_channels))
+        for offset in range(500, core_total, 500):
+            core_channels.extend(page_items(request(f"{core}/api/v1/channels?limit=500&offset={offset}", token=bootstrap)))
         gateway_by_number = {
             str(item.get("number") or "").strip(): item
             for item in core_channels
