@@ -360,12 +360,20 @@ volumes:
             time.sleep(3)
         if len(channels) < 2:
             raise RuntimeError("Jellyfin imported fewer than two channels")
-        selected = channels[:2]
+        core_channels = page_items(request(f"{core}/api/v1/channels?limit=5000&offset=0", token=bootstrap))
+        gateway_by_number = {
+            str(item.get("number") or "").strip(): item
+            for item in core_channels
+            if str(item.get("number") or "").strip()
+        }
+        gateway_numbers = set(gateway_by_number)
+        eligible_numbers = {number for number, item in gateway_by_number.items() if int(item.get("streams", 0) or 0) > 0}
+        selected = [item for item in channels if str(item.get("Number") or item.get("ChannelNumber") or "").strip() in eligible_numbers][:2]
+        if len(selected) < 2:
+            raise RuntimeError("Jellyfin did not import two channels with gateway stream mappings")
         ids = [(str(item.get("Id", "")), str(item.get("Number", "")), str(item.get("ChannelNumber", ""))) for item in selected]
         if any(not item[0] for item in ids):
             raise RuntimeError("Jellyfin returned a channel without an ID")
-        core_channels = page_items(request(f"{core}/api/v1/channels?limit=5000&offset=0", token=bootstrap))
-        gateway_numbers = {str(item.get("number") or "").strip() for item in core_channels}
         selected_numbers = {number or fallback for _, number, fallback in ids if number or fallback}
         if not selected_numbers or not selected_numbers & gateway_numbers:
             raise RuntimeError("Jellyfin channel numbers do not overlap gateway channels")
@@ -402,6 +410,7 @@ volumes:
                     "EnableDirectStream": True,
                 },
                 jf_token,
+                timeout=120,
             )
             if not isinstance(opened, dict):
                 raise RuntimeError("Jellyfin did not return a live stream record")
