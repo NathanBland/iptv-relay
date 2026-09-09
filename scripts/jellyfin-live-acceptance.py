@@ -328,7 +328,8 @@ volumes:
             report["storage"]["temporaryBytesPeak"] = max(report["storage"]["temporaryBytesPeak"], storage_bytes(root))
         report["sourceRefreshCycles"] = source_cycles
         report["sharedProviderIds"] = len(shared_ids)
-        request(f"{jf}/Startup/Configuration", "POST", {"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"})
+        request(f"{jf}/Startup/Configuration", "POST", {"ServerName": "IPTV Acceptance", "UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"})
+        request(f"{jf}/Startup/User")
         request(f"{jf}/Startup/User", "POST", {"Name": "acceptance", "Password": admin_password})
         request(f"{jf}/Startup/Complete", "POST", {})
         auth_header = {"X-Emby-Authorization": 'MediaBrowser Client="iptv-live-acceptance", Device="runner", DeviceId="runner", Version="1"'}
