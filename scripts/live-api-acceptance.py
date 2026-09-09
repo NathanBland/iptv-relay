@@ -455,7 +455,14 @@ def run_gate(values: dict[str, str], build: bool = True, report_file: Path | Non
                 f"stagingSnapshots={final.get('stagingSnapshots', 0)}"
             )
         peak = max((item.get("databaseBytes", 0) for item in [baseline, *cycles, final]), default=0)
-        report = {"identityMode": identity_mode, "sharedProviderIds": len(shared), "providerUnmatched": {"xtreamOnlyCount": len(provider_ids - xmltv), "xmltvOnlyCount": len(xmltv - provider_ids), "xtreamOnlySample": sorted(provider_ids - xmltv)[:10], "xmltvOnlySample": sorted(xmltv - provider_ids)[:10]}, "providerCap": cap, "cycles": 3, "gatewayOutput": "playlist verified", "sampleProgrammes": samples, "storage": {"baseline": baseline, "cycles": cycles, "peakDatabaseBytes": peak, "final": final}}
+        verified_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        report = {"verifiedCommit": verified_commit, "identityMode": identity_mode, "sharedProviderIds": len(shared), "providerUnmatched": {"xtreamOnlyCount": len(provider_ids - xmltv), "xmltvOnlyCount": len(xmltv - provider_ids), "xtreamOnlySample": sorted(provider_ids - xmltv)[:10], "xmltvOnlySample": sorted(xmltv - provider_ids)[:10]}, "providerCap": cap, "cycles": 3, "gatewayOutput": "playlist verified", "sampleProgrammes": samples, "storage": {"baseline": baseline, "cycles": cycles, "peakDatabaseBytes": peak, "final": final}}
         report_json = json.dumps(report, sort_keys=True)
         print(report_json, flush=True)
         if report_file is not None:
