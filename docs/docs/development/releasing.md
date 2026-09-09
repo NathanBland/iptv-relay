@@ -55,7 +55,7 @@ The script does these operations:
 1. Confirm that the worktree is clean.
 2. Confirm that `main` is not behind `origin/main`.
 3. Run the full local test suite.
-4. Update the workspace version and lock file.
+4. Update the workspace version and lock files.
 5. Create a version commit and an annotated tag.
 6. Push `main` and the tag.
 7. Wait for the container workflow to pass.

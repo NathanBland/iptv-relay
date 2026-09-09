@@ -356,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-domain"
-version = "0.1.0"
+version = "0.2.11"
 dependencies = [
  "chrono",
  "serde",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-parsers"
-version = "0.1.0"
+version = "0.2.11"
 dependencies = [
  "base64",
  "chrono",

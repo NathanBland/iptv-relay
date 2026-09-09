@@ -88,9 +88,10 @@ git fetch origin main --tags
 sed -i.bak "s/^version = \"${current_version}\"$/version = \"${next_version}\"/" Cargo.toml
 rm Cargo.toml.bak
 cargo check --workspace
+cargo check --manifest-path fuzz/Cargo.toml
 git diff --check
 
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock fuzz/Cargo.lock
 git commit -m "Bump version to ${next_version}"
 release_commit="$(git rev-parse HEAD)"
 git tag -a "$release_tag" -m "Release ${release_tag}" "$release_commit"

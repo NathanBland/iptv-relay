@@ -1,4 +1,5 @@
 /target/
+/.abacusai/
 /fuzz/artifacts/
 /fuzz/corpus/
 /fuzz/target/
