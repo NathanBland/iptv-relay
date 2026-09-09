@@ -36,11 +36,35 @@ The image build job requests `contents: read`, `packages: write`, `id-token: wri
 
 ## Release steps
 
-1. Confirm that the local test runner passes.
-2. Confirm that `.env.live`, `.env.xtreme`, and other credential files are not staged.
-3. Create and push a version tag.
-4. Wait for the container workflow to pass.
-5. Verify the image signature before deployment.
+Run the release script from a clean and current `main` branch:
+
+```bash
+./cut_release.sh
+```
+
+The default command increments the patch version.
+Use `minor`, `major`, or an exact version when necessary:
+
+```bash
+./cut_release.sh minor
+./cut_release.sh 1.4.0
+```
+
+The script does these operations:
+
+1. Confirm that the worktree is clean.
+2. Confirm that `main` is not behind `origin/main`.
+3. Run the full local test suite.
+4. Update the workspace version and lock file.
+5. Create a version commit and an annotated tag.
+6. Push `main` and the tag.
+7. Wait for the container workflow to pass.
+8. Create the GitHub release with generated notes.
+
+The script stops when `origin/main` changes during validation.
+Run the script again from the updated branch.
+
+Do not run the script when credential files are in the worktree.
 
 Use this command to verify a signature:
 
