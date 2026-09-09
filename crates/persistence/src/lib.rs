@@ -2594,6 +2594,32 @@ impl JobRepository {
             .bind(parent_job_id)
             .execute(&mut *transaction)
             .await?;
+            sqlx::query(
+                r"
+                DELETE FROM provider_reconciliation_candidate_streams
+                WHERE run_id IN (
+                    SELECT id
+                    FROM provider_reconciliation_runs
+                    WHERE parent_job_id = $1
+                )
+                ",
+            )
+            .bind(parent_job_id)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                r"
+                DELETE FROM provider_reconciliation_candidates
+                WHERE run_id IN (
+                    SELECT id
+                    FROM provider_reconciliation_runs
+                    WHERE parent_job_id = $1
+                )
+                ",
+            )
+            .bind(parent_job_id)
+            .execute(&mut *transaction)
+            .await?;
         }
         transaction.commit().await?;
         Ok(parent_canceled || target_canceled)

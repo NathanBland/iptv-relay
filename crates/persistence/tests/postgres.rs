@@ -550,6 +550,14 @@ async fn canceled_parent_cannot_publish_provider_reconciliation() {
         .await
         .unwrap();
     assert!(jobs.cancel(finalizer.id).await.unwrap());
+    let canceled_before_finalize_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM provider_reconciliation_candidates WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(canceled_before_finalize_count, 0);
     assert_eq!(
         catalog
             .finalize_provider_reconciliation(run_id, parent.id, finalizer.id)
