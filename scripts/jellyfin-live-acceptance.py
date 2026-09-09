@@ -408,6 +408,13 @@ volumes:
                     "AutoOpenLiveStream": True,
                     "EnableDirectPlay": True,
                     "EnableDirectStream": True,
+                    "DeviceProfile": {
+                        "Name": "IPTV acceptance",
+                        "SupportedMediaTypes": "Audio,Video",
+                        "MaxStreamingBitrate": 120000000,
+                        "DirectPlayProfiles": [{"Container": "ts", "Type": "Video", "VideoCodec": "h264,mpeg2video", "AudioCodec": "aac,mp2"}],
+                        "TranscodingProfiles": [{"Container": "ts", "Type": "Video", "Protocol": "http", "VideoCodec": "h264,mpeg2video", "AudioCodec": "aac,mp2"}],
+                    },
                 },
                 jf_token,
                 timeout=120,
