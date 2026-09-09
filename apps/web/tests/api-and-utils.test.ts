@@ -113,6 +113,10 @@ describe('display utilities', () => {
     expect(formatProgrammeTime('2026-01-01T19:00:00Z', 'Invalid/Timezone')).toMatch(/12:00\s?PM/)
   })
 
+  it('rejects invalid programme timestamps before applying a display timezone', () => {
+    expect(formatProgrammeTime('not-a-time', 'America/Denver')).toBe('Invalid time')
+  })
+
   it('selects current and upcoming programme instants at a fixed clock', () => {
     const winterNow = Date.parse('2026-01-01T19:00:00Z')
     const summerNow = Date.parse('2026-07-01T18:00:00Z')
@@ -126,6 +130,10 @@ describe('display utilities', () => {
     const summer = partitionProgrammesAt(programmes, summerNow)
     expect(summer.current.map((item) => item.id)).toEqual(['summer'])
     expect(summer.upcoming.map((item) => item.id)).toEqual(['next'])
+    expect(partitionProgrammesAt([
+      { id: 'invalid', channel: 'Denver', title: 'Invalid', start: 'bad', end: '2026-07-01T20:00:00Z', source: 'XMLTV', confidence: 100 },
+      { id: 'reversed', channel: 'Denver', title: 'Reversed', start: '2026-07-01T20:00:00Z', end: '2026-07-01T19:00:00Z', source: 'XMLTV', confidence: 100 },
+    ], summerNow)).toEqual({ current: [], upcoming: [] })
   })
 
   it('merges classes and formats bitrate', () => {
