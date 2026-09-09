@@ -27,7 +27,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"succeeded", "failed", "cancelled", "dead"}
-LIVE_KEYS = {"IPTV_TEST_XMLTV_URL", "XMLTV_URL", "LIVE_ACCEPTANCE_PROVIDER_CAP"}
+LIVE_KEYS = {"IPTV_TEST_XMLTV_URL", "XMLTV_URL", "LIVE_ACCEPTANCE_PROVIDER_CAP", "IPTV_TEST_PROVIDER_MAX_CONNECTIONS"}
 XTREAM_KEYS = {"URL", "USER", "PWD"}
 
 
@@ -261,6 +261,13 @@ def main() -> int:
         raise RuntimeError("soak duration must be positive")
     if args.refresh_cycles < 1:
         raise RuntimeError("refresh cycle count must be positive")
+    capacity_text = live.get("LIVE_ACCEPTANCE_PROVIDER_CAP") or live.get("IPTV_TEST_PROVIDER_MAX_CONNECTIONS") or "2"
+    try:
+        provider_capacity = int(capacity_text)
+    except ValueError:
+        raise RuntimeError("provider capacity must be an integer") from None
+    if provider_capacity < 2:
+        raise RuntimeError("provider capacity must allow two concurrent streams")
 
     project = f"iptv-jellyfin-live-{secrets.token_hex(4)}"
     root = Path(tempfile.mkdtemp(prefix="iptv-jellyfin-live-"))
@@ -327,6 +334,7 @@ volumes:
         if not shared_source_ids:
             raise RuntimeError("Xtream and XMLTV produced no shared provider identities")
         source = request(f"{core}/api/v1/sources", "POST", {"name": "live-jellyfin-xtream", "kind": "Xtream", "endpoint": xtream_endpoint(xtream["URL"], xtream["USER"], xtream["PWD"], "player_api.php"), "timezone": "UTC"}, bootstrap)
+        request(f"{core}/api/v1/sources/{source['id']}", "PATCH", {"maxConnections": provider_capacity}, bootstrap)
         guide = request(f"{core}/api/v1/sources", "POST", {"name": "live-jellyfin-xmltv", "kind": "XMLTV", "endpoint": xmltv, "timezone": "UTC"}, bootstrap)
         source_cycles: list[dict[str, Any]] = []
         for cycle in range(args.refresh_cycles):
@@ -359,6 +367,7 @@ volumes:
             report["storage"]["temporaryBytesPeak"] = max(report["storage"]["temporaryBytesPeak"], storage_bytes(root))
         report["sourceRefreshCycles"] = source_cycles
         report["sharedProviderIds"] = len(shared_ids)
+        report["providerCapacityConfigured"] = provider_capacity
         request(f"{jf}/Startup/Configuration", "POST", {"ServerName": "IPTV Acceptance", "UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"})
         request(f"{jf}/Startup/User")
         request(f"{jf}/Startup/User", "POST", {"Name": "acceptance", "Password": admin_password})
