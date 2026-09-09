@@ -212,6 +212,7 @@ def main() -> int:
     parser.add_argument("--live-env", default=".env.live")
     parser.add_argument("--xtream-env", default=".env.xtreme")
     parser.add_argument("--soak-seconds", type=int, default=int(os.environ.get("JELLYFIN_ACCEPTANCE_SECONDS", "60")))
+    parser.add_argument("--refresh-cycles", type=int, default=int(os.environ.get("JELLYFIN_ACCEPTANCE_REFRESH_CYCLES", "3")))
     parser.add_argument("--report")
     parser.add_argument("--keep", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -230,6 +231,8 @@ def main() -> int:
         raise RuntimeError("no XMLTV URL is configured")
     if args.soak_seconds < 1:
         raise RuntimeError("soak duration must be positive")
+    if args.refresh_cycles < 1:
+        raise RuntimeError("refresh cycle count must be positive")
 
     project = f"iptv-jellyfin-live-{secrets.token_hex(4)}"
     root = Path(tempfile.mkdtemp(prefix="iptv-jellyfin-live-"))
@@ -298,7 +301,7 @@ volumes:
         source = request(f"{core}/api/v1/sources", "POST", {"name": "live-jellyfin-xtream", "kind": "Xtream", "endpoint": xtream_endpoint(xtream["URL"], xtream["USER"], xtream["PWD"], "player_api.php"), "timezone": "UTC"}, bootstrap)
         guide = request(f"{core}/api/v1/sources", "POST", {"name": "live-jellyfin-xmltv", "kind": "XMLTV", "endpoint": xmltv, "timezone": "UTC"}, bootstrap)
         source_cycles: list[dict[str, Any]] = []
-        for cycle in range(3):
+        for cycle in range(args.refresh_cycles):
             for item in (source, guide):
                 try:
                     request(f"{core}/api/v1/sources/{item['id']}/sync", "POST", token=bootstrap)
