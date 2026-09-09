@@ -350,10 +350,10 @@ volumes:
         wait_http(f"{jf}/health")
         report["storage"]["temporaryBytesPeak"] = storage_bytes(root)
         stream_payload = request(xtream_endpoint(xtream["URL"], xtream["USER"], xtream["PWD"], "player_api.php") + "&action=get_live_streams")
-        live_provider_ids = extract_provider_ids(stream_payload)
+        live_provider_ids = {value.casefold() for value in extract_provider_ids(stream_payload)}
         if not live_provider_ids:
             raise RuntimeError("Xtream returned no usable provider identities")
-        xmltv_ids = xmltv_channel_ids(xmltv)
+        xmltv_ids = {value.casefold() for value in xmltv_channel_ids(xmltv)}
         shared_source_ids = live_provider_ids & xmltv_ids
         if not shared_source_ids:
             raise RuntimeError("Xtream and XMLTV produced no shared provider identities")
@@ -378,12 +378,33 @@ volumes:
                     time.sleep(2)
                 else:
                     raise RuntimeError("source synchronization exceeded deadline")
-            mappings = page_items(request(f"{core}/api/v1/epg/mappings?limit=5000&offset=0", token=bootstrap))
+            mapping_page = request(f"{core}/api/v1/epg/mappings?limit=500&offset=0", token=bootstrap)
+            mappings = page_items(mapping_page)
+            mapping_total = int(mapping_page.get("total", len(mappings)) or len(mappings)) if isinstance(mapping_page, dict) else len(mappings)
+            for offset in range(500, mapping_total, 500):
+                mappings.extend(page_items(request(f"{core}/api/v1/epg/mappings?limit=500&offset={offset}", token=bootstrap)))
             mapped_provider_ids = {
-                str(item.get("canonicalKey") or item.get("epgXmltvId") or "").strip()
+                value
                 for item in mappings
-                if str(item.get("canonicalKey") or item.get("epgXmltvId") or "").strip()
+                for value in (
+                    str(item.get("canonicalKey") or "").strip().casefold(),
+                    str(item.get("epgXmltvId") or "").strip().casefold(),
+                )
+                if value and not value.startswith("stream:")
             }
+            mapped_channel_identities: dict[str, set[str]] = {}
+            for item in mappings:
+                channel_id = str(item.get("channelId") or "").strip()
+                identities = {
+                    value
+                    for value in (
+                        str(item.get("canonicalKey") or "").strip().casefold(),
+                        str(item.get("epgXmltvId") or "").strip().casefold(),
+                    )
+                    if value and not value.startswith("stream:")
+                }
+                if channel_id and identities:
+                    mapped_channel_identities[channel_id] = identities
             shared_ids = shared_source_ids & mapped_provider_ids
             if not shared_ids:
                 raise RuntimeError("gateway reconciliation produced no shared provider identities")
@@ -429,29 +450,72 @@ volumes:
         core_total = int(core_page.get("total", len(core_channels)) or len(core_channels))
         for offset in range(500, core_total, 500):
             core_channels.extend(page_items(request(f"{core}/api/v1/channels?limit=500&offset={offset}", token=bootstrap)))
-        gateway_by_number = {
-            str(item.get("number") or "").strip(): item
-            for item in core_channels
-            if str(item.get("number") or "").strip()
-        }
+        gateway_by_number: dict[str, list[dict[str, Any]]] = {}
+        for item in core_channels:
+            number = str(item.get("number") or "").strip()
+            if number:
+                gateway_by_number.setdefault(number, []).append(item)
         gateway_numbers = set(gateway_by_number)
-        eligible_numbers = {number for number, item in gateway_by_number.items() if int(item.get("streams", 0) or 0) > 0}
+        eligible_numbers = {
+            number
+            for number, items in gateway_by_number.items()
+            if any(int(item.get("streams", 0) or 0) > 0 for item in items)
+        }
         provider_streams = provider_streams_by_number(stream_payload)
         provider_records = provider_records_by_number(stream_payload)
         usable_numbers: set[str] = set()
+        selected_identity_by_number: dict[str, str] = {}
+        selection_candidates: list[dict[str, Any]] = []
         for item in channels:
             number = str(item.get("Number") or item.get("ChannelNumber") or "").strip()
             if number not in eligible_numbers or number in usable_numbers:
                 continue
             record = provider_records.get(number, {})
-            provider_identity = str(record.get("epg_channel_id") or record.get("stream_id") or "").strip()
-            if provider_identity not in shared_source_ids:
+            gateway_item = next(
+                (
+                    candidate
+                    for candidate in gateway_by_number.get(number, [])
+                    if mapped_channel_identities.get(str(candidate.get("id") or "").strip(), set()) & shared_ids
+                ),
+                gateway_by_number.get(number, [{}])[0],
+            )
+            mapped_identities = mapped_channel_identities.get(str(gateway_item.get("id") or "").strip(), set())
+            provider_identity = str(record.get("epg_channel_id") or record.get("stream_id") or "").strip().casefold()
+            mapped_identity = next(iter(mapped_identities & shared_ids), "")
+            if not mapped_identity:
+                if len(selection_candidates) < 20:
+                    selection_candidates.append({"number": number, "providerIdentity": provider_identity, "mapped": bool(mapped_identities & shared_ids)})
                 continue
             stream_id = provider_streams.get(number)
-            if stream_id and provider_stream_has_ts(xtream["URL"], xtream["USER"], xtream["PWD"], stream_id):
+            has_ts = bool(stream_id and provider_stream_has_ts(xtream["URL"], xtream["USER"], xtream["PWD"], stream_id))
+            if len(selection_candidates) < 20:
+                selection_candidates.append({"number": number, "providerIdentity": provider_identity, "mapped": True, "hasTs": has_ts})
+            if has_ts:
                 usable_numbers.add(number)
+                selected_identity_by_number[number] = mapped_identity
             if len(usable_numbers) >= 2:
                 break
+        report["selectionDiagnostics"] = {
+            "jellyfinChannels": len(channels),
+            "gatewayChannels": len(gateway_by_number),
+            "gatewayEligibleChannels": len(eligible_numbers),
+            "numberOverlap": len(set(item.get("Number") or item.get("ChannelNumber") or "" for item in channels) & eligible_numbers),
+            "sharedProviderIdSample": sorted(shared_ids)[:10],
+            "targetProviderIdentities": {
+                number: str(provider_records.get(number, {}).get("epg_channel_id") or provider_records.get(number, {}).get("stream_id") or "").strip().casefold()
+                for number in ("2", "4", "10", "12")
+            },
+            "targetProviderIdentityMembership": {
+                number: str(provider_records.get(number, {}).get("epg_channel_id") or provider_records.get(number, {}).get("stream_id") or "").strip().casefold() in shared_ids
+                for number in ("2", "4", "10", "12")
+            },
+            "providerRecordOverlapCount": sum(
+                1
+                for item in page_items(stream_payload)
+                if str(item.get("epg_channel_id") or item.get("stream_id") or "").strip().casefold() in shared_ids
+            ),
+            "candidates": selection_candidates,
+        }
         if len(usable_numbers) < 2:
             raise RuntimeError("Xtream did not provide two mapped channels with MPEG-TS data")
         selected = [item for item in channels if str(item.get("Number") or item.get("ChannelNumber") or "").strip() in usable_numbers][:2]
@@ -467,9 +531,10 @@ volumes:
         provider_identity = []
         for item, (channel_id, number, fallback) in zip(selected, ids):
             provider_ids = item.get("ProviderIds") if isinstance(item.get("ProviderIds"), dict) else {}
-            identity = next((str(value).strip() for value in provider_ids.values() if str(value).strip() in shared_ids), "")
+            identity = next((str(value).strip().casefold() for value in provider_ids.values() if str(value).strip().casefold() in shared_ids), "")
             record = provider_records.get(number or fallback, {})
-            identity = identity or str(record.get("epg_channel_id") or record.get("stream_id") or "").strip()
+            identity = identity or selected_identity_by_number.get(number or fallback, "")
+            identity = identity or str(record.get("epg_channel_id") or record.get("stream_id") or "").strip().casefold()
             if identity:
                 provider_identity.append(identity)
         if len(provider_identity) != 2:
@@ -477,9 +542,9 @@ volumes:
         if not set(provider_identity).issubset(shared_ids):
             raise RuntimeError("Jellyfin channel mappings did not match reconciled provider identities")
         selected_gateway_ids = {
-            str(gateway_by_number[number].get("id", ""))
+            str(item.get("id", ""))
             for _, number, fallback in ids
-            if (number or fallback) in gateway_by_number
+            for item in gateway_by_number.get(number or fallback, [])
         }
         report["channels"] = [{"id": item[0], "number": item[1] or item[2], "providerIdentity": identity} for item, identity in zip(ids, provider_identity)]
         # A second provider refresh must preserve Jellyfin's identity and number.
@@ -579,7 +644,7 @@ volumes:
         failure = error
     finally:
         if not args.keep:
-            down = compose(env_file, project, override, "down", "--volumes", "--remove-orphans", check=False)
+            down = compose(env_file, project, override, "down", "--volumes", "--remove-orphans", "--rmi", "local", check=False)
             remaining = compose(env_file, project, override, "ps", "-aq", check=False)
             report["storage"]["temporaryBytesFinal"] = storage_bytes(root)
             volumes = remaining_volumes(project)
