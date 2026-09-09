@@ -4301,6 +4301,8 @@ mod tests {
                 "IPTV_OIDC_ALLOWED_SUBJECTS",
                 "IPTV_OIDC_ALLOWED_EMAILS",
                 "IPTV_OIDC_SCOPES",
+                "IPTV_DEV_MODE",
+                "IPTV_DEV_AUTH_DISABLED",
                 "IPTV_OUTPUT_TOKEN",
                 "IPTV_ADMIN_BOOTSTRAP_TOKEN",
                 "IPTV_MASTER_KEY",
