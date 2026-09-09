@@ -139,6 +139,33 @@ def extract_provider_ids(payload: Any) -> set[str]:
     }
 
 
+def provider_streams_by_number(payload: Any) -> dict[str, str]:
+    """Return the first Xtream stream identity for each provider channel number."""
+    streams: dict[str, str] = {}
+    for item in page_items(payload):
+        number = str(item.get("num") or item.get("channel_number") or "").strip()
+        stream_id = str(item.get("stream_id") or "").strip()
+        if number and stream_id:
+            streams.setdefault(number, stream_id)
+    return streams
+
+
+def provider_stream_has_ts(base: str, user: str, password: str, stream_id: str) -> bool:
+    """Check a provider stream without logging its URL or credentials."""
+    root = base.rstrip("/")
+    for suffix in ("/player_api.php", "/xmltv.php"):
+        if root.endswith(suffix):
+            root = root[: -len(suffix)]
+    url = f"{root}/live/{urllib.parse.quote(user, safe='')}/{urllib.parse.quote(password, safe='')}/{urllib.parse.quote(stream_id, safe='')}.ts"
+    request = urllib.request.Request(url, headers={"Accept": "video/mp2t", "User-Agent": "iptv-live-acceptance"})
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = response.read(188 * 4)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+        return False
+    return len(payload) >= 188 and len(payload) % 188 == 0 and payload[0] == 0x47
+
+
 def xmltv_channel_ids(url: str) -> set[str]:
     request = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"})
     try:
@@ -220,6 +247,7 @@ def main() -> int:
     if args.self_test:
         assert xtream_endpoint("https://provider.example/base", "user", "password", "player_api.php").endswith("/player_api.php?username=user&password=password")
         assert extract_provider_ids([{"epg_channel_id": "one"}, {"stream_id": 2}]) == {"one", "2"}
+        assert provider_streams_by_number([{"num": 7, "stream_id": 42}]) == {"7": "42"}
         print("live Jellyfin acceptance self-test passed")
         return 0
     live = parse_env(ROOT / args.live_env, LIVE_KEYS)
@@ -371,7 +399,20 @@ volumes:
         }
         gateway_numbers = set(gateway_by_number)
         eligible_numbers = {number for number, item in gateway_by_number.items() if int(item.get("streams", 0) or 0) > 0}
-        selected = [item for item in channels if str(item.get("Number") or item.get("ChannelNumber") or "").strip() in eligible_numbers][:2]
+        provider_streams = provider_streams_by_number(stream_payload)
+        usable_numbers: set[str] = set()
+        for item in channels:
+            number = str(item.get("Number") or item.get("ChannelNumber") or "").strip()
+            if number not in eligible_numbers or number in usable_numbers:
+                continue
+            stream_id = provider_streams.get(number)
+            if stream_id and provider_stream_has_ts(xtream["URL"], xtream["USER"], xtream["PWD"], stream_id):
+                usable_numbers.add(number)
+            if len(usable_numbers) >= 2:
+                break
+        if len(usable_numbers) < 2:
+            raise RuntimeError("Xtream did not provide two mapped channels with MPEG-TS data")
+        selected = [item for item in channels if str(item.get("Number") or item.get("ChannelNumber") or "").strip() in usable_numbers][:2]
         if len(selected) < 2:
             raise RuntimeError("Jellyfin did not import two channels with gateway stream mappings")
         ids = [(str(item.get("Id", "")), str(item.get("Number", "")), str(item.get("ChannelNumber", ""))) for item in selected]
