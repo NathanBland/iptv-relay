@@ -19,6 +19,9 @@ services:
       CARGO_PROFILE_RELEASE_LTO: "off"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "256"
       CARGO_PROFILE_RELEASE_DEBUG: "0"
+      # Enable the local-only control API bypass when both flags are true.
+      IPTV_DEV_MODE: ${IPTV_DEV_MODE:-false}
+      IPTV_DEV_AUTH_DISABLED: ${IPTV_DEV_AUTH_DISABLED:-false}
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://127.0.0.1:8081/health/live"]
       interval: 10s

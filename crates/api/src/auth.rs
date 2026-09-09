@@ -46,6 +46,7 @@ struct AuthInner {
     login_csrf_tokens: Mutex<HashMap<[u8; 32], Instant>>,
     operator_tokens: Mutex<HashMap<[u8; 32], OperatorTokenRecord>>,
     oidc: Option<OidcClient>,
+    dev_auth_disabled: bool,
 }
 
 impl fmt::Debug for AuthManager {
@@ -59,6 +60,7 @@ impl fmt::Debug for AuthManager {
                 &self.inner.bootstrap_bearer_enabled.load(Ordering::Acquire),
             )
             .field("secure_cookies", &self.inner.secure_cookies)
+            .field("dev_auth_disabled", &self.inner.dev_auth_disabled)
             .field("operator_token_count", &self.operator_token_count())
             .field("active_sessions", &self.session_count())
             .finish()
@@ -82,6 +84,7 @@ pub(crate) enum Authorization {
     Bearer,
     Session,
     OperatorToken,
+    Development,
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +113,23 @@ impl AuthManager {
         secure_cookies: bool,
         oidc_config: Option<OidcConfig>,
     ) -> Self {
+        Self::new_with_oidc_and_dev(
+            password_hash,
+            bearer_token,
+            secure_cookies,
+            oidc_config,
+            false,
+        )
+    }
+
+    /// Create an authentication manager with the explicit local development bypass.
+    pub(crate) fn new_with_oidc_and_dev(
+        password_hash: impl Into<Arc<str>>,
+        bearer_token: &str,
+        secure_cookies: bool,
+        oidc_config: Option<OidcConfig>,
+        dev_auth_disabled: bool,
+    ) -> Self {
         Self {
             inner: Arc::new(AuthInner {
                 password_hash: password_hash.into(),
@@ -120,6 +140,7 @@ impl AuthManager {
                 login_csrf_tokens: Mutex::new(HashMap::new()),
                 operator_tokens: Mutex::new(HashMap::new()),
                 oidc: oidc_config.map(OidcClient::new),
+                dev_auth_disabled,
             }),
         }
     }
@@ -228,6 +249,10 @@ impl AuthManager {
         self.inner.oidc.is_some()
     }
 
+    pub(crate) fn dev_auth_disabled(&self) -> bool {
+        self.inner.dev_auth_disabled
+    }
+
     pub(crate) async fn complete_oidc_login(
         &self,
         headers: &HeaderMap,
@@ -292,6 +317,9 @@ impl AuthManager {
         require_csrf: bool,
         required_scope: Option<&str>,
     ) -> Option<Authorization> {
+        if self.inner.dev_auth_disabled {
+            return Some(Authorization::Development);
+        }
         if self.inner.bootstrap_bearer_enabled.load(Ordering::Acquire)
             && bearer_token(headers)
                 .is_some_and(|token| constant_time_eq(&digest(token), &self.inner.bearer_hash))
@@ -605,6 +633,27 @@ mod tests {
         manager.disable_bootstrap_bearer();
 
         assert_eq!(manager.authorize(&headers, false), None);
+    }
+
+    #[test]
+    fn development_auth_bypass_authorizes_control_scopes_without_headers() {
+        let manager = AuthManager::new_with_oidc_and_dev(
+            hash_admin_password("admin-password").unwrap(),
+            "bootstrap-token",
+            false,
+            None,
+            true,
+        );
+        let headers = HeaderMap::new();
+        assert_eq!(
+            manager.authorize(&headers, false),
+            Some(Authorization::Development)
+        );
+        assert_eq!(
+            manager.authorize_scope(&headers, true, OPERATOR_TOKEN_CONTROL_SCOPE),
+            Some(Authorization::Development)
+        );
+        assert!(manager.dev_auth_disabled());
     }
 
     #[test]

@@ -48,6 +48,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tower_http::{catch_panic::CatchPanicLayer, compression::CompressionLayer};
+use tracing::warn;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -69,6 +70,8 @@ pub struct AppConfig {
     pub tuner_count: u16,
     pub runtime_versions: RuntimeVersions,
     pub oidc: Option<OidcConfig>,
+    pub dev_mode: bool,
+    pub dev_auth_disabled: bool,
 }
 
 impl fmt::Debug for AppConfig {
@@ -83,6 +86,8 @@ impl fmt::Debug for AppConfig {
             .field("tuner_count", &self.tuner_count)
             .field("runtime_versions", &self.runtime_versions)
             .field("oidc", &self.oidc)
+            .field("dev_mode", &self.dev_mode)
+            .field("dev_auth_disabled", &self.dev_auth_disabled)
             .finish()
     }
 }
@@ -156,17 +161,21 @@ impl AppState {
         let catalog_repository = database
             .as_ref()
             .map(|database| CatalogRepository::new(database.pool().clone()));
+        if config.dev_auth_disabled {
+            warn!("development authentication bypass is enabled; use only for local testing");
+        }
         Self {
             database,
             catalog: Arc::new(RwLock::new(CatalogSnapshot::default())),
             public_base_url: config.public_base_url.trim_end_matches('/').into(),
             output_token_hash: token_hash(&config.output_token),
             environment_output_token: Arc::from(config.output_token.as_str()),
-            auth: AuthManager::new_with_oidc(
+            auth: AuthManager::new_with_oidc_and_dev(
                 config.admin_password_hash,
                 &config.admin_bootstrap_token,
                 secure_cookies,
                 config.oidc,
+                config.dev_mode && config.dev_auth_disabled,
             ),
             tuner_count: config.tuner_count,
             runtime_versions: config.runtime_versions,
@@ -1758,6 +1767,9 @@ async fn login(
     let Ok(Json(request)) = request else {
         return invalid_auth_request();
     };
+    if state.auth.dev_auth_disabled() {
+        return Json(auth_status_body(true, state.auth.oidc_enabled())).into_response();
+    }
     let verified = match state
         .auth
         .verify_login(&headers, request.username, request.password)
@@ -9047,6 +9059,27 @@ mod tests {
         state_with_database(None)
     }
 
+    fn development_state() -> AppState {
+        static PASSWORD_HASH: OnceLock<String> = OnceLock::new();
+        AppState::new(
+            None,
+            AppConfig {
+                public_base_url: "http://gateway.test".into(),
+                output_token: "output-secret".into(),
+                admin_bootstrap_token: "admin-secret".into(),
+                admin_password_hash: PASSWORD_HASH
+                    .get_or_init(|| hash_admin_password("admin-password").unwrap())
+                    .clone(),
+                master_key: MasterKey::from_bytes([7_u8; 32]),
+                tuner_count: 3,
+                runtime_versions: RuntimeVersions::default(),
+                oidc: None,
+                dev_mode: true,
+                dev_auth_disabled: true,
+            },
+        )
+    }
+
     fn state_with_database(database: Option<Database>) -> AppState {
         static PASSWORD_HASH: OnceLock<String> = OnceLock::new();
         AppState::new(
@@ -9062,6 +9095,8 @@ mod tests {
                 tuner_count: 3,
                 runtime_versions: RuntimeVersions::default(),
                 oidc: None,
+                dev_mode: false,
+                dev_auth_disabled: false,
             },
         )
     }
@@ -9091,6 +9126,8 @@ mod tests {
                 tuner_count: 3,
                 runtime_versions: RuntimeVersions::default(),
                 oidc: Some(oidc),
+                dev_mode: false,
+                dev_auth_disabled: false,
             },
         )
     }
@@ -9115,6 +9152,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn development_auth_allows_control_api_but_keeps_output_and_internal_tokens() {
+        let app_state = development_state();
+        let response = router(app_state.clone())
+            .oneshot(
+                Request::get("/api/v1/auth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router(development_state())
+            .oneshot(
+                Request::post("/api/v1/auth/login")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"username":"operator","password":"ignored"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = router(app_state.clone())
+            .oneshot(Request::get("/api/v1/sources").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = router(app_state.clone())
+            .oneshot(
+                Request::get("/out/wrong-token/playlist.m3u")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = router(app_state)
+            .oneshot(
+                Request::post("/internal/v1/provider-reservations")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"pool_id":"pool","capacity":1}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -11762,6 +11849,8 @@ mod tests {
             tuner_count: 3,
             runtime_versions: RuntimeVersions::default(),
             oidc: None,
+            dev_mode: false,
+            dev_auth_disabled: false,
         };
         let debug = format!("{config:?}");
         assert!(debug.contains("https://gateway.test"));

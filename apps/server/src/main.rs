@@ -92,6 +92,8 @@ struct ServerEnvironment {
     master_key: MasterKey,
     tuner_count: u16,
     oidc: Option<iptv_api::OidcConfig>,
+    dev_mode: bool,
+    dev_auth_disabled: bool,
 }
 
 impl std::fmt::Debug for ServerEnvironment {
@@ -106,6 +108,8 @@ impl std::fmt::Debug for ServerEnvironment {
             .field("master_key", &self.master_key)
             .field("tuner_count", &self.tuner_count)
             .field("oidc", &self.oidc)
+            .field("dev_mode", &self.dev_mode)
+            .field("dev_auth_disabled", &self.dev_auth_disabled)
             .finish()
     }
 }
@@ -121,6 +125,8 @@ impl ServerEnvironment {
             tuner_count: self.tuner_count,
             runtime_versions,
             oidc: self.oidc,
+            dev_mode: self.dev_mode,
+            dev_auth_disabled: self.dev_auth_disabled,
         }
     }
 }
@@ -151,6 +157,11 @@ where
     let public_base_url =
         lookup("IPTV_PUBLIC_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_owned());
     let oidc = oidc_config_from(&mut lookup, &public_base_url)?;
+    let dev_mode = parse_bool_env(&mut lookup, "IPTV_DEV_MODE")?;
+    let dev_auth_disabled = parse_bool_env(&mut lookup, "IPTV_DEV_AUTH_DISABLED")?;
+    if dev_auth_disabled && !dev_mode {
+        bail!("IPTV_DEV_AUTH_DISABLED requires IPTV_DEV_MODE=true");
+    }
 
     Ok(ServerEnvironment {
         bind,
@@ -167,7 +178,21 @@ where
             .filter(|count| *count > 0)
             .unwrap_or(1),
         oidc,
+        dev_mode,
+        dev_auth_disabled,
     })
+}
+
+fn parse_bool_env<F>(lookup: &mut F, name: &str) -> Result<bool>
+where
+    F: FnMut(&str) -> std::result::Result<String, env::VarError>,
+{
+    match lookup(name).ok().as_deref().map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(value) if value.eq_ignore_ascii_case("true") => Ok(true),
+        Some(value) if value.eq_ignore_ascii_case("false") => Ok(false),
+        Some(value) => bail!("{name} must be true or false, got {value:?}"),
+    }
 }
 
 fn oidc_config_from<F>(
@@ -3707,6 +3732,44 @@ mod tests {
             "https://iptv.example.test/base"
         );
         assert_eq!(environment.tuner_count, 7);
+    }
+
+    #[test]
+    fn development_auth_requires_both_explicit_flags() {
+        let environment = server_environment_from(lookup(&[
+            ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
+            ("IPTV_MASTER_KEY", MASTER_KEY),
+            ("IPTV_DEV_MODE", "true"),
+            ("IPTV_DEV_AUTH_DISABLED", "true"),
+        ]))
+        .expect("development flags");
+        assert!(environment.dev_mode);
+        assert!(environment.dev_auth_disabled);
+
+        let error = server_environment_from(lookup(&[
+            ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
+            ("IPTV_MASTER_KEY", MASTER_KEY),
+            ("IPTV_DEV_AUTH_DISABLED", "true"),
+        ]))
+        .expect_err("auth bypass without development mode");
+        assert!(error.to_string().contains("IPTV_DEV_AUTH_DISABLED"));
+    }
+
+    #[test]
+    fn development_flags_reject_invalid_boolean_values() {
+        let error = server_environment_from(lookup(&[
+            ("IPTV_ADMIN_PASSWORD_HASH", "hash"),
+            ("IPTV_OUTPUT_TOKEN", OUTPUT_TOKEN),
+            ("IPTV_ADMIN_BOOTSTRAP_TOKEN", BOOTSTRAP_TOKEN),
+            ("IPTV_MASTER_KEY", MASTER_KEY),
+            ("IPTV_DEV_MODE", "yes"),
+        ]))
+        .expect_err("invalid development mode");
+        assert!(error.to_string().contains("must be true or false"));
     }
 
     #[test]

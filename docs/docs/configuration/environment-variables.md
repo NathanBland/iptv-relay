@@ -17,6 +17,8 @@ The gateway reads configuration from environment variables. The Compose file pas
 | `IPTV_ADMIN_PASSWORD_HASH` | _empty_ | Argon2id PHC hash. When set, the plaintext password is ignored. |
 | `IPTV_MASTER_KEY` | Required | Base64 32-byte key for secret encryption. |
 | `IPTV_TUNER_COUNT` | `1` | HDHomeRun tuner count for the environment output profile. |
+| `IPTV_DEV_MODE` | `false` | Enable local development behavior. Keep this false for deployments. |
+| `IPTV_DEV_AUTH_DISABLED` | `false` | Disable web and control API authentication when `IPTV_DEV_MODE=true`. |
 | `RUST_LOG` | `info` | Log level filter. |
 
 ### Optional OIDC sign-in
@@ -92,3 +94,18 @@ Prefer `IPTV_ADMIN_PASSWORD_HASH` over `IPTV_ADMIN_PASSWORD` in production. Use 
 Generate a random 32-byte base64 key for `IPTV_MASTER_KEY`. The core and worker services must use the same key.
 
 The output token protects all `/out/{token}/...` endpoints. Use a random 256-bit value.
+
+### Local development authentication
+
+Set both development variables to bypass web and control API login during local testing:
+
+```text
+IPTV_DEV_MODE=true
+IPTV_DEV_AUTH_DISABLED=true
+```
+
+The gateway rejects `IPTV_DEV_AUTH_DISABLED=true` when `IPTV_DEV_MODE` is false.
+
+This mode does not bypass output-token or internal worker authentication.
+
+Use this mode only with the local development Compose override.
