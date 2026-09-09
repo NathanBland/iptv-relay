@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
+import io
 import json
 import os
 import re
@@ -19,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +137,25 @@ def extract_provider_ids(payload: Any) -> set[str]:
         for item in page_items(payload)
         if str(item.get("epg_channel_id") or item.get("stream_id") or "").strip()
     }
+
+
+def xmltv_channel_ids(url: str) -> set[str]:
+    request = urllib.request.Request(url, headers={"Accept-Encoding": "gzip"})
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            payload = response.read()
+            if response.headers.get("Content-Encoding", "").lower() == "gzip":
+                payload = gzip.decompress(payload)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+        raise RuntimeError("XMLTV provider request failed") from None
+    try:
+        return {
+            str(node.attrib.get("id", "")).strip()
+            for node in ET.parse(io.BytesIO(payload)).getroot().findall("channel")
+            if str(node.attrib.get("id", "")).strip()
+        }
+    except (ET.ParseError, OSError):
+        raise RuntimeError("XMLTV provider payload is invalid") from None
 
 
 def storage_bytes(path: Path) -> int:
@@ -269,6 +291,10 @@ volumes:
         live_provider_ids = extract_provider_ids(stream_payload)
         if not live_provider_ids:
             raise RuntimeError("Xtream returned no usable provider identities")
+        xmltv_ids = xmltv_channel_ids(xmltv)
+        shared_source_ids = live_provider_ids & xmltv_ids
+        if not shared_source_ids:
+            raise RuntimeError("Xtream and XMLTV produced no shared provider identities")
         source = request(f"{core}/api/v1/sources", "POST", {"name": "live-jellyfin-xtream", "kind": "Xtream", "endpoint": xtream_endpoint(xtream["URL"], xtream["USER"], xtream["PWD"], "player_api.php"), "timezone": "UTC"}, bootstrap)
         guide = request(f"{core}/api/v1/sources", "POST", {"name": "live-jellyfin-xmltv", "kind": "XMLTV", "endpoint": xmltv, "timezone": "UTC"}, bootstrap)
         source_cycles: list[dict[str, Any]] = []
@@ -291,13 +317,13 @@ volumes:
                     raise RuntimeError("source synchronization exceeded deadline")
             mappings = page_items(request(f"{core}/api/v1/epg/mappings?limit=5000&offset=0", token=bootstrap))
             mapped_provider_ids = {
-                str(item.get("epgChannelId") or "").strip()
+                str(item.get("canonicalKey") or item.get("epgXmltvId") or "").strip()
                 for item in mappings
-                if str(item.get("epgChannelId") or "").strip()
+                if str(item.get("canonicalKey") or item.get("epgXmltvId") or "").strip()
             }
-            shared_ids = live_provider_ids & mapped_provider_ids
+            shared_ids = shared_source_ids & mapped_provider_ids
             if not shared_ids:
-                raise RuntimeError("Xtream and XMLTV produced no shared provider identities")
+                raise RuntimeError("gateway reconciliation produced no shared provider identities")
             source_cycles.append({"cycle": cycle + 1, "sharedProviderIds": len(shared_ids)})
             report["storage"]["temporaryBytesPeak"] = max(report["storage"]["temporaryBytesPeak"], storage_bytes(root))
         report["sourceRefreshCycles"] = source_cycles
