@@ -72,6 +72,8 @@ release_tag="v${next_version}"
 
 git fetch origin main --tags
 git merge-base --is-ancestor origin/main HEAD || fail "main is behind origin/main; update it before a release"
+[[ "$(git rev-parse origin/main)" == "$(git rev-parse HEAD)" ]] \
+  || fail "push local main commits before a release"
 git rev-parse -q --verify "refs/tags/${release_tag}" >/dev/null && fail "tag ${release_tag} already exists locally"
 git ls-remote --exit-code --tags origin "refs/tags/${release_tag}" >/dev/null 2>&1 \
   && fail "tag ${release_tag} already exists on origin" || true
