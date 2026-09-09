@@ -491,7 +491,7 @@ volumes:
             stream_id = match.group(1) if match else stream_id
             if not stream_id:
                 raise RuntimeError("Jellyfin did not return a live stream identity")
-            streams.append({"open": opened, "streamId": stream_id})
+            streams.append({"streamId": stream_id, "liveStreamId": str(media_source.get("LiveStreamId") or "")})
         if len(streams) != 2:
             raise RuntimeError("Jellyfin did not open two live streams")
         started = time.monotonic()
@@ -530,9 +530,13 @@ volumes:
         if any(count == 0 or count % 188 for count in byte_counts):
             raise RuntimeError("Jellyfin stream did not return MPEG-TS bytes")
         for stream in streams:
-            live_stream_id = stream["open"].get("LiveStreamId") or stream["open"].get("MediaSource", {}).get("LiveStreamId")
+            live_stream_id = stream.get("liveStreamId")
             if live_stream_id:
-                request(f"{jf}/LiveTv/LiveStreams/Close", "POST", {"LiveStreamId": live_stream_id}, jf_token)
+                request(
+                    f"{jf}/LiveStreams/Close?liveStreamId={urllib.parse.quote(live_stream_id, safe='')}",
+                    "POST",
+                    token=jf_token,
+                )
         _, active, available = wait_no_sessions(core, bootstrap)
         report["gatewayAfterStreams"] = {"providerActiveSessions": active, "providerAvailableSlots": available}
     except BaseException as error:
