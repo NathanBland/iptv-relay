@@ -204,10 +204,11 @@ describe('expanded management pages', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Cancel sync' }))
     await waitFor(() => expect(cancel).toHaveBeenCalledWith('source-prime'))
 
-    await userEvent.click(screen.getByText('5m'))
-    const intervalInput = screen.getByLabelText('Refresh interval in seconds')
+    await userEvent.click(screen.getByText('Every 5 minutes'))
+    await userEvent.selectOptions(screen.getByLabelText('Refresh schedule'), 'custom')
+    const intervalInput = screen.getByLabelText('Custom interval in hours')
     await userEvent.clear(intervalInput)
-    await userEvent.type(intervalInput, '600')
+    await userEvent.type(intervalInput, '0.1666667')
     await userEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() => expect(interval).toHaveBeenCalledWith('source-local', 600))
 

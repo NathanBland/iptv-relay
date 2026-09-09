@@ -18,12 +18,34 @@ import { sourceSchema, sourceUpdateSchema } from '@/lib/validation'
 
 const sourceKinds: SourceKind[] = ['M3U', 'Xtream', 'XMLTV', 'Network tuner']
 
+const refreshSchedules = [
+  { seconds: 0, label: 'Manual only' },
+  { seconds: 15 * 60, label: 'Every 15 minutes' },
+  { seconds: 30 * 60, label: 'Every 30 minutes' },
+  { seconds: 60 * 60, label: 'Every hour' },
+  { seconds: 6 * 60 * 60, label: 'Every 6 hours' },
+  { seconds: 12 * 60 * 60, label: 'Every 12 hours' },
+  { seconds: 24 * 60 * 60, label: 'Every day' },
+] as const
+
 function formatInterval(seconds: number): string {
-  if (seconds === 0) return 'Manual'
-  if (seconds < 60) return `${seconds}s`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`
-  return `${Math.floor(seconds / 86400)}d`
+  if (seconds === 0) return 'Manual only'
+  if (seconds < 60) return `Every ${seconds} seconds`
+  if (seconds < 3600) return `Every ${Math.floor(seconds / 60)} minutes`
+  if (seconds < 86400) return `Every ${Math.floor(seconds / 3600)} hours`
+  return `Every ${Math.floor(seconds / 86400)} days`
+}
+
+function scheduledInterval(seconds: number): string {
+  return refreshSchedules.some((schedule) => schedule.seconds === seconds) ? String(seconds) : 'custom'
+}
+
+function formatNextEligibleRefresh(source: Source): string | null {
+  if (source.refreshIntervalSeconds === 0 || !source.lastRefreshedAt) return null
+  const lastRefresh = new Date(source.lastRefreshedAt)
+  if (Number.isNaN(lastRefresh.getTime())) return null
+  const nextRefresh = new Date(lastRefresh.getTime() + source.refreshIntervalSeconds * 1000)
+  return nextRefresh.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
 }
 
 function formatBytes(value: number): string {
@@ -125,7 +147,8 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
   })
 
   const [editingInterval, setEditingInterval] = useState<string | null>(null)
-  const [intervalValue, setIntervalValue] = useState('')
+  const [intervalSchedule, setIntervalSchedule] = useState('0')
+  const [customIntervalHours, setCustomIntervalHours] = useState('')
   const [editingSource, setEditingSource] = useState<Source | null>(null)
 
   const updateSourceMutation = useMutation({
@@ -396,21 +419,43 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
                   <TableCell>{formatRelativeTime(source.lastSync)}</TableCell>
                   <TableCell>
                     {editingInterval === source.id ? (
-                      <span className="inline-flex items-center gap-1">
-                        <Input
-                          className="h-7 w-20 text-xs"
-                          type="number"
-                          min={0}
-                          value={intervalValue}
-                          onChange={(event) => setIntervalValue(event.target.value)}
-                          aria-label="Refresh interval in seconds"
-                        />
+                      <div className="flex min-w-64 flex-col gap-2">
+                        <label className="text-xs text-slate-400">
+                          Refresh schedule
+                          <Select
+                            className="mt-1 h-8 text-xs"
+                            value={intervalSchedule}
+                            onChange={(event) => setIntervalSchedule(event.target.value)}
+                            aria-label="Refresh schedule"
+                          >
+                            {refreshSchedules.map((schedule) => <option key={schedule.seconds} value={schedule.seconds}>{schedule.label}</option>)}
+                            <option value="custom">Custom interval</option>
+                          </Select>
+                        </label>
+                        {intervalSchedule === 'custom' ? (
+                          <label className="text-xs text-slate-400">
+                            Custom interval in hours
+                            <Input
+                              className="mt-1 h-8 text-xs"
+                              type="number"
+                              min={0.25}
+                              step={0.25}
+                              value={customIntervalHours}
+                              onChange={(event) => setCustomIntervalHours(event.target.value)}
+                              aria-label="Custom interval in hours"
+                            />
+                          </label>
+                        ) : null}
+                        <p className="text-[0.68rem] text-slate-500">The scheduler checks for eligible refreshes every minute.</p>
+                        <span className="inline-flex gap-1">
                         <Button
                           variant="ghost"
                           size="sm"
-                          disabled={refreshIntervalMutation.isPending}
+                          disabled={refreshIntervalMutation.isPending || (intervalSchedule === 'custom' && Number(customIntervalHours) <= 0)}
                           onClick={() => {
-                            const seconds = Math.max(0, Math.floor(Number(intervalValue) || 0))
+                            const seconds = intervalSchedule === 'custom'
+                              ? Math.max(0, Math.round(Number(customIntervalHours) * 3600))
+                              : Number(intervalSchedule)
                             refreshIntervalMutation.mutate(
                               { id: source.id, seconds },
                               { onSuccess: () => setEditingInterval(null) },
@@ -422,12 +467,14 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
                         <Button variant="ghost" size="sm" onClick={() => setEditingInterval(null)}>
                           Cancel
                         </Button>
-                      </span>
+                        </span>
+                      </div>
                     ) : (
                       <button
                         className="inline-flex items-center gap-1 text-xs text-slate-300 hover:text-white"
                         onClick={() => {
-                          setIntervalValue(String(source.refreshIntervalSeconds))
+                          setIntervalSchedule(scheduledInterval(source.refreshIntervalSeconds))
+                          setCustomIntervalHours((source.refreshIntervalSeconds / 3600).toString())
                           setEditingInterval(source.id)
                         }}
                       >
@@ -438,6 +485,11 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
                             {source.lastRefreshedAt ? (
                               <span className="block text-[0.68rem] text-slate-500">
                                 last: {formatRelativeTime(source.lastRefreshedAt)}
+                              </span>
+                            ) : null}
+                            {formatNextEligibleRefresh(source) ? (
+                              <span className="block text-[0.68rem] text-slate-500">
+                                next eligible: {formatNextEligibleRefresh(source)}
                               </span>
                             ) : null}
                           </span>
