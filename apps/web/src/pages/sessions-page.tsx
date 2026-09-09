@@ -1,9 +1,10 @@
-import { useQuery } from '@tanstack/react-query'
-import { Activity, Network, Users } from 'lucide-react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Activity, Network, Power, Users } from 'lucide-react'
 import { HealthBadge } from '@/components/health-badge'
 import { LoadingPage } from '@/components/loading-page'
 import { PageHeader } from '@/components/page-header'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { apiClient } from '@/lib/api/client'
@@ -36,6 +37,11 @@ function sessionKey(session: Session) {
 
 export function SessionsPage({ client = apiClient }: { client?: IptvApiClient }) {
   const query = useQuery({ ...apiQueries(client).sessions })
+  const queryClient = useQueryClient()
+  const terminate = useMutation({
+    mutationFn: (session: Session) => client.terminateSession(session),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['sessions'] }),
+  })
   const sessions = query.data ?? []
   if (!query.data) return <LoadingPage label="sessions" />
 
@@ -57,27 +63,29 @@ export function SessionsPage({ client = apiClient }: { client?: IptvApiClient })
         <div className="overflow-x-auto">
           <Table>
             <caption className="sr-only">Live shared IPTV upstream sessions</caption>
-            <TableHeader><TableRow><TableHead>Source</TableHead><TableHead>Provider pool</TableHead><TableHead>Viewers</TableHead><TableHead>Generation</TableHead><TableHead>Ring</TableHead><TableHead>Recovery</TableHead><TableHead>Status</TableHead></TableRow></TableHeader>
+            <TableHeader><TableRow><TableHead>Source</TableHead><TableHead>Provider pool</TableHead><TableHead>Viewers</TableHead><TableHead>Generation</TableHead><TableHead>Ring</TableHead><TableHead>Recovery</TableHead><TableHead>Status</TableHead><TableHead>Action</TableHead></TableRow></TableHeader>
             <TableBody>
               {sessions.length === 0
-                ? <TableRow><TableCell colSpan={7} className="py-8 text-center text-slate-500">No live shared sessions.</TableCell></TableRow>
+                ? <TableRow><TableCell colSpan={8} className="py-8 text-center text-slate-500">No live shared sessions.</TableCell></TableRow>
                 : sessions.map((session) => {
                     const retained = ringPercent(session)
                     return (
                       <TableRow key={sessionKey(session)}>
-                        <TableCell className="font-mono text-xs font-medium text-white">{session.sourceId}</TableCell>
+                        <TableCell className="font-mono text-xs font-medium text-white"><span className="block font-sans text-sm">{session.channelName || 'Unknown channel'}</span><span>{session.sourceId}</span></TableCell>
                         <TableCell><Badge>{session.providerPoolId}</Badge><p className="mt-1 text-xs text-slate-500">{session.providerAvailableSlots} slots available · peak {session.providerHighWatermark}</p></TableCell>
                         <TableCell className="font-mono">{session.viewerCount}</TableCell>
                         <TableCell className="font-mono text-xs">configured {session.configuredGeneration}<br />upstream {session.upstreamGeneration}</TableCell>
                         <TableCell className="min-w-44"><div className="flex justify-between font-mono text-xs"><span>{session.retainedPackets.toLocaleString()} / {session.capacityPackets.toLocaleString()} packets</span><span>{retained}%</span></div><progress className="mt-1 h-1.5 w-full accent-sky-400" aria-label={`${session.sourceId} ring utilization`} max={100} value={retained} /><p className="mt-1 text-xs text-slate-500">lag {session.lagEvents} · wraps {session.wrapEvents} · overwritten {session.overwrittenPackets.toLocaleString()}</p></TableCell>
                         <TableCell className="text-xs">reconnects {session.reconnectAttempts} · failovers {session.failoverAttempts}<br /><span className="text-slate-500">failures {session.failureCount}{session.lastFailure ? ` · ${failureLabels[session.lastFailure]}` : ''}</span></TableCell>
                         <TableCell><HealthBadge state={sessionHealth(session.state)} /><p className="mt-1 text-xs capitalize text-slate-500">{session.state.replace('-', ' ')}</p></TableCell>
+                        <TableCell><Button variant="ghost" size="sm" className="text-slate-400 hover:text-red-300" disabled={terminate.isPending} onClick={() => { if (window.confirm(`Terminate the stream for ${session.channelName || session.sourceId}?`)) terminate.mutate(session) }}><Power aria-hidden="true" className="mr-1 size-3" />Terminate</Button></TableCell>
                       </TableRow>
                     )
                   })}
             </TableBody>
           </Table>
         </div>
+        {terminate.isError ? <p role="alert" className="border-t border-white/5 px-4 py-3 text-sm text-rose-300">The session could not be terminated. Refresh and try again.</p> : null}
       </Card>
     </>
   )

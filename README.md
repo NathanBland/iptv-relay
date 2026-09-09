@@ -569,6 +569,7 @@ Operator API tokens support `read`, `control`, `output`, and `admin` scopes. The
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/v1/sessions` | List active media sessions. |
+| POST | `/api/v1/sessions/{provider_pool_id}/{source_id}/{generation}/terminate` | Terminate one active media session. |
 | GET | `/api/v1/session-events` | Subscribe to session SSE events. |
 | GET | `/api/v1/catalog-events` | Subscribe to catalog SSE events. |
 

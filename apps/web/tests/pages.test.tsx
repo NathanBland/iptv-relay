@@ -200,6 +200,25 @@ describe('management pages', () => {
     expect(screen.getAllByRole('progressbar')).toHaveLength(3)
   })
 
+  it('terminates a selected session after confirmation', async () => {
+    const client = new MockIptvApiClient()
+    const terminate = vi.spyOn(client, 'terminateSession')
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    renderWithQuery(<SessionsPage client={client} />)
+    await screen.findByText('source-kwgn-hd')
+    await userEvent.click(screen.getAllByRole('button', { name: /Terminate/ })[0]!)
+    await waitFor(() => expect(terminate).toHaveBeenCalled())
+    vi.restoreAllMocks()
+  })
+
+  it('shows an empty session list without provider slots', async () => {
+    const client = new MockIptvApiClient()
+    vi.spyOn(client, 'getSessions').mockResolvedValue([])
+    renderWithQuery(<SessionsPage client={client} />)
+    expect(await screen.findByText('No live shared sessions.')).toBeInTheDocument()
+    expect(screen.getByText(/Shared upstreams/).previousSibling).toHaveTextContent('0')
+  })
+
   it('maps every actor state and safely bounds ring utilization', () => {
     expect(sessionHealth('streaming')).toBe('healthy')
     expect(sessionHealth('recovering')).toBe('degraded')

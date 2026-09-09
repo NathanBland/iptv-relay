@@ -116,6 +116,7 @@ impl RecoveryPolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpTsSessionSnapshot {
     pub key: HttpTsSessionKey,
+    pub channel_name: Option<String>,
     pub state: SessionState,
     pub viewer_count: usize,
     pub upstream_generation: u64,
@@ -132,6 +133,7 @@ pub struct HttpTsSessionSnapshot {
 #[derive(Debug)]
 pub(crate) struct SessionDiagnostics {
     key: HttpTsSessionKey,
+    channel_name: Option<Arc<str>>,
     inner: Mutex<DiagnosticsState>,
 }
 
@@ -157,9 +159,10 @@ struct ViewerPosition {
 }
 
 impl SessionDiagnostics {
-    pub(crate) fn new(key: HttpTsSessionKey) -> Arc<Self> {
+    pub(crate) fn new(key: HttpTsSessionKey, channel_name: Option<Arc<str>>) -> Arc<Self> {
         Arc::new(Self {
             key,
+            channel_name,
             inner: Mutex::new(DiagnosticsState {
                 state: SessionState::Idle,
                 next_viewer_id: 1,
@@ -178,6 +181,14 @@ impl SessionDiagnostics {
 
     pub(crate) fn set_state(&self, state: SessionState) {
         self.inner.lock().state = state;
+    }
+
+    pub(crate) fn key(&self) -> &HttpTsSessionKey {
+        &self.key
+    }
+
+    pub(crate) fn channel_name(&self) -> Option<&str> {
+        self.channel_name.as_deref()
     }
 
     pub(crate) fn set_generation(&self, generation: u64) {
@@ -222,6 +233,10 @@ impl SessionDiagnostics {
         !self.inner.lock().viewers.is_empty()
     }
 
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.inner.lock().state == SessionState::Stopping
+    }
+
     pub(crate) fn register_viewer(
         self: &Arc<Self>,
         generation: u64,
@@ -263,6 +278,7 @@ impl SessionDiagnostics {
         let inner = self.inner.lock();
         HttpTsSessionSnapshot {
             key: self.key.clone(),
+            channel_name: self.channel_name.as_deref().map(str::to_owned),
             state: inner.state,
             viewer_count: inner.viewers.len(),
             upstream_generation: inner.upstream_generation,
@@ -338,7 +354,7 @@ mod tests {
 
     #[test]
     fn viewer_positions_and_counters_are_snapshotted() {
-        let diagnostics = SessionDiagnostics::new(HttpTsSessionKey::new("pool", "source", 1));
+        let diagnostics = SessionDiagnostics::new(HttpTsSessionKey::new("pool", "source", 1), None);
         diagnostics.set_state(SessionState::Recovering);
         let first = diagnostics.register_viewer(0, 2);
         let second = diagnostics.register_viewer(0, 4);

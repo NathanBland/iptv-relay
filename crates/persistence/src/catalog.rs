@@ -2291,6 +2291,7 @@ pub struct ChannelStreamSourceRow {
 #[derive(Clone, FromRow)]
 pub struct ChannelPlaybackCandidateRow {
     pub channel_id: Uuid,
+    pub channel_name: String,
     pub channel_revision: i64,
     pub provider_stream_id: Uuid,
     pub source_snapshot_id: Uuid,
@@ -2312,6 +2313,7 @@ impl fmt::Debug for ChannelPlaybackCandidateRow {
         formatter
             .debug_struct("ChannelPlaybackCandidateRow")
             .field("channel_id", &self.channel_id)
+            .field("channel_name", &self.channel_name)
             .field("channel_revision", &self.channel_revision)
             .field("provider_stream_id", &self.provider_stream_id)
             .field("source_snapshot_id", &self.source_snapshot_id)
@@ -2334,6 +2336,7 @@ impl fmt::Debug for ChannelPlaybackCandidateRow {
 #[derive(Clone, Debug)]
 pub struct ChannelPlaybackPlan {
     pub channel_id: Uuid,
+    pub channel_name: String,
     pub channel_revision: i64,
     pub candidates: Vec<ChannelPlaybackCandidateRow>,
 }
@@ -2357,6 +2360,7 @@ impl CatalogRepository {
             r"
             SELECT
                 c.id AS channel_id,
+                c.name AS channel_name,
                 c.revision AS channel_revision,
                 ps.id AS provider_stream_id,
                 ss.id AS source_snapshot_id,
@@ -2404,6 +2408,7 @@ impl CatalogRepository {
         };
         Ok(Some(ChannelPlaybackPlan {
             channel_id: first.channel_id,
+            channel_name: first.channel_name.clone(),
             channel_revision: first.channel_revision,
             candidates,
         }))
@@ -7375,6 +7380,7 @@ mod tests {
         let channel_id = Uuid::now_v7();
         let candidate = ChannelPlaybackCandidateRow {
             channel_id,
+            channel_name: "News".to_owned(),
             channel_revision: 4,
             provider_stream_id: Uuid::now_v7(),
             source_snapshot_id: Uuid::now_v7(),

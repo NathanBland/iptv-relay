@@ -850,6 +850,11 @@ export class FetchIptvApiClient implements IptvApiClient {
     return this.request(API_PATHS.sessions, (value) => asObjectArray<Session>(value, 'Sessions response'))
   }
 
+  async terminateSession(session: Pick<Session, 'providerPoolId' | 'sourceId' | 'configuredGeneration'>): Promise<void> {
+    const path = `${API_PATHS.sessions}/${encodeURIComponent(session.providerPoolId)}/${encodeURIComponent(session.sourceId)}/${session.configuredGeneration}/terminate`
+    await this.request(path, () => undefined, { method: 'POST', body: '{}' })
+  }
+
   async getJobs(): Promise<Job[]> {
     return this.request(API_PATHS.jobs, (value) => asObjectArray<Job>(value, 'Jobs response'))
   }
@@ -1511,6 +1516,8 @@ export class MockIptvApiClient implements IptvApiClient {
   async getSessions(): Promise<Session[]> {
     return mockSessions.map((session) => ({ ...session }))
   }
+
+  async terminateSession(_session: Pick<Session, 'providerPoolId' | 'sourceId' | 'configuredGeneration'>): Promise<void> {}
 
   async getJobs(): Promise<Job[]> {
     return mockJobs.map((job) => ({ ...job, progress: { ...job.progress } }))

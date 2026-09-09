@@ -7,6 +7,7 @@ The sessions API lists active media sessions and provides realtime Server-Sent E
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/v1/sessions` | List active media sessions. |
+| POST | `/api/v1/sessions/{provider_pool_id}/{source_id}/{generation}/terminate` | Terminate one active media session. |
 | GET | `/api/v1/session-events` | Subscribe to session SSE events. |
 | GET | `/api/v1/catalog-events` | Subscribe to catalog SSE events. |
 | GET | `/api/v1/jobs` | List jobs. |
@@ -20,6 +21,22 @@ curl http://localhost:8080/api/v1/sessions \
 ```
 
 The response lists active media sessions with viewer counts and upstream details.
+Each session includes `channelName` when the gateway knows the catalog name.
+The `sourceId` and `configuredGeneration` fields identify the session instance.
+
+## Terminate a session
+
+If a viewer no longer releases a stream, terminate the session with its provider pool, source ID, and configured generation:
+
+```bash
+curl -X POST \
+  http://localhost:8080/api/v1/sessions/{provider_pool_id}/{source_id}/{generation}/terminate \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
+  -H "X-CSRF-Token: $IPTV_CSRF_TOKEN"
+```
+
+The endpoint closes downstream viewers and the shared upstream ring.
+The endpoint releases the provider slot after the session handles close.
 
 ## Catalog SSE events
 

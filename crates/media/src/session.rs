@@ -18,6 +18,7 @@ use tokio::{
     task::AbortHandle,
     time::{Instant, MissedTickBehavior},
 };
+use tracing::{debug, info, warn};
 
 use crate::{
     AcquireError, BrokeredInputFormat, HttpTsSessionSnapshot, MPEG_TS_PACKET_SIZE, MpegTsRing,
@@ -180,6 +181,7 @@ impl HttpTsEndpoint {
 #[derive(Clone)]
 pub struct HttpTsSourceSpec {
     key: HttpTsSessionKey,
+    channel_name: Option<Arc<str>>,
     endpoints: Vec<HttpTsEndpoint>,
     adapter_policy: InputAdapterPolicy,
     process_input_format: BrokeredInputFormat,
@@ -195,6 +197,7 @@ impl fmt::Debug for HttpTsSourceSpec {
         formatter
             .debug_struct("HttpTsSourceSpec")
             .field("key", &self.key)
+            .field("channel_name", &self.channel_name)
             .field("primary", &self.endpoints[0])
             .field("alternate_count", &self.endpoints.len().saturating_sub(1))
             .field("adapter_policy", &self.adapter_policy)
@@ -212,6 +215,7 @@ impl HttpTsSourceSpec {
     pub fn new(key: HttpTsSessionKey, url: impl Into<Arc<str>>, ring: MpegTsRingConfig) -> Self {
         Self {
             key,
+            channel_name: None,
             endpoints: vec![HttpTsEndpoint::new(url)],
             adapter_policy: InputAdapterPolicy::Auto,
             process_input_format: BrokeredInputFormat::DirectMpegTs,
@@ -225,6 +229,11 @@ impl HttpTsSourceSpec {
 
     pub fn key(&self) -> &HttpTsSessionKey {
         &self.key
+    }
+
+    /// Adds a redacted display label for diagnostics and operator views.
+    pub fn set_channel_name(&mut self, name: impl Into<Arc<str>>) {
+        self.channel_name = Some(name.into());
     }
 
     pub fn adapter_policy(&self) -> InputAdapterPolicy {
@@ -275,6 +284,7 @@ impl HttpTsSourceSpec {
 impl PartialEq for HttpTsSourceSpec {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
+            && self.channel_name == other.channel_name
             && self.endpoints == other.endpoints
             && self.adapter_policy == other.adapter_policy
             && self.process_input_format == other.process_input_format
@@ -481,6 +491,21 @@ impl HttpTsSessionManager {
         diagnostics
     }
 
+    /// Closes a live session and wakes all viewers so their handles release.
+    pub fn terminate(&self, key: &HttpTsSessionKey) -> bool {
+        let Some(session) = self
+            .inner
+            .session_index
+            .get(key)
+            .and_then(|entry| entry.value().upgrade())
+        else {
+            return false;
+        };
+        session.terminate();
+        self.inner.session_index.remove(key);
+        true
+    }
+
     /// Opens an independent viewer cursor on a single-flight shared session.
     ///
     /// # Errors
@@ -563,6 +588,17 @@ impl HttpTsSession {
             process_id: self.input.process_id(),
         }
     }
+
+    fn terminate(&self) {
+        self.diagnostics.set_state(SessionState::Stopping);
+        self.ring.close(RingCloseReason::Shutdown);
+        info!(
+            provider_pool_id = %self.key.provider_pool_id,
+            source_id = %self.key.source_id,
+            generation = self.key.generation,
+            "media session terminated by operator"
+        );
+    }
 }
 
 impl Drop for HttpTsSession {
@@ -624,7 +660,14 @@ async fn start_http_ts_session(
     providers: Arc<DashMap<Arc<str>, ProviderSlotBroker>>,
     source: HttpTsSourceSpec,
 ) -> Result<HttpTsSession, SessionStartError> {
-    let diagnostics = SessionDiagnostics::new(source.key.clone());
+    let diagnostics = SessionDiagnostics::new(source.key.clone(), source.channel_name.clone());
+    info!(
+        provider_pool_id = %source.key.provider_pool_id,
+        source_id = %source.key.source_id,
+        generation = source.key.generation,
+        channel_name = source.channel_name.as_deref().unwrap_or(""),
+        "media session starting"
+    );
     diagnostics.set_state(SessionState::Reserving);
     let primary_pool_id = source.endpoints[0]
         .effective_pool_id(&source.key.provider_pool_id)
@@ -808,6 +851,7 @@ fn sanitize_reqwest_error(error: reqwest::Error) -> SessionStartError {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn pump_http_ts(
     response: Response,
     ring: MpegTsRing,
@@ -867,6 +911,18 @@ async fn pump_http_ts(
 
     loop {
         diagnostics.record_failure(active_failure);
+        warn!(
+            provider_pool_id = %diagnostics.key().provider_pool_id,
+            source_id = %diagnostics.key().source_id,
+            generation = diagnostics.key().generation,
+            channel_name = diagnostics.channel_name().unwrap_or(""),
+            failure = ?active_failure,
+            viewers = diagnostics.has_viewers(),
+            "media session upstream failure"
+        );
+        if diagnostics.is_stopping() {
+            return;
+        }
         if !diagnostics.has_viewers() {
             diagnostics.set_state(SessionState::Stopping);
             ring.close(RingCloseReason::Shutdown);
@@ -1007,6 +1063,16 @@ async fn recover_session(
         let failover_offset = usize::from(endpoints.len() > 1);
         let endpoint_index = (previous_endpoint + failover_offset + attempt) % endpoints.len();
         let is_failover = endpoint_index != previous_endpoint;
+        debug!(
+            provider_pool_id = %diagnostics.key().provider_pool_id,
+            source_id = %diagnostics.key().source_id,
+            generation = diagnostics.key().generation,
+            channel_name = diagnostics.channel_name().unwrap_or(""),
+            attempt,
+            endpoint_index,
+            failover = is_failover,
+            "media session recovery attempt"
+        );
         diagnostics.set_state(if is_failover {
             SessionState::FailingOver
         } else {
@@ -1022,6 +1088,13 @@ async fn recover_session(
             endpoint,
             current_pool_id,
         ) else {
+            debug!(
+                provider_pool_id = %diagnostics.key().provider_pool_id,
+                source_id = %diagnostics.key().source_id,
+                generation = diagnostics.key().generation,
+                attempt,
+                "media session recovery attempt could not acquire provider capacity"
+            );
             attempt = attempt.saturating_add(1);
             sleep_until_retry(deadline, recovery.retry_delay()).await;
             continue;
@@ -1164,16 +1237,62 @@ async fn stream_until_failure(
             Ok(Some(Ok(chunk))) => match packetizer.push(&chunk) {
                 Ok(packets) => {
                     if push_packets(ring, diagnostics, &packets).is_err() {
+                        debug!(
+                            provider_pool_id = %diagnostics.key().provider_pool_id,
+                            source_id = %diagnostics.key().source_id,
+                            generation = diagnostics.key().generation,
+                            channel_name = diagnostics.channel_name().unwrap_or(""),
+                            "media session ring closed while publishing packets"
+                        );
                         return SessionFailureKind::Packetization;
                     }
                 }
-                Err(_) => return SessionFailureKind::Packetization,
+                Err(error) => {
+                    warn!(
+                        provider_pool_id = %diagnostics.key().provider_pool_id,
+                        source_id = %diagnostics.key().source_id,
+                        generation = diagnostics.key().generation,
+                        channel_name = diagnostics.channel_name().unwrap_or(""),
+                        error = %error,
+                        "media session rejected MPEG-TS input"
+                    );
+                    return SessionFailureKind::Packetization;
+                }
             },
-            Ok(Some(Err(_))) | Err(_) => return SessionFailureKind::Http,
+            Ok(Some(Err(error))) => {
+                warn!(
+                    provider_pool_id = %diagnostics.key().provider_pool_id,
+                    source_id = %diagnostics.key().source_id,
+                    generation = diagnostics.key().generation,
+                    channel_name = diagnostics.channel_name().unwrap_or(""),
+                    error = %error.without_url(),
+                    "media session upstream read failed"
+                );
+                return SessionFailureKind::Http;
+            }
+            Err(_) => {
+                warn!(
+                    provider_pool_id = %diagnostics.key().provider_pool_id,
+                    source_id = %diagnostics.key().source_id,
+                    generation = diagnostics.key().generation,
+                    channel_name = diagnostics.channel_name().unwrap_or(""),
+                    timeout_ms = u64::try_from(read_timeout.as_millis()).unwrap_or(u64::MAX),
+                    "media session upstream read timed out"
+                );
+                return SessionFailureKind::Http;
+            }
             Ok(None) => {
                 return if packetizer.pending_bytes() == 0 {
                     SessionFailureKind::UpstreamEnded
                 } else {
+                    warn!(
+                        provider_pool_id = %diagnostics.key().provider_pool_id,
+                        source_id = %diagnostics.key().source_id,
+                        generation = diagnostics.key().generation,
+                        channel_name = diagnostics.channel_name().unwrap_or(""),
+                        pending_bytes = packetizer.pending_bytes(),
+                        "media session upstream ended with an incomplete MPEG-TS packet"
+                    );
                     SessionFailureKind::Packetization
                 };
             }
@@ -1989,7 +2108,8 @@ mod tests {
             Err(SessionStartError::UnknownProvider { pool_id }) if pool_id.as_ref() == "unknown"
         ));
 
-        let diagnostics = SessionDiagnostics::new(HttpTsSessionKey::new("provider", "unit", 1));
+        let diagnostics =
+            SessionDiagnostics::new(HttpTsSessionKey::new("provider", "unit", 1), None);
         let ring = MpegTsRing::new(MpegTsRingConfig::new(4, 0).unwrap());
 
         let mut empty: HttpBody = Box::pin(stream::empty());
@@ -2135,9 +2255,8 @@ mod tests {
         let client = Client::new();
         let providers = DashMap::new();
         let source_id: Arc<str> = "source".into();
-        let diagnostics = Arc::new(SessionDiagnostics::new(HttpTsSessionKey::new(
-            "provider", "source", 1,
-        )));
+        let diagnostics =
+            SessionDiagnostics::new(HttpTsSessionKey::new("provider", "source", 1), None);
         let ring = MpegTsRing::new(MpegTsRingConfig::new(2, 0).unwrap());
         let result = recover_session(
             RecoveryContext {
@@ -2187,7 +2306,8 @@ mod tests {
         let broker = ProviderSlotBroker::new("provider", 1);
         let lease = broker.try_acquire("source").unwrap();
         let ring = MpegTsRing::new(MpegTsRingConfig::new(2, 0).unwrap());
-        let diagnostics = SessionDiagnostics::new(HttpTsSessionKey::new("provider", "source", 1));
+        let diagnostics =
+            SessionDiagnostics::new(HttpTsSessionKey::new("provider", "source", 1), None);
         let config = HttpPumpConfig {
             client: client.clone(),
             providers: Arc::new(DashMap::new()),
@@ -2214,7 +2334,8 @@ mod tests {
         pre_roll: usize,
     ) -> (ViewerHandle, MpegTsRing, Arc<SessionDiagnostics>) {
         let ring = MpegTsRing::new(MpegTsRingConfig::new(capacity, pre_roll).unwrap());
-        let diagnostics = SessionDiagnostics::new(HttpTsSessionKey::new("provider", "local", 1));
+        let diagnostics =
+            SessionDiagnostics::new(HttpTsSessionKey::new("provider", "local", 1), None);
         diagnostics.set_state(SessionState::Streaming);
         let task = tokio::spawn(std::future::pending::<()>());
         let abort_handle = task.abort_handle();

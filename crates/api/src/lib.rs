@@ -709,6 +709,7 @@ struct EventChannelQuery {
 struct SessionResponse {
     provider_pool_id: String,
     source_id: String,
+    channel_name: Option<String>,
     configured_generation: u64,
     upstream_generation: u64,
     state: String,
@@ -926,7 +927,7 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, reset_source_circuit_breaker, list_groups, list_jobs, cancel_job, list_dead_letters, get_dead_letter, replay_dead_letter, close_dead_letter, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, reset_source_circuit_breaker, list_groups, list_jobs, cancel_job, list_dead_letters, get_dead_letter, replay_dead_letter, close_dead_letter, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, terminate_session, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
     components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SupportLogEntry, SupportBundleResponse, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
@@ -1230,6 +1231,10 @@ fn event_control_routes() -> Router<AppState> {
 fn operations_control_routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/sessions", get(list_sessions))
+        .route(
+            "/api/v1/sessions/{provider_pool_id}/{source_id}/{generation}/terminate",
+            post(terminate_session),
+        )
         .route("/api/v1/support/bundle", get(support_bundle))
         .route("/api/v1/support/logs", get(support_logs))
         .route("/api/v1/jellyfin/setup", get(jellyfin_setup))
@@ -2271,7 +2276,15 @@ async fn system_info_value(state: &AppState) -> SystemInfo {
     let mut pools = HashSet::new();
     let mut provider_connections = 0;
     let mut provider_limit = 0;
-    {
+    for session in state.media.list_snapshots() {
+        if pools.insert(Arc::clone(&session.key.provider_pool_id))
+            && let Some(snapshot) = state.media.provider_snapshot(&session.key.provider_pool_id)
+        {
+            provider_connections += snapshot.active_sessions;
+            provider_limit += snapshot.capacity;
+        }
+    }
+    if pools.is_empty() {
         let catalog = state.catalog.read().await;
         for source in catalog.stream_sources.values() {
             if pools.insert(Arc::clone(&source.provider_pool_id))
@@ -5731,6 +5744,33 @@ async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Res
 }
 
 #[utoipa::path(
+    post,
+    path = "/api/v1/sessions/{provider_pool_id}/{source_id}/{generation}/terminate",
+    tag = "sessions",
+    params(
+        ("provider_pool_id" = String, Path, description = "Provider pool identifier"),
+        ("source_id" = String, Path, description = "Stable source identifier"),
+        ("generation" = u64, Path, description = "Configured session generation")
+    ),
+    responses((status = 204), (status = 404, body = ProblemDetails), (status = 401, body = ProblemDetails))
+)]
+async fn terminate_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((provider_pool_id, source_id, generation)): Path<(String, String, u64)>,
+) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    let key = HttpTsSessionKey::new(provider_pool_id, source_id, generation);
+    if state.media.terminate(&key) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        not_found()
+    }
+}
+
+#[utoipa::path(
     get,
     path = "/api/v1/session-events",
     tag = "sessions",
@@ -5993,6 +6033,7 @@ fn session_response(
     SessionResponse {
         provider_pool_id: snapshot.key.provider_pool_id.to_string(),
         source_id: snapshot.key.source_id.to_string(),
+        channel_name: snapshot.channel_name.clone(),
         configured_generation: snapshot.key.generation,
         upstream_generation: snapshot.upstream_generation,
         state: session_state_name(snapshot.state).to_owned(),
@@ -6829,16 +6870,20 @@ async fn open_channel_viewer(state: &AppState, channel_id: Uuid) -> StreamResult
 async fn channel_source_spec(state: &AppState, channel_id: Uuid) -> StreamResult<HttpTsSourceSpec> {
     let memory_source = {
         let catalog = state.catalog.read().await;
-        let enabled = catalog
+        catalog
             .channels
             .iter()
-            .any(|channel| channel.id == channel_id && channel.enabled);
-        enabled
-            .then(|| catalog.stream_sources.get(&channel_id).cloned())
-            .flatten()
+            .find(|channel| channel.id == channel_id && channel.enabled)
+            .and_then(|channel| {
+                catalog
+                    .stream_sources
+                    .get(&channel_id)
+                    .cloned()
+                    .map(|source| (source, channel.name.clone()))
+            })
     };
-    if let Some(source) = memory_source {
-        return in_memory_source_spec(state, &source);
+    if let Some((source, channel_name)) = memory_source {
+        return in_memory_source_spec(state, &source, &channel_name);
     }
 
     let Some(catalog) = &state.catalog_repository else {
@@ -6855,6 +6900,7 @@ async fn channel_source_spec(state: &AppState, channel_id: Uuid) -> StreamResult
 fn in_memory_source_spec(
     state: &AppState,
     source: &ChannelStreamSource,
+    channel_name: &str,
 ) -> StreamResult<HttpTsSourceSpec> {
     state.media.configure_provider(ProviderSpec::new(
         Arc::clone(&source.provider_pool_id),
@@ -6862,7 +6908,7 @@ fn in_memory_source_spec(
     ));
     let ring = default_ring(source.estimated_bitrate_bits_per_second)
         .map_err(|detail| Box::new(invalid_buffer_policy(detail)))?;
-    Ok(HttpTsSourceSpec::new(
+    let mut spec = HttpTsSourceSpec::new(
         HttpTsSessionKey::new(
             Arc::clone(&source.provider_pool_id),
             Arc::clone(&source.source_id),
@@ -6870,7 +6916,9 @@ fn in_memory_source_spec(
         ),
         Arc::clone(&source.upstream_url),
         ring,
-    ))
+    );
+    spec.set_channel_name(channel_name.to_owned());
+    Ok(spec)
 }
 
 fn database_source_spec(
@@ -6909,6 +6957,7 @@ fn database_source_spec(
         primary_url,
         ring,
     );
+    spec.set_channel_name(plan.channel_name.clone());
     spec.set_adapter_policy(adapter_policy);
     for candidate in plan.candidates.iter().skip(1) {
         spec.add_alternate(HttpTsEndpoint::for_provider(
@@ -9231,6 +9280,7 @@ mod tests {
     ) -> HttpTsSessionSnapshot {
         HttpTsSessionSnapshot {
             key: HttpTsSessionKey::new("provider-private-id", "source-safe-id", 7),
+            channel_name: Some("Channel".to_owned()),
             state,
             viewer_count: 2,
             upstream_generation: 3,
@@ -9544,6 +9594,22 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             "application/problem+json"
         );
+    }
+
+    #[tokio::test]
+    async fn terminate_session_requires_admin_and_reports_missing_session() {
+        let path = "/api/v1/sessions/provider/source/7/terminate";
+        let unauthorized = router(state())
+            .oneshot(Request::post(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let missing = router(state())
+            .oneshot(admin_request("POST", path, None))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -10103,6 +10169,7 @@ mod tests {
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["providerPoolId"], "provider-private-id");
         assert_eq!(json["sourceId"], "source-safe-id");
+        assert_eq!(json["channelName"], "Channel");
         assert_eq!(json["configuredGeneration"], 7);
         assert_eq!(json["upstreamGeneration"], 3);
         assert_eq!(json["viewerCount"], 2);
@@ -11711,6 +11778,7 @@ mod tests {
     ) -> ChannelPlaybackCandidateRow {
         ChannelPlaybackCandidateRow {
             channel_id: Uuid::from_u128(1),
+            channel_name: "Test channel".to_owned(),
             channel_revision: 4,
             provider_stream_id: stream_id,
             source_snapshot_id: Uuid::from_u128(stream_id.as_u128() + 100),
@@ -11737,6 +11805,7 @@ mod tests {
         let second = playback_candidate(Uuid::from_u128(40), alternate_pool, 2);
         let plan = ChannelPlaybackPlan {
             channel_id: first.channel_id,
+            channel_name: first.channel_name.clone(),
             channel_revision: first.channel_revision,
             candidates: vec![first.clone(), second.clone()],
         };
@@ -11791,6 +11860,7 @@ mod tests {
             candidate.input_adapter = input_adapter.to_owned();
             let plan = ChannelPlaybackPlan {
                 channel_id: candidate.channel_id,
+                channel_name: candidate.channel_name.clone(),
                 channel_revision: candidate.channel_revision,
                 candidates: vec![candidate],
             };
@@ -11802,6 +11872,7 @@ mod tests {
         candidate.input_adapter = "invalid-adapter?token=secret".to_owned();
         let plan = ChannelPlaybackPlan {
             channel_id: candidate.channel_id,
+            channel_name: candidate.channel_name.clone(),
             channel_revision: candidate.channel_revision,
             candidates: vec![candidate],
         };
@@ -11840,6 +11911,7 @@ mod tests {
         let mut candidate = playback_candidate(Uuid::from_u128(50), Uuid::from_u128(60), 0);
         let plan = ChannelPlaybackPlan {
             channel_id: candidate.channel_id,
+            channel_name: candidate.channel_name.clone(),
             channel_revision: candidate.channel_revision,
             candidates: vec![candidate.clone()],
         };
@@ -12851,6 +12923,7 @@ mod tests {
         assert_serializes(SessionResponse {
             provider_pool_id: "pool".to_owned(),
             source_id: "source".to_owned(),
+            channel_name: Some("Channel".to_owned()),
             configured_generation: 1,
             upstream_generation: 1,
             state: "streaming".to_owned(),

@@ -1427,15 +1427,43 @@ fn stable_m3u_key(entry: &iptv_parsers::M3uEntry) -> String {
     if let Some(tvg_id) = entry.tvg_id().filter(|value| !value.trim().is_empty()) {
         return format!("tvg:{tvg_id}");
     }
-    let mut hasher = Sha256::new();
-    hasher.update(entry.title.as_bytes());
-    hasher.update([0]);
-    hasher.update(entry.group_title().unwrap_or_default().as_bytes());
-    hasher.update([0]);
-    hash_credential_independent_asset(&mut hasher, &entry.url);
-    format!("derived:{:x}", hasher.finalize())
+    if let Some(stream_id) = first_attribute(&entry.attributes, &["channel-id", "stream-id", "id"])
+        .filter(|value| !value.trim().is_empty())
+    {
+        return format!("provider:{stream_id}");
+    }
+    // Do not use the stream URL for the fallback identity. Providers often
+    // rotate hosts, paths, or signed query strings while the channel stays
+    // the same. The source account scopes this key during reconciliation.
+    let channel_number = first_attribute(
+        &entry.attributes,
+        &["tvg-chno", "channel-number", "ch-number"],
+    )
+    .unwrap_or_default();
+    format!(
+        "m3u:{}:{}:{}",
+        normalize_identity_part(&channel_number),
+        normalize_identity_part(entry.group_title().unwrap_or_default()),
+        normalize_identity_part(&entry.title),
+    )
 }
 
+fn normalize_identity_part(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut separator = false;
+    for character in value.trim().chars() {
+        if character.is_alphanumeric() {
+            normalized.extend(character.to_lowercase());
+            separator = false;
+        } else if !separator {
+            normalized.push('-');
+            separator = true;
+        }
+    }
+    normalized.trim_matches('-').to_owned()
+}
+
+#[cfg(test)]
 fn hash_credential_independent_asset(hasher: &mut Sha256, endpoint: &Url) {
     hasher.update(endpoint.host_str().unwrap_or_default().as_bytes());
     hasher.update([0]);
@@ -1879,27 +1907,27 @@ mod tests {
     }
 
     #[test]
-    fn stable_keys_prefer_tvg_id_and_hash_fallback_without_plain_url() {
+    fn stable_keys_prefer_tvg_id_and_use_compound_fallback_without_url() {
         let parsed = iptv_parsers::parse_m3u(
             std::io::Cursor::new(
-                b"#EXTM3U\n#EXTINF:-1 tvg-id=\"one\",One\nhttps://example.test/one\n#EXTINF:-1,Two\nhttps://alice:secret@example.test/two\n",
+                b"#EXTM3U\n#EXTINF:-1 tvg-id=\"one\",One\nhttps://example.test/one\n#EXTINF:-1 tvg-chno=\"2\" group-title=\"News\",Two\nhttps://alice:secret@example.test/two\n",
             ),
             ParseLimits::default(),
         )
         .expect("playlist");
         assert_eq!(stable_m3u_key(&parsed.entries[0]), "tvg:one");
         let fallback = stable_m3u_key(&parsed.entries[1]);
-        assert!(fallback.starts_with("derived:"));
+        assert_eq!(fallback, "m3u:2:news:two");
         assert!(!fallback.contains("alice"));
         assert!(!fallback.contains("secret"));
     }
 
     #[test]
-    fn stable_keys_survive_credential_rotation_but_distinguish_assets() {
+    fn stable_keys_survive_url_rotation_and_duplicate_entries() {
         let source = b"#EXTM3U\n\
-#EXTINF:-1 group-title=\"Sports\",Game\nhttps://old-user:old-pass@example.test/live/old-user/old-pass/41.ts?token=old\n\
-#EXTINF:-1 group-title=\"Sports\",Game\nhttps://new-user:new-pass@example.test/live/new-user/new-pass/41.ts?token=new\n\
-#EXTINF:-1 group-title=\"Sports\",Game\nhttps://new-user:new-pass@example.test/live/new-user/new-pass/42.ts?token=new\n";
+#EXTINF:-1 tvg-chno=\"41\" group-title=\"Sports\",Game\nhttps://old-user:old-pass@example.test/live/old-user/old-pass/41.ts?token=old\n\
+#EXTINF:-1 tvg-chno=\"41\" group-title=\"Sports\",Game\nhttps://new-user:new-pass@example.test/live/new-user/new-pass/41.ts?token=new\n\
+#EXTINF:-1 tvg-chno=\"42\" group-title=\"Sports\",Game\nhttps://new-user:new-pass@example.test/live/new-user/new-pass/42.ts?token=new\n";
         let parsed = iptv_parsers::parse_m3u(std::io::Cursor::new(source), ParseLimits::default())
             .expect("playlist");
         let keys = parsed
@@ -1907,13 +1935,26 @@ mod tests {
             .iter()
             .map(stable_m3u_key)
             .collect::<Vec<_>>();
-        assert_eq!(keys[0], keys[1]);
-        assert_ne!(keys[1], keys[2]);
+        assert_eq!(keys[0], "m3u:41:sports:game");
+        assert_eq!(keys[1], "m3u:41:sports:game");
+        assert_eq!(keys[2], "m3u:42:sports:game");
         for key in keys {
             assert!(!key.contains("user"));
             assert!(!key.contains("pass"));
             assert!(!key.contains("token"));
         }
+    }
+
+    #[test]
+    fn stable_keys_without_provider_ids_ignore_url_rotation() {
+        let source = b"#EXTM3U\n#EXTINF:-1 group-title=\"News\",Local News\nhttps://one.example/live/a.ts\n#EXTINF:-1 group-title=\"News\",Local News\nhttps://two.example/live/b.ts\n";
+        let parsed = iptv_parsers::parse_m3u(std::io::Cursor::new(source), ParseLimits::default())
+            .expect("playlist");
+        assert_eq!(stable_m3u_key(&parsed.entries[0]), "m3u::news:local-news");
+        assert_eq!(
+            stable_m3u_key(&parsed.entries[0]),
+            stable_m3u_key(&parsed.entries[1])
+        );
     }
 
     #[test]

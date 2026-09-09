@@ -505,6 +505,7 @@ export type SessionFailure =
 export interface Session {
   providerPoolId: string
   sourceId: string
+  channelName?: string | null
   configuredGeneration: number
   upstreamGeneration: number
   state: SessionState
@@ -754,6 +755,7 @@ export interface IptvApiClient {
   deleteLineupTemplate(id: string): Promise<void>
   applyLineupTemplate(id: string): Promise<SaveResult>
   getSessions(): Promise<Session[]>
+  terminateSession(session: Pick<Session, 'providerPoolId' | 'sourceId' | 'configuredGeneration'>): Promise<void>
   getJobs(): Promise<Job[]>
   getSupportBundle(): Promise<SupportBundle>
   getSupportLogs(): Promise<SupportLogEntry[]>
