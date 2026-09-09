@@ -87,6 +87,8 @@ async fn migrations_and_job_lifecycle_are_transactionally_usable() {
     for index_name in [
         "source_snapshots_active_owner_lookup_idx",
         "jobs_refresh_source_latest_idx",
+        "channels_region_prefix_group_idx",
+        "channels_region_prefix_enabled_idx",
     ] {
         let index_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_indexes \
