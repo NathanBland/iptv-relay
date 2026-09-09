@@ -1,6 +1,6 @@
 # Jellyfin
 
-The gateway produces token-protected M3U and XMLTV endpoints. Jellyfin reads these endpoints as an M3U tuner.
+The gateway provides M3U, XMLTV, and HDHomeRun output endpoints for Jellyfin.
 
 ## Output URLs
 
@@ -50,16 +50,40 @@ Use an authenticated session or an operator API token with the `output` or `admi
 
 After the rotation, the `GET /api/v1/jellyfin/setup` endpoint returns `regeneration-required`. The plaintext token is not retained. Call the rotate endpoint again to receive a new plaintext token.
 
-## Add the tuner to Jellyfin
+## Configure an M3U tuner
+
+Use this configuration when you want Jellyfin to read the gateway M3U playlist.
 
 1. Open the Jellyfin dashboard.
-2. Go to **Live TV** and select **Tuners**.
-3. Add a new M3U tuner.
-4. Enter the M3U playlist URL from the setup response.
-5. Add the XMLTV guide URL in the guide settings.
-6. Save the tuner.
+2. Select **Live TV**.
+3. Select **Tuner Devices**.
+4. Add a tuner.
+5. Set **Tuner Type** to **M3U Tuner**.
+6. Set **File or URL** to `playlistUrl` from the setup response.
+7. Leave **User agent** empty.
+8. Set **Simultaneous stream limit** to the value of `IPTV_TUNER_COUNT`.
+9. Keep **Auto-loop live streams** disabled.
+10. Save the tuner.
 
-Jellyfin reads the playlist and guide from the token-protected endpoints.
+Set **Auto-loop live streams** only when the provider stream requires it.
+The M3U output includes channel aliases and `tvg-logo` values when a logo is available.
+
+## Configure XMLTV guide data
+
+Add XMLTV after you save an M3U tuner or an HDHomeRun tuner.
+
+1. Select **Live TV**.
+2. Select **TV Guide Data Providers**.
+3. Add a guide provider.
+4. Set the provider type to **XMLTV**.
+5. Set the XMLTV URL to `xmltvUrl` from the setup response.
+6. Save the guide provider.
+7. Select the guide provider menu.
+8. Select **Map Channels**.
+9. Map each tuner channel to the matching XMLTV channel.
+
+The XMLTV output uses the same channel IDs as the M3U output.
+The XMLTV output includes aliases and channel icons when a logo is available.
 
 ## HDHomeRun emulation
 
@@ -71,6 +95,37 @@ The gateway emulates an HDHomeRun device for clients that require it.
 | Lineup | `http://localhost:8080/out/{token}/hdhr/lineup.json` |
 | Lineup status | `http://localhost:8080/out/{token}/hdhr/lineup_status.json` |
 | Device XML | `http://localhost:8080/out/{token}/hdhr/device.xml` |
+
+## Configure an HDHomeRun tuner
+
+Use this configuration instead of an M3U tuner when you want HDHomeRun integration.
+Do not add the same gateway channels through both tuner types.
+
+1. Open the Jellyfin dashboard.
+2. Select **Live TV**.
+3. Select **Tuner Devices**.
+4. Add a tuner.
+5. Set **Tuner Type** to **HDHomeRun**.
+6. Set **Tuner IP Address** to the HDHomeRun base URL.
+7. Use `hdhrDeviceUrl` without the final `/device.xml` path component.
+8. Disable **Allow hardware transcoding**.
+9. Disable **Restrict to channels marked as favorite**.
+10. Save the tuner.
+
+For example, change this setup URL:
+
+```text
+https://gateway.example/out/{token}/hdhr/device.xml
+```
+
+To this tuner address:
+
+```text
+https://gateway.example/out/{token}/hdhr
+```
+
+The HDHomeRun lineup includes canonical channel aliases and `ImageURL` values when a logo is available.
+Add XMLTV guide data after you save the HDHomeRun tuner.
 
 ## Jellyfin setup page
 

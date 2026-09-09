@@ -141,12 +141,17 @@ curl -b cookies.txt http://localhost:8080/api/v1/jellyfin/setup
 ```
 
 The response returns `playlistUrl`, `xmltvUrl`, and `hdhrDeviceUrl`.
-Add the M3U and XMLTV URLs to a Jellyfin M3U tuner.
+For an M3U tuner, set **File or URL** to `playlistUrl`.
+Add `xmltvUrl` as an XMLTV guide provider.
 The copied URLs include the output token.
 Do not paste provider credentials into Jellyfin.
 
 Set `IPTV_PUBLIC_BASE_URL` to the address that Jellyfin uses to reach the gateway.
 Use the gateway host name instead of `localhost` when Jellyfin runs on another host.
+
+For an HDHomeRun tuner, set **Tuner IP Address** to `hdhrDeviceUrl` without the final `/device.xml` path component.
+Set `IPTV_TUNER_COUNT` to the number of concurrent tuners that the output profile should report.
+See [the Jellyfin configuration guide](docs/docs/configuration/jellyfin.md) for all tuner settings.
 
 ## Platform install guides
 

@@ -2664,7 +2664,7 @@ impl CatalogRepository {
             SELECT
                 c.id,
                 c.channel_number,
-                c.name,
+                coalesce(channel_alias.canonical_name, c.name) AS name,
                 coalesce(c.group_name, 'Uncategorized') AS group_name,
                 c.logo_url,
                 c.enabled,
@@ -2672,6 +2672,14 @@ impl CatalogRepository {
                 (m.channel_id IS NOT NULL) AS epg_mapped
             FROM output_profiles op
             JOIN channels c ON c.enabled
+            LEFT JOIN LATERAL (
+                SELECT ca.canonical_name
+                FROM channel_aliases ca
+                WHERE normalize_channel_name(ca.alias) = normalize_channel_name(c.name)
+                   OR normalize_channel_name(ca.canonical_name) = normalize_channel_name(c.name)
+                ORDER BY ca.canonical_name
+                LIMIT 1
+            ) channel_alias ON true
             LEFT JOIN output_profile_channels opc
                 ON opc.output_profile_id = op.id AND opc.channel_id = c.id
             LEFT JOIN (

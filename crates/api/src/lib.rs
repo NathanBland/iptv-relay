@@ -7120,9 +7120,12 @@ struct HdhrDiscover {
     model_number: &'static str,
     firmware_name: &'static str,
     firmware_version: String,
+    #[serde(rename = "DeviceID")]
     device_id: &'static str,
     device_auth: String,
+    #[serde(rename = "BaseURL")]
     base_url: String,
+    #[serde(rename = "LineupURL")]
     lineup_url: String,
     tuner_count: u16,
 }
@@ -7153,7 +7156,10 @@ async fn hdhr_discover(State(state): State<AppState>, Path(token): Path<String>)
 struct HdhrChannel {
     guide_number: String,
     guide_name: String,
+    #[serde(rename = "URL")]
     url: String,
+    #[serde(rename = "ImageURL", skip_serializing_if = "Option::is_none")]
+    image_url: Option<String>,
 }
 
 async fn hdhr_lineup(State(state): State<AppState>, Path(token): Path<String>) -> Response {
@@ -7182,6 +7188,7 @@ async fn hdhr_lineup(State(state): State<AppState>, Path(token): Path<String>) -
                     "{}/out/{}/stream/{}.ts",
                     state.public_base_url, token, channel.id
                 ),
+                image_url: channel.logo_url,
             })
             .collect::<Vec<_>>();
         return no_store_response(Json(channels).into_response());
@@ -7198,6 +7205,7 @@ async fn hdhr_lineup(State(state): State<AppState>, Path(token): Path<String>) -
                 "{}/out/{}/stream/{}.ts",
                 state.public_base_url, token, channel.id
             ),
+            image_url: channel.logo_url.clone(),
         })
         .collect();
     no_store_response(Json(channels).into_response())
@@ -10453,18 +10461,33 @@ mod tests {
 
         let included_channel_id = Uuid::now_v7();
         let excluded_channel_id = Uuid::now_v7();
-        for (id, number, name) in [
-            (included_channel_id, "10", "Included channel"),
-            (excluded_channel_id, "20", "Excluded channel"),
+        for (id, number, name, logo_url) in [
+            (
+                included_channel_id,
+                "10",
+                "Included channel HD",
+                Some("https://images.test/included.png"),
+            ),
+            (excluded_channel_id, "20", "Excluded channel", None),
         ] {
-            sqlx::query("INSERT INTO channels (id, channel_number, name) VALUES ($1, $2, $3)")
-                .bind(id)
-                .bind(number)
-                .bind(name)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO channels (id, channel_number, name, logo_url) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(id)
+            .bind(number)
+            .bind(name)
+            .bind(logo_url)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
+        sqlx::query("INSERT INTO channel_aliases (id, canonical_name, alias) VALUES ($1, $2, $3)")
+            .bind(Uuid::now_v7())
+            .bind("Included channel")
+            .bind("Included channel HD")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("UPDATE output_profiles SET include_all_channels = false WHERE id = $1")
             .bind(iptv_persistence::ENVIRONMENT_OUTPUT_PROFILE_ID)
             .execute(&pool)
@@ -10493,6 +10516,8 @@ mod tests {
         assert_no_store(&playlist_response);
         let playlist_body = response_text(playlist_response).await;
         assert!(playlist_body.contains("Included channel"));
+        assert!(!playlist_body.contains("Included channel HD"));
+        assert!(playlist_body.contains("tvg-logo=\"https://images.test/included.png\""));
         assert!(!playlist_body.contains("Excluded channel"));
         assert!(playlist_body.contains(&included_channel_id.to_string()));
         assert!(!playlist_body.contains(&excluded_channel_id.to_string()));
@@ -10524,13 +10549,27 @@ mod tests {
         let discover: serde_json::Value =
             serde_json::from_str(&response_text(discover).await).unwrap();
         assert_eq!(discover["TunerCount"], 3);
+        assert!(discover.get("BaseURL").is_some());
+        assert!(discover.get("LineupURL").is_some());
+        assert!(discover.get("DeviceID").is_some());
+        assert!(discover.get("BaseUrl").is_none());
+        assert!(discover.get("LineupUrl").is_none());
+        assert!(discover.get("DeviceId").is_none());
 
         let xmltv = output_response(&app, "/out/output-secret/xmltv.xml").await;
         assert_eq!(xmltv.status(), StatusCode::OK);
         assert_no_store(&xmltv);
+        let xmltv_body = response_text(xmltv).await;
+        assert!(xmltv_body.contains("<display-name>Included channel</display-name>"));
+        assert!(xmltv_body.contains("<icon src=\"https://images.test/included.png\"/>"));
         let lineup = output_response(&app, "/out/output-secret/hdhr/lineup.json").await;
         assert_eq!(lineup.status(), StatusCode::OK);
         assert_no_store(&lineup);
+        let lineup: serde_json::Value = serde_json::from_str(&response_text(lineup).await).unwrap();
+        assert_eq!(lineup[0]["GuideName"], "Included channel");
+        assert_eq!(lineup[0]["ImageURL"], "https://images.test/included.png");
+        assert!(lineup[0].get("URL").is_some());
+        assert!(lineup[0].get("Url").is_none());
         let lineup_status =
             output_response(&app, "/out/output-secret/hdhr/lineup_status.json").await;
         assert_eq!(lineup_status.status(), StatusCode::OK);
@@ -13317,7 +13356,9 @@ mod tests {
         let playlist = output_response(&app, "/out/output-secret/playlist.m3u").await;
         assert_eq!(playlist.status(), StatusCode::OK);
         assert_no_store(&playlist);
-        assert!(response_text(playlist).await.contains("Discovery Channel"));
+        let playlist = response_text(playlist).await;
+        assert!(playlist.contains("Discovery Channel"));
+        assert!(playlist.contains("tvg-logo=\"https://gateway.test/logo.png\""));
 
         let xmltv = app
             .clone()
@@ -13330,10 +13371,17 @@ mod tests {
             .unwrap();
         assert_eq!(xmltv.status(), StatusCode::OK);
         assert_no_store(&xmltv);
-        assert!(response_text(xmltv).await.contains("Discovery programme"));
+        let xmltv = response_text(xmltv).await;
+        assert!(xmltv.contains("Discovery programme"));
+        assert!(xmltv.contains("<icon src=\"https://gateway.test/logo.png\"/>"));
         let discover = output_response(&app, "/out/output-secret/hdhr/discover.json").await;
         assert_eq!(discover.status(), StatusCode::OK);
         assert_no_store(&discover);
+        let discover: serde_json::Value =
+            serde_json::from_str(&response_text(discover).await).unwrap();
+        assert!(discover.get("BaseURL").is_some());
+        assert!(discover.get("LineupURL").is_some());
+        assert!(discover.get("DeviceID").is_some());
         let lineup = app
             .clone()
             .oneshot(
@@ -13345,7 +13393,10 @@ mod tests {
             .unwrap();
         assert_eq!(lineup.status(), StatusCode::OK);
         assert_no_store(&lineup);
-        assert!(response_text(lineup).await.contains("Discovery Channel"));
+        let lineup: serde_json::Value = serde_json::from_str(&response_text(lineup).await).unwrap();
+        assert_eq!(lineup[0]["GuideName"], "Discovery Channel");
+        assert_eq!(lineup[0]["ImageURL"], "https://gateway.test/logo.png");
+        assert!(lineup[0].get("URL").is_some());
         let status = app
             .clone()
             .oneshot(
