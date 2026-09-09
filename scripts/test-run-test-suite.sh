@@ -64,6 +64,10 @@ run_runner --live >/dev/null
 grep -q '^make live-acceptance$' "$TEST_DIR/log"
 
 : > "$TEST_DIR/log"
+run_runner --live-jellyfin >/dev/null
+grep -q '^make live-jellyfin-acceptance$' "$TEST_DIR/log"
+
+: > "$TEST_DIR/log"
 set +e
 FAIL_OUTPUT=$(FAKE_MAKE_FAIL_STAGE=lint run_runner 2>&1 >/dev/null)
 FAIL_STATUS=$?

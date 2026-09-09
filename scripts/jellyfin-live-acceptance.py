@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -57,6 +58,17 @@ def compose(env_file: Path, project: str, override: Path, *args: str, check: boo
         detail = (result.stderr or result.stdout).strip().splitlines()
         raise RuntimeError(f"Compose failed: {' '.join(args)}: {' '.join(detail[-8:])}")
     return result
+
+
+def remaining_volumes(project: str) -> str:
+    result = subprocess.run(
+        ["docker", "volume", "ls", "--quiet", "--filter", f"label=com.docker.compose.project={project}"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
 def request(url: str, method: str = "GET", body: Any = None, token: str | None = None, timeout: float = 30) -> Any:
@@ -112,6 +124,64 @@ def page_items(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def extract_provider_ids(payload: Any) -> set[str]:
+    """Return provider identities from Xtream streams without using names."""
+    return {
+        str(item.get("epg_channel_id") or item.get("stream_id") or "").strip()
+        for item in page_items(payload)
+        if str(item.get("epg_channel_id") or item.get("stream_id") or "").strip()
+    }
+
+
+def storage_bytes(path: Path) -> int:
+    total = 0
+    for item in path.rglob("*"):
+        if item.is_file():
+            try:
+                total += item.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def sessions_state(core: str, token: str) -> tuple[list[dict[str, Any]], int, int]:
+    sessions = page_items(request(f"{core}/api/v1/sessions", token=token))
+    active = sum(int(item.get("providerActiveSessions", 0) or 0) for item in sessions)
+    available = sum(int(item.get("providerAvailableSlots", 0) or 0) for item in sessions)
+    return sessions, active, available
+
+
+def wait_sessions(core: str, token: str, expected: int, timeout: float = 90) -> tuple[list[dict[str, Any]], int, int]:
+    deadline = time.monotonic() + timeout
+    last: tuple[list[dict[str, Any]], int, int] = ([], 0, 0)
+    while time.monotonic() < deadline:
+        last = sessions_state(core, token)
+        if last[1] >= expected:
+            return last
+        time.sleep(1)
+    raise RuntimeError(f"gateway did not report {expected} active provider sessions")
+
+
+def wait_no_sessions(core: str, token: str, timeout: float = 90) -> tuple[list[dict[str, Any]], int, int]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = sessions_state(core, token)
+        if not state[0] and state[1] == 0:
+            return state
+        time.sleep(1)
+    raise RuntimeError("gateway retained live sessions after Jellyfin streams stopped")
+
+
+def post_first(base: str, paths: list[str], body: Any, token: str) -> Any:
+    last: BaseException | None = None
+    for path in paths:
+        try:
+            return request(base + path, "POST", body, token)
+        except RuntimeError as error:
+            last = error
+    raise RuntimeError(f"Jellyfin did not accept the requested refresh ({type(last).__name__})")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live-env", default=".env.live")
@@ -119,7 +189,13 @@ def main() -> int:
     parser.add_argument("--soak-seconds", type=int, default=int(os.environ.get("JELLYFIN_ACCEPTANCE_SECONDS", "60")))
     parser.add_argument("--report")
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+    if args.self_test:
+        assert xtream_endpoint("https://provider.example/base", "user", "password", "player_api.php").endswith("/player_api.php?username=user&password=password")
+        assert extract_provider_ids([{"epg_channel_id": "one"}, {"stream_id": 2}]) == {"one", "2"}
+        print("live Jellyfin acceptance self-test passed")
+        return 0
     live = parse_env(ROOT / args.live_env, LIVE_KEYS)
     xtream = parse_env(ROOT / args.xtream_env, XTREAM_KEYS)
     if not all(xtream.get(key) for key in XTREAM_KEYS):
@@ -172,7 +248,11 @@ volumes:
   jellyfin-cache:
   jellyfin-transcode:
 """ % (core_port, jellyfin_port), encoding="utf-8")
-    report: dict[str, Any] = {"soakSeconds": args.soak_seconds, "jellyfinImage": env["JELLYFIN_IMAGE"]}
+    report: dict[str, Any] = {
+        "soakSeconds": args.soak_seconds,
+        "jellyfinImage": env["JELLYFIN_IMAGE"],
+        "storage": {"temporaryBytesPeak": 0, "temporaryBytesFinal": 0},
+    }
     failure: BaseException | None = None
     cleanup_ok = True
     try:
@@ -181,20 +261,44 @@ volumes:
         jf = f"http://127.0.0.1:{jellyfin_port}"
         wait_http(f"{core}/health/ready")
         wait_http(f"{jf}/health")
+        report["storage"]["temporaryBytesPeak"] = storage_bytes(root)
+        stream_payload = request(xtream_endpoint(xtream["URL"], xtream["USER"], xtream["PWD"], "player_api.php") + "&action=get_live_streams")
+        live_provider_ids = extract_provider_ids(stream_payload)
+        if not live_provider_ids:
+            raise RuntimeError("Xtream returned no usable provider identities")
         source = request(f"{core}/api/v1/sources", "POST", {"name": "live-jellyfin-xtream", "kind": "Xtream", "endpoint": xtream_endpoint(xtream["URL"], xtream["USER"], xtream["PWD"], "player_api.php"), "timezone": "UTC"}, bootstrap)
         guide = request(f"{core}/api/v1/sources", "POST", {"name": "live-jellyfin-xmltv", "kind": "XMLTV", "endpoint": xmltv, "timezone": "UTC"}, bootstrap)
-        for item in (source, guide):
-            request(f"{core}/api/v1/sources/{item['id']}/sync", "POST", token=bootstrap)
-        deadline = time.monotonic() + 1800
-        while time.monotonic() < deadline:
-            states = [request(f"{core}/api/v1/sources/{item['id']}/sync-status", token=bootstrap) for item in (source, guide)]
-            if all(str(state.get("status", "")).lower() in TERMINAL for state in states):
-                if not all(str(state.get("status", "")).lower() == "succeeded" for state in states):
-                    raise RuntimeError("source synchronization failed")
-                break
-            time.sleep(2)
-        else:
-            raise RuntimeError("source synchronization exceeded deadline")
+        source_cycles: list[dict[str, Any]] = []
+        for cycle in range(3):
+            for item in (source, guide):
+                try:
+                    request(f"{core}/api/v1/sources/{item['id']}/sync", "POST", token=bootstrap)
+                except RuntimeError as error:
+                    if "409" not in str(error):
+                        raise
+                deadline = time.monotonic() + 1800
+                while time.monotonic() < deadline:
+                    state = request(f"{core}/api/v1/sources/{item['id']}/sync-status", token=bootstrap)
+                    if str(state.get("status", "")).lower() in TERMINAL:
+                        if str(state.get("status", "")).lower() != "succeeded":
+                            raise RuntimeError("source synchronization failed")
+                        break
+                    time.sleep(2)
+                else:
+                    raise RuntimeError("source synchronization exceeded deadline")
+            mappings = page_items(request(f"{core}/api/v1/epg/mappings?limit=5000&offset=0", token=bootstrap))
+            mapped_provider_ids = {
+                str(item.get("epgChannelId") or "").strip()
+                for item in mappings
+                if str(item.get("epgChannelId") or "").strip()
+            }
+            shared_ids = live_provider_ids & mapped_provider_ids
+            if not shared_ids:
+                raise RuntimeError("Xtream and XMLTV produced no shared provider identities")
+            source_cycles.append({"cycle": cycle + 1, "sharedProviderIds": len(shared_ids)})
+            report["storage"]["temporaryBytesPeak"] = max(report["storage"]["temporaryBytesPeak"], storage_bytes(root))
+        report["sourceRefreshCycles"] = source_cycles
+        report["sharedProviderIds"] = len(shared_ids)
         request(f"{jf}/Startup/Configuration", "POST", {"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"})
         request(f"{jf}/Startup/User", "POST", {"Name": "acceptance", "Password": admin_password})
         request(f"{jf}/Startup/Complete", "POST", {})
@@ -212,38 +316,126 @@ volumes:
         tuner = request(f"{jf}/LiveTv/TunerHosts", "POST", {"TunerType": "hdhomerun", "DeviceId": secrets.token_hex(4).upper(), "Url": tuner_url}, jf_token)
         provider = request(f"{jf}/LiveTv/ListingProviders", "POST", {"Type": "XmlTv", "Path": guide_url, "Enabled": True}, jf_token)
         report["jellyfin"] = {"tunerConfigured": bool(tuner is not None), "guideConfigured": bool(provider is not None)}
-        channels = page_items(request(f"{jf}/LiveTv/Channels?UserId={user_id}&EnableImages=false", token=jf_token))
+        request(f"{jf}/LiveTv/Tuners/Discover?newDevicesOnly=false", token=jf_token)
+        tasks = page_items(request(f"{jf}/ScheduledTasks", token=jf_token))
+        guide_task = next((item for item in tasks if "refresh guide" in str(item.get("Name", "")).lower()), None)
+        if guide_task and guide_task.get("Id"):
+            request(f"{jf}/ScheduledTasks/Running/{guide_task['Id']}", "POST", token=jf_token)
+        channels = []
+        deadline = time.monotonic() + 900
+        while time.monotonic() < deadline:
+            channels = page_items(request(f"{jf}/LiveTv/Channels?UserId={user_id}&EnableImages=false", token=jf_token))
+            if len(channels) >= 2:
+                break
+            time.sleep(3)
         if len(channels) < 2:
             raise RuntimeError("Jellyfin imported fewer than two channels")
         selected = channels[:2]
         ids = [(str(item.get("Id", "")), str(item.get("Number", "")), str(item.get("ChannelNumber", ""))) for item in selected]
         if any(not item[0] for item in ids):
             raise RuntimeError("Jellyfin returned a channel without an ID")
-        report["channels"] = [{"id": item[0], "number": item[1] or item[2]} for item in ids]
-        # Use Jellyfin's LiveStreams API and consume its returned stream URLs.
-        streams: list[Any] = []
+        core_channels = page_items(request(f"{core}/api/v1/channels?limit=5000&offset=0", token=bootstrap))
+        gateway_numbers = {str(item.get("number") or "").strip() for item in core_channels}
+        selected_numbers = {number or fallback for _, number, fallback in ids if number or fallback}
+        if not selected_numbers or not selected_numbers & gateway_numbers:
+            raise RuntimeError("Jellyfin channel numbers do not overlap gateway channels")
+        provider_identity = []
+        for item, (channel_id, number, fallback) in zip(selected, ids):
+            provider_ids = item.get("ProviderIds") if isinstance(item.get("ProviderIds"), dict) else {}
+            identity = next((str(value).strip() for value in provider_ids.values() if str(value).strip()), "")
+            identity = identity or str(item.get("ExternalId") or item.get("ChannelId") or number or fallback).strip()
+            if identity:
+                provider_identity.append(identity)
+        if len(provider_identity) != 2:
+            raise RuntimeError("Jellyfin did not expose provider identity for both channels")
+        report["channels"] = [{"id": item[0], "number": item[1] or item[2], "providerIdentity": identity} for item, identity in zip(ids, provider_identity)]
+        # A second provider refresh must preserve Jellyfin's identity and number.
+        if guide_task and guide_task.get("Id"):
+            request(f"{jf}/ScheduledTasks/Running/{guide_task['Id']}", "POST", token=jf_token)
+            time.sleep(2)
+            refreshed = page_items(request(f"{jf}/LiveTv/Channels?UserId={user_id}&EnableImages=false", token=jf_token))
+            by_id = {str(item.get("Id", "")): str(item.get("Number", "") or item.get("ChannelNumber", "")) for item in refreshed}
+            if any(by_id.get(channel_id) != (number or fallback) for channel_id, number, fallback in ids):
+                raise RuntimeError("Jellyfin channel identity or number changed after refresh")
+        # Open both streams through Jellyfin's Live TV API. Do not open the
+        # gateway URL directly because that would skip Jellyfin's tuner path.
+        streams: list[dict[str, Any]] = []
         for channel_id, _, _ in ids:
-            streams.append(request(f"{jf}/LiveTv/LiveStreams", "POST", {"OpenToken": secrets.token_urlsafe(18), "UserId": user_id, "ChannelId": channel_id, "EnableDirectPlay": True, "EnableDirectStream": True, "PlaySessionId": secrets.token_hex(8)}, jf_token))
-        urls = [str(item.get("MediaSource", {}).get("TranscodingUrl") or item.get("Url") or "") for item in streams if isinstance(item, dict)]
-        if len(urls) != 2 or any(not url for url in urls):
-            raise RuntimeError("Jellyfin did not return two live stream URLs")
+            opened = request(
+                f"{jf}/LiveTv/LiveStreams/Open",
+                "POST",
+                {
+                    "OpenToken": secrets.token_urlsafe(18),
+                    "UserId": user_id,
+                    "ItemId": channel_id,
+                    "PlaySessionId": secrets.token_hex(8),
+                    "EnableDirectPlay": True,
+                    "EnableDirectStream": True,
+                },
+                jf_token,
+            )
+            if not isinstance(opened, dict):
+                raise RuntimeError("Jellyfin did not return a live stream record")
+            media_source = opened.get("MediaSource") if isinstance(opened.get("MediaSource"), dict) else opened
+            stream_id = str(media_source.get("Id") or "")
+            stream_path = str(media_source.get("Path") or "")
+            match = re.search(r"/LiveStreamFiles/([^/]+)/stream", stream_path)
+            stream_id = match.group(1) if match else stream_id
+            if not stream_id:
+                raise RuntimeError("Jellyfin did not return a live stream identity")
+            streams.append({"open": opened, "streamId": stream_id})
+        if len(streams) != 2:
+            raise RuntimeError("Jellyfin did not open two live streams")
         started = time.monotonic()
-        byte_counts = []
-        for url in urls:
-            with urllib.request.urlopen(url if url.startswith("http") else jf + url, timeout=args.soak_seconds + 30) as response:
-                payload = response.read(188 * 20)
-                byte_counts.append(len(payload))
-        time.sleep(args.soak_seconds)
+        byte_counts = [0, 0]
+        errors: list[BaseException] = []
+
+        def consume(index: int, stream_id: str) -> None:
+            try:
+                target = f"{jf}/LiveTv/LiveStreamFiles/{urllib.parse.quote(stream_id, safe='')}/stream.ts"
+                req = urllib.request.Request(target, headers={"X-Emby-Token": jf_token, "Accept": "video/mp2t"})
+                with urllib.request.urlopen(req, timeout=args.soak_seconds + 30) as response:
+                    byte_counts[index] = len(response.read(188 * 20))
+                    time.sleep(args.soak_seconds)
+            except BaseException as error:
+                errors.append(error)
+
+        readers = [threading.Thread(target=consume, args=(index, stream["streamId"]), daemon=True) for index, stream in enumerate(streams)]
+        for reader in readers:
+            reader.start()
+        sessions, active, available = wait_sessions(core, bootstrap, expected=2)
+        report["gatewayDuringStreams"] = {
+            "sessionCount": len(sessions),
+            "providerActiveSessions": active,
+            "providerAvailableSlots": available,
+            "distinctSessionIdentities": len({(item.get("sourceId"), item.get("configuredGeneration"), item.get("channelName")) for item in sessions}),
+        }
+        if active != 2 or report["gatewayDuringStreams"]["distinctSessionIdentities"] < 2:
+            raise RuntimeError("gateway did not expose two distinct active provider sessions")
+        for reader in readers:
+            reader.join(args.soak_seconds + 60)
+        if any(reader.is_alive() for reader in readers):
+            raise RuntimeError("Jellyfin stream consumers exceeded their deadline")
+        if errors:
+            raise RuntimeError("Jellyfin live stream request failed") from errors[0]
         report["streams"] = {"count": 2, "bytes": byte_counts, "durationSeconds": round(time.monotonic() - started, 2)}
         if any(count == 0 or count % 188 for count in byte_counts):
             raise RuntimeError("Jellyfin stream did not return MPEG-TS bytes")
+        for stream in streams:
+            live_stream_id = stream["open"].get("LiveStreamId") or stream["open"].get("MediaSource", {}).get("LiveStreamId")
+            if live_stream_id:
+                request(f"{jf}/LiveTv/LiveStreams/Close", "POST", {"LiveStreamId": live_stream_id}, jf_token)
+        _, active, available = wait_no_sessions(core, bootstrap)
+        report["gatewayAfterStreams"] = {"providerActiveSessions": active, "providerAvailableSlots": available}
     except BaseException as error:
         failure = error
     finally:
         if not args.keep:
             down = compose(env_file, project, override, "down", "--volumes", "--remove-orphans", check=False)
             remaining = compose(env_file, project, override, "ps", "-aq", check=False)
-            report["cleanup"] = {"composeDown": down.returncode == 0, "remainingContainers": bool(remaining.stdout.strip()), "temporaryFilesRemoved": False}
+            report["storage"]["temporaryBytesFinal"] = storage_bytes(root)
+            volumes = remaining_volumes(project)
+            report["cleanup"] = {"composeDown": down.returncode == 0, "remainingContainers": bool(remaining.stdout.strip()), "remainingVolumes": bool(volumes and volumes != "unknown"), "temporaryFilesRemoved": False}
             env_file.unlink(missing_ok=True)
             override.unlink(missing_ok=True)
             try:
@@ -251,7 +443,7 @@ volumes:
                 report["cleanup"]["temporaryFilesRemoved"] = True
             except OSError:
                 report["cleanup"]["temporaryFilesRemoved"] = False
-            cleanup_ok = down.returncode == 0 and not remaining.stdout.strip() and report["cleanup"]["temporaryFilesRemoved"]
+            cleanup_ok = down.returncode == 0 and not remaining.stdout.strip() and not report["cleanup"]["remainingVolumes"] and report["cleanup"]["temporaryFilesRemoved"]
     verified = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True, capture_output=True, check=True).stdout.strip()
     report["verifiedCommit"] = verified
     if args.report:
@@ -260,7 +452,7 @@ volumes:
     if failure:
         print(f"live Jellyfin acceptance failed: {failure}", file=sys.stderr)
         return 1
-    if not cleanup_ok or report.get("cleanup", {}).get("remainingContainers") or not report.get("cleanup", {}).get("temporaryFilesRemoved"):
+    if not cleanup_ok or report.get("cleanup", {}).get("remainingContainers") or report.get("cleanup", {}).get("remainingVolumes") or not report.get("cleanup", {}).get("temporaryFilesRemoved"):
         return 1
     return 0
 

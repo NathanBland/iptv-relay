@@ -175,6 +175,20 @@ It fails when the provider and XMLTV data have no shared IDs.
 The gate reports redacted storage metrics and removes its containers, volumes, and temporary environment file after every result.
 The report includes final pending jobs, reconciliation candidates, staging snapshots, temporary files, and cleanup status.
 
+Run the real-provider Jellyfin gate only after the live gate passes:
+
+```bash
+./scripts/run-test-suite.sh --live-jellyfin
+```
+
+The Jellyfin gate reads `.env.live` for the XMLTV URL and `.env.xtreme` for Xtream credentials.
+It starts an isolated Jellyfin server and configures the gateway HDHomeRun and XMLTV endpoints through APIs.
+It opens two different Jellyfin Live TV streams for a 60-second soak by default.
+Set `JELLYFIN_ACCEPTANCE_SECONDS` to use a longer soak.
+The gate compares provider identities and channel numbers, then verifies gateway sessions and provider slots.
+The gate removes runner-owned containers, volumes, networks, and temporary files after every result.
+Use `--live-jellyfin` only with authorized credentials and a reachable provider.
+
 ## Compare M3U and Xtream streams
 
 Run the provider stream comparison when playback differs between source types:
@@ -282,6 +296,12 @@ Run the live-provider acceptance test:
 
 ```bash
 make live-acceptance
+```
+
+Run the real-provider Jellyfin acceptance test:
+
+```bash
+make live-jellyfin-acceptance
 ```
 
 ## Fuzz tests

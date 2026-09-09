@@ -41,6 +41,10 @@ The Compose file defines a `test` profile with extra services:
 | `media-acceptance` | Deterministic media acceptance test. |
 | `fault-acceptance` | Fault-injection acceptance test. |
 | `live-acceptance` | Live-provider acceptance test. |
+| `jellyfin-acceptance` | Deterministic Jellyfin-output acceptance test. |
+
+The real-provider Jellyfin gate runs from the host with `make live-jellyfin-acceptance`.
+It uses a disposable Jellyfin server and reads `.env.live` and `.env.xtreme` without changing either file.
 
 Run a test service with the `--profile test` flag.
 
