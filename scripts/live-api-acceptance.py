@@ -247,13 +247,13 @@ def compose(env_file: Path, project: str, *args: str, check: bool = True) -> sub
 
 
 def storage_metrics(env_file: Path, project: str) -> dict[str, int]:
-    query = "SELECT pg_database_size(current_database()), (SELECT temp_bytes FROM pg_stat_database WHERE datname=current_database()), (SELECT count(*) FROM source_snapshots WHERE status='staging'), (SELECT count(*) FROM provider_reconciliation_candidates), (SELECT count(*) FROM jobs WHERE status IN ('queued','running'));"
+    query = "SELECT pg_database_size(current_database()), (SELECT temp_bytes FROM pg_stat_database WHERE datname=current_database()), (SELECT COALESCE(sum(size), 0) FROM pg_ls_tmpdir()), (SELECT count(*) FROM source_snapshots WHERE status='staging'), (SELECT count(*) FROM provider_reconciliation_candidates), (SELECT count(*) FROM jobs WHERE status IN ('queued','running'));"
     result = compose(env_file, project, "exec", "-T", "postgres", "psql", "-U", "iptv", "-d", "iptv", "-At", "-c", query, check=False)
     fields = result.stdout.strip().split("|")
-    if result.returncode or len(fields) != 5:
+    if result.returncode or len(fields) != 6:
         raise RuntimeError("storage metrics unavailable")
     try:
-        return {"databaseBytes": int(fields[0]), "tempBytes": int(fields[1]), "stagingSnapshots": int(fields[2]), "reconciliationCandidates": int(fields[3]), "pendingJobs": int(fields[4])}
+        return {"databaseBytes": int(fields[0]), "tempBytesCumulative": int(fields[1]), "tempFileBytes": int(fields[2]), "stagingSnapshots": int(fields[3]), "reconciliationCandidates": int(fields[4]), "pendingJobs": int(fields[5])}
     except ValueError:
         raise RuntimeError("storage metrics unavailable") from None
 
@@ -294,7 +294,7 @@ def set_capacity(base: str, token: str, source: str, cap: int) -> None:
             time.sleep(3)
 
 
-def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
+def run_gate(values: dict[str, str], build: bool = True, report_file: Path | None = None) -> dict[str, Any]:
     def stop_handler(signum: int, _frame: Any) -> None:
         raise KeyboardInterrupt(f"received signal {signum}")
 
@@ -456,7 +456,11 @@ def run_gate(values: dict[str, str], build: bool = True) -> dict[str, Any]:
             )
         peak = max((item.get("databaseBytes", 0) for item in [baseline, *cycles, final]), default=0)
         report = {"identityMode": identity_mode, "sharedProviderIds": len(shared), "providerUnmatched": {"xtreamOnlyCount": len(provider_ids - xmltv), "xmltvOnlyCount": len(xmltv - provider_ids), "xtreamOnlySample": sorted(provider_ids - xmltv)[:10], "xmltvOnlySample": sorted(xmltv - provider_ids)[:10]}, "providerCap": cap, "cycles": 3, "gatewayOutput": "playlist verified", "sampleProgrammes": samples, "storage": {"baseline": baseline, "cycles": cycles, "peakDatabaseBytes": peak, "final": final}}
-        print(json.dumps(report, sort_keys=True), flush=True)
+        report_json = json.dumps(report, sort_keys=True)
+        print(report_json, flush=True)
+        if report_file is not None:
+            report_file.parent.mkdir(parents=True, exist_ok=True)
+            report_file.write_text(report_json + "\n", encoding="utf-8")
         return report
     finally:
         # Ignore a second interrupt while runner-owned resources are removed.
@@ -489,13 +493,15 @@ def main() -> int:
     parser.add_argument("--env-file", default=str(ROOT / ".env.xtreme"))
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--no-build", action="store_true", help="use the existing local core image")
+    parser.add_argument("--report-file", type=Path, help="write the redacted JSON acceptance report to this path")
     args = parser.parse_args()
     try:
         if args.self_test:
             assert m3u_ids(b'#EXTINF:-1 tvg-id="ABC",Test\nurl\n') == {"ABC"}
+            assert programme_key(("Show", "20260101000000 +0000", "20260101010000 +0000")) == programme_key(("Show", "20251231170000 -0700", "20251231180000 -0700"))
             print("live API acceptance self-test passed")
         else:
-            run_gate(parse_env(Path(args.env_file)), build=not args.no_build)
+            run_gate(parse_env(Path(args.env_file)), build=not args.no_build, report_file=args.report_file)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"live API acceptance failed: {exc}", file=sys.stderr)
         return 1
