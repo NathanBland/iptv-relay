@@ -343,7 +343,7 @@ volumes:
             raise RuntimeError("Jellyfin authentication returned no session")
         tuner_url = "http://gateway:8080/out/%s/hdhr" % output
         guide_url = "http://gateway:8080/out/%s/xmltv.xml" % output
-        tuner = request(f"{jf}/LiveTv/TunerHosts", "POST", {"TunerType": "hdhomerun", "DeviceId": secrets.token_hex(4).upper(), "Url": tuner_url}, jf_token)
+        tuner = request(f"{jf}/LiveTv/TunerHosts", "POST", {"Type": "hdhomerun", "TunerCount": 3, "DeviceId": secrets.token_hex(4).upper(), "Url": tuner_url}, jf_token)
         provider = request(f"{jf}/LiveTv/ListingProviders", "POST", {"Type": "XmlTv", "Path": guide_url, "Enabled": True}, jf_token)
         report["jellyfin"] = {"tunerConfigured": bool(tuner is not None), "guideConfigured": bool(provider is not None)}
         request(f"{jf}/LiveTv/Tuners/Discover?newDevicesOnly=false", token=jf_token)
