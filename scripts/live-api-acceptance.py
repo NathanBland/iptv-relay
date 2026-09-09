@@ -347,23 +347,32 @@ def run_gate(values: dict[str, str], build: bool = True, report_file: Path | Non
     master_key = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
     gateway_port, postgres_port, core_port = free_port(), free_port(), free_port()
     env = {"POSTGRES_PASSWORD": db_password, "IPTV_GATEWAY_PORT": str(gateway_port), "IPTV_POSTGRES_PORT": str(postgres_port), "IPTV_PUBLIC_BASE_URL": f"http://127.0.0.1:{gateway_port}", "IPTV_OUTPUT_TOKEN": output_token, "IPTV_ADMIN_BOOTSTRAP_TOKEN": bootstrap, "IPTV_ADMIN_PASSWORD": secret(24), "IPTV_MASTER_KEY": master_key, "IPTV_WORKER_COUNT": "1"}
-    handle, env_name = tempfile.mkstemp(prefix="iptv-live-api-", suffix=".env")
-    Path(env_name).write_text("\n".join(f"{key}={value}" for key, value in env.items()) + "\n", encoding="utf-8")
-    os.close(handle)
-    env_file = Path(env_name)
-    compose_override = temp_root / "compose.override.yml"
-    compose_override.write_text(
-        "services:\n"
-        "  core:\n"
-        "    ports:\n"
-        f"      - 127.0.0.1:{core_port}:8081\n",
-        encoding="utf-8",
-    )
+    env_file: Path | None = None
+    try:
+        handle, env_name = tempfile.mkstemp(prefix="iptv-live-api-", suffix=".env")
+        env_file = Path(env_name)
+        with os.fdopen(handle, "w", encoding="utf-8") as output:
+            output.write("\n".join(f"{key}={value}" for key, value in env.items()) + "\n")
+        compose_override = temp_root / "compose.override.yml"
+        compose_override.write_text(
+            "services:\n"
+            "  core:\n"
+            "    ports:\n"
+            f"      - 127.0.0.1:{core_port}:8081\n",
+            encoding="utf-8",
+        )
+    except BaseException:
+        if env_file is not None:
+            env_file.unlink(missing_ok=True)
+        shutil.rmtree(temp_root, ignore_errors=True)
+        raise
+    assert env_file is not None
     global COMPOSE_OVERRIDE
     COMPOSE_OVERRIDE = compose_override
     base = f"http://127.0.0.1:{core_port}"
     cycles: list[dict[str, int]] = []
     identities: list[tuple[str, ...]] = []
+    report: dict[str, Any] | None = None
 
     try:
         start_args = ["up", "-d", "--wait", "postgres", "core"]
@@ -463,12 +472,6 @@ def run_gate(values: dict[str, str], build: bool = True, report_file: Path | Non
             text=True,
         ).stdout.strip()
         report = {"verifiedCommit": verified_commit, "identityMode": identity_mode, "sharedProviderIds": len(shared), "providerUnmatched": {"xtreamOnlyCount": len(provider_ids - xmltv), "xmltvOnlyCount": len(xmltv - provider_ids), "xtreamOnlySample": sorted(provider_ids - xmltv)[:10], "xmltvOnlySample": sorted(xmltv - provider_ids)[:10]}, "providerCap": cap, "cycles": 3, "gatewayOutput": "playlist verified", "sampleProgrammes": samples, "storage": {"baseline": baseline, "cycles": cycles, "peakDatabaseBytes": peak, "final": final}}
-        report_json = json.dumps(report, sort_keys=True)
-        print(report_json, flush=True)
-        if report_file is not None:
-            report_file.parent.mkdir(parents=True, exist_ok=True)
-            report_file.write_text(report_json + "\n", encoding="utf-8")
-        return report
     finally:
         # Ignore a second interrupt while runner-owned resources are removed.
         # The first signal already stopped the acceptance loop; cleanup must
@@ -489,13 +492,36 @@ def run_gate(values: dict[str, str], build: bool = True, report_file: Path | Non
             remaining = compose(env_file, project, "ps", "-aq", check=False)
         env_file.unlink(missing_ok=True)
         shutil.rmtree(temp_root, ignore_errors=True)
+        cleanup_status = {
+            "composeDown": cleanup.returncode == 0,
+            "remainingContainers": bool(remaining.stdout.strip()),
+            "environmentFileRemoved": not env_file.exists(),
+            "temporaryFilesRemoved": not temp_root.exists(),
+        }
         COMPOSE_OVERRIDE = None
-        if cleanup.returncode or remaining.returncode or remaining.stdout.strip():
+        cleanup_failed = (
+            cleanup.returncode
+            or remaining.returncode
+            or remaining.stdout.strip()
+            or not cleanup_status["environmentFileRemoved"]
+            or not cleanup_status["temporaryFilesRemoved"]
+        )
+        if report is not None:
+            report["cleanup"] = cleanup_status
+            report_json = json.dumps(report, sort_keys=True)
+            print(report_json, flush=True)
+            if report_file is not None:
+                report_file.parent.mkdir(parents=True, exist_ok=True)
+                report_file.write_text(report_json + "\n", encoding="utf-8")
+        if cleanup_failed:
             detail = (cleanup.stderr or cleanup.stdout or remaining.stderr or remaining.stdout).strip().splitlines()
             message = f"live acceptance cleanup failed: {'\\n'.join(detail[-12:])}"
             if sys.exc_info()[1] is None:
                 raise RuntimeError(message)
             print(message, file=sys.stderr)
+    if report is None:
+        raise RuntimeError("live acceptance did not produce a report")
+    return report
 
 
 def main() -> int:
