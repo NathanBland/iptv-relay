@@ -31,6 +31,10 @@ LIVE_KEYS = {"IPTV_TEST_XMLTV_URL", "XMLTV_URL", "LIVE_ACCEPTANCE_PROVIDER_CAP",
 XTREAM_KEYS = {"URL", "USER", "PWD"}
 
 
+def interrupt_runner(signum: int, _frame: Any) -> None:
+    raise KeyboardInterrupt(f"runner interrupted by signal {signum}")
+
+
 def parse_env(path: Path, allowed: set[str]) -> dict[str, str]:
     values: dict[str, str] = {}
     for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -276,6 +280,9 @@ def main() -> int:
     if provider_capacity < 2:
         raise RuntimeError("provider capacity must allow two concurrent streams")
 
+    signal.signal(signal.SIGINT, interrupt_runner)
+    signal.signal(signal.SIGTERM, interrupt_runner)
+
     project = f"iptv-jellyfin-live-{secrets.token_hex(4)}"
     root = Path(tempfile.mkdtemp(prefix="iptv-jellyfin-live-"))
     env_file = root / "compose.env"
@@ -446,6 +453,13 @@ volumes:
                 provider_identity.append(identity)
         if len(provider_identity) != 2:
             raise RuntimeError("Jellyfin did not expose provider identity for both channels")
+        if not set(provider_identity).issubset(shared_ids):
+            raise RuntimeError("Jellyfin provider identities did not match reconciled provider identities")
+        selected_gateway_ids = {
+            str(gateway_by_number[number].get("id", ""))
+            for _, number, fallback in ids
+            if (number or fallback) in gateway_by_number
+        }
         report["channels"] = [{"id": item[0], "number": item[1] or item[2], "providerIdentity": identity} for item, identity in zip(ids, provider_identity)]
         # A second provider refresh must preserve Jellyfin's identity and number.
         if guide_task and guide_task.get("Id"):
@@ -516,9 +530,10 @@ volumes:
             "sessionCount": len(sessions),
             "providerActiveSessions": active,
             "providerAvailableSlots": available,
-            "distinctSessionIdentities": len({(item.get("sourceId"), item.get("configuredGeneration"), item.get("channelName")) for item in sessions}),
+            "distinctSessionIdentities": len({(item.get("providerPoolId"), item.get("sourceId"), item.get("configuredGeneration")) for item in sessions}),
         }
-        if active != 2 or report["gatewayDuringStreams"]["distinctSessionIdentities"] < 2:
+        session_channel_ids = {str(item.get("sourceId", "")) for item in sessions}
+        if active != 2 or report["gatewayDuringStreams"]["distinctSessionIdentities"] < 2 or session_channel_ids != selected_gateway_ids:
             raise RuntimeError("gateway did not expose two distinct active provider sessions")
         for reader in readers:
             reader.join(args.soak_seconds + 60)
