@@ -91,7 +91,10 @@ def request(url: str, method: str = "GET", body: Any = None, token: str | None =
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         if isinstance(error, urllib.error.HTTPError):
             error.read(256)
-        raise RuntimeError(f"request failed: {method} {url.split('?', 1)[0]} ({type(error).__name__})") from None
+            detail = f" status={error.code}"
+        else:
+            detail = ""
+        raise RuntimeError(f"request failed: {method} {url.split('?', 1)[0]}{detail} ({type(error).__name__})") from None
 
 
 def wait_http(url: str, timeout: float = 300) -> None:
