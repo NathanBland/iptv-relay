@@ -11,7 +11,7 @@ axum.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
-iptv-domain = { path = "../domain", version = "0.2.17" }
+iptv-domain = { path = "../domain", version = "0.2.18" }
 parking_lot.workspace = true
 reqwest.workspace = true
 serde.workspace = true
