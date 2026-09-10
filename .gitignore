@@ -21,3 +21,6 @@
 *.profraw
 lcov.info
 /.pnpm-store/
+node_modules/
+__pycache__/
+*.py[cod]

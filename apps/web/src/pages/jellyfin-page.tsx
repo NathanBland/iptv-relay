@@ -13,6 +13,10 @@ const EMPTY_SETUP: JellyfinSetup = {
   guideDaysMax: 30,
 }
 
+function hdhrTunerUrl(deviceUrl: string | undefined): string | undefined {
+  return deviceUrl?.replace(/\/device\.xml$/, '')
+}
+
 export function JellyfinPage({ client = apiClient }: { client?: IptvApiClient }) {
   const [copied, setCopied] = useState('')
   const [rotated, setRotated] = useState<JellyfinSetup | null>(null)
@@ -41,7 +45,7 @@ export function JellyfinPage({ client = apiClient }: { client?: IptvApiClient })
   const endpoints = [
     { label: 'M3U tuner URL', value: setup.playlistUrl },
     { label: 'XMLTV guide URL', value: setup.xmltvUrl },
-    { label: 'HDHomeRun device URL', value: setup.hdhrDeviceUrl },
+    { label: 'HDHomeRun tuner URL', value: hdhrTunerUrl(setup.hdhrDeviceUrl) },
   ]
 
   async function copyEndpoint(label: string, value: string | undefined) {
@@ -57,7 +61,7 @@ export function JellyfinPage({ client = apiClient }: { client?: IptvApiClient })
         <Card>
           <CardHeader><div><h2 className="font-semibold text-white">Connection settings</h2><p className="mt-1 text-xs text-slate-500">The output profile supplies the token and tuner count.</p></div></CardHeader>
           <CardContent className="space-y-3">
-            <p className="text-sm text-slate-400">The published URLs below come from the relay output profile. Copy each URL into the matching Jellyfin Live TV field. The guide horizon accepts up to {setup.guideDaysMax} days.</p>
+            <p className="text-sm text-slate-400">The published URLs below come from the relay output profile. Copy each URL into the matching Jellyfin Live TV field. Use the HDHomeRun tuner URL for Jellyfin Tuner IP Address. The guide horizon accepts up to {setup.guideDaysMax} days.</p>
             <div className="flex items-center gap-3">
               <Button type="button" variant="secondary" onClick={() => rotation.mutate()} disabled={rotation.isPending} aria-label="Rotate publish token">{rotation.isPending ? 'Wait…' : 'Rotate publish token'}<RefreshCw aria-hidden="true" className="size-4" /></Button>
               {rotation.isError ? <p role="status" className="text-xs text-rose-400">Token rotation failed.</p> : null}

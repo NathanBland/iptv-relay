@@ -355,7 +355,7 @@ describe('management workflow accessibility', () => {
     // to appear before asserting their accessible names.
     expect(await screen.findByRole('button', { name: 'Copy M3U tuner URL' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Copy XMLTV guide URL' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Copy HDHomeRun device URL' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Copy HDHomeRun tuner URL' })).toBeInTheDocument()
     expect(screen.getByRole('link', { name: /Jellyfin docs/ })).toBeInTheDocument()
     expectNoAlert()
   })
