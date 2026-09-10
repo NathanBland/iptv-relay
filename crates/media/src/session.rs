@@ -36,7 +36,7 @@ const MAX_PRIMING_PACKETS: usize = 16_384;
 
 /// The input-adapter policy for one HTTP MPEG-TS source.
 ///
-/// `Auto` selects native HTTP MPEG-TS input. It does not select an HLS adapter.
+/// `Auto` selects the FFmpeg remuxer for direct MPEG-TS input.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InputAdapterPolicy {
     #[default]
@@ -66,9 +66,10 @@ impl InputAdapterPolicy {
     #[must_use]
     pub const fn selected_adapter(self) -> SessionInputAdapter {
         match self {
-            Self::Auto | Self::NativeTs => SessionInputAdapter::NativeTs,
-            Self::Ffmpeg => SessionInputAdapter::Ffmpeg,
+            Self::Auto => SessionInputAdapter::Ffmpeg,
             Self::Vlc => SessionInputAdapter::Vlc,
+            Self::NativeTs => SessionInputAdapter::NativeTs,
+            Self::Ffmpeg => SessionInputAdapter::Ffmpeg,
         }
     }
 }
@@ -513,6 +514,28 @@ impl HttpTsSessionManager {
     /// Returns an error when the provider is unknown/full, response headers do
     /// not arrive before the startup timeout, or the HTTP request/status fails.
     pub async fn open(&self, source: HttpTsSourceSpec) -> Result<ViewerHandle, SessionStartError> {
+        self.open_with_capacity_wait(source, true).await
+    }
+
+    /// Opens a viewer without waiting when a new provider slot is unavailable.
+    ///
+    /// Existing shared sessions still attach successfully at full capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AcquireError::AtCapacity`] immediately for a new full-pool session.
+    pub async fn try_open(
+        &self,
+        source: HttpTsSourceSpec,
+    ) -> Result<ViewerHandle, SessionStartError> {
+        self.open_with_capacity_wait(source, false).await
+    }
+
+    async fn open_with_capacity_wait(
+        &self,
+        source: HttpTsSourceSpec,
+        wait_for_capacity: bool,
+    ) -> Result<ViewerHandle, SessionStartError> {
         for endpoint in &source.endpoints {
             let pool_id = endpoint.effective_pool_id(&source.key.provider_pool_id);
             if !self.inner.providers.contains_key(pool_id) {
@@ -529,7 +552,7 @@ impl HttpTsSessionManager {
             .inner
             .sessions
             .get_or_try_init(key, || async move {
-                start_http_ts_session(client, providers, source).await
+                start_http_ts_session(client, providers, source, wait_for_capacity).await
             })
             .await?;
         self.inner
@@ -603,6 +626,18 @@ impl HttpTsSession {
 
 impl Drop for HttpTsSession {
     fn drop(&mut self) {
+        let snapshot = self.ring.snapshot();
+        info!(
+            provider_pool_id = %self.key.provider_pool_id,
+            source_id = %self.key.source_id,
+            generation = self.key.generation,
+            adapter = ?self.input.adapter(),
+            process_id = self.input.process_id(),
+            retained_packets = snapshot.retained_packets,
+            next_sequence = snapshot.next_sequence,
+            close_reason = ?snapshot.closed,
+            "media session released after its final viewer disconnected"
+        );
         self.diagnostics.set_state(SessionState::Stopping);
         self.ring.close(RingCloseReason::Shutdown);
         self.input.request_shutdown();
@@ -658,9 +693,37 @@ struct PreparedHttpTsEndpoint {
 async fn start_http_ts_session(
     client: Client,
     providers: Arc<DashMap<Arc<str>, ProviderSlotBroker>>,
-    source: HttpTsSourceSpec,
+    mut source: HttpTsSourceSpec,
+    wait_for_capacity: bool,
 ) -> Result<HttpTsSession, SessionStartError> {
+    // Select an unused ordered endpoint for each new channel session. The
+    // session registry still makes same-channel viewers share the existing
+    // session before this initializer runs.
+    let active = source
+        .endpoints
+        .first()
+        .and_then(|endpoint| {
+            providers.get(endpoint.effective_pool_id(&source.key.provider_pool_id))
+        })
+        .map(|broker| broker.snapshot().active_sessions)
+        .unwrap_or(0);
+    if active < source.endpoints.len() {
+        let mut endpoints = source.endpoints.clone();
+        endpoints.rotate_left(active);
+        source.endpoints = endpoints;
+    }
     let diagnostics = SessionDiagnostics::new(source.key.clone(), source.channel_name.clone());
+    if let Ok(parsed) = reqwest::Url::parse(&source.endpoints[0].url) {
+        if let Some(host) = parsed.host_str() {
+            let server = format!(
+                "{}://{}{}",
+                parsed.scheme(),
+                host,
+                parsed.port().map_or(String::new(), |p| format!(":{p}"))
+            );
+            diagnostics.set_base_server(server);
+        }
+    }
     let selected_adapter = source.adapter_policy.selected_adapter();
     diagnostics.set_adapter(selected_adapter);
     info!(
@@ -681,9 +744,13 @@ async fn start_http_ts_session(
         .ok_or_else(|| SessionStartError::UnknownProvider {
             pool_id: Arc::clone(&primary_pool_id),
         })?;
-    let lease = broker
-        .acquire_wait(source.key.allocation_key(), source.startup_timeout)
-        .await?;
+    let lease = if wait_for_capacity {
+        broker
+            .acquire_wait(source.key.allocation_key(), source.startup_timeout)
+            .await?
+    } else {
+        broker.try_acquire(source.key.allocation_key())?
+    };
     let lease_id = lease.lease_id();
     diagnostics.set_state(SessionState::Starting);
 
@@ -1715,7 +1782,7 @@ mod tests {
     fn adapter_policy_selects_typed_direct_input_without_hls() {
         assert_eq!(
             InputAdapterPolicy::Auto.selected_adapter(),
-            SessionInputAdapter::NativeTs
+            SessionInputAdapter::Ffmpeg
         );
         assert_eq!(
             InputAdapterPolicy::NativeTs.selected_adapter(),
@@ -2630,11 +2697,13 @@ mod tests {
         let manager = HttpTsSessionManager::new(Client::new());
         manager.configure_provider(ProviderSpec::new("provider", 3));
         let source = |channel: &str| {
-            HttpTsSourceSpec::new(
+            let mut source = HttpTsSourceSpec::new(
                 HttpTsSessionKey::new("provider", channel.to_owned(), 1),
                 format!("http://{address}/{channel}"),
                 MpegTsRingConfig::new(3, 0).unwrap(),
-            )
+            );
+            source.set_adapter_policy(InputAdapterPolicy::NativeTs);
+            source
         };
 
         let mut pairs = Vec::new();
@@ -2659,7 +2728,7 @@ mod tests {
         );
 
         assert!(matches!(
-            manager.open(source("four")).await,
+            manager.try_open(source("four")).await,
             Err(SessionStartError::Provider(AcquireError::AtCapacity {
                 capacity: 3,
                 active_sessions: 3,

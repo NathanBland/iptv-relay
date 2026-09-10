@@ -27,14 +27,16 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
 use iptv_domain::{
     ApplyRequirement, EffectiveSetting, InheritanceSource, SettingDefinition,
     SettingValidationError, resolve_settings, setting_catalog,
 };
 use iptv_media::{
-    AcquireError, HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSessionSnapshot,
-    HttpTsSourceSpec, InputAdapterPolicy, MpegTsRingConfig, PoolSnapshot, ProviderSpec,
-    SessionFailureKind, SessionStartError, SessionState, SlotLease, ViewerHandle,
+    AcquireError, FfmpegInputAdapter, HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager,
+    HttpTsSessionSnapshot, HttpTsSourceSpec, InputAdapterPolicy, MpegTsRingConfig, PoolSnapshot,
+    ProviderSpec, RingCloseReason, RingRead, SessionFailureKind, SessionStartError, SessionState,
+    SlotLease, ViewerHandle,
 };
 use iptv_persistence::{
     AuditEventRecord, CatalogRepository, ChannelPlaybackCandidateRow, ChannelPlaybackPlan,
@@ -385,6 +387,14 @@ struct CreateSourceRequest {
     #[schema(write_only = true)]
     password: Option<String>,
     timezone: Option<String>,
+    #[serde(default)]
+    alternative_base_urls: Vec<String>,
+    #[serde(default = "default_source_max_connections")]
+    max_connections: i32,
+}
+
+const fn default_source_max_connections() -> i32 {
+    1
 }
 
 impl fmt::Debug for CreateSourceRequest {
@@ -416,6 +426,7 @@ struct UpdateSourceRequest {
     max_connections: Option<i32>,
     timezone: Option<String>,
     enabled: Option<bool>,
+    alternative_base_urls: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -435,6 +446,7 @@ struct SourceResponse {
     enabled: bool,
     cb_consecutive_failures: i32,
     cb_opened_at: Option<DateTime<Utc>>,
+    alternative_base_urls: Vec<String>,
 }
 
 impl From<&SourceSummary> for SourceResponse {
@@ -454,6 +466,7 @@ impl From<&SourceSummary> for SourceResponse {
             enabled: source.enabled,
             cb_consecutive_failures: source.cb_consecutive_failures,
             cb_opened_at: source.cb_opened_at,
+            alternative_base_urls: source.alternative_base_urls.clone(),
         }
     }
 }
@@ -719,6 +732,8 @@ struct SessionResponse {
     provider_pool_id: String,
     source_id: String,
     channel_name: Option<String>,
+    adapter: String,
+    base_server: Option<String>,
     configured_generation: u64,
     upstream_generation: u64,
     state: String,
@@ -3272,6 +3287,11 @@ async fn create_source(
         Ok(kind) => kind,
         Err(error) => return persistence_error_response(error),
     };
+    if request.max_connections < 1 {
+        return persistence_error_response(PersistenceError::InvalidSource(
+            "max connections must be one or greater".to_owned(),
+        ));
+    }
     let endpoint = match canonical_source_endpoint(&request, kind) {
         Ok(endpoint) => endpoint,
         Err(error) => return persistence_error_response(error),
@@ -3286,6 +3306,16 @@ async fn create_source(
         .await
     {
         Ok(created) => {
+            if request.max_connections != 1 || !request.alternative_base_urls.is_empty() {
+                let update = iptv_persistence::SourceUpdate {
+                    max_connections: Some(request.max_connections),
+                    alternative_base_urls: Some(request.alternative_base_urls.clone()),
+                    ..Default::default()
+                };
+                if let Err(error) = repository.update_source(created.source.id, &update).await {
+                    return persistence_error_response(error);
+                }
+            }
             // Enqueue an immediate refresh job so the first sync starts
             // without a manual trigger from the user.
             if let Some(job_repository) = &state.job_repository {
@@ -3295,9 +3325,11 @@ async fn create_source(
                 );
                 let _ = job_repository.enqueue(&job).await;
             }
+            let mut response_source = created.source.clone();
+            response_source.alternative_base_urls = request.alternative_base_urls.clone();
             (
                 StatusCode::CREATED,
-                Json(SourceResponse::from(&created.source)),
+                Json(SourceResponse::from(&response_source)),
             )
                 .into_response()
         }
@@ -3915,6 +3947,7 @@ async fn update_source(
         max_connections: request.max_connections,
         timezone: request.timezone,
         enabled: request.enabled,
+        alternative_base_urls: request.alternative_base_urls.clone(),
     };
     match repository.update_source(source_id, &update).await {
         Ok(()) => {
@@ -4389,10 +4422,7 @@ async fn channel_stream(
     let Some(uuid) = Uuid::parse_str(&channel_id).ok() else {
         return not_found();
     };
-    match open_channel_viewer(&state, uuid).await {
-        Ok(viewer) => mpeg_ts_response(viewer),
-        Err(response) => *response,
-    }
+    open_channel_response(&state, uuid).await
 }
 
 #[utoipa::path(
@@ -6059,6 +6089,12 @@ fn session_response(
         provider_pool_id: snapshot.key.provider_pool_id.to_string(),
         source_id: snapshot.key.source_id.to_string(),
         channel_name: snapshot.channel_name.clone(),
+        adapter: snapshot
+            .adapter
+            .map(session_adapter_name)
+            .unwrap_or("unknown")
+            .to_owned(),
+        base_server: snapshot.base_server.clone(),
         configured_generation: snapshot.key.generation,
         upstream_generation: snapshot.upstream_generation,
         state: session_state_name(snapshot.state).to_owned(),
@@ -6097,6 +6133,14 @@ const fn session_state_name(state: SessionState) -> &'static str {
         SessionState::FailingOver => "failing-over",
         SessionState::Stopping => "stopping",
         SessionState::Failed => "failed",
+    }
+}
+
+const fn session_adapter_name(adapter: iptv_media::SessionInputAdapter) -> &'static str {
+    match adapter {
+        iptv_media::SessionInputAdapter::NativeTs => "native-ts",
+        iptv_media::SessionInputAdapter::Ffmpeg => "ffmpeg",
+        iptv_media::SessionInputAdapter::Vlc => "vlc",
     }
 }
 
@@ -6885,21 +6929,76 @@ async fn stream_channel(
             Err(error) => return persistence_error_response(error),
         }
     }
-    match open_channel_viewer(&state, channel_id).await {
-        Ok(viewer) => mpeg_ts_response(viewer),
-        Err(response) => *response,
-    }
+    open_channel_response(&state, channel_id).await
 }
 
 type StreamResult<T> = Result<T, Box<Response>>;
 
-async fn open_channel_viewer(state: &AppState, channel_id: Uuid) -> StreamResult<ViewerHandle> {
-    let spec = channel_source_spec(state, channel_id).await?;
-    state
-        .media
-        .open(spec)
-        .await
-        .map_err(|error| Box::new(session_start_response(error)))
+async fn open_channel_response(state: &AppState, channel_id: Uuid) -> Response {
+    let spec = match channel_source_spec(state, channel_id).await {
+        Ok(spec) => spec,
+        Err(response) => return *response,
+    };
+    match state.media.try_open(spec.clone()).await {
+        Ok(viewer) => mpeg_ts_response(viewer),
+        Err(SessionStartError::Provider(AcquireError::AtCapacity { .. })) => {
+            capacity_placeholder_response(state.media.clone(), spec)
+        }
+        Err(error) => session_start_response(error),
+    }
+}
+
+fn capacity_placeholder_response(
+    media: HttpTsSessionManager,
+    source: HttpTsSourceSpec,
+) -> Response {
+    let ring = match default_ring(1_000_000) {
+        Ok(ring) => ring,
+        Err(detail) => return invalid_buffer_policy(detail),
+    };
+    let mut placeholder = match FfmpegInputAdapter::new().start_capacity_placeholder(ring) {
+        Ok(placeholder) => placeholder,
+        Err(_) => {
+            return session_start_response(SessionStartError::Process {
+                adapter: iptv_media::SessionInputAdapter::Ffmpeg,
+            });
+        }
+    };
+    let mut cursor = placeholder.subscribe();
+    let stream = async_stream::stream! {
+        let mut retry = tokio::time::interval(Duration::from_millis(500));
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = retry.tick() => {
+                    match media.try_open(source.clone()).await {
+                        Ok(viewer) => {
+                            placeholder.request_shutdown();
+                            let mut live = viewer.into_byte_stream();
+                            while let Some(item) = live.next().await {
+                                yield item.map_err(|_| std::io::Error::other("live media stream failed"));
+                            }
+                            return;
+                        }
+                        Err(SessionStartError::Provider(AcquireError::AtCapacity { .. })) => {}
+                        Err(_) => {}
+                    }
+                }
+                read = cursor.next(32) => {
+                    match read {
+                        Ok(RingRead::Packets { bytes, .. }) => yield Ok(bytes),
+                        Ok(RingRead::Lagged { .. } | RingRead::GenerationBoundary { .. }) => {}
+                        Ok(RingRead::Closed { reason: RingCloseReason::Shutdown, .. }) => return,
+                        Ok(RingRead::Closed { .. }) | Err(_) => {
+                            yield Err(std::io::Error::other("capacity placeholder stream failed"));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    };
+    mpeg_ts_body_response(Body::from_stream(stream))
 }
 
 async fn channel_source_spec(state: &AppState, channel_id: Uuid) -> StreamResult<HttpTsSourceSpec> {
@@ -6989,11 +7088,23 @@ fn database_source_spec(
             plan.channel_id.to_string(),
             playback_generation(plan),
         ),
-        primary_url,
+        primary_url.clone(),
         ring,
     );
     spec.set_channel_name(plan.channel_name.clone());
     spec.set_adapter_policy(adapter_policy);
+    if let Ok(alternatives) =
+        serde_json::from_value::<Vec<String>>(primary.alternative_base_urls.clone())
+    {
+        for base in alternatives {
+            if let Ok(url) = replace_url_origin(&primary_url, &base) {
+                spec.add_alternate(HttpTsEndpoint::for_provider(
+                    primary.provider_pool_id.to_string(),
+                    url,
+                ));
+            }
+        }
+    }
     for candidate in plan.candidates.iter().skip(1) {
         spec.add_alternate(HttpTsEndpoint::for_provider(
             candidate.provider_pool_id.to_string(),
@@ -7001,6 +7112,16 @@ fn database_source_spec(
         ));
     }
     Ok(spec)
+}
+
+fn replace_url_origin(original: &str, base: &str) -> Result<String, ()> {
+    let source = url::Url::parse(original).map_err(|_| ())?;
+    let base = url::Url::parse(base).map_err(|_| ())?;
+    let mut result = source;
+    result.set_scheme(base.scheme()).map_err(|_| ())?;
+    result.set_host(base.host_str()).map_err(|_| ())?;
+    result.set_port(base.port()).map_err(|_| ())?;
+    Ok(result.to_string())
 }
 
 fn input_adapter_policy(value: &str) -> StreamResult<InputAdapterPolicy> {
@@ -7059,7 +7180,11 @@ fn playback_generation(plan: &ChannelPlaybackPlan) -> u64 {
 }
 
 fn mpeg_ts_response(viewer: ViewerHandle) -> Response {
-    let mut response = Response::new(Body::from_stream(viewer.into_byte_stream()));
+    mpeg_ts_body_response(Body::from_stream(viewer.into_byte_stream()))
+}
+
+fn mpeg_ts_body_response(body: Body) -> Response {
+    let mut response = Response::new(body);
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp2t"));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -7536,14 +7661,23 @@ async fn trigger_health_check(
     let Some(repo) = state.catalog_repository.as_ref() else {
         return persistence_unavailable();
     };
+    let Some(job_repository) = state.job_repository.as_ref() else {
+        return persistence_unavailable();
+    };
     let limit = body.and_then(|request| request.limit).unwrap_or(50);
     match repo.list_streams_needing_health_check(limit).await {
         Ok(streams) => {
-            let queued = i64::try_from(streams.len()).unwrap_or(i64::MAX);
-            // Mark streams as checking so they are not re-queued. A single
-            // batch update replaces one round trip per stream.
-            let ids: Vec<uuid::Uuid> = streams.iter().map(|s| s.provider_stream_id).collect();
-            let _ = repo.mark_streams_checking(&ids).await;
+            let mut queued = 0_i64;
+            for stream in streams {
+                match job_repository
+                    .enqueue_health_probe_if_idle(stream.provider_stream_id, -1, 2)
+                    .await
+                {
+                    Ok(Some(_)) => queued = queued.saturating_add(1),
+                    Ok(None) => {}
+                    Err(error) => return persistence_error_response(error),
+                }
+            }
             Json(HealthCheckTriggerResponse { queued }).into_response()
         }
         Err(error) => persistence_error_response(error),
@@ -9389,8 +9523,10 @@ mod tests {
         last_failure: Option<SessionFailureKind>,
     ) -> HttpTsSessionSnapshot {
         HttpTsSessionSnapshot {
+            base_server: None,
             key: HttpTsSessionKey::new("provider-private-id", "source-safe-id", 7),
             channel_name: Some("Channel".to_owned()),
+            adapter: Some(iptv_media::SessionInputAdapter::Vlc),
             state,
             viewer_count: 2,
             upstream_generation: 3,
@@ -11897,6 +12033,7 @@ mod tests {
         max_connections: i32,
     ) -> ChannelPlaybackCandidateRow {
         ChannelPlaybackCandidateRow {
+            alternative_base_urls: serde_json::json!([]),
             channel_id: Uuid::from_u128(1),
             channel_name: "Test channel".to_owned(),
             channel_revision: 4,
@@ -12959,6 +13096,7 @@ mod tests {
             versions: RuntimeVersions::default(),
         });
         assert_serializes(SourceResponse {
+            alternative_base_urls: Vec::new(),
             id: id.clone(),
             name: "Source".to_owned(),
             kind: "M3U".to_owned(),
@@ -13041,9 +13179,11 @@ mod tests {
             state: "scheduled".to_owned(),
         });
         assert_serializes(SessionResponse {
+            base_server: None,
             provider_pool_id: "pool".to_owned(),
             source_id: "source".to_owned(),
             channel_name: Some("Channel".to_owned()),
+            adapter: "vlc".to_owned(),
             configured_generation: 1,
             upstream_generation: 1,
             state: "streaming".to_owned(),
@@ -13415,6 +13555,8 @@ mod tests {
     #[test]
     fn standard_xtream_fields_build_a_canonical_player_api_endpoint() {
         let request = CreateSourceRequest {
+            max_connections: 1,
+            alternative_base_urls: Vec::new(),
             name: "Provider".to_owned(),
             kind: "Xtream".to_owned(),
             endpoint: Some(String::new()),
@@ -13444,6 +13586,8 @@ mod tests {
     #[test]
     fn xtream_endpoint_validation_rejects_partial_credentials_and_secret_url_conflicts() {
         let partial = CreateSourceRequest {
+            max_connections: 1,
+            alternative_base_urls: Vec::new(),
             name: "Provider".to_owned(),
             kind: "Xtream".to_owned(),
             endpoint: None,
@@ -13483,6 +13627,8 @@ mod tests {
     #[test]
     fn non_xtream_sources_require_one_endpoint_and_reject_credentials() {
         let missing = CreateSourceRequest {
+            max_connections: 1,
+            alternative_base_urls: Vec::new(),
             name: "M3U".to_owned(),
             kind: "M3U".to_owned(),
             endpoint: None,

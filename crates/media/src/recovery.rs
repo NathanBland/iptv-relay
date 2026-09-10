@@ -123,6 +123,8 @@ impl RecoveryPolicy {
 pub struct HttpTsSessionSnapshot {
     pub key: HttpTsSessionKey,
     pub channel_name: Option<String>,
+    pub adapter: Option<SessionInputAdapter>,
+    pub base_server: Option<String>,
     pub state: SessionState,
     pub viewer_count: usize,
     pub upstream_generation: u64,
@@ -142,6 +144,7 @@ pub(crate) struct SessionDiagnostics {
     key: HttpTsSessionKey,
     channel_name: Option<Arc<str>>,
     adapter: Mutex<Option<SessionInputAdapter>>,
+    base_server: Mutex<Option<String>>,
     inner: Mutex<DiagnosticsState>,
 }
 
@@ -173,6 +176,7 @@ impl SessionDiagnostics {
             key,
             channel_name,
             adapter: Mutex::new(None),
+            base_server: Mutex::new(None),
             inner: Mutex::new(DiagnosticsState {
                 state: SessionState::Idle,
                 next_viewer_id: 1,
@@ -204,6 +208,10 @@ impl SessionDiagnostics {
 
     pub(crate) fn set_adapter(&self, adapter: SessionInputAdapter) {
         *self.adapter.lock() = Some(adapter);
+    }
+
+    pub(crate) fn set_base_server(&self, value: impl Into<String>) {
+        *self.base_server.lock() = Some(value.into());
     }
 
     pub(crate) fn adapter(&self) -> Option<SessionInputAdapter> {
@@ -299,6 +307,8 @@ impl SessionDiagnostics {
         HttpTsSessionSnapshot {
             key: self.key.clone(),
             channel_name: self.channel_name.as_deref().map(str::to_owned),
+            adapter: *self.adapter.lock(),
+            base_server: self.base_server.lock().clone(),
             state: inner.state,
             viewer_count: inner.viewers.len(),
             upstream_generation: inner.upstream_generation,

@@ -3,10 +3,7 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -176,7 +173,7 @@ pub enum CredentialBrokerError {
     TaskStopped,
 }
 
-/// A one-request loopback broker for one process session.
+/// A reconnectable loopback broker for one process session.
 pub struct CredentialBroker {
     input_source: InputSource,
     shutdown: Option<oneshot::Sender<()>>,
@@ -224,7 +221,7 @@ impl CredentialBroker {
             client,
             endpoint,
             token_hash,
-            consumed: Arc::new(AtomicBool::new(false)),
+            request_lock: Arc::new(Mutex::new(())),
         };
         let app = Router::new()
             .route("/session/{token}", get(proxy_session))
@@ -344,7 +341,7 @@ struct BrokerState {
     client: Client,
     endpoint: CredentialBrokerEndpoint,
     token_hash: [u8; 32],
-    consumed: Arc<AtomicBool>,
+    request_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -470,7 +467,7 @@ impl fmt::Debug for BrokerState {
             .debug_struct("BrokerState")
             .field("endpoint", &self.endpoint)
             .field("token_hash", &"<redacted>")
-            .field("consumed", &self.consumed.load(Ordering::Relaxed))
+            .field("request_lock", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
@@ -678,13 +675,7 @@ async fn proxy_session(State(state): State<BrokerState>, Path(token): Path<Strin
     if !constant_time_eq(&digest(token.as_bytes()), &state.token_hash) {
         return empty_response(StatusCode::NOT_FOUND);
     }
-    if state
-        .consumed
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return empty_response(StatusCode::NOT_FOUND);
-    }
+    let request_guard = Arc::clone(&state.request_lock).lock_owned().await;
 
     let Ok(upstream) = state
         .client
@@ -700,9 +691,10 @@ async fn proxy_session(State(state): State<BrokerState>, Path(token): Path<Strin
     }
 
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-    let stream = upstream
-        .bytes_stream()
-        .map(|chunk| chunk.map_err(|_| std::io::Error::other("upstream media read failed")));
+    let stream = upstream.bytes_stream().map(move |chunk| {
+        let _request_guard = &request_guard;
+        chunk.map_err(|_| std::io::Error::other("upstream media read failed"))
+    });
     let mut response = Response::new(Body::from_stream(stream));
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -743,7 +735,10 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use axum::{
         extract::State,
@@ -795,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broker_proxies_one_request_and_redacts_all_credentials() {
+    async fn broker_supports_reconnects_and_redacts_all_credentials() {
         #[derive(Clone)]
         struct UpstreamState {
             requests: Arc<AtomicUsize>,
@@ -868,8 +863,12 @@ mod tests {
         assert_eq!(body, "Bearer provider-secret|session=provider-cookie");
 
         let replay = Client::new().get(&process_url).send().await.unwrap();
-        assert_eq!(replay.status(), StatusCode::NOT_FOUND);
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            replay.text().await.unwrap(),
+            "Bearer provider-secret|session=provider-cookie"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
 
         broker.shutdown().await.unwrap();
         upstream_task.abort();

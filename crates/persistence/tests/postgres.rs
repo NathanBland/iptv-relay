@@ -4044,6 +4044,7 @@ async fn source_configuration_and_job_management_work() {
         .update_source(
             provider.source.id,
             &SourceUpdate {
+                alternative_base_urls: None,
                 max_connections: Some(4),
                 timezone: Some("America/Denver".to_owned()),
                 enabled: Some(true),
@@ -4055,6 +4056,7 @@ async fn source_configuration_and_job_management_work() {
         .update_source(
             guide.source.id,
             &SourceUpdate {
+                alternative_base_urls: None,
                 timezone: Some("America/New_York".to_owned()),
                 ..SourceUpdate::default()
             },

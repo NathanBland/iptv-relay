@@ -19,6 +19,7 @@ use tokio::{
     process::{Child, ChildStdout, Command},
     sync::{oneshot, watch},
 };
+use tracing::{info, warn};
 
 use crate::{
     CredentialBroker, CredentialBrokerEndpoint, CredentialBrokerError, HlsBrokerConfig,
@@ -314,6 +315,18 @@ impl FfmpegInputAdapter {
                 "-loglevel".into(),
                 "error".into(),
                 "-nostdin".into(),
+                "-reconnect".into(),
+                "1".into(),
+                "-reconnect_at_eof".into(),
+                "1".into(),
+                "-reconnect_on_network_error".into(),
+                "1".into(),
+                "-reconnect_on_http_error".into(),
+                "4xx,5xx".into(),
+                "-reconnect_streamed".into(),
+                "1".into(),
+                "-reconnect_delay_max".into(),
+                "2".into(),
                 "-i".into(),
                 input.command_argument(),
                 "-map".into(),
@@ -340,6 +353,60 @@ impl FfmpegInputAdapter {
     ) -> Result<ProcessInputSession, ProcessAdapterError> {
         self.command(input).spawn(ring_config)
     }
+
+    /// Starts a fixed MPEG-TS placeholder for a client that waits for capacity.
+    ///
+    /// The placeholder contains H.264 video, AAC audio, and a capacity message.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted spawn or setup error.
+    pub fn start_capacity_placeholder(
+        self,
+        ring_config: MpegTsRingConfig,
+    ) -> Result<ProcessInputSession, ProcessAdapterError> {
+        AuditedProcessCommand {
+            adapter: ProcessAdapterKind::Ffmpeg,
+            executable: ProcessAdapterKind::Ffmpeg.executable(),
+            arguments: vec![
+                "-hide_banner".into(),
+                "-loglevel".into(),
+                "error".into(),
+                "-nostdin".into(),
+                "-re".into(),
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                "color=c=0x08111f:s=1280x720:r=30".into(),
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                "anullsrc=channel_layout=stereo:sample_rate=48000".into(),
+                "-vf".into(),
+                "drawtext=text='No more slots available':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2".into(),
+                "-c:v".into(),
+                "libx264".into(),
+                "-preset".into(),
+                "ultrafast".into(),
+                "-tune".into(),
+                "zerolatency".into(),
+                "-pix_fmt".into(),
+                "yuv420p".into(),
+                "-g".into(),
+                "30".into(),
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "96k".into(),
+                "-muxdelay".into(),
+                "0".into(),
+                "-f".into(),
+                "mpegts".into(),
+                "pipe:1".into(),
+            ],
+        }
+        .spawn(ring_config)
+    }
 }
 
 /// Fixed VLC remux-to-MPEG-TS adapter.
@@ -363,6 +430,7 @@ impl VlcInputAdapter {
                 "dummy".into(),
                 "--no-video-title-show".into(),
                 "--quiet".into(),
+                "--repeat".into(),
                 input.command_argument(),
                 "--sout".into(),
                 "#standard{access=fd,mux=ts,dst=1}".into(),
@@ -844,6 +912,31 @@ async fn supervise_process(
         }
     };
 
+    match &exit {
+        ProcessExit::Completed {
+            success: true,
+            code,
+        } => {
+            info!(adapter = %adapter, process_id = child.id(), ?code, "media adapter process completed")
+        }
+        ProcessExit::Cancelled { code } => {
+            info!(adapter = %adapter, process_id = child.id(), ?code, "media adapter process cancelled");
+        }
+        ProcessExit::Completed {
+            success: false,
+            code,
+        } => {
+            warn!(adapter = %adapter, process_id = child.id(), ?code, "media adapter process exited unsuccessfully")
+        }
+        ProcessExit::Failed { stage, kind } => warn!(
+            adapter = %adapter,
+            process_id = child.id(),
+            ?stage,
+            ?kind,
+            "media adapter process failed"
+        ),
+    }
+
     let _ = completion.send(Some(exit));
 }
 
@@ -1057,6 +1150,18 @@ mod tests {
                 "-loglevel",
                 "error",
                 "-nostdin",
+                "-reconnect",
+                "1",
+                "-reconnect_at_eof",
+                "1",
+                "-reconnect_on_network_error",
+                "1",
+                "-reconnect_on_http_error",
+                "4xx,5xx",
+                "-reconnect_streamed",
+                "1",
+                "-reconnect_delay_max",
+                "2",
                 "-i",
                 "http://127.0.0.1:8080/play/1?token=x",
                 "-map",
@@ -1085,6 +1190,7 @@ mod tests {
                 "dummy",
                 "--no-video-title-show",
                 "--quiet",
+                "--repeat",
                 "http://[::1]:8080/play/1?token=x",
                 "--sout",
                 "#standard{access=fd,mux=ts,dst=1}",

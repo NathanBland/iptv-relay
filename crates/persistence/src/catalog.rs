@@ -2306,6 +2306,7 @@ pub struct ChannelPlaybackCandidateRow {
     pub quality_rank: i32,
     pub health_status: String,
     pub bitrate_kbps: Option<i32>,
+    pub alternative_base_urls: serde_json::Value,
 }
 
 impl fmt::Debug for ChannelPlaybackCandidateRow {
@@ -2375,6 +2376,7 @@ impl CatalogRepository {
                 cs.quality_rank,
                 ps.health_status,
                 ps.bitrate_kbps
+                ,pa.alternative_base_urls
             FROM channels c
             JOIN channel_streams cs ON cs.channel_id = c.id
             JOIN provider_streams ps ON ps.id = cs.provider_stream_id
@@ -7414,6 +7416,7 @@ mod tests {
     fn playback_candidate_debug_redacts_provider_values() {
         let channel_id = Uuid::now_v7();
         let candidate = ChannelPlaybackCandidateRow {
+            alternative_base_urls: serde_json::json!([]),
             channel_id,
             channel_name: "News".to_owned(),
             channel_revision: 4,

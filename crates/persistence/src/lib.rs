@@ -645,6 +645,7 @@ pub struct SourceUpdate {
     pub max_connections: Option<i32>,
     pub timezone: Option<String>,
     pub enabled: Option<bool>,
+    pub alternative_base_urls: Option<Vec<String>>,
 }
 
 impl fmt::Debug for NewSource {
@@ -676,6 +677,7 @@ pub struct SourceSummary {
     pub enabled: bool,
     pub cb_consecutive_failures: i32,
     pub cb_opened_at: Option<DateTime<Utc>>,
+    pub alternative_base_urls: Vec<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -726,6 +728,7 @@ struct SourceSummaryRow {
     enabled: bool,
     cb_consecutive_failures: i32,
     cb_opened_at: Option<DateTime<Utc>>,
+    alternative_base_urls: serde_json::Value,
 }
 
 #[derive(Debug, FromRow)]
@@ -801,14 +804,14 @@ impl SourceRepository {
                 SELECT id, name, source_type AS kind, base_url_template AS endpoint,
                        revision, updated_at, refresh_interval_seconds, last_refreshed_at,
                        max_connections, source_timezone AS timezone, enabled,
-                       cb_consecutive_failures, cb_opened_at
+                       cb_consecutive_failures, cb_opened_at, alternative_base_urls
                 FROM provider_accounts
                 WHERE enabled = true
                 UNION ALL
                 SELECT id, name, 'xmltv' AS kind, url_template AS endpoint,
                        revision, updated_at, refresh_interval_seconds, last_refreshed_at,
                        1 AS max_connections, timezone, enabled,
-                       cb_consecutive_failures, cb_opened_at
+                       cb_consecutive_failures, cb_opened_at, '[]'::jsonb AS alternative_base_urls
                 FROM epg_sources
                 WHERE enabled = true
             )
@@ -823,7 +826,8 @@ impl SourceRepository {
                    sources.timezone,
                    sources.enabled,
                    sources.cb_consecutive_failures,
-                   sources.cb_opened_at
+                   sources.cb_opened_at,
+                   sources.alternative_base_urls
             FROM source_rows AS sources
             LEFT JOIN LATERAL (
                 SELECT activated_at, record_count
@@ -999,6 +1003,7 @@ impl SourceRepository {
                 enabled: true,
                 cb_consecutive_failures: 0,
                 cb_opened_at: None,
+                alternative_base_urls: Vec::new(),
             },
             refresh_job,
         })
@@ -1315,11 +1320,15 @@ impl SourceRepository {
         if let Some(timezone) = update.timezone.as_deref() {
             validate_timezone(timezone)?;
         }
+        if let Some(urls) = &update.alternative_base_urls {
+            validate_alternative_base_urls(urls)?;
+        }
         let provider_result = sqlx::query(
             "UPDATE provider_accounts
              SET max_connections = COALESCE($2, max_connections),
                  source_timezone = COALESCE($3, source_timezone),
                  enabled = COALESCE($4, enabled),
+                 alternative_base_urls = COALESCE($5, alternative_base_urls),
                  updated_at = now()
              WHERE id = $1",
         )
@@ -1327,6 +1336,12 @@ impl SourceRepository {
         .bind(update.max_connections)
         .bind(update.timezone.as_deref())
         .bind(update.enabled)
+        .bind(
+            update
+                .alternative_base_urls
+                .as_ref()
+                .map(|v| serde_json::json!(v)),
+        )
         .execute(&self.pool)
         .await?;
         if provider_result.rows_affected() > 0 {
@@ -1594,6 +1609,33 @@ fn redact_source_endpoint(endpoint: &str) -> Result<String, PersistenceError> {
     Ok(parsed.to_string())
 }
 
+fn validate_alternative_base_urls(urls: &[String]) -> Result<(), PersistenceError> {
+    let mut seen = std::collections::HashSet::new();
+    for raw in urls {
+        let parsed = url::Url::parse(raw).map_err(|_| {
+            PersistenceError::InvalidSource(
+                "alternative server must be an absolute HTTP(S) URL".to_owned(),
+            )
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(PersistenceError::InvalidSource(
+                "alternative server must be an absolute HTTP(S) base URL without query or fragment"
+                    .to_owned(),
+            ));
+        }
+        if !seen.insert(parsed.to_string()) {
+            return Err(PersistenceError::InvalidSource(
+                "alternative servers must be unique".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn source_summary_from_row(row: SourceSummaryRow) -> Result<SourceSummary, PersistenceError> {
     let kind = SourceKind::from_database(&row.kind)?;
     let state = if row.cb_opened_at.is_some() {
@@ -1622,6 +1664,9 @@ fn source_summary_from_row(row: SourceSummaryRow) -> Result<SourceSummary, Persi
         enabled: row.enabled,
         cb_consecutive_failures: row.cb_consecutive_failures,
         cb_opened_at: row.cb_opened_at,
+        alternative_base_urls: serde_json::from_value(row.alternative_base_urls).map_err(|_| {
+            PersistenceError::InvalidSource("stored alternative servers are invalid".to_owned())
+        })?,
     })
 }
 
@@ -3619,6 +3664,7 @@ mod tests {
             (None, "healthy"),
         ] {
             let summary = source_summary_from_row(SourceSummaryRow {
+                alternative_base_urls: serde_json::json!([]),
                 id: Uuid::nil(),
                 name: "Source".to_owned(),
                 kind: "m3u".to_owned(),
@@ -3643,6 +3689,7 @@ mod tests {
         }
 
         let circuit_open_summary = source_summary_from_row(SourceSummaryRow {
+            alternative_base_urls: serde_json::json!([]),
             id: Uuid::nil(),
             name: "Source".to_owned(),
             kind: "m3u".to_owned(),

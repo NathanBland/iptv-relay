@@ -102,7 +102,14 @@ def remaining_volumes(project: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
-def request(url: str, method: str = "GET", body: Any = None, token: str | None = None, timeout: float = 30) -> Any:
+def request(
+    url: str,
+    method: str = "GET",
+    body: Any = None,
+    token: str | None = None,
+    timeout: float = 30,
+    extra_headers: dict[str, str] | None = None,
+) -> Any:
     headers = {"Accept": "application/json"}
     if token:
         headers["X-Emby-Token"] = token
@@ -111,6 +118,8 @@ def request(url: str, method: str = "GET", body: Any = None, token: str | None =
     if body is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(body).encode()
+    if extra_headers:
+        headers.update(extra_headers)
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -348,6 +357,7 @@ def main() -> int:
         "IPTV_ADMIN_BOOTSTRAP_TOKEN": bootstrap, "IPTV_ADMIN_PASSWORD": admin_password,
         "IPTV_MASTER_KEY": master_key, "IPTV_PUBLIC_BASE_URL": "http://gateway:8080",
         "IPTV_GATEWAY_PORT": str(gateway_port), "IPTV_POSTGRES_PORT": str(postgres_port),
+        "IPTV_TUNER_COUNT": str(provider_capacity),
         "IPTV_WORKER_COUNT": "1", "JELLYFIN_IMAGE": os.environ.get("JELLYFIN_IMAGE", "jellyfin/jellyfin:10.10.7"),
     }
     env_file.write_text("\n".join(f"{key}={value}" for key, value in env.items()) + "\n", encoding="utf-8")
@@ -456,6 +466,31 @@ volumes:
         report["sourceRefreshCycles"] = source_cycles
         report["sharedProviderIds"] = len(shared_ids)
         report["providerCapacityConfigured"] = provider_capacity
+        target_names = {"usa: espn [720p]", "usa: espn 2 [720p]"}
+        target_channels: dict[str, dict[str, Any]] = {}
+        for query in ("USA: ESPN [720p]", "USA: ESPN 2 [720p]"):
+            page = request(
+                f"{core}/api/v1/channels?limit=100&offset=0&search={urllib.parse.quote(query)}",
+                token=bootstrap,
+            )
+            for item in page_items(page):
+                name = str(item.get("name") or "").strip().casefold()
+                if name in target_names:
+                    target_channels[name] = item
+        if set(target_channels) != target_names:
+            raise RuntimeError("gateway did not provide the ESPN and ESPN 2 test channels")
+        request(f"{core}/api/v1/groups/enabled", "PATCH", {"enabled": False}, bootstrap)
+        for item in target_channels.values():
+            request(
+                f"{core}/api/v1/channels/{urllib.parse.quote(str(item['id']), safe='')}/enabled",
+                "PATCH",
+                {"enabled": True},
+                bootstrap,
+            )
+        report["lineupScope"] = {
+            "disabledAllGroups": True,
+            "enabledChannels": sorted(str(item["name"]) for item in target_channels.values()),
+        }
         request(f"{jf}/Startup/Configuration", "POST", {"ServerName": "IPTV Acceptance", "UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"})
         request(f"{jf}/Startup/User")
         request(f"{jf}/Startup/User", "POST", {"Name": "acceptance", "Password": admin_password})
@@ -508,36 +543,51 @@ volumes:
         provider_records = provider_records_by_number(stream_payload)
         usable_numbers: set[str] = set()
         selected_identity_by_number: dict[str, str] = {}
+        selected_gateway_id_by_number: dict[str, str] = {}
         selection_candidates: list[dict[str, Any]] = []
-        for item in channels:
-            number = str(item.get("Number") or item.get("ChannelNumber") or "").strip()
-            if number not in eligible_numbers or number in usable_numbers:
-                continue
-            record = provider_records.get(number, {})
-            gateway_item = next(
-                (
-                    candidate
-                    for candidate in gateway_by_number.get(number, [])
-                    if mapped_channel_identities.get(str(candidate.get("id") or "").strip(), set()) & shared_ids
-                ),
-                gateway_by_number.get(number, [{}])[0],
-            )
-            mapped_identities = mapped_channel_identities.get(str(gateway_item.get("id") or "").strip(), set())
-            provider_identity = str(record.get("epg_channel_id") or record.get("stream_id") or "").strip().casefold()
-            mapped_identity = next(iter(mapped_identities & shared_ids), "")
-            if not mapped_identity:
+        provider_ts_cache: dict[str, bool] = {}
+        selection_deadline = time.monotonic() + 900
+        while time.monotonic() < selection_deadline:
+            usable_numbers.clear()
+            selected_identity_by_number.clear()
+            selected_gateway_id_by_number.clear()
+            selection_candidates.clear()
+            for item in channels:
+                number = str(item.get("Number") or item.get("ChannelNumber") or "").strip()
+                if number not in eligible_numbers or number in usable_numbers:
+                    continue
+                record = provider_records.get(number, {})
+                gateway_item = next(
+                    (
+                        candidate
+                        for candidate in gateway_by_number.get(number, [])
+                        if mapped_channel_identities.get(str(candidate.get("id") or "").strip(), set()) & shared_ids
+                    ),
+                    gateway_by_number.get(number, [{}])[0],
+                )
+                mapped_identities = mapped_channel_identities.get(str(gateway_item.get("id") or "").strip(), set())
+                provider_identity = str(record.get("epg_channel_id") or record.get("stream_id") or "").strip().casefold()
+                mapped_identity = next(iter(mapped_identities & shared_ids), "")
                 if len(selection_candidates) < 20:
-                    selection_candidates.append({"number": number, "providerIdentity": provider_identity, "mapped": bool(mapped_identities & shared_ids)})
-                continue
-            stream_id = provider_streams.get(number)
-            has_ts = bool(stream_id and provider_stream_has_ts(xtream["URL"], xtream["USER"], xtream["PWD"], stream_id))
-            if len(selection_candidates) < 20:
-                selection_candidates.append({"number": number, "providerIdentity": provider_identity, "mapped": True, "hasTs": has_ts})
-            if has_ts:
-                usable_numbers.add(number)
-                selected_identity_by_number[number] = mapped_identity
+                    selection_candidates.append({"number": number, "providerIdentity": provider_identity, "mapped": bool(mapped_identity)})
+                if not mapped_identity:
+                    continue
+                stream_id = provider_streams.get(number)
+                if number not in provider_ts_cache:
+                    provider_ts_cache[number] = bool(stream_id and provider_stream_has_ts(xtream["URL"], xtream["USER"], xtream["PWD"], stream_id))
+                has_ts = provider_ts_cache[number]
+                if selection_candidates:
+                    selection_candidates[-1]["hasTs"] = has_ts
+                if has_ts:
+                    usable_numbers.add(number)
+                    selected_identity_by_number[number] = mapped_identity
+                    selected_gateway_id_by_number[number] = str(gateway_item.get("id") or "").strip()
+                if len(usable_numbers) >= 2:
+                    break
             if len(usable_numbers) >= 2:
                 break
+            time.sleep(3)
+            channels = page_items(request(f"{jf}/LiveTv/Channels?UserId={user_id}&EnableImages=false", token=jf_token))
         report["selectionDiagnostics"] = {
             "jellyfinChannels": len(channels),
             "gatewayChannels": len(gateway_by_number),
@@ -585,10 +635,9 @@ volumes:
         if not set(provider_identity).issubset(shared_ids):
             raise RuntimeError("Jellyfin channel mappings did not match reconciled provider identities")
         selected_gateway_ids = {
-            str(item.get("id", ""))
+            selected_gateway_id_by_number.get(number or fallback, "")
             for _, number, fallback in ids
-            for item in gateway_by_number.get(number or fallback, [])
-        }
+        } - {""}
         report["channels"] = [{"id": item[0], "number": item[1] or item[2], "providerIdentity": identity} for item, identity in zip(ids, provider_identity)]
         # A second provider refresh must preserve Jellyfin's identity and number.
         if guide_task and guide_task.get("Id"):
@@ -600,61 +649,42 @@ volumes:
                 raise RuntimeError("Jellyfin channel identity or number changed after refresh")
         # Open both streams through Jellyfin's Live TV API. Do not open the
         # gateway URL directly because that would skip Jellyfin's tuner path.
-        streams: list[dict[str, Any]] = []
-        for channel_id, _, _ in ids:
-            opened = request(
-                f"{jf}/Items/{urllib.parse.quote(channel_id, safe='')}/PlaybackInfo?UserId={urllib.parse.quote(user_id, safe='')}",
-                "POST",
-                {
-                    "UserId": user_id,
-                    "PlaySessionId": secrets.token_hex(8),
-                    "AutoOpenLiveStream": True,
-                    "EnableDirectPlay": True,
-                    "EnableDirectStream": True,
-                    "DeviceProfile": {
-                        "Name": "IPTV acceptance",
-                        "SupportedMediaTypes": "Audio,Video",
-                        "MaxStreamingBitrate": 120000000,
-                        "DirectPlayProfiles": [{"Container": "ts", "Type": "Video", "VideoCodec": "h264,mpeg2video", "AudioCodec": "aac,mp2"}],
-                        "TranscodingProfiles": [{"Container": "ts", "Type": "Video", "Protocol": "http", "VideoCodec": "h264,mpeg2video", "AudioCodec": "aac,mp2"}],
-                    },
-                },
-                jf_token,
-                timeout=120,
-            )
-            if not isinstance(opened, dict):
-                raise RuntimeError("Jellyfin did not return a live stream record")
-            media_sources = opened.get("MediaSources") if isinstance(opened.get("MediaSources"), list) else []
-            media_source = next((item for item in media_sources if isinstance(item, dict)), None)
-            if media_source is None:
-                raise RuntimeError("Jellyfin playback info did not include a live media source")
-            stream_id = str(media_source.get("Id") or "")
-            stream_path = str(media_source.get("Path") or "")
-            match = re.search(r"/LiveStreamFiles/([^/]+)/stream", stream_path)
-            stream_id = match.group(1) if match else stream_id
-            if not stream_id:
-                raise RuntimeError("Jellyfin did not return a live stream identity")
-            streams.append({"streamId": stream_id, "liveStreamId": str(media_source.get("LiveStreamId") or "")})
-        if len(streams) != 2:
-            raise RuntimeError("Jellyfin did not open two live streams")
-        started = time.monotonic()
+        streams: list[dict[str, Any] | None] = [None, None]
+        readers: list[threading.Thread] = []
         stream_results: list[dict[str, Any]] = [
             {"bytes": 0, "packets": 0, "readErrors": 0, "reconnects": 0, "terminalState": "not-started"}
-            for _ in streams
+            for _ in ids
         ]
         errors: list[BaseException] = []
-        soak_deadline = started + args.soak_seconds
+        started = time.monotonic()
+        soak_deadline: list[float | None] = [None]
 
-        def consume(index: int, stream_id: str) -> None:
+        def consume(index: int, stream: dict[str, str], device_authorization: str) -> None:
             validator = MpegTsValidator()
             first_byte_at: float | None = None
             last_byte_at: float | None = None
             try:
-                target = f"{jf}/LiveTv/LiveStreamFiles/{urllib.parse.quote(stream_id, safe='')}/stream.ts"
-                req = urllib.request.Request(target, headers={"X-Emby-Token": jf_token, "Accept": "video/mp2t"})
+                query = urllib.parse.urlencode(
+                    {
+                        "Static": "true",
+                        "MediaSourceId": stream["mediaSourceId"],
+                        "LiveStreamId": stream["liveStreamId"],
+                        "PlaySessionId": stream["playSessionId"],
+                        "DeviceId": stream["deviceId"],
+                    }
+                )
+                target = f"{jf}/Videos/{urllib.parse.quote(stream['channelId'], safe='')}/stream.ts?{query}"
+                req = urllib.request.Request(
+                    target,
+                    headers={
+                        "X-Emby-Token": jf_token,
+                        "X-Emby-Authorization": device_authorization,
+                        "Accept": "video/mp2t",
+                    },
+                )
                 with urllib.request.urlopen(req, timeout=min(10, args.soak_seconds + 5)) as response:
                     stream_results[index]["terminalState"] = "consuming"
-                    while time.monotonic() < soak_deadline:
+                    while soak_deadline[0] is None or time.monotonic() < soak_deadline[0]:
                         payload = response.read(MPEG_TS_PACKET_SIZE * 256)
                         if not payload:
                             stream_results[index]["terminalState"] = "upstream-ended"
@@ -679,10 +709,81 @@ volumes:
                     }
                 )
 
-        readers = [threading.Thread(target=consume, args=(index, stream["streamId"]), daemon=True) for index, stream in enumerate(streams)]
-        for reader in readers:
+        def open_and_consume(index: int, channel_id: str) -> None:
+            try:
+                device_id = f"iptv-live-acceptance-{index + 1}"
+                device_authorization = (
+                    'MediaBrowser Client="iptv-live-acceptance", Device="runner", '
+                    f'DeviceId="{device_id}", Version="1", Token="{jf_token}"'
+                )
+                play_session_id = secrets.token_hex(8)
+                opened = request(
+                    f"{jf}/Items/{urllib.parse.quote(channel_id, safe='')}/PlaybackInfo?UserId={urllib.parse.quote(user_id, safe='')}",
+                    "POST",
+                    {
+                        "UserId": user_id,
+                        "PlaySessionId": play_session_id,
+                        "AutoOpenLiveStream": True,
+                        "EnableDirectPlay": True,
+                        "EnableDirectStream": True,
+                        "DeviceProfile": {
+                            "Name": "IPTV acceptance",
+                            "SupportedMediaTypes": "Audio,Video",
+                            "MaxStreamingBitrate": 120000000,
+                            "DirectPlayProfiles": [{"Container": "ts", "Type": "Video", "VideoCodec": "h264,mpeg2video", "AudioCodec": "aac,mp2"}],
+                            "TranscodingProfiles": [{"Container": "ts", "Type": "Video", "Protocol": "http", "VideoCodec": "h264,mpeg2video", "AudioCodec": "aac,mp2"}],
+                        },
+                    },
+                    jf_token,
+                    timeout=120,
+                    extra_headers={"X-Emby-Authorization": device_authorization},
+                )
+                if not isinstance(opened, dict):
+                    raise RuntimeError("Jellyfin did not return a live stream record")
+                media_sources = opened.get("MediaSources") if isinstance(opened.get("MediaSources"), list) else []
+                media_source = next((item for item in media_sources if isinstance(item, dict)), None)
+                if media_source is None:
+                    raise RuntimeError("Jellyfin playback info did not include a live media source")
+                stream_id = str(media_source.get("Id") or "")
+                stream_path = str(media_source.get("Path") or "")
+                match = re.search(r"/LiveStreamFiles/([^/]+)/stream", stream_path)
+                stream_id = match.group(1) if match else stream_id
+                if not stream_id:
+                    raise RuntimeError("Jellyfin did not return a live stream identity")
+                streams[index] = {
+                    "channelId": channel_id,
+                    "streamId": stream_id,
+                    "mediaSourceId": str(media_source.get("Id") or ""),
+                    "liveStreamId": str(media_source.get("LiveStreamId") or ""),
+                    "playSessionId": play_session_id,
+                    "deviceId": device_id,
+                }
+                consume(index, streams[index], device_authorization)
+            except BaseException as error:
+                if stream_results[index]["terminalState"] == "not-started":
+                    stream_results[index]["readErrors"] += 1
+                    stream_results[index]["terminalState"] = f"open-error:{type(error).__name__}"
+                    errors.append(error)
+
+        for index, (channel_id, _, _) in enumerate(ids):
+            reader = threading.Thread(target=open_and_consume, args=(index, channel_id), daemon=True)
+            readers.append(reader)
             reader.start()
-        sessions, active, available = wait_sessions(core, bootstrap, expected=2)
+        open_deadline = time.monotonic() + 120
+        while any(stream is None for stream in streams) and not errors and time.monotonic() < open_deadline:
+            time.sleep(0.1)
+        if any(stream is None for stream in streams):
+            raise RuntimeError("Jellyfin did not open two live streams")
+        soak_deadline[0] = time.monotonic() + args.soak_seconds
+        try:
+            sessions, active, available = wait_sessions(core, bootstrap, expected=2)
+        except RuntimeError:
+            report["streamResults"] = stream_results
+            if errors:
+                raise RuntimeError(
+                    f"Jellyfin stream request failed before gateway activation ({type(errors[0]).__name__})"
+                ) from None
+            raise
         report["gatewayDuringStreams"] = {
             "sessionCount": len(sessions),
             "providerActiveSessions": active,
@@ -696,7 +797,7 @@ volumes:
         minimum_active = active
         maximum_active = active
         latest_session_details: list[dict[str, Any]] = []
-        while time.monotonic() < soak_deadline:
+        while soak_deadline[0] is not None and time.monotonic() < soak_deadline[0]:
             sampled_sessions, sampled_active, sampled_available = sessions_state(core, bootstrap)
             session_sample_count += 1
             minimum_active = min(minimum_active, sampled_active)
@@ -720,7 +821,7 @@ volumes:
             ]
             if sampled_active != 2 or len(sampled_sessions) != 2:
                 raise RuntimeError("gateway lost one of two sessions during the soak")
-            time.sleep(min(1, max(0, soak_deadline - time.monotonic())))
+            time.sleep(min(1, max(0, soak_deadline[0] - time.monotonic())))
         for reader in readers:
             reader.join(args.soak_seconds + 60)
         if any(reader.is_alive() for reader in readers):
@@ -751,6 +852,7 @@ volumes:
         ):
             raise RuntimeError("Jellyfin stream did not produce valid MPEG-TS for the full soak")
         for stream in streams:
+            assert stream is not None
             live_stream_id = stream.get("liveStreamId")
             if live_stream_id:
                 request(
