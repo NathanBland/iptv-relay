@@ -302,14 +302,14 @@ export class FetchIptvApiClient implements IptvApiClient {
     this.readCsrfToken = options.readCsrfToken ?? readCsrfCookie
   }
 
-  private async request<T>(path: string, decode: (value: unknown) => T, init: RequestInit = {}): Promise<T> {
+  private async request<T>(path: string, decode: (value: unknown) => T, init: RequestInit = {}, allowMissingCsrf = false): Promise<T> {
     const headers = new Headers(init.headers)
     headers.set('Accept', 'application/json, application/problem+json')
     const method = init.method?.toUpperCase() ?? 'GET'
     if (init.body !== undefined) headers.set('Content-Type', 'application/json')
     if (MUTATION_METHODS.has(method)) {
       const csrfToken = this.readCsrfToken()
-      if (!csrfToken) {
+      if (!csrfToken && !allowMissingCsrf) {
         throw new IptvApiError({
           type: 'urn:iptv:error:missing-csrf-token',
           title: 'CSRF token unavailable',
@@ -317,7 +317,7 @@ export class FetchIptvApiClient implements IptvApiClient {
           detail: 'Refresh the page before retrying this request.',
         })
       }
-      headers.set('X-CSRF-Token', csrfToken)
+      if (csrfToken) headers.set('X-CSRF-Token', csrfToken)
     }
 
     let response: Response
@@ -531,41 +531,10 @@ export class FetchIptvApiClient implements IptvApiClient {
   }
 
   async updateSource(id: string, input: SourceUpdateInput): Promise<void> {
-    const csrfToken = this.readCsrfToken()
-    if (!csrfToken) {
-      throw new IptvApiError({
-        type: 'urn:iptv:error:missing-csrf-token',
-        title: 'CSRF token unavailable',
-        status: 400,
-        detail: 'Sign in before you change source settings.',
-      })
-    }
-    const headers = new Headers()
-    headers.set('Content-Type', 'application/json')
-    headers.set('Accept', 'application/json, application/problem+json')
-    headers.set('X-CSRF-Token', csrfToken)
-    let response: Response
-    try {
-      response = await this.fetcher(
-        `${API_PATHS.sources}/${encodeURIComponent(id)}`,
-        {
-          method: 'PATCH',
-          headers,
-          body: JSON.stringify(input),
-          credentials: 'same-origin',
-        },
-      )
-    } catch {
-      throw new IptvApiError({
-        type: 'urn:iptv:error:network',
-        title: 'Unable to reach the IPTV API',
-        status: 0,
-        detail: 'The same-origin API request failed before a response was received.',
-      })
-    }
-    if (!response.ok) {
-      throw await problemFromResponse(response)
-    }
+    await this.request(`${API_PATHS.sources}/${encodeURIComponent(id)}`, () => undefined, {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    }, true)
   }
 
   private async deleteResource(path: string, _resource: string): Promise<void> {

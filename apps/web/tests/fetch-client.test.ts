@@ -209,7 +209,7 @@ describe('FetchIptvApiClient', () => {
     await expect(client.setSourceRefreshInterval('id', 60)).rejects.toMatchObject({ problem: { status: 400 } })
     await expect(client.triggerSourceSync('id')).rejects.toMatchObject({ problem: { status: 400 } })
     await expect(client.cancelSourceSync('id')).rejects.toMatchObject({ problem: { status: 400 } })
-    await expect(client.updateSource('id', {})).rejects.toMatchObject({ problem: { status: 400 } })
+    await expect(new FetchIptvApiClient(async () => new Response(null, { status: 204 })).updateSource('id', {})).resolves.toBeUndefined()
     await expect(client.setChannelEpgMapping('id', 'epg')).rejects.toMatchObject({ problem: { status: 400 } })
     await expect(client.resolveReview('id', false)).rejects.toMatchObject({ problem: { status: 400 } })
     await expect(client.deleteUser('id')).rejects.toMatchObject({ problem: { status: 403 } })
@@ -251,6 +251,9 @@ describe('FetchIptvApiClient', () => {
     await expect(noCsrfClient.login({ username: 'operator', password: 'secret' })).rejects.toMatchObject({
       problem: { status: 403, type: 'urn:iptv:error:missing-csrf-token' },
     })
+    const authDisabledFetcher = vi.fn(async () => new Response(null, { status: 204 }))
+    await expect(new FetchIptvApiClient(authDisabledFetcher).updateSource('source-1', { maxConnections: 2 })).resolves.toBeUndefined()
+    expect(authDisabledFetcher).toHaveBeenCalledWith('/api/v1/sources/source-1', expect.objectContaining({ method: 'PATCH' }))
 
     const unauthorized = () => jsonResponse({ type: 'urn:iptv:error:unauthorized', title: 'Sign-in required' }, 401)
     const onUnauthorized = vi.fn()
