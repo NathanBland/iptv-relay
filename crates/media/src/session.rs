@@ -36,7 +36,7 @@ const MAX_PRIMING_PACKETS: usize = 16_384;
 
 /// The input-adapter policy for one HTTP MPEG-TS source.
 ///
-/// `Auto` selects the FFmpeg remuxer for direct MPEG-TS input.
+/// `Auto` selects the `FFmpeg` remuxer for direct MPEG-TS input.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum InputAdapterPolicy {
     #[default]
@@ -66,10 +66,9 @@ impl InputAdapterPolicy {
     #[must_use]
     pub const fn selected_adapter(self) -> SessionInputAdapter {
         match self {
-            Self::Auto => SessionInputAdapter::Ffmpeg,
+            Self::Auto | Self::Ffmpeg => SessionInputAdapter::Ffmpeg,
             Self::Vlc => SessionInputAdapter::Vlc,
             Self::NativeTs => SessionInputAdapter::NativeTs,
-            Self::Ffmpeg => SessionInputAdapter::Ffmpeg,
         }
     }
 }
@@ -705,24 +704,23 @@ async fn start_http_ts_session(
         .and_then(|endpoint| {
             providers.get(endpoint.effective_pool_id(&source.key.provider_pool_id))
         })
-        .map(|broker| broker.snapshot().active_sessions)
-        .unwrap_or(0);
+        .map_or(0, |broker| broker.snapshot().active_sessions);
     if active < source.endpoints.len() {
         let mut endpoints = source.endpoints.clone();
         endpoints.rotate_left(active);
         source.endpoints = endpoints;
     }
     let diagnostics = SessionDiagnostics::new(source.key.clone(), source.channel_name.clone());
-    if let Ok(parsed) = reqwest::Url::parse(&source.endpoints[0].url) {
-        if let Some(host) = parsed.host_str() {
-            let server = format!(
-                "{}://{}{}",
-                parsed.scheme(),
-                host,
-                parsed.port().map_or(String::new(), |p| format!(":{p}"))
-            );
-            diagnostics.set_base_server(server);
-        }
+    if let Ok(parsed) = reqwest::Url::parse(&source.endpoints[0].url)
+        && let Some(host) = parsed.host_str()
+    {
+        let server = format!(
+            "{}://{}{}",
+            parsed.scheme(),
+            host,
+            parsed.port().map_or(String::new(), |p| format!(":{p}"))
+        );
+        diagnostics.set_base_server(server);
     }
     let selected_adapter = source.adapter_policy.selected_adapter();
     diagnostics.set_adapter(selected_adapter);

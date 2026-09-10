@@ -917,7 +917,7 @@ async fn supervise_process(
             success: true,
             code,
         } => {
-            info!(adapter = %adapter, process_id = child.id(), ?code, "media adapter process completed")
+            info!(adapter = %adapter, process_id = child.id(), ?code, "media adapter process completed");
         }
         ProcessExit::Cancelled { code } => {
             info!(adapter = %adapter, process_id = child.id(), ?code, "media adapter process cancelled");
@@ -926,7 +926,7 @@ async fn supervise_process(
             success: false,
             code,
         } => {
-            warn!(adapter = %adapter, process_id = child.id(), ?code, "media adapter process exited unsuccessfully")
+            warn!(adapter = %adapter, process_id = child.id(), ?code, "media adapter process exited unsuccessfully");
         }
         ProcessExit::Failed { stage, kind } => warn!(
             adapter = %adapter,

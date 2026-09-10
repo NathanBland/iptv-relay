@@ -2325,6 +2325,7 @@ impl fmt::Debug for ChannelPlaybackCandidateRow {
             .field("input_adapter", &self.input_adapter)
             .field("stream_url", &"<redacted>")
             .field("url_secret_ciphertext", &"<redacted>")
+            .field("alternative_base_urls", &"<redacted>")
             .field("priority", &self.priority)
             .field("quality_rank", &self.quality_rank)
             .field("health_status", &self.health_status)

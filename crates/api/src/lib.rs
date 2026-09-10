@@ -407,6 +407,8 @@ impl fmt::Debug for CreateSourceRequest {
             .field("server_url", &redacted_option(self.server_url.as_ref()))
             .field("username", &redacted_option(self.username.as_ref()))
             .field("password", &redacted_option(self.password.as_ref()))
+            .field("alternative_base_urls", &"<redacted>")
+            .field("max_connections", &self.max_connections)
             .field("timezone", &self.timezone)
             .finish()
     }
@@ -3326,7 +3328,9 @@ async fn create_source(
                 let _ = job_repository.enqueue(&job).await;
             }
             let mut response_source = created.source.clone();
-            response_source.alternative_base_urls = request.alternative_base_urls.clone();
+            response_source
+                .alternative_base_urls
+                .clone_from(&request.alternative_base_urls);
             (
                 StatusCode::CREATED,
                 Json(SourceResponse::from(&response_source)),
@@ -6091,8 +6095,7 @@ fn session_response(
         channel_name: snapshot.channel_name.clone(),
         adapter: snapshot
             .adapter
-            .map(session_adapter_name)
-            .unwrap_or("unknown")
+            .map_or("unknown", session_adapter_name)
             .to_owned(),
         base_server: snapshot.base_server.clone(),
         configured_generation: snapshot.key.generation,
@@ -6956,13 +6959,10 @@ fn capacity_placeholder_response(
         Ok(ring) => ring,
         Err(detail) => return invalid_buffer_policy(detail),
     };
-    let mut placeholder = match FfmpegInputAdapter::new().start_capacity_placeholder(ring) {
-        Ok(placeholder) => placeholder,
-        Err(_) => {
-            return session_start_response(SessionStartError::Process {
-                adapter: iptv_media::SessionInputAdapter::Ffmpeg,
-            });
-        }
+    let Ok(mut placeholder) = FfmpegInputAdapter::new().start_capacity_placeholder(ring) else {
+        return session_start_response(SessionStartError::Process {
+            adapter: iptv_media::SessionInputAdapter::Ffmpeg,
+        });
     };
     let mut cursor = placeholder.subscribe();
     let stream = async_stream::stream! {
@@ -6971,17 +6971,13 @@ fn capacity_placeholder_response(
         loop {
             tokio::select! {
                 _ = retry.tick() => {
-                    match media.try_open(source.clone()).await {
-                        Ok(viewer) => {
-                            placeholder.request_shutdown();
-                            let mut live = viewer.into_byte_stream();
-                            while let Some(item) = live.next().await {
-                                yield item.map_err(|_| std::io::Error::other("live media stream failed"));
-                            }
-                            return;
+                    if let Ok(viewer) = media.try_open(source.clone()).await {
+                        placeholder.request_shutdown();
+                        let mut live = viewer.into_byte_stream();
+                        while let Some(item) = live.next().await {
+                            yield item.map_err(|_| std::io::Error::other("live media stream failed"));
                         }
-                        Err(SessionStartError::Provider(AcquireError::AtCapacity { .. })) => {}
-                        Err(_) => {}
+                        return;
                     }
                 }
                 read = cursor.next(32) => {
@@ -7118,9 +7114,9 @@ fn replace_url_origin(original: &str, base: &str) -> Result<String, ()> {
     let source = url::Url::parse(original).map_err(|_| ())?;
     let base = url::Url::parse(base).map_err(|_| ())?;
     let mut result = source;
-    result.set_scheme(base.scheme()).map_err(|_| ())?;
+    result.set_scheme(base.scheme())?;
     result.set_host(base.host_str()).map_err(|_| ())?;
-    result.set_port(base.port()).map_err(|_| ())?;
+    result.set_port(base.port())?;
     Ok(result.to_string())
 }
 
