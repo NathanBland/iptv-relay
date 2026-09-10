@@ -16,9 +16,9 @@ futures-util.workspace = true
 getrandom.workspace = true
 http-body-util.workspace = true
 jsonwebtoken.workspace = true
-iptv-domain = { path = "../domain", version = "0.2.16" }
-iptv-media = { path = "../media", version = "0.2.16" }
-iptv-persistence = { path = "../persistence", version = "0.2.16" }
+iptv-domain = { path = "../domain", version = "0.2.17" }
+iptv-media = { path = "../media", version = "0.2.17" }
+iptv-persistence = { path = "../persistence", version = "0.2.17" }
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
