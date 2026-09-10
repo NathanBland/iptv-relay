@@ -23,12 +23,14 @@ export interface Source {
   maxConnections: number
   timezone: string
   enabled: boolean
+  alternativeBaseUrls: string[]
 }
 
 export interface SourceUpdateInput {
   maxConnections?: number
   timezone?: string
   enabled?: boolean
+  alternativeBaseUrls?: string[]
 }
 
 export interface SourceInput {
@@ -39,6 +41,8 @@ export interface SourceInput {
   username?: string
   password?: string
   timezone?: string
+  alternativeBaseUrls?: string[]
+  maxConnections?: number
 }
 
 export interface SourceSyncStatus {
@@ -506,6 +510,8 @@ export interface Session {
   providerPoolId: string
   sourceId: string
   channelName?: string | null
+  adapter: 'native-ts' | 'ffmpeg' | 'vlc' | 'unknown'
+  baseServer?: string | null
   configuredGeneration: number
   upstreamGeneration: number
   state: SessionState

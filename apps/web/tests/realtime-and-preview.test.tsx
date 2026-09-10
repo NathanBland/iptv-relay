@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
@@ -12,9 +12,12 @@ const player = vi.hoisted(() => ({
   unload: vi.fn(),
   detachMediaElement: vi.fn(),
   destroy: vi.fn(),
+  on: vi.fn(),
+  off: vi.fn(),
 }))
 const mpegts = vi.hoisted(() => ({
   supported: true,
+  Events: { ERROR: 'error' },
   getFeatureList: vi.fn(() => ({ mseLivePlayback: mpegts.supported })),
   createPlayer: vi.fn(() => player),
 }))
@@ -60,6 +63,8 @@ describe('stream preview', () => {
     const client = new MockIptvApiClient()
     const onClose = vi.fn()
     const view = render(<StreamPreview channelId="channel / one" channelName="KUSA" client={client} onClose={onClose} />)
+    await waitFor(() => expect(player.load).toHaveBeenCalled())
+    fireEvent.playing(view.container.querySelector('video')!)
     expect(await screen.findByText('Live')).toBeInTheDocument()
     expect(mpegts.createPlayer).toHaveBeenCalledWith(expect.objectContaining({ url: '/api/v1/channels/channel%20%2F%20one/stream' }), expect.any(Object))
     await userEvent.click(screen.getByRole('button', { name: 'Stop' }))
@@ -92,7 +97,9 @@ describe('stream preview', () => {
     mpegts.supported = true
     player.load.mockImplementation(() => undefined)
     const client = new MockIptvApiClient()
-    render(<StreamPreview channelId="three" channelName="Three" client={client} onClose={vi.fn()} />)
+    const view = render(<StreamPreview channelId="three" channelName="Three" client={client} onClose={vi.fn()} />)
+    await waitFor(() => expect(player.load).toHaveBeenCalled())
+    fireEvent.playing(view.container.querySelector('video')!)
     expect(await screen.findByText('Live')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Stop' }))
     player.load.mockImplementationOnce(() => { throw new Error('resume') })

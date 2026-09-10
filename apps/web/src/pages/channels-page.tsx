@@ -64,7 +64,7 @@ export function ChannelsPage({ client = apiClient }: { client?: IptvApiClient })
   const total = query.data?.total ?? 0
   const pageCount = Math.ceil(total / PAGE_SIZE)
   const [sorting, setSorting] = useState<SortingState>([{ id: 'number', desc: false }])
-  const [previewChannel, setPreviewChannel] = useState<{ id: string; name: string } | null>(null)
+  const [previewChannels, setPreviewChannels] = useState<{ id: string; name: string }[]>([])
 
   const channelToggle = useMutation({
     mutationFn: ({ channelId, enabled }: { channelId: string; enabled: boolean }) =>
@@ -111,7 +111,9 @@ export function ChannelsPage({ client = apiClient }: { client?: IptvApiClient })
         size="sm"
         disabled={info.row.original.state === 'offline' || !info.row.original.enabled}
         aria-label={`Preview ${info.row.original.name}`}
-        onClick={() => setPreviewChannel({ id: info.row.original.id, name: info.row.original.name })}
+        onClick={() => setPreviewChannels((current) => current.some((channel) => channel.id === info.row.original.id)
+          ? current
+          : [...current, { id: info.row.original.id, name: info.row.original.name }])}
       >
         <Eye aria-hidden="true" className="size-4" />
       </Button>
@@ -130,14 +132,15 @@ export function ChannelsPage({ client = apiClient }: { client?: IptvApiClient })
   return (
     <>
       <PageHeader eyebrow="Lineup" title="Channels" description="Inspect normalized channel identity, alternate streams, groups, codecs, and health-derived primary ordering. Toggle channels and groups to control Jellyfin output." />
-      {previewChannel && (
+      {previewChannels.map((channel) => (
         <StreamPreview
-          channelId={previewChannel.id}
-          channelName={previewChannel.name}
+          key={channel.id}
+          channelId={channel.id}
+          channelName={channel.name}
           client={client}
-          onClose={() => setPreviewChannel(null)}
+          onClose={() => setPreviewChannels((current) => current.filter((item) => item.id !== channel.id))}
         />
-      )}
+      ))}
       <Card>
         <div className="flex flex-col justify-between gap-3 border-b border-white/8 p-4 sm:flex-row sm:items-center">
           <div className="flex flex-1 flex-col gap-2 sm:flex-row sm:items-center">

@@ -20,6 +20,8 @@ export function StreamPreview({ channelId, channelName, client, onClose }: Strea
 
   useEffect(() => {
     let cancelled = false
+    let removeVideoListeners = () => {}
+    let removePlayerListener = () => {}
 
     async function startPlayback() {
       try {
@@ -35,6 +37,18 @@ export function StreamPreview({ channelId, channelName, client, onClose }: Strea
         const video = videoRef.current
         if (!video) return
 
+        const handlePlaying = () => setStatus('playing')
+        const handleMediaError = () => {
+          setStatus('error')
+          setError('The browser could not decode the live stream.')
+        }
+        video.addEventListener('playing', handlePlaying)
+        video.addEventListener('error', handleMediaError)
+        removeVideoListeners = () => {
+          video.removeEventListener('playing', handlePlaying)
+          video.removeEventListener('error', handleMediaError)
+        }
+
         const player = mpegts.createPlayer({
           type: 'mpegts',
           isLive: true,
@@ -46,11 +60,22 @@ export function StreamPreview({ channelId, channelName, client, onClose }: Strea
           liveBufferLatencyMinRemain: 0.3,
         })
 
+        const handlePlayerError = (_type: string, detail: string) => {
+          setStatus('error')
+          setError(`Live stream playback failed: ${detail}`)
+        }
+        player.on(mpegts.Events.ERROR, handlePlayerError)
+        removePlayerListener = () => player.off(mpegts.Events.ERROR, handlePlayerError)
+
         player.attachMediaElement(video)
         player.load()
-        player.play()
+        void Promise.resolve(player.play()).catch(() => {
+          if (!cancelled) {
+            setStatus('error')
+            setError('The browser could not start live playback.')
+          }
+        })
         playerRef.current = player
-        setStatus('playing')
       } catch (err) {
         if (cancelled) return
         setStatus('error')
@@ -63,6 +88,8 @@ export function StreamPreview({ channelId, channelName, client, onClose }: Strea
     return () => {
       cancelled = true
       const player = playerRef.current
+      removeVideoListeners()
+      removePlayerListener()
       if (player) {
         try {
           player.pause()

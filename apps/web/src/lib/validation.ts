@@ -25,6 +25,8 @@ export const sourceSchema = z.object({
   username: z.string(),
   password: z.string(),
   timezone: nonBlank('Enter an IANA timezone.'),
+  maxConnections: z.number().int().min(1),
+  alternativeBaseUrls: z.string(),
 }).superRefine((value, context) => {
   const hasStandardXtreamValue = [value.serverUrl, value.username, value.password]
     .some((part) => typeof part === 'string' && part.trim().length > 0)
@@ -72,6 +74,7 @@ export const sourceUpdateSchema = z.object({
   maxConnections: z.number().int('Use a whole number.').min(1, 'Use at least one connection.'),
   timezone: nonBlank('Enter a timezone.'),
   enabled: z.boolean(),
+  alternativeBaseUrls: z.string(),
 })
 
 export const eventTemplateSchema = z.object({

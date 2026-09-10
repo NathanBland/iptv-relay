@@ -38,6 +38,7 @@ export const mockSources: Source[] = [
     refreshIntervalSeconds: 3600,
     lastRefreshedAt: '2026-08-19T17:57:00Z',
     maxConnections: 4,
+    alternativeBaseUrls: [],
     timezone: 'UTC',
     enabled: true,
   },
@@ -52,6 +53,7 @@ export const mockSources: Source[] = [
     refreshIntervalSeconds: 0,
     lastRefreshedAt: null,
     maxConnections: 1,
+    alternativeBaseUrls: [],
     timezone: 'America/Denver',
     enabled: true,
   },
@@ -66,6 +68,7 @@ export const mockSources: Source[] = [
     refreshIntervalSeconds: 7200,
     lastRefreshedAt: '2026-08-19T16:45:00Z',
     maxConnections: 1,
+    alternativeBaseUrls: [],
     timezone: 'UTC',
     enabled: true,
   },
@@ -206,6 +209,7 @@ export const mockSessions: Session[] = [
   {
     providerPoolId: 'provider-prime',
     sourceId: 'source-kwgn-hd',
+    adapter: 'vlc',
     configuredGeneration: 4,
     upstreamGeneration: 4,
     state: 'streaming',
@@ -227,6 +231,7 @@ export const mockSessions: Session[] = [
   {
     providerPoolId: 'provider-prime',
     sourceId: 'source-espn-hevc',
+    adapter: 'vlc',
     configuredGeneration: 9,
     upstreamGeneration: 9,
     state: 'streaming',
@@ -248,6 +253,7 @@ export const mockSessions: Session[] = [
   {
     providerPoolId: 'provider-prime',
     sourceId: 'source-nfl-event-01',
+    adapter: 'ffmpeg',
     configuredGeneration: 12,
     upstreamGeneration: 13,
     state: 'recovering',

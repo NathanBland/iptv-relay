@@ -1167,6 +1167,7 @@ export class MockIptvApiClient implements IptvApiClient {
       maxConnections: 1,
       timezone: input.timezone?.trim() || 'UTC',
       enabled: true,
+      alternativeBaseUrls: input.alternativeBaseUrls ?? [],
     }
     this.sources.push(source)
     return { ...source }

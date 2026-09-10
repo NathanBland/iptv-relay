@@ -187,10 +187,12 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
       username: '',
       password: '',
       timezone: 'UTC',
+      maxConnections: 1,
+      alternativeBaseUrls: '',
     },
     validators: { onSubmit: sourceSchema },
     onSubmit: async ({ value }) => {
-      await mutation.mutateAsync(value)
+      await mutation.mutateAsync({ ...value, alternativeBaseUrls: value.alternativeBaseUrls.split('\n').map((url) => url.trim()).filter(Boolean) })
       form.reset()
     },
   })
@@ -249,6 +251,14 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
                   </label>
                 )}
               </form.Field>
+              <form.Field name="maxConnections">
+                {(field) => <label className="text-xs font-medium text-slate-300">Max connections<Input className="mt-1" type="number" min={1} value={field.state.value} onChange={(event) => field.handleChange(Number(event.target.value))} /></label>}
+              </form.Field>
+              <form.Subscribe selector={(state) => state.values.maxConnections}>
+                {(maxConnections) => maxConnections > 1 ? <form.Field name="alternativeBaseUrls">
+                  {(field) => <label className="text-xs font-medium text-slate-300">Alternative servers (optional)<textarea className="mt-1 min-h-20 w-full rounded-md border border-white/10 bg-white/5 px-3 py-2 text-sm text-white" value={field.state.value} onChange={(event) => field.handleChange(event.target.value)} placeholder="One base URL per line" /></label>}
+                </form.Field> : null}
+              </form.Subscribe>
               <form.Subscribe selector={(state) => state.values.kind}>
                 {(kind) => kind === 'Xtream' ? (
                   <>
@@ -789,10 +799,12 @@ function SourceEditDialog({
       maxConnections: source.maxConnections,
       timezone: source.timezone,
       enabled: source.enabled,
+      alternativeBaseUrls: source.alternativeBaseUrls.join('\n'),
     },
     validators: { onSubmit: sourceUpdateSchema },
     onSubmit: async ({ value }) => {
-      await onSave({ maxConnections: value.maxConnections, timezone: value.timezone.trim() || 'UTC', enabled: value.enabled })
+      const alternativeBaseUrls = value.alternativeBaseUrls.split('\n').map((url) => url.trim()).filter(Boolean)
+      await onSave({ maxConnections: value.maxConnections, timezone: value.timezone.trim() || 'UTC', enabled: value.enabled, alternativeBaseUrls })
     },
   })
 
@@ -848,6 +860,22 @@ function SourceEditDialog({
                 </span>
               </label>}
             </form.Field>
+            {form.state.values.maxConnections > 1 ? (
+              <form.Field name="alternativeBaseUrls">
+                {(field) => <label className="block text-xs font-medium text-slate-300">
+                  Alternative servers (optional)
+                  <textarea
+                    className="mt-1 min-h-20 w-full rounded-md border border-white/10 bg-white/5 px-3 py-2 text-sm text-white"
+                    value={field.state.value}
+                    onBlur={field.handleBlur}
+                    onChange={(event) => field.handleChange(event.target.value)}
+                    placeholder="One base URL per line"
+                    aria-label="Alternative servers"
+                  />
+                  <span className="mt-1 block text-[0.68rem] text-slate-500">Use one absolute HTTP(S) base URL per line.</span>
+                </label>}
+              </form.Field>
+            ) : null}
             <form.Field name="enabled">
               {(field) => <label className="flex items-center gap-2 text-xs font-medium text-slate-300">
                 <input
