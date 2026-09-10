@@ -158,6 +158,9 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
       queryClient.invalidateQueries({ queryKey: ['sources'] })
       setEditingSource(null)
     },
+    onError: (error: unknown) => {
+      setNotice(error instanceof Error ? error.message : 'Failed to update source.')
+    },
   })
 
   const syncMutation = useMutation({
@@ -545,7 +548,7 @@ export function SourcesPage({ client = apiClient }: { client?: IptvApiClient }) 
           source={editingSource}
           pending={updateSourceMutation.isPending}
           onSave={(input) =>
-            updateSourceMutation.mutate({ id: editingSource.id, input })
+            updateSourceMutation.mutateAsync({ id: editingSource.id, input }).then(() => undefined)
           }
           onClose={() => setEditingSource(null)}
         />
@@ -778,7 +781,7 @@ function SourceEditDialog({
 }: {
   source: Source
   pending: boolean
-  onSave: (input: SourceUpdateInput) => void
+  onSave: (input: SourceUpdateInput) => Promise<void>
   onClose: () => void
 }) {
   const form = useForm({
@@ -789,7 +792,7 @@ function SourceEditDialog({
     },
     validators: { onSubmit: sourceUpdateSchema },
     onSubmit: async ({ value }) => {
-      onSave({ maxConnections: value.maxConnections, timezone: value.timezone.trim() || 'UTC', enabled: value.enabled })
+      await onSave({ maxConnections: value.maxConnections, timezone: value.timezone.trim() || 'UTC', enabled: value.enabled })
     },
   })
 
@@ -860,8 +863,8 @@ function SourceEditDialog({
               <Button variant="ghost" size="sm" onClick={onClose} disabled={pending}>
                 Cancel
               </Button>
-              <form.Subscribe selector={(state) => [state.canSubmit, state.isSubmitting]}>
-                {([canSubmit, isSubmitting]) => <Button size="sm" type="submit" disabled={pending || !canSubmit || isSubmitting}>
+              <form.Subscribe selector={(state) => state.isSubmitting}>
+                {(isSubmitting) => <Button size="sm" type="submit" disabled={pending || isSubmitting}>
                   {pending || isSubmitting ? 'Wait…' : 'Save changes'}
                 </Button>}
               </form.Subscribe>
