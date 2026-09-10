@@ -417,8 +417,8 @@ async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() 
     .unwrap();
     sqlx::query(
         "INSERT INTO provider_reconciliation_candidates
-            (run_id, canonical_key, name)
-         VALUES ($1, 'channel', 'Channel')",
+            (run_id, canonical_key, name, group_name)
+         VALUES ($1, 'channel', 'Channel', 'News')",
     )
     .bind(run_id)
     .execute(&pool)
@@ -431,6 +431,17 @@ async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() 
     )
     .bind(run_id)
     .bind(stream_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let existing_channel_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO channels
+            (id, channel_number, name, enabled, managed_by, provider_account_id, canonical_key)
+         VALUES ($1, '1', 'Channel', false, 'automatic', $2, 'channel')",
+    )
+    .bind(existing_channel_id)
+    .bind(account_id)
     .execute(&pool)
     .await
     .unwrap();
@@ -471,6 +482,12 @@ async fn reconciliation_create_and_finalize_do_not_deadlock_on_snapshot_locks() 
     .await
     .unwrap();
     assert_eq!(remaining_candidates, 0);
+    let enabled: bool = sqlx::query_scalar("SELECT enabled FROM channels WHERE id = $1")
+        .bind(existing_channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!enabled, "publication must preserve a disabled channel");
 
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
@@ -1504,9 +1521,9 @@ async fn reconcile_xtream_snapshots_retain_channels_and_replace_stream_links() {
     .unwrap();
     sqlx::query(
         "INSERT INTO provider_streams \
-         (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, url_template, \
+         (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, group_name, url_template, \
           attributes, directives, supported) \
-         VALUES ($1, $2, $3, 'xtream:101', 'Xtream News', 'news.xtream', \
+         VALUES ($1, $2, $3, 'xtream:101', 'Xtream News', 'news.xtream', 'News', \
                  'https://provider.test/live/101', '{}'::jsonb, '[]'::jsonb, true)",
     )
     .bind(first_stream_id)
@@ -1529,6 +1546,42 @@ async fn reconcile_xtream_snapshots_retain_channels_and_replace_stream_links() {
     .fetch_one(&pool)
     .await
     .unwrap();
+    catalog
+        .set_channel_enabled(channel_id, false)
+        .await
+        .unwrap();
+    let new_stream_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_streams \
+         (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, group_name, url_template, \
+          attributes, directives, supported) \
+         VALUES ($1, $2, $3, 'xtream:103', 'Xtream News 2', 'news.xtream.2', 'News', \
+                 'https://provider.test/live/103', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(new_stream_id)
+    .bind(first_snapshot_id)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let grouped = catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+    assert!(grouped.channels >= 1);
+    let new_channel_enabled: bool = sqlx::query_scalar(
+        "SELECT c.enabled
+         FROM channels c
+         WHERE c.provider_account_id = $1 AND c.canonical_key = 'news.xtream.2'",
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !new_channel_enabled,
+        "new channels in a disabled group must remain disabled"
+    );
 
     let second_snapshot_id = uuid::Uuid::now_v7();
     let second_stream_id = uuid::Uuid::now_v7();
@@ -1625,6 +1678,15 @@ async fn reconcile_xtream_snapshots_retain_channels_and_replace_stream_links() {
             .await
             .unwrap();
     assert_eq!(linked_stream_ids, vec![second_stream_id]);
+    let enabled: bool = sqlx::query_scalar("SELECT enabled FROM channels WHERE id = $1")
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !enabled,
+        "provider refresh must preserve a disabled channel"
+    );
 
     drop(catalog);
     drop(database);
