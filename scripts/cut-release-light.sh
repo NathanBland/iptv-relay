@@ -24,6 +24,9 @@ find crates apps -name Cargo.toml -exec \
   sed -i.bak "s/version = \"[0-9]*\.[0-9]*\.[0-9]*\"/version = \"$version\"/g" {} +
 find . -name 'Cargo.toml.bak' -delete
 
+# Keep release builds compatible with --locked after the version bump.
+cargo check --offline
+
 git add -A
 if ! git diff --cached --quiet; then
   git commit -m "Release $tag"
