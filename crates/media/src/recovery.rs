@@ -26,6 +26,12 @@ pub enum SessionState {
 pub enum SessionFailureKind {
     UpstreamEnded,
     Http,
+    UpstreamRead,
+    ReadTimeout,
+    InvalidSync,
+    IncompleteTail,
+    RingClosed,
+    DownstreamLag,
     Packetization,
     Priming,
     RecoveryExpired,
@@ -126,6 +132,7 @@ pub struct HttpTsSessionSnapshot {
     pub reconnect_attempts: u64,
     pub failover_attempts: u64,
     pub failure_count: u64,
+    pub first_failure: Option<SessionFailureKind>,
     pub last_failure: Option<SessionFailureKind>,
     pub ring: RingSnapshot,
 }
@@ -150,6 +157,7 @@ struct DiagnosticsState {
     reconnect_attempts: u64,
     failover_attempts: u64,
     failure_count: u64,
+    first_failure: Option<SessionFailureKind>,
     last_failure: Option<SessionFailureKind>,
 }
 
@@ -176,6 +184,7 @@ impl SessionDiagnostics {
                 reconnect_attempts: 0,
                 failover_attempts: 0,
                 failure_count: 0,
+                first_failure: None,
                 last_failure: None,
             }),
         })
@@ -232,6 +241,7 @@ impl SessionDiagnostics {
     pub(crate) fn record_failure(&self, failure: SessionFailureKind) {
         let mut inner = self.inner.lock();
         inner.failure_count = inner.failure_count.saturating_add(1);
+        inner.first_failure.get_or_insert(failure);
         inner.last_failure = Some(failure);
     }
 
@@ -298,6 +308,7 @@ impl SessionDiagnostics {
             reconnect_attempts: inner.reconnect_attempts,
             failover_attempts: inner.failover_attempts,
             failure_count: inner.failure_count,
+            first_failure: inner.first_failure,
             last_failure: inner.last_failure,
             ring,
         }
@@ -376,6 +387,7 @@ mod tests {
         diagnostics.record_lag();
         diagnostics.record_reconnect(true);
         diagnostics.record_failure(SessionFailureKind::Http);
+        diagnostics.record_failure(SessionFailureKind::ReadTimeout);
 
         let snapshot = diagnostics.snapshot(ring_snapshot());
         assert_eq!(snapshot.viewer_count, 2);
@@ -385,8 +397,9 @@ mod tests {
         assert_eq!(snapshot.ring_lag_events, 1);
         assert_eq!(snapshot.reconnect_attempts, 1);
         assert_eq!(snapshot.failover_attempts, 1);
-        assert_eq!(snapshot.failure_count, 1);
-        assert_eq!(snapshot.last_failure, Some(SessionFailureKind::Http));
+        assert_eq!(snapshot.failure_count, 2);
+        assert_eq!(snapshot.first_failure, Some(SessionFailureKind::Http));
+        assert_eq!(snapshot.last_failure, Some(SessionFailureKind::ReadTimeout));
 
         drop(first);
         drop(second);

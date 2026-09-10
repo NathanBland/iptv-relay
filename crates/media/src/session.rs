@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 use crate::{
     AcquireError, BrokeredInputFormat, HttpTsSessionSnapshot, MPEG_TS_PACKET_SIZE, MpegTsRing,
     MpegTsRingConfig, PoolSnapshot, ProcessAdapterKind, ProviderSlotBroker, RecoveryPolicy,
-    RingCloseReason, RingRead, RingReadError, SessionFailureKind, SessionState,
+    RingCloseReason, RingRead, RingReadError, RingWriteError, SessionFailureKind, SessionState,
     SharedSessionRegistry, SlotLease,
     psi::PatPmtTracker,
     recovery::{SessionDiagnostics, ViewerRegistration},
@@ -893,7 +893,7 @@ async fn pump_http_ts(
     let mut active_failure = match initial_prime {
         Ok(packets) => {
             if push_packets(&ring, &diagnostics, &packets).is_err() {
-                SessionFailureKind::Packetization
+                SessionFailureKind::RingClosed
             } else {
                 diagnostics.set_state(SessionState::Streaming);
                 stream_until_failure(
@@ -1175,7 +1175,7 @@ async fn recover_session(
         let generation = ring.start_new_generation().ok()?;
         diagnostics.set_generation(generation);
         if push_packets(ring, diagnostics, &primed).is_err() {
-            diagnostics.record_failure(SessionFailureKind::Packetization);
+            diagnostics.record_failure(SessionFailureKind::RingClosed);
             return None;
         }
         diagnostics.set_state(SessionState::Streaming);
@@ -1217,12 +1217,12 @@ async fn prime_body(
     loop {
         let chunk = tokio::time::timeout_at(deadline, body.next())
             .await
-            .map_err(|_| SessionFailureKind::Priming)?
+            .map_err(|_| SessionFailureKind::ReadTimeout)?
             .ok_or(SessionFailureKind::UpstreamEnded)?
-            .map_err(|_| SessionFailureKind::Http)?;
+            .map_err(|_| SessionFailureKind::UpstreamRead)?;
         let packets = packetizer
             .push(&chunk)
-            .map_err(|_| SessionFailureKind::Packetization)?;
+            .map_err(|error| packetizer_failure(&error))?;
         for (packet_index, packet) in packets.chunks_exact(MPEG_TS_PACKET_SIZE).enumerate() {
             if retained.len() == MAX_PRIMING_PACKETS * MPEG_TS_PACKET_SIZE {
                 retained.advance(MPEG_TS_PACKET_SIZE);
@@ -1273,7 +1273,7 @@ async fn stream_until_failure(
                             adapter = ?diagnostics.adapter(),
                             "media session ring closed while publishing packets"
                         );
-                        return SessionFailureKind::Packetization;
+                        return SessionFailureKind::RingClosed;
                     }
                 }
                 Err(error) => {
@@ -1286,7 +1286,7 @@ async fn stream_until_failure(
                         error = %error,
                         "media session rejected MPEG-TS input"
                     );
-                    return SessionFailureKind::Packetization;
+                    return packetizer_failure(&error);
                 }
             },
             Ok(Some(Err(error))) => {
@@ -1299,7 +1299,7 @@ async fn stream_until_failure(
                     error = %error.without_url(),
                     "media session upstream read failed"
                 );
-                return SessionFailureKind::Http;
+                return SessionFailureKind::UpstreamRead;
             }
             Err(_) => {
                 warn!(
@@ -1311,7 +1311,7 @@ async fn stream_until_failure(
                     timeout_ms = u64::try_from(read_timeout.as_millis()).unwrap_or(u64::MAX),
                     "media session upstream read timed out"
                 );
-                return SessionFailureKind::Http;
+                return SessionFailureKind::ReadTimeout;
             }
             Ok(None) => {
                 return if packetizer.pending_bytes() == 0 {
@@ -1326,7 +1326,7 @@ async fn stream_until_failure(
                         pending_bytes = packetizer.pending_bytes(),
                         "media session upstream ended with an incomplete MPEG-TS packet"
                     );
-                    SessionFailureKind::Packetization
+                    SessionFailureKind::IncompleteTail
                 };
             }
         }
@@ -1337,13 +1337,20 @@ fn push_packets(
     ring: &MpegTsRing,
     diagnostics: &SessionDiagnostics,
     packets: &[u8],
-) -> Result<(), ()> {
+) -> Result<(), RingWriteError> {
     if packets.is_empty() {
         return Ok(());
     }
-    let outcome = ring.push(packets).map_err(|_| ())?;
+    let outcome = ring.push(packets)?;
     diagnostics.record_write(outcome.packets_overwritten);
     Ok(())
+}
+
+const fn packetizer_failure(error: &PacketizerError) -> SessionFailureKind {
+    match error {
+        PacketizerError::InvalidSyncByte { .. } => SessionFailureKind::InvalidSync,
+        PacketizerError::IncompleteTail { .. } => SessionFailureKind::IncompleteTail,
+    }
 }
 
 struct RecoveryKeepalive {
@@ -2166,7 +2173,7 @@ mod tests {
                 Instant::now() + Duration::from_millis(20),
             )
             .await,
-            Err(SessionFailureKind::Packetization)
+            Err(SessionFailureKind::InvalidSync)
         );
 
         let mut no_pat: HttpBody = Box::pin(stream::iter([Ok::<_, reqwest::Error>(Bytes::from(
@@ -2195,7 +2202,7 @@ mod tests {
                 Instant::now() + Duration::from_millis(2),
             )
             .await,
-            Err(SessionFailureKind::Priming)
+            Err(SessionFailureKind::ReadTimeout)
         );
 
         let prefixed = [
@@ -2226,7 +2233,7 @@ mod tests {
                 Instant::now() + Duration::from_millis(1),
             )
             .await,
-            Err(SessionFailureKind::Priming)
+            Err(SessionFailureKind::ReadTimeout)
         );
 
         let mut incomplete: HttpBody = Box::pin(stream::iter([Ok::<_, reqwest::Error>(
@@ -2241,7 +2248,7 @@ mod tests {
                 Duration::from_secs(1),
             )
             .await,
-            SessionFailureKind::Packetization
+            SessionFailureKind::IncompleteTail
         );
 
         let closed = MpegTsRing::new(MpegTsRingConfig::new(2, 0).unwrap());
@@ -2258,7 +2265,7 @@ mod tests {
                 Duration::from_secs(1),
             )
             .await,
-            SessionFailureKind::Packetization
+            SessionFailureKind::RingClosed
         );
         assert_eq!(push_packets(&ring, &diagnostics, &[]), Ok(()));
 

@@ -731,6 +731,7 @@ struct SessionResponse {
     reconnect_attempts: u64,
     failover_attempts: u64,
     failure_count: u64,
+    first_failure: Option<String>,
     last_failure: Option<String>,
     provider_capacity: usize,
     provider_active_sessions: usize,
@@ -6058,6 +6059,10 @@ fn session_response(
         reconnect_attempts: snapshot.reconnect_attempts,
         failover_attempts: snapshot.failover_attempts,
         failure_count: snapshot.failure_count,
+        first_failure: snapshot
+            .first_failure
+            .map(session_failure_name)
+            .map(str::to_owned),
         last_failure: snapshot
             .last_failure
             .map(session_failure_name)
@@ -6087,6 +6092,12 @@ const fn session_failure_name(failure: SessionFailureKind) -> &'static str {
     match failure {
         SessionFailureKind::UpstreamEnded => "upstream-ended",
         SessionFailureKind::Http => "http",
+        SessionFailureKind::UpstreamRead => "upstream-read",
+        SessionFailureKind::ReadTimeout => "read-timeout",
+        SessionFailureKind::InvalidSync => "invalid-sync",
+        SessionFailureKind::IncompleteTail => "incomplete-tail",
+        SessionFailureKind::RingClosed => "ring-closed",
+        SessionFailureKind::DownstreamLag => "downstream-lag",
         SessionFailureKind::Packetization => "packetization",
         SessionFailureKind::Priming => "priming",
         SessionFailureKind::RecoveryExpired => "recovery-expired",
@@ -9377,6 +9388,7 @@ mod tests {
             reconnect_attempts: 7,
             failover_attempts: 8,
             failure_count: 9,
+            first_failure: last_failure,
             last_failure,
             ring: RingSnapshot {
                 generation: 3,
@@ -10242,6 +10254,12 @@ mod tests {
         for (failure, expected) in [
             (SessionFailureKind::UpstreamEnded, "upstream-ended"),
             (SessionFailureKind::Http, "http"),
+            (SessionFailureKind::UpstreamRead, "upstream-read"),
+            (SessionFailureKind::ReadTimeout, "read-timeout"),
+            (SessionFailureKind::InvalidSync, "invalid-sync"),
+            (SessionFailureKind::IncompleteTail, "incomplete-tail"),
+            (SessionFailureKind::RingClosed, "ring-closed"),
+            (SessionFailureKind::DownstreamLag, "downstream-lag"),
             (SessionFailureKind::Packetization, "packetization"),
             (SessionFailureKind::Priming, "priming"),
             (SessionFailureKind::RecoveryExpired, "recovery-expired"),
@@ -10262,6 +10280,7 @@ mod tests {
         assert_eq!(json["viewerCount"], 2);
         assert_eq!(json["retainedPackets"], 20);
         assert_eq!(json["providerCapacity"], 3);
+        assert_eq!(json["firstFailure"], "http");
         assert_eq!(json["lastFailure"], "http");
         assert!(json.get("endpoint").is_none());
 
@@ -13025,6 +13044,7 @@ mod tests {
             reconnect_attempts: 0,
             failover_attempts: 0,
             failure_count: 0,
+            first_failure: Some("http".to_owned()),
             last_failure: Some("http".to_owned()),
             provider_capacity: 3,
             provider_active_sessions: 1,

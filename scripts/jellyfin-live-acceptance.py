@@ -29,6 +29,30 @@ ROOT = Path(__file__).resolve().parents[1]
 TERMINAL = {"succeeded", "failed", "cancelled", "dead"}
 LIVE_KEYS = {"IPTV_TEST_XMLTV_URL", "XMLTV_URL", "LIVE_ACCEPTANCE_PROVIDER_CAP", "IPTV_TEST_PROVIDER_MAX_CONNECTIONS"}
 XTREAM_KEYS = {"URL", "USER", "PWD"}
+MPEG_TS_PACKET_SIZE = 188
+
+
+class MpegTsValidator:
+    """Validate MPEG-TS data across arbitrary HTTP body boundaries."""
+
+    def __init__(self) -> None:
+        self.pending = bytearray()
+        self.bytes = 0
+        self.packets = 0
+
+    def feed(self, payload: bytes) -> None:
+        self.bytes += len(payload)
+        self.pending.extend(payload)
+        aligned = len(self.pending) // MPEG_TS_PACKET_SIZE * MPEG_TS_PACKET_SIZE
+        for offset in range(0, aligned, MPEG_TS_PACKET_SIZE):
+            if self.pending[offset] != 0x47:
+                raise RuntimeError(f"invalid MPEG-TS sync byte at packet {self.packets}")
+            self.packets += 1
+        del self.pending[:aligned]
+
+    def finish(self) -> None:
+        if self.pending:
+            raise RuntimeError(f"stream ended with {len(self.pending)} incomplete MPEG-TS bytes")
 
 
 def interrupt_runner(signum: int, _frame: Any) -> None:
@@ -269,6 +293,25 @@ def main() -> int:
         assert extract_provider_ids([{"epg_channel_id": "one"}, {"stream_id": 2}]) == {"one", "2"}
         assert provider_streams_by_number([{"num": 7, "stream_id": 42}]) == {"7": "42"}
         assert provider_records_by_number([{"num": 7, "epg_channel_id": "seven"}])["7"]["epg_channel_id"] == "seven"
+        validator = MpegTsValidator()
+        validator.feed(bytes([0x47]) + bytes(MPEG_TS_PACKET_SIZE - 1))
+        validator.feed(bytes([0x47]) + bytes(MPEG_TS_PACKET_SIZE - 1))
+        validator.finish()
+        assert validator.packets == 2
+        invalid = MpegTsValidator()
+        invalid.feed(bytes([0x47]) + bytes(MPEG_TS_PACKET_SIZE - 1))
+        try:
+            invalid.feed(bytes(MPEG_TS_PACKET_SIZE))
+            raise AssertionError("invalid MPEG-TS sync was accepted")
+        except RuntimeError as error:
+            assert "invalid MPEG-TS sync" in str(error)
+        incomplete = MpegTsValidator()
+        incomplete.feed(bytes([0x47]))
+        try:
+            incomplete.finish()
+            raise AssertionError("incomplete MPEG-TS tail was accepted")
+        except RuntimeError as error:
+            assert "incomplete MPEG-TS" in str(error)
         print("live Jellyfin acceptance self-test passed")
         return 0
     live = parse_env(ROOT / args.live_env, LIVE_KEYS)
@@ -595,18 +638,46 @@ volumes:
         if len(streams) != 2:
             raise RuntimeError("Jellyfin did not open two live streams")
         started = time.monotonic()
-        byte_counts = [0, 0]
+        stream_results: list[dict[str, Any]] = [
+            {"bytes": 0, "packets": 0, "readErrors": 0, "reconnects": 0, "terminalState": "not-started"}
+            for _ in streams
+        ]
         errors: list[BaseException] = []
+        soak_deadline = started + args.soak_seconds
 
         def consume(index: int, stream_id: str) -> None:
+            validator = MpegTsValidator()
+            first_byte_at: float | None = None
+            last_byte_at: float | None = None
             try:
                 target = f"{jf}/LiveTv/LiveStreamFiles/{urllib.parse.quote(stream_id, safe='')}/stream.ts"
                 req = urllib.request.Request(target, headers={"X-Emby-Token": jf_token, "Accept": "video/mp2t"})
-                with urllib.request.urlopen(req, timeout=args.soak_seconds + 30) as response:
-                    byte_counts[index] = len(response.read(188 * 20))
-                    time.sleep(args.soak_seconds)
+                with urllib.request.urlopen(req, timeout=min(10, args.soak_seconds + 5)) as response:
+                    stream_results[index]["terminalState"] = "consuming"
+                    while time.monotonic() < soak_deadline:
+                        payload = response.read(MPEG_TS_PACKET_SIZE * 256)
+                        if not payload:
+                            stream_results[index]["terminalState"] = "upstream-ended"
+                            raise RuntimeError("Jellyfin stream ended before the soak completed")
+                        now = time.monotonic()
+                        first_byte_at = first_byte_at or now
+                        last_byte_at = now
+                        validator.feed(payload)
+                    validator.finish()
+                    stream_results[index]["terminalState"] = "soak-complete"
             except BaseException as error:
+                stream_results[index]["readErrors"] += 1
+                stream_results[index]["terminalState"] = f"read-error:{type(error).__name__}"
                 errors.append(error)
+            finally:
+                stream_results[index].update(
+                    {
+                        "bytes": validator.bytes,
+                        "packets": validator.packets,
+                        "firstByteSeconds": round(first_byte_at - started, 3) if first_byte_at else None,
+                        "lastByteSeconds": round(last_byte_at - started, 3) if last_byte_at else None,
+                    }
+                )
 
         readers = [threading.Thread(target=consume, args=(index, stream["streamId"]), daemon=True) for index, stream in enumerate(streams)]
         for reader in readers:
@@ -621,15 +692,64 @@ volumes:
         session_channel_ids = {str(item.get("sourceId", "")) for item in sessions}
         if active != 2 or report["gatewayDuringStreams"]["distinctSessionIdentities"] < 2 or session_channel_ids != selected_gateway_ids:
             raise RuntimeError("gateway did not expose two distinct active provider sessions")
+        session_sample_count = 0
+        minimum_active = active
+        maximum_active = active
+        latest_session_details: list[dict[str, Any]] = []
+        while time.monotonic() < soak_deadline:
+            sampled_sessions, sampled_active, sampled_available = sessions_state(core, bootstrap)
+            session_sample_count += 1
+            minimum_active = min(minimum_active, sampled_active)
+            maximum_active = max(maximum_active, sampled_active)
+            latest_session_details = [
+                {
+                    "providerPoolId": item.get("providerPoolId"),
+                    "sourceId": item.get("sourceId"),
+                    "configuredGeneration": item.get("configuredGeneration"),
+                    "upstreamGeneration": item.get("upstreamGeneration"),
+                    "state": item.get("state"),
+                    "viewerCount": item.get("viewerCount"),
+                    "lagEvents": item.get("lagEvents"),
+                    "failureCount": item.get("failureCount"),
+                    "firstFailure": item.get("firstFailure"),
+                    "reconnectAttempts": item.get("reconnectAttempts"),
+                    "failoverAttempts": item.get("failoverAttempts"),
+                    "lastFailure": item.get("lastFailure"),
+                }
+                for item in sampled_sessions
+            ]
+            if sampled_active != 2 or len(sampled_sessions) != 2:
+                raise RuntimeError("gateway lost one of two sessions during the soak")
+            time.sleep(min(1, max(0, soak_deadline - time.monotonic())))
         for reader in readers:
             reader.join(args.soak_seconds + 60)
         if any(reader.is_alive() for reader in readers):
             raise RuntimeError("Jellyfin stream consumers exceeded their deadline")
         if errors:
             raise RuntimeError("Jellyfin live stream request failed") from errors[0]
-        report["streams"] = {"count": 2, "bytes": byte_counts, "durationSeconds": round(time.monotonic() - started, 2)}
-        if any(count == 0 or count % 188 for count in byte_counts):
-            raise RuntimeError("Jellyfin stream did not return MPEG-TS bytes")
+        report["streams"] = {
+            "count": 2,
+            "results": stream_results,
+            "durationSeconds": round(time.monotonic() - started, 2),
+        }
+        report["gatewayDuringStreams"].update(
+            {
+                "sampleCount": session_sample_count,
+                "minimumActiveSessions": minimum_active,
+                "maximumActiveSessions": maximum_active,
+                "finalSessions": latest_session_details,
+            }
+        )
+        minimum_last_byte = max(0.5, args.soak_seconds * 0.8)
+        if any(
+            result["packets"] == 0
+            or result["bytes"] != result["packets"] * MPEG_TS_PACKET_SIZE
+            or result["terminalState"] != "soak-complete"
+            or not isinstance(result["lastByteSeconds"], float)
+            or result["lastByteSeconds"] < minimum_last_byte
+            for result in stream_results
+        ):
+            raise RuntimeError("Jellyfin stream did not produce valid MPEG-TS for the full soak")
         for stream in streams:
             live_stream_id = stream.get("liveStreamId")
             if live_stream_id:
