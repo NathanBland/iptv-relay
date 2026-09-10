@@ -3917,7 +3917,19 @@ async fn update_source(
         enabled: request.enabled,
     };
     match repository.update_source(source_id, &update).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            if request.max_connections.is_some()
+                && let Ok(Some((pool_id, capacity))) =
+                    repository.provider_pool_capacity(source_id).await
+                && let Ok(capacity) = usize::try_from(capacity)
+                && capacity > 0
+            {
+                state
+                    .media
+                    .configure_provider(ProviderSpec::new(pool_id.to_string(), capacity));
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(PersistenceError::SourceNotFound(_)) => not_found(),
         Err(error) => persistence_error_response(error),
     }

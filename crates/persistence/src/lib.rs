@@ -1350,6 +1350,25 @@ impl SourceRepository {
         Err(PersistenceError::SourceNotFound(source_id))
     }
 
+    /// Returns the effective provider pool and capacity for a source.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn provider_pool_capacity(
+        &self,
+        source_id: Uuid,
+    ) -> Result<Option<(Uuid, i32)>, PersistenceError> {
+        sqlx::query_as::<_, (Uuid, i32)>(
+            "SELECT COALESCE(pa.connection_pool_id, pa.id),
+                    COALESCE(cp.max_connections, pa.max_connections)
+             FROM provider_accounts pa
+             LEFT JOIN connection_pools cp ON cp.id = pa.connection_pool_id
+             WHERE pa.id = $1",
+        )
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(PersistenceError::from)
+    }
+
     /// Deletes a source and all related data in one transaction.
     ///
     /// Removes the provider account or EPG source, cancels pending refresh
