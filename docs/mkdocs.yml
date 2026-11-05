@@ -58,6 +58,7 @@ nav:
       - OpenAPI Drift Check: development/openapi-drift-check.md
       - Architecture: development/architecture.md
       - Live Job Diagnostics: development/live-job-diagnostics.md
+      - Stream Slate Acceptance: development/stream-slate-acceptance.md
       - Release Images: development/releasing.md
 plugins:
   - search

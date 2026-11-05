@@ -36,9 +36,9 @@ pub use catalog::{
     ProviderReconciliationRunProgress, ProviderReconciliationUpdate, ReconcileStats,
     ReconciliationRevisionRow, ReconciliationRollbackStats, RecordingRow, RecordingRuleRow,
     RecordingStats, RegionFilterStats, RegionPrefixRow, RegionSettingsRow, ReviewCandidateRow,
-    StreamHealthPage, StreamHealthRow, StreamHealthStats, StreamHealthUpdate, StreamProbeTargetRow,
-    StreamProfileRow, SystemCounts, UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput,
-    UserRow,
+    StreamHealthPage, StreamHealthRow, StreamHealthStats, StreamHealthUpdate,
+    StreamMediaProfileRow, StreamProbeTargetRow, StreamProfileRow, SystemCounts,
+    UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput, UserRow,
 };
 pub use cleanup::{IngestCleanupRepository, IngestCleanupStats};
 

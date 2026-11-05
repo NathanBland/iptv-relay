@@ -286,6 +286,11 @@ impl HttpTsSourceSpec {
         self.viewer_delay = delay;
     }
 
+    /// Returns how far each viewer stays behind the newest data.
+    pub fn viewer_delay(&self) -> Duration {
+        self.viewer_delay
+    }
+
     pub fn set_recovery_policy(&mut self, recovery: RecoveryPolicy) {
         self.recovery = recovery;
     }
@@ -1571,6 +1576,25 @@ impl ViewerHandle {
 
     pub fn session_snapshot(&self) -> HttpTsSessionSnapshot {
         self.session.snapshot()
+    }
+
+    /// Returns the buffer state at the position of this viewer. The slate
+    /// path uses it to decide when live output can start.
+    pub fn startup_status(&self) -> crate::slate::ViewerStartupStatus {
+        let snapshot = self.session.ring.snapshot();
+        let generation = self.cursor.generation();
+        let position = self.cursor.next_sequence();
+        let buffered = snapshot.generation != generation || snapshot.next_sequence > position;
+        let lead = self
+            .session
+            .ring
+            .lead_millis(generation, position)
+            .map(std::time::Duration::from_millis);
+        crate::slate::ViewerStartupStatus {
+            buffered,
+            lead,
+            closed: snapshot.closed.is_some(),
+        }
     }
 
     /// Converts this viewer into a `Send + 'static` byte stream accepted by

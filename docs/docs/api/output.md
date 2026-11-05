@@ -50,6 +50,25 @@ curl http://localhost:8080/out/{token}/stream/{channel_path}
 
 The endpoint delivers the raw MPEG-TS stream. The media plane shares one upstream provider session across multiple viewers.
 
+### Stream slates
+
+The endpoint does not send an HTTP error for a provider problem. When live media is not available, the endpoint sends a slate. A slate is a short video with a message:
+
+| Condition | Slate message |
+|---|---|
+| The live buffer fills | Stream starting in N seconds |
+| All provider connections are in use | All tuners in use, stay tuned for one to open up |
+| The provider or the input adapter fails | Having trouble reaching this channel, retrying |
+
+The relay retries the provider while the slate plays. Each retry opens at most one provider connection, and the relay obeys the connection limit of the provider pool.
+
+- When the pool is full, the relay retries each 500 ms.
+- After a provider error, the relay waits 1 s, then 2 s, then 4 s, up to 30 s.
+
+When live media is ready, the relay splices it into the same response. The slate uses the last measured resolution, frame rate, and codecs of the channel. When no measured data exists, the slate uses 1280x720 H.264 at 30 fps with 48 kHz stereo AAC.
+
+The endpoint sends an HTTP error only for a channel without a source or for a configuration error.
+
 ## HDHomeRun emulation
 
 The HDHomeRun endpoints emulate an HDHomeRun device. Clients that require HDHomeRun discovery use these endpoints.

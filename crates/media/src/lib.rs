@@ -15,6 +15,7 @@ pub mod recovery;
 pub mod registry;
 pub mod ring;
 pub mod session;
+pub mod slate;
 
 pub use broker::{AcquireError, PoolSnapshot, ProviderSlotBroker, SlotLease};
 pub use credential_broker::{
@@ -45,4 +46,8 @@ pub use session::{
     HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSourceSpec, InputAdapterPolicy,
     MpegTsPacketizer, PacketizerError, ProviderSpec, SessionAdapterDiagnostics,
     SessionInputAdapter, SessionStartError, ViewerByteStream, ViewerHandle, ViewerStreamError,
+};
+pub use slate::{
+    MeasuredStreamProfile, SlateKind, SlateOptions, SlateProfile, SlatedOpen, SlatedStream,
+    SpliceMuxer, StartFailure, open_with_slates,
 };

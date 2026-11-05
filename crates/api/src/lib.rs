@@ -28,16 +28,15 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
 use iptv_domain::{
     ApplyRequirement, EffectiveSetting, InheritanceSource, SettingDefinition,
     SettingValidationError, resolve_settings, setting_catalog,
 };
 use iptv_media::{
-    AcquireError, FfmpegInputAdapter, HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager,
-    HttpTsSessionSnapshot, HttpTsSourceSpec, InputAdapterPolicy, MpegTsRingConfig, PoolSnapshot,
-    ProviderSpec, RingCloseReason, RingRead, SessionFailureKind, SessionStartError, SessionState,
-    SlotLease, ViewerHandle,
+    AcquireError, HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSessionSnapshot,
+    HttpTsSourceSpec, InputAdapterPolicy, MpegTsRingConfig, PoolSnapshot, ProviderSpec,
+    SessionFailureKind, SessionStartError, SessionState, SlotLease, ViewerHandle,
+    slate::{MeasuredStreamProfile, SlateOptions, SlateProfile, SlatedOpen, open_with_slates},
 };
 use iptv_persistence::{
     AuditEventRecord, CatalogRepository, ChannelPlaybackCandidateRow, ChannelPlaybackPlan,
@@ -6959,79 +6958,57 @@ async fn stream_channel(
 type StreamResult<T> = Result<T, Box<Response>>;
 
 async fn open_channel_response(state: &AppState, channel_id: Uuid) -> Response {
-    let spec = match channel_source_spec(state, channel_id).await {
-        Ok(spec) => spec,
+    let (spec, provider_stream_id) = match channel_source_spec(state, channel_id).await {
+        Ok(source) => source,
         Err(response) => return *response,
     };
-    match state.media.try_open(spec.clone()).await {
-        Ok(viewer) => {
-            passive_capture::spawn_passive_capture(
-                state.catalog_repository.as_ref(),
-                channel_id,
-                &viewer,
-            );
-            mpeg_ts_response(viewer)
-        }
-        Err(SessionStartError::Provider(AcquireError::AtCapacity { .. })) => {
-            capacity_placeholder_response(state.media.clone(), spec)
-        }
-        Err(error) => session_start_response(error),
+    let profile = slate_profile(state, provider_stream_id).await;
+    let catalog = state.catalog_repository.clone();
+    let hook: iptv_media::slate::ViewerHook = Arc::new(move |viewer: &ViewerHandle| {
+        passive_capture::spawn_passive_capture(catalog.as_ref(), channel_id, viewer);
+    });
+    let options = SlateOptions::new(profile).with_viewer_hook(hook);
+    // A provider problem never becomes an HTTP error. The client receives a
+    // slate and the relay retries within the provider pool limit.
+    match open_with_slates(state.media.clone(), spec, options).await {
+        SlatedOpen::Direct(viewer) => mpeg_ts_response(viewer),
+        SlatedOpen::Slated(stream) => mpeg_ts_body_response(Body::from_stream(stream)),
+        SlatedOpen::Failed(error) => session_start_response(error),
     }
 }
 
-fn capacity_placeholder_response(
-    media: HttpTsSessionManager,
-    source: HttpTsSourceSpec,
-) -> Response {
-    // The placeholder is a low-rate slate, so it does not need the live floor.
-    let placeholder_policy = RingPolicy {
-        max_bytes: 4 * 1024 * 1024,
-        pre_roll: Duration::from_secs(2),
-        ..RingPolicy::default()
+/// Reads the last measured media profile of the primary provider stream. A
+/// missing or failed read gives the safe default profile.
+async fn slate_profile(state: &AppState, provider_stream_id: Option<Uuid>) -> SlateProfile {
+    let (Some(catalog), Some(provider_stream_id)) =
+        (state.catalog_repository.as_ref(), provider_stream_id)
+    else {
+        return SlateProfile::default();
     };
-    let ring = match policy_ring(1_000_000, placeholder_policy) {
-        Ok(ring) => ring,
-        Err(detail) => return invalid_buffer_policy(detail),
-    };
-    let Ok(mut placeholder) = FfmpegInputAdapter::new().start_capacity_placeholder(ring) else {
-        return session_start_response(SessionStartError::Process {
-            adapter: iptv_media::SessionInputAdapter::Ffmpeg,
-        });
-    };
-    let mut cursor = placeholder.subscribe();
-    let stream = async_stream::stream! {
-        let mut retry = tokio::time::interval(Duration::from_millis(500));
-        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = retry.tick() => {
-                    if let Ok(viewer) = media.try_open(source.clone()).await {
-                        placeholder.request_shutdown();
-                        let mut live = viewer.into_byte_stream();
-                        while let Some(item) = live.next().await {
-                            yield item.map_err(|_| std::io::Error::other("live media stream failed"));
-                        }
-                        return;
-                    }
-                }
-                read = cursor.next(32) => {
-                    match read {
-                        Ok(RingRead::Packets { bytes, .. }) => yield Ok(bytes),
-                        Ok(RingRead::Lagged { .. } | RingRead::GenerationBoundary { .. }) => {}
-                        Ok(RingRead::Closed { reason: RingCloseReason::Shutdown, .. }) => return,
-                        Ok(RingRead::Closed { .. }) | Err(_) => {
-                            yield Err(std::io::Error::other("capacity placeholder stream failed"));
-                            return;
-                        }
-                    }
-                }
-            }
+    match catalog.stream_media_profile(provider_stream_id).await {
+        Ok(Some(row)) => SlateProfile::from_measured(&MeasuredStreamProfile {
+            video_codec: row.video_codec,
+            video_width: row.video_width.map(i64::from),
+            video_height: row.video_height.map(i64::from),
+            video_fps: row.video_fps,
+            audio_codec: row.audio_codec,
+            audio_channels: row.audio_channels.map(i64::from),
+            audio_sample_rate: row.audio_sample_rate.map(i64::from),
+        }),
+        Ok(None) => SlateProfile::default(),
+        Err(error) => {
+            tracing::warn!(%error, "slate profile read failed; the default profile is used");
+            SlateProfile::default()
         }
-    };
-    mpeg_ts_body_response(Body::from_stream(stream))
+    }
 }
 
-async fn channel_source_spec(state: &AppState, channel_id: Uuid) -> StreamResult<HttpTsSourceSpec> {
+/// Returns the source of a channel and the primary provider stream, if the
+/// catalog database supplies the channel.
+async fn channel_source_spec(
+    state: &AppState,
+    channel_id: Uuid,
+) -> StreamResult<(HttpTsSourceSpec, Option<Uuid>)> {
     let memory_source = {
         let catalog = state.catalog.read().await;
         catalog
@@ -7047,7 +7024,7 @@ async fn channel_source_spec(state: &AppState, channel_id: Uuid) -> StreamResult
             })
     };
     if let Some((source, channel_name)) = memory_source {
-        return in_memory_source_spec(state, &source, &channel_name);
+        return in_memory_source_spec(state, &source, &channel_name).map(|spec| (spec, None));
     }
 
     let Some(catalog) = &state.catalog_repository else {
@@ -7062,7 +7039,11 @@ async fn channel_source_spec(state: &AppState, channel_id: Uuid) -> StreamResult
         Some(primary) => ring_policy(state, &primary.provider_pool_id.to_string()).await,
         None => RingPolicy::default(),
     };
-    database_source_spec(state, &plan, policy)
+    let provider_stream_id = plan
+        .candidates
+        .first()
+        .map(|primary| primary.provider_stream_id);
+    database_source_spec(state, &plan, policy).map(|spec| (spec, provider_stream_id))
 }
 
 fn in_memory_source_spec(
@@ -11945,7 +11926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_stream_errors_are_retryable_and_redacted() {
+    async fn configured_stream_errors_become_slates_and_stay_redacted() {
         let app_state = state();
         let channel_id = Uuid::now_v7();
         app_state
@@ -11981,10 +11962,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(response.headers()[header::RETRY_AFTER], "5");
-        let body = response_text(response).await;
-        assert!(!body.contains("super-secret"));
+        // A provider error gives a retry slate, not an HTTP error. The body
+        // does not end, so the test reads only the headers.
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "video/mp2t");
+        for value in response.headers().values() {
+            assert!(!value.to_str().unwrap_or_default().contains("super-secret"));
+        }
     }
 
     #[tokio::test]
