@@ -4,6 +4,7 @@ mod catalog;
 mod cleanup;
 mod event_scan;
 mod outbox;
+mod sports_info;
 
 use std::{fmt, str::FromStr, time::Duration};
 
@@ -47,6 +48,7 @@ pub use event_scan::{
     EventScanSkip, MAX_EVENT_SCAN_SKIPS, compile_template_regex, resolve_event_timezone,
     stable_event_channel_name,
 };
+pub use sports_info::{SportsInfo, SportsTeam};
 
 /// Embedded database migrations for the service schema.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");

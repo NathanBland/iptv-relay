@@ -399,7 +399,12 @@ async fn worker() -> Result<()> {
     let repository = JobRepository::new(database.pool().clone());
     let sources = SourceRepository::new(database.pool().clone(), master_key.clone());
     let snapshots = PgSnapshotStore::new(database.pool().clone());
-    let catalog = CatalogRepository::new(database.pool().clone());
+    let mut catalog = CatalogRepository::new(database.pool().clone());
+    // An ESPN failure never stops a scan. Without a client, the scan uses parsed values.
+    match iptv_sports::EspnClient::new() {
+        Ok(client) => catalog = catalog.with_sports(client),
+        Err(error) => warn!(%error, "ESPN client did not start; sports metadata is off"),
+    }
     let worker_id = worker_id_from(|name| env::var(name));
     info!(%worker_id, "job worker started");
 

@@ -7530,3 +7530,138 @@ async fn channel_alias_key_and_override_migrations_are_idempotent() {
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
 }
+
+/// Serves the recorded ESPN scoreboards from memory. Other paths give 404.
+async fn spawn_espn_mock() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                let target = request.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let body = if target.ends_with("/hockey/nhl/scoreboard?dates=20261104") {
+                    Some(include_str!(
+                        "../../sports/tests/fixtures/nhl_scoreboard_20261104.json"
+                    ))
+                } else if target.ends_with("/hockey/nhl/scoreboard?dates=20261105") {
+                    Some(include_str!(
+                        "../../sports/tests/fixtures/nhl_scoreboard_20261105.json"
+                    ))
+                } else {
+                    None
+                };
+                let response = match body {
+                    Some(body) => format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    ),
+                    None => {
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_owned()
+                    }
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    format!("http://{address}")
+}
+
+#[tokio::test]
+async fn event_scan_stores_sports_metadata_and_survives_espn_failure() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let now = utc("2026-11-04T15:00:00Z");
+    let base_url = spawn_espn_mock().await;
+    let client = iptv_sports::EspnClient::with_config(iptv_sports::EspnClientConfig {
+        base_url,
+        ..iptv_sports::EspnClientConfig::default()
+    })
+    .unwrap();
+    let catalog = CatalogRepository::new(pool.clone()).with_sports(client);
+    // The mock has no NBA data, so the NBA lookup fails with a 404.
+    let names = [
+        "NHL: 01 - 7:30pm Senators @ Sabres [1080p]",
+        "NBA: 02 - 7:00pm Pistons @ 76ers [1080p]",
+    ];
+    let channels = seed_event_channels(&pool, "America/New_York", now, &names).await;
+    let [nhl, nba] = channels[..] else {
+        unreachable!("two channels");
+    };
+
+    let report = catalog
+        .scan_all_event_channels_at(now, &EventScanSettings::default())
+        .await
+        .unwrap();
+    assert_eq!(report.scheduled, 2, "{report:?}");
+
+    let guide = catalog.list_programmes_for_channels(&[nhl]).await.unwrap();
+    let event = guide
+        .iter()
+        .find(|programme| {
+            programme
+                .category_list()
+                .contains(&"Sports event".to_owned())
+        })
+        .unwrap_or_else(|| panic!("no sports programme: {guide:?}"));
+    assert_eq!(event.title, "Ottawa Senators at Buffalo Sabres");
+    assert_eq!(event.category_list(), ["Sports", "Sports event", "NHL"]);
+    assert_eq!(event.starts_at, utc("2026-11-05T00:30:00Z"));
+    let sports = event.sports().expect("sports metadata");
+    assert_eq!(sports.league, "NHL");
+    assert_eq!(sports.local_date.to_string(), "2026-11-04");
+    assert_eq!(sports.home.as_ref().unwrap().name, "Buffalo Sabres");
+    assert_eq!(sports.venue.as_deref(), Some("KeyBank Center"));
+    assert_eq!(
+        sports.icon_url(),
+        Some("https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/buf.png")
+    );
+    let description = event.description.as_deref().unwrap();
+    assert!(description.starts_with("Ottawa Senators at Buffalo Sabres. League: NHL."));
+    assert!(description.contains("KeyBank Center"), "{description}");
+    // The filler titles use the matchup too.
+    assert_eq!(
+        guide[0].title,
+        "Upcoming: Ottawa Senators at Buffalo Sabres, Nov 4 7:30 PM EST"
+    );
+    let stored: Value = sqlx::query_scalar(
+        "SELECT metadata FROM generated_programmes WHERE channel_id = $1 AND kind = 'event'",
+    )
+    .bind(nhl)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored["sports"]["away"]["abbreviation"], "OTT");
+    assert_eq!(stored["template"], "built-in-sports");
+
+    // An ESPN failure keeps the parsed title and the sports categories.
+    let guide = catalog.list_programmes_for_channels(&[nba]).await.unwrap();
+    let event = guide
+        .iter()
+        .find(|programme| {
+            programme
+                .category_list()
+                .contains(&"Sports event".to_owned())
+        })
+        .unwrap_or_else(|| panic!("no sports programme: {guide:?}"));
+    assert_eq!(event.title, "Pistons @ 76ers");
+    assert_eq!(event.category_list(), ["Sports", "Sports event", "NBA"]);
+    let sports = event.sports().unwrap();
+    assert!(sports.home.is_none() && sports.icon_url().is_none());
+
+    drop(catalog);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}

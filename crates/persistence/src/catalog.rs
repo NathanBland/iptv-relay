@@ -23,6 +23,7 @@ use crate::event_scan::{
     compile_template_regex, plan_event_channel_guide, resolve_event_timezone, slot_number,
     stable_event_channel_name,
 };
+use crate::sports_info::{SportsInfo, detect_league, lookup_sports_info};
 use regex::Regex;
 
 const DEFAULT_PAGE_SIZE: i64 = 100;
@@ -73,6 +74,8 @@ pub struct OutputProfileRow {
 #[derive(Clone, Debug)]
 pub struct CatalogRepository {
     pool: PgPool,
+    /// ESPN client for the event scan. `None` turns the sports enrichment off.
+    sports: Option<iptv_sports::EspnClient>,
 }
 
 /// One durable provider-catalog reconciliation checkpoint.
@@ -188,7 +191,14 @@ impl ProviderReconciliationProgress for NoopProviderReconciliationProgress {
 
 impl CatalogRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, sports: None }
+    }
+
+    /// Sets the ESPN client that the event scan uses when its settings have none.
+    #[must_use]
+    pub fn with_sports(mut self, client: iptv_sports::EspnClient) -> Self {
+        self.sports = Some(client);
+        self
     }
 
     /// Creates or returns durable work for one complete staged M3U or Xtream snapshot.
@@ -2856,7 +2866,8 @@ impl CatalogRepository {
                     p.categories,
                     p.starts_at,
                     coalesce(p.stops_at, 'infinity'::timestamptz) AS stops_at,
-                    es.name AS source_name
+                    es.name AS source_name,
+                    NULL::jsonb AS metadata
                 FROM programmes p
                 JOIN epg_channels ec ON ec.id = p.epg_channel_id
                 JOIN channel_epg_mappings m ON m.epg_channel_id = ec.id
@@ -2870,11 +2881,12 @@ impl CatalogRepository {
                     c.name AS channel_name,
                     gp.title,
                     NULL::text AS subtitle,
-                    gp.source_title AS description,
+                    coalesce(gp.metadata->>'description', gp.source_title) AS description,
                     gp.categories,
                     gp.starts_at,
                     gp.stops_at,
-                    gp.rule_name AS source_name
+                    gp.rule_name AS source_name,
+                    gp.metadata
                 FROM generated_programmes gp
                 JOIN event_channels ec ON ec.id = gp.event_channel_id
                 JOIN channels c ON c.id = gp.channel_id
@@ -3378,6 +3390,14 @@ impl CatalogRepository {
             start = end;
         }
 
+        if let Some(client) = settings.sports.as_ref().or(self.sports.as_ref()) {
+            for plan in &mut planned {
+                if in_scope(plan.template.id) && plan.state != EventChannelState::Hidden {
+                    enrich_with_sports(plan, client, now, settings).await;
+                }
+            }
+        }
+
         // Channels that a template owns. Cleanup does not touch these.
         let owned: Vec<Uuid> = planned.iter().map(|plan| plan.channel_id).collect();
         for plan in &planned {
@@ -3502,6 +3522,19 @@ impl CatalogRepository {
             } else {
                 plan.template.display_name.clone()
             };
+            let sports = plan
+                .sports
+                .as_ref()
+                .filter(|_| programme.kind == GeneratedProgrammeKind::Event);
+            let mut metadata = json!({
+                "template": plan.template.name,
+                "sourceTitle": programme.source_title,
+                "stableName": plan.stable_name,
+            });
+            if let Some(info) = sports {
+                metadata["sports"] = json!(info);
+                metadata["description"] = json!(info.description(&programme.title));
+            }
             sqlx::query(
                 r"
                 INSERT INTO generated_programmes
@@ -3524,12 +3557,11 @@ impl CatalogRepository {
             .bind(programme.starts_at)
             .bind(programme.stops_at)
             .bind(&programme.title)
-            .bind(json!(["Dynamic event", kind]))
-            .bind(json!({
-                "template": plan.template.name,
-                "sourceTitle": programme.source_title,
-                "stableName": plan.stable_name,
-            }))
+            .bind(match sports {
+                Some(info) => json!(info.categories()),
+                None => json!(["Dynamic event", kind]),
+            })
+            .bind(metadata)
             .execute(&mut *transaction)
             .await?;
         }
@@ -4483,9 +4515,17 @@ pub struct ProgrammeRow {
     pub starts_at: DateTime<Utc>,
     pub stops_at: DateTime<Utc>,
     pub source_name: Option<String>,
+    /// Metadata of a generated programme. `None` for imported programmes.
+    #[sqlx(default)]
+    pub metadata: Option<Value>,
 }
 
 impl ProgrammeRow {
+    /// Returns the sports metadata of a generated event programme.
+    pub fn sports(&self) -> Option<SportsInfo> {
+        serde_json::from_value(self.metadata.as_ref()?.get("sports")?.clone()).ok()
+    }
+
     pub fn category_list(&self) -> Vec<String> {
         self.categories
             .as_array()
@@ -4584,6 +4624,11 @@ struct PlannedEventChannel<'a> {
     event: GeneratedProgramme,
     state: EventChannelState,
     programmes: Vec<GeneratedProgramme>,
+    captures: BTreeMap<String, String>,
+    group_name: Option<String>,
+    timezone: Tz,
+    grace: Duration,
+    sports: Option<SportsInfo>,
 }
 
 #[derive(Debug)]
@@ -4754,7 +4799,45 @@ fn plan_event_channel<'a>(
         event,
         state,
         programmes,
+        captures: matched.captures,
+        group_name: stream.group_name.clone(),
+        timezone,
+        grace,
+        sports: None,
     })
+}
+
+/// Adds ESPN metadata to the event programme of one plan.
+///
+/// An ESPN error never stops the scan. The plan then keeps the parsed values.
+async fn enrich_with_sports(
+    plan: &mut PlannedEventChannel<'_>,
+    client: &iptv_sports::EspnClient,
+    now: DateTime<Utc>,
+    settings: &EventScanSettings,
+) {
+    let Some(league) = detect_league(&plan.captures, plan.group_name.as_deref()) else {
+        return;
+    };
+    let local_date = plan
+        .event
+        .starts_at
+        .with_timezone(&plan.timezone)
+        .date_naive();
+    let info = lookup_sports_info(
+        client,
+        league,
+        local_date,
+        &plan.captures,
+        plan.event.starts_at,
+    )
+    .await;
+    if let Some(matchup) = info.matchup() {
+        plan.event.title = matchup;
+        plan.programmes =
+            plan_event_channel_guide(&plan.event, plan.timezone, now, plan.grace, settings);
+    }
+    plan.sports = Some(info);
 }
 
 /// Compiles the built-in sports rules with the settings of one template.
@@ -8045,6 +8128,7 @@ mod tests {
             starts_at: Utc::now(),
             stops_at: Utc::now(),
             source_name: None,
+            metadata: None,
         };
         assert_eq!(
             row.category_list(),
@@ -8065,6 +8149,7 @@ mod tests {
             starts_at: Utc::now(),
             stops_at: Utc::now(),
             source_name: None,
+            metadata: None,
         };
         assert!(row.category_list().is_empty());
     }

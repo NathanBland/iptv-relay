@@ -23,6 +23,7 @@ iptv-ingest = { path = "../../crates/ingest", version = "0.3.1" }
 iptv-media = { path = "../../crates/media", version = "0.3.1" }
 iptv-parsers = { path = "../../crates/parsers", version = "0.3.1" }
 iptv-persistence = { path = "../../crates/persistence", version = "0.3.1" }
+iptv-sports = { path = "../../crates/sports", version = "0.3.1" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
