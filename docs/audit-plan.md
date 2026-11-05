@@ -37,6 +37,8 @@ Redaction: this document replaces the output token in all URLs with `<token>`. I
 | F11 | `/api/v1/system` reports `providerLimit: 0` when no session is active. | Low | WP6 |
 | F12 | The Xtream source timezone is `UTC`, but the provider publishes US Eastern times. | Medium | Operator action, WP4 |
 | F13 | Jellyfin shows 1080p and 20 Mbps for all relay channels, because the HDHomeRun lineup has no quality fields. | Medium | WP11 |
+| F14 | The provider sends live data in bursts with gaps of up to 27 s. The relay forwards the bursts without pacing, so transcoding clients run dry. | High | WP12 |
+| F15 | A stream that cannot start (pool full, provider error) gives an untested slate or an HTTP error. Jellyfin can fail to open the channel. | Medium | WP13 |
 
 ## 3. Findings
 
@@ -327,6 +329,49 @@ Fix options:
 
 Recommendation: use Option A. It keeps the current Jellyfin setup and gives correct values to all HDHomeRun clients. Option B is an immediate workaround that the operator can apply before Option A ships.
 
+### F14. Bursty provider delivery stalls transcoding clients
+
+The parent session measured this finding on 2026-11-04 against v0.2.20.
+
+Evidence:
+
+- The provider sends live data in bursts of 4 to 10 MB every 10 to 27 s, with no data between the bursts. All 3 active channels show this pattern.
+- The measurement came from inside the relay. The parent polled `/api/v1/sessions` each second and compared `overwrittenPackets` plus `retainedPackets`. No proxy was in the path.
+- Jellyfin's `SharedHttpStream` file and its HLS segments show the same pattern: 7 or 8 segments of 3 s each at one time, then gaps of up to 27 s.
+- The relay adds no delay. `into_byte_stream` (`crates/media/src/session.rs`) sends 32-packet batches when they arrive. Caddy uses `flush_interval -1`.
+- One remote viewer (Moonfin for Android, Pixel 7a, transcoded to about 3.8 Mbps) stalls about 15 s into playback, because the player runs out of data in a gap. Direct-play Roku and Android TV viewers report no problem.
+- The provider startup burst is 30 to 45 s of media. A 60 s pull of channel 16968 returned 100 s of media.
+- All 3 provider slots were in use by real Jellyfin viewers during the measurement.
+
+Root cause: the relay forwards the provider bursts directly. A client with a small buffer, or a Jellyfin transcode that writes segments in real time, has no data during the gaps.
+
+Fix: pace each viewer at real time from the PCR, and keep each viewer a fixed delay behind the ring head (WP12). The startup burst fills the delay, so the first viewer starts immediately.
+
+Interaction with v0.2.19: `RingPolicy::from_settings` in `crates/api/src/lib.rs` already reads `media.viewer.start_delay_seconds` as the ring pre-roll, with a default of 2 s. WP12 changes the meaning to "paced delay behind the head" and changes the default to 30 s. The value 0 must keep the current unpaced behavior.
+
+### F15. Stream start failures need slates
+
+Current state:
+
+- `capacity_placeholder_response` (`crates/api/src/lib.rs`) streams an ffmpeg `lavfi` slate with the text "No more slots available" (1280x720, 30 fps, libx264, AAC 96 kbit/s). It retries `try_open` every 500 ms, and then splices to the live stream.
+- No test on a real client covers this splice.
+- A provider error or a startup error returns an HTTP error. Jellyfin then fails to open the channel.
+
+Operator goals:
+
+- A stream must start immediately and never fail to open in Jellyfin.
+- While the buffer fills (if necessary), show "Stream starting in N seconds" with a countdown.
+- While the provider pool is full, show "All tuners in use, stay tuned for one to open up".
+- On a provider error or a startup error, show "Having trouble reaching this channel, retrying". Do not return an HTTP error.
+
+Main risk: Jellyfin probes the first seconds of the stream. It sets direct play or transcode from the slate parameters. If the live stream has a different resolution, frame rate, audio codec, audio channel count, or timestamp base, playback can fail after the splice.
+
+Mitigations:
+
+- Render each slate to agree with the last known stream profile of the channel (WP11b data). Use the same PIDs (`0x100` video, `0x101` audio).
+- At the splice, set `discontinuity_indicator`, and send a new PAT and PMT. Keep PTS and PCR monotonic, or rebase them.
+- Keep the audio layout identical between slate and live.
+
 ## 4. Work packages
 
 ### 4.1 Shared-file lanes
@@ -335,9 +380,10 @@ Recommendation: use Option A. It keeps the current Jellyfin setup and gives corr
 
 | Lane | Files | Packages, in order |
 |------|-------|--------------------|
-| API | `crates/api/src/lib.rs`, `tests/fixtures/openapi.json` | WP1, WP11a, WP5, WP7, WP8b, WP6 |
+| API | `crates/api/src/lib.rs` (except the stream handler functions), `tests/fixtures/openapi.json` | WP1, WP11a, WP5, WP7, WP8b, WP6 |
 | Persistence | `crates/persistence/src/catalog.rs`, `crates/persistence/tests/postgres.rs`, new files in `migrations/` | WP3, WP11a, WP4, WP8b |
-| Media | `crates/media/src/*`, `apps/server/src/main.rs` (health-check code only) | WP11b |
+| Media | `crates/media/src/*` (including `session.rs` `into_byte_stream` and `ring.rs`), `apps/server/src/main.rs` (health-check code only) | WP11b, WP12, WP13, WP6 |
+| Stream handlers | `crates/api/src/lib.rs` functions `stream_channel`, `open_channel_response`, `capacity_placeholder_response`, `RingPolicy`, and the passive capture hook | WP12, WP13, WP6 |
 | Web | `apps/web/src/lib/api/client.ts`, `apps/web/src/lib/api/types.ts` | WP1, WP5, WP7 |
 | Parser | `crates/domain/src/events.rs`, `crates/parsers/src/events.rs`, `tests/fixtures/events/` | WP2 |
 | Sports | new crate `crates/sports/` | WP8a |
@@ -351,13 +397,13 @@ Migration numbers: the last migration is `0074`. The v0.2.19 diff adds no migrat
 
 ```text
 Wave 0: v0.2.19 ring fix (done, on main)
-Wave 1 (parallel): WP1 (API+Web lanes)   WP2 (Parser lane)   WP3 (Persistence lane)   WP8a (Sports lane)   WP10 (read-only)
-Wave 2 (parallel): WP4 (Persistence + Worker; needs WP2, WP3)   WP5 (API + Web; needs WP1, WP3)
-Wave 3:            WP7 (API + Web; needs WP4, WP5)
-Wave 4:            WP8b (API + Persistence; needs WP4, WP7, WP8a)
-Wave 1b: WP11a (API + Persistence; after WP1 and WP3; small)
-Wave 1c: WP11b (Media; after v0.2.19; parallel with Wave 2)
-Wave 5 (parallel): WP6 (API + media/ingest; needs WP8b to clear the API lane)   WP9 (optional; after WP8b)
+Wave 1 (done):     WP1, WP2, WP3, WP8a, WP10, WP11b  -> merged on claude/audit-integration
+Wave 2a:           WP11a (API + Persistence; small)
+                   WP12 (Media + Stream handlers; parallel with WP11a, WP4, WP5)
+Wave 2b (parallel): WP4 (Persistence + Worker)   WP5 (API + Web)   WP12 continues
+Wave 3 (parallel):  WP7 (API + Web; needs WP4, WP5)   WP13 (Media + Stream handlers; needs WP11b, WP12)
+Wave 4:             WP8b (API + Persistence; needs WP4, WP7, WP8a)
+Wave 5 (parallel):  WP6 (API + Media + Stream handlers; needs WP8b, WP12, WP13)   WP9 (optional; after WP8b)
 ```
 
 ### 4.3 Model guidance
@@ -377,6 +423,8 @@ Wave 5 (parallel): WP6 (API + media/ingest; needs WP8b to clear the API lane)   
 | WP10 | Sonnet | Read-only investigation. |
 | WP11a | Haiku | Small, mechanical change to the lineup JSON, with a clear specification and tests. |
 | WP11b | Sonnet | Passive capture of stream data in the media path. It must not open extra provider connections. |
+| WP12 | Sonnet | Medium size, contained in the media crate, with a clear specification and fake-clock tests. |
+| WP13 | Opus | Large and risky. Splices must work on several real clients and on the Jellyfin transcoder. It needs design judgment and on-device test planning. |
 
 ### 4.4 Package briefs
 
@@ -474,7 +522,7 @@ Test plan:
 
 - Findings: F9 (except the ring keys) and F11.
 - Files: `crates/domain/src/config.rs`, `crates/api/src/lib.rs` (state and startup, `system_info_value`), `crates/media/src/recovery.rs`, `crates/ingest/src/*` (limits), `apps/server/src/main.rs` (if the worker reads ingest limits).
-- Depends on: v0.2.19, and on WP8b to clear the API lane.
+- Depends on: WP8b (API lane), WP12 and WP13 (they edit the same media and stream functions). WP12 owns the `media.viewer.start_delay_seconds` meaning and default; do not change them.
 
 Brief:
 
@@ -581,6 +629,49 @@ Test plan:
 
 - A unit test with a short recorded TS sample in `tests/fixtures/`.
 - After deployment, play one channel, then run `GET /api/v1/streams/health` and confirm that the stream has codec and resolution data.
+
+#### WP12. Paced viewer buffer (Sonnet)
+
+- Findings: F14.
+- Files: `crates/media/src/session.rs` (`into_byte_stream`, viewer cursor), `crates/media/src/ring.rs`, a new `crates/media/src/pacing.rs`, `crates/api/src/lib.rs` (`RingPolicy` and the session diagnostics response only), `tests/fixtures/openapi.json` if the diagnostics change.
+- Depends on: Wave 1 (done). Coordinate with WP6 and WP13: they edit the same functions. WP12 goes first.
+
+Brief:
+
+> Pace each viewer's output at real time, and keep each viewer a target delay behind the ring head. Read section F14 of `docs/audit-plan.md` first.
+> (1) Find the PCR PID from the PMT. Pace the output by PCR against a monotonic clock. Handle PCR wrap (33-bit base), discontinuities, and generation boundaries (a new generation resets the PCR reference). If no PCR exists, fall back to pacing by the measured byte rate.
+> (2) Target delay: `media.viewer.start_delay_seconds`. Change its default to 30 s. The value 0 must keep the current unpaced behavior exactly.
+> (3) The first viewer starts immediately. The provider startup burst (30 to 45 s) fills the delay; pacing holds it back. If the burst is shorter than the target, start with the data that exists.
+> (4) A late joiner gets a pre-roll equal to the delay from the ring. It must not open a new provider connection.
+> (5) Size the ring for at least `max(60 s, 2 x delay)` of media by duration, so 1080p60 at 8 Mbps or more fits. Keep the `media.ring.max_bytes` cap and the 32 MiB floor from v0.2.19.
+> (6) Add a `leadSeconds` value for each viewer to the session diagnostics.
+> (7) Tests with a fake clock: pacing timing, PCR wrap, generation boundary, delay 0 keeps the current behavior, and late-joiner pre-roll.
+> Do not change the lag recovery from v0.2.19 (skip to the next PAT/PMT boundary). Done when the tests pass, fmt and clippy pass, and the status file lists the changed settings default.
+
+Test plan:
+
+- Fake-clock unit tests.
+- After deployment: watch one channel on the Moonfin Android client with transcoding for 10 minutes, and confirm no stall. Check `leadSeconds` in `/api/v1/sessions` (GET only).
+
+#### WP13. Stream slates (Opus)
+
+- Findings: F15.
+- Files: `crates/api/src/lib.rs` (`stream_channel`, `open_channel_response`, `capacity_placeholder_response`), `crates/media/src/session.rs` (splice path), a new `crates/media/src/slate.rs`.
+- Depends on: WP11b (stream profile data) and WP12 (paced output). Coordinate with WP6.
+
+Brief:
+
+> Make each channel open immediately in Jellyfin, and never return an HTTP error for a provider problem. Read section F15 of `docs/audit-plan.md` first.
+> Add three slates: "Stream starting in N seconds" with a countdown (ffmpeg `drawtext` with `eif`) while the WP12 buffer fills, if necessary; "All tuners in use, stay tuned for one to open up" while the pool is full; and "Having trouble reaching this channel, retrying" for provider and startup errors.
+> Render each slate to agree with the last known stream profile of the channel (resolution, frame rate, video codec, audio codec, channels, sample rate) from the WP11b data. Use a safe default when no data exists. Use PIDs `0x100` and `0x101`.
+> At the splice from slate to live: set `discontinuity_indicator`, send a new PAT and PMT, and keep PTS and PCR monotonic (rebase if necessary). Keep the audio layout identical.
+> Do not open more provider connections than the pool allows. Keep the existing 500 ms `try_open` retry, and add a back-off for provider errors.
+> Write a manual acceptance plan for each slate-to-live transition on Roku, Jellyfin Android TV, Moonfin for Android, the Jellyfin web client, and the Jellyfin HLS transcoder. Done when unit tests cover slate selection and splice packet rules, and the operator completes the manual plan.
+
+Test plan:
+
+- Unit tests for slate selection and splice packets (PAT/PMT, discontinuity flag, monotonic PCR).
+- Manual on-device tests from the acceptance plan. The provider has only 3 connections, so schedule them when no other viewer is active.
 
 ## 5. Verification after all packages
 
