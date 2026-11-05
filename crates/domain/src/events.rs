@@ -202,11 +202,16 @@ pub const EVENT_TITLE_METADATA_KEY: &str = "event_title";
 #[must_use]
 pub fn builtin_sports_event_rules() -> EventRuleSet {
     const PREFIX: &str = r"(?:\[[^\]]{1,32}\]\s*|(?:event|vip|sports|slot)\s*\d*\s*[:|]\s*|(?:[A-Z]{2}\s+)?\([^()]{1,32}\)\s*:\s*)*";
-    const LEAGUE: &str = r"(?:(?P<league>NCAA(?:\s+(?:Football|Basketball|Hockey|Baseball|Soccer))?|WNBA|NFL|NHL|NBA|MLB|MLS|CFL|EPL|UFC|hockey|fc|soccer|football|basketball|baseball|rugby|cricket|tennis|golf)\s*:\s*(?:[0-9]{1,3}\s*[-\u{2013}]\s*)?)?";
+    const LEAGUE_NAMES: &str = r"NCAA(?:\s+(?:Football|Basketball|Hockey|Baseball|Soccer))?|WNBA|NFL|NHL|NBA|MLB|MLS|CFL|EPL|UFC|hockey|fc|soccer|football|basketball|baseball|rugby|cricket|tennis|golf";
+    // League, then a colon or a slot number, for example `NHL: 03 - `, `NBA: `, or `MLB 01: `.
+    // The `slot` group is the slot number of the channel when the title has one.
+    // The parser renames `slot_b` (slot before the colon) to `slot`.
+    const LEAGUE: &str = r"(?:(?P<league>NCAA(?:\s+(?:Football|Basketball|Hockey|Baseball|Soccer))?|WNBA|NFL|NHL|NBA|MLB|MLS|CFL|EPL|UFC|hockey|fc|soccer|football|basketball|baseball|rugby|cricket|tennis|golf)\b(?:\s*:\s*(?:(?P<slot>[0-9]{1,3})\b\s*(?:[-\u{2013}]\s*)?)?|\s+(?P<slot_b>[0-9]{1,3})\s*:\s*))?";
     // Text between the away team and the date: a spelled date and parenthesized tags.
     const SUFFIX: &str = r"(?:\s+[A-Za-z]{3,9}\s+[0-9]{1,2}\s+[0-9]{1,2}(?::[0-9]{2})?\s*[AP]M(?:\s+[A-Z]{2,4})?)?(?:\s+\([^()]{1,64}\))*";
     const TRAILER: &str = r"(?:\s*[-|]?\s*(?:\[[^\]]{1,32}\]|\([^()]{1,64}\)|UHD|4K|FHD|HD|SD|2160p|1080p|720p))*\s*$";
     const TIME: &str = r"[0-9]{1,2}(?::[0-9]{2})?\s*[ap]m";
+    const EXPLICIT: &str = r"20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}";
     // (label, date regex, trailing seconds regex, chrono format)
     let formats = [
         (
@@ -228,7 +233,7 @@ pub fn builtin_sports_event_rules() -> EventRuleSet {
             "%m/%d/%Y %I:%M %p",
         ),
     ];
-    let mut rules = Vec::with_capacity(formats.len() * 2 + 2);
+    let mut rules = Vec::with_capacity(formats.len() * 2 + 4);
     for (format_index, (label, date_regex, seconds, date_format)) in formats.into_iter().enumerate()
     {
         rules.push(builtin_sports_rule(
@@ -268,6 +273,35 @@ pub fn builtin_sports_event_rules() -> EventRuleSet {
         None,
         "{away} @ {home}",
     ));
+    // Matchup, `@`, spelled month and day, time, then `:LEAGUE SLOT`. The `@`
+    // separates the matchup from the date. The order of the teams does not give
+    // home and away. The year comes from the reference instant.
+    rules.push(builtin_sports_rule(
+        8,
+        "Built-in sports: vs, spelled date, trailing league".to_owned(),
+        format!(
+            r"(?i)^{PREFIX}(?P<team_a>.+?)\s+(?:v|vs|versus)\.?\s+(?P<team_b>.+?)\s+@\s+(?P<month>[A-Za-z]{{3,9}})\.?\s+(?P<day>[0-9]{{1,2}})\s+(?P<time>{TIME})(?:\s+[A-Z]{{2,4}})?\s*:\s*(?P<league>{LEAGUE_NAMES})\b(?:\s*[-\u{{2013}}]?\s*(?P<slot>[0-9]{{1,3}})\b)?{TRAILER}"
+        ),
+        None,
+        "{team_a} vs {team_b}",
+    ));
+    // League and slot, then `TEAM x TEAM start:DATE stop:DATE`. The `x` gives no
+    // home or away. The stop time sets the duration.
+    let mut explicit = builtin_sports_rule(
+        9,
+        "Built-in sports: x, explicit start and stop".to_owned(),
+        format!(
+            r"(?i)^{PREFIX}{LEAGUE}(?P<team_a>.+?)\s+(?:x|v|vs|versus)\.?\s+(?P<team_b>.+?)\s+start:\s*{EXPLICIT}\s+stop:\s*(?P<stop>{EXPLICIT}){TRAILER}"
+        ),
+        None,
+        "{team_a} vs {team_b}",
+    );
+    explicit.date_patterns = vec![DatePattern {
+        regex: format!(r"(?i)start:\s*(?P<datetime>{EXPLICIT})"),
+        format: "%Y-%m-%d %H:%M:%S".to_owned(),
+        timezone: None,
+    }];
+    rules.push(explicit);
     EventRuleSet(rules)
 }
 
@@ -354,7 +388,7 @@ mod tests {
         let first = builtin_sports_event_rules();
         let second = builtin_sports_event_rules();
         assert_eq!(first, second);
-        assert_eq!(first.len(), 8);
+        assert_eq!(first.len(), 10);
         assert_eq!(first.0[0].name, "Built-in sports: vs (ISO local time)");
         assert_eq!(first.0[1].guide.title_template, "{away} @ {home}");
         assert!(first.0.iter().all(|rule| {
@@ -363,7 +397,11 @@ mod tests {
                 && rule.guide.duration_seconds == 10_800
                 && rule.guide.filler_title == "No programs available"
                 && rule.matcher.name_regex.is_some()
-                && rule.date_patterns.len() == usize::from(!rule.name.ends_with("(time only)"))
+                && rule.date_patterns.len()
+                    == usize::from(
+                        !rule.name.ends_with("(time only)")
+                            && !rule.name.ends_with("trailing league"),
+                    )
                 && rule.metadata.get(EVENT_TITLE_METADATA_KEY) == Some(&rule.guide.title_template)
         }));
         assert_eq!(

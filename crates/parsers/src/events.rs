@@ -320,7 +320,8 @@ impl CompiledEventRules {
                 continue;
             }
             let starts_at = parse_candidate_date(compiled, candidate)?;
-            let captures = collect_captures(compiled, candidate);
+            let mut captures = collect_captures(compiled, candidate);
+            apply_stop_capture(compiled, starts_at, &mut captures)?;
             return Ok(Some(MatchedEvent {
                 rule: &compiled.rule,
                 starts_at,
@@ -329,6 +330,36 @@ impl CompiledEventRules {
         }
         Ok(None)
     }
+}
+
+/// Converts an explicit `stop` capture into a `duration_seconds` capture.
+fn apply_stop_capture(
+    compiled: &CompiledRule,
+    starts_at: Option<DateTime<Utc>>,
+    captures: &mut BTreeMap<String, String>,
+) -> Result<(), EventDateError> {
+    let (Some(start), Some(stop), Some(pattern)) = (
+        starts_at,
+        captures.get("stop").cloned(),
+        compiled.dates.first(),
+    ) else {
+        return Ok(());
+    };
+    let timezone = pattern
+        .definition
+        .timezone
+        .as_deref()
+        .unwrap_or(&compiled.rule.timezone);
+    let stop_at = parse_event_local_datetime(&stop, &pattern.definition.format, timezone)?;
+    let seconds = (stop_at - start).num_seconds();
+    if seconds <= 0 {
+        return Err(EventDateError::InvalidDate {
+            value: stop,
+            format: "stop after start".to_owned(),
+        });
+    }
+    captures.insert("duration_seconds".to_owned(), seconds.to_string());
+    Ok(())
 }
 
 fn collect_captures(
@@ -350,6 +381,9 @@ fn collect_captures(
         {
             collect_regex_captures(Some(&date.regex), input, &mut values);
         }
+    }
+    if let Some(slot) = values.remove("slot_b") {
+        values.entry("slot".to_owned()).or_insert(slot);
     }
     values
 }
@@ -709,7 +743,7 @@ fn stable_event_key(
     source_title: &str,
     starts_at: DateTime<Utc>,
 ) -> String {
-    let mut identity = ["league", "home", "away", "event"]
+    let mut identity = ["league", "home", "away", "team_a", "team_b", "event"]
         .into_iter()
         .filter_map(|field| matched.captures.get(field))
         .map(|value| normalize_identity(value))
@@ -896,6 +930,76 @@ pub fn resolve_time_only_start(
     Ok(today)
 }
 
+/// Resolves a start from a month name, a day, and a clock time with no year.
+///
+/// The year is the one that puts the date nearest to the local date of
+/// `reference`. A nonexistent or ambiguous local time fails closed.
+///
+/// # Errors
+///
+/// Returns [`EventDateError`] for an unknown month, an invalid date or time,
+/// an unknown timezone, or a daylight saving conflict.
+pub fn resolve_spelled_date_start(
+    month: &str,
+    day: &str,
+    time: &str,
+    reference: DateTime<Utc>,
+    timezone: &str,
+) -> Result<DateTime<Utc>, EventDateError> {
+    let invalid = |value: String| EventDateError::InvalidDate {
+        value,
+        format: "month day time".to_owned(),
+    };
+    let lowered = month.to_ascii_lowercase();
+    let month_number = MONTHS
+        .iter()
+        .position(|name| lowered.len() >= 3 && name.starts_with(&lowered))
+        .and_then(|index| u32::try_from(index + 1).ok())
+        .ok_or_else(|| invalid(format!("{month} {day}")))?;
+    let day_number: u32 = day.parse().map_err(|_| invalid(format!("{month} {day}")))?;
+    let clock = parse_clock_time(time)?;
+    let tz =
+        Tz::from_str(timezone).map_err(|_| EventDateError::UnknownTimezone(timezone.to_owned()))?;
+    let local_reference = reference.with_timezone(&tz).date_naive();
+    let date = (-1..=1)
+        .filter_map(|offset| {
+            NaiveDate::from_ymd_opt(
+                chrono::Datelike::year(&local_reference) + offset,
+                month_number,
+                day_number,
+            )
+        })
+        .min_by_key(|date| (*date - local_reference).num_days().abs())
+        .ok_or_else(|| invalid(format!("{month} {day}")))?;
+    let naive = date.and_time(clock);
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(value) => Ok(value.with_timezone(&Utc)),
+        LocalResult::Ambiguous(_, _) => Err(EventDateError::AmbiguousLocalTime {
+            value: naive.to_string(),
+            timezone: tz.name().to_owned(),
+        }),
+        LocalResult::None => Err(EventDateError::NonexistentLocalTime {
+            value: naive.to_string(),
+            timezone: tz.name().to_owned(),
+        }),
+    }
+}
+
+const MONTHS: [&str; 12] = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+];
+
 impl MatchedEvent<'_> {
     /// Returns the start instant, resolving a time-only match when needed.
     ///
@@ -914,10 +1018,15 @@ impl MatchedEvent<'_> {
         if self.starts_at.is_some() {
             return Ok(self.starts_at);
         }
-        self.captures
-            .get("time")
-            .map(|time| resolve_time_only_start(time, reference, timezone))
-            .transpose()
+        let Some(time) = self.captures.get("time") else {
+            return Ok(None);
+        };
+        match (self.captures.get("month"), self.captures.get("day")) {
+            (Some(month), Some(day)) => {
+                resolve_spelled_date_start(month, day, time, reference, timezone).map(Some)
+            }
+            _ => resolve_time_only_start(time, reference, timezone).map(Some),
+        }
     }
 }
 
@@ -1784,6 +1893,21 @@ mod tests {
                 text("time").as_ref(),
                 "{name}"
             );
+            for key in ["slot", "team_a", "team_b"] {
+                assert_eq!(
+                    matched.captures.get(key),
+                    text(key).as_ref(),
+                    "{name} {key}"
+                );
+            }
+            assert_eq!(
+                matched.captures.get("duration_seconds"),
+                entry["duration_seconds"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .as_ref(),
+                "{name}"
+            );
             let expected_start: DateTime<Utc> =
                 entry["starts_at"].as_str().unwrap().parse().unwrap();
             if entry["time"].is_null() {
@@ -1805,6 +1929,67 @@ mod tests {
             .unwrap();
             assert!(guide.iter().any(|item| item.title == title), "{name}");
         }
+    }
+
+    #[test]
+    fn spelled_date_resolves_year_nearest_to_reference() {
+        let at = |reference: &str, month: &str, day: &str| {
+            resolve_spelled_date_start(
+                month,
+                day,
+                "7:00 PM",
+                reference.parse().unwrap(),
+                "America/New_York",
+            )
+            .map(|value| value.to_rfc3339())
+        };
+        assert_eq!(
+            at("2026-11-04T15:00:00Z", "Nov", "4").unwrap(),
+            "2026-11-05T00:00:00+00:00"
+        );
+        assert_eq!(
+            at("2026-12-31T20:00:00Z", "January", "2").unwrap(),
+            "2027-01-03T00:00:00+00:00"
+        );
+        assert_eq!(
+            at("2027-01-01T20:00:00Z", "Dec", "30").unwrap(),
+            "2026-12-31T00:00:00+00:00"
+        );
+        assert!(matches!(
+            at("2026-11-04T15:00:00Z", "Foo", "4"),
+            Err(EventDateError::InvalidDate { .. })
+        ));
+        assert!(at("2026-11-04T15:00:00Z", "Nov", "31").is_err());
+    }
+
+    #[test]
+    fn at_rules_keep_away_at_home_meaning_and_capture_slot() {
+        let compiled = CompiledEventRules::new(builtin_sports_event_rules()).unwrap();
+        let candidate = EventCandidate {
+            name: "NHL: 03 - 10pm Sharks @ Kings [1080p]",
+            group: None,
+            epg_title: None,
+            categories: &[],
+            metadata: &EMPTY_METADATA,
+        };
+        let matched = compiled.first_match(&candidate).unwrap().unwrap();
+        assert_eq!(matched.captures["away"], "Sharks");
+        assert_eq!(matched.captures["home"], "Kings");
+        assert_eq!(matched.captures["slot"], "03");
+        assert!(!matched.captures.contains_key("team_a"));
+    }
+
+    #[test]
+    fn explicit_stop_before_start_fails_closed() {
+        let compiled = CompiledEventRules::new(builtin_sports_event_rules()).unwrap();
+        let candidate = EventCandidate {
+            name: "MLB 01:  Brewers x Rays start:2026-10-28 08:00:00 stop:2026-10-28 07:13:20 [1080p]",
+            group: None,
+            epg_title: None,
+            categories: &[],
+            metadata: &EMPTY_METADATA,
+        };
+        assert!(compiled.first_match(&candidate).is_err());
     }
 
     #[test]
