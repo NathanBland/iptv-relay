@@ -136,6 +136,9 @@ pub struct HttpTsSessionSnapshot {
     pub failure_count: u64,
     pub first_failure: Option<SessionFailureKind>,
     pub last_failure: Option<SessionFailureKind>,
+    /// Media milliseconds between each viewer and the newest data, one entry for
+    /// each viewer in registration order. A viewer with no timing data has no entry.
+    pub viewer_lead_millis: Vec<u64>,
     pub ring: RingSnapshot,
 }
 
@@ -320,8 +323,20 @@ impl SessionDiagnostics {
             failure_count: inner.failure_count,
             first_failure: inner.first_failure,
             last_failure: inner.last_failure,
+            viewer_lead_millis: Vec::new(),
             ring,
         }
+    }
+
+    /// Positions of all viewers in registration order.
+    pub(crate) fn viewer_positions(&self) -> Vec<(u64, u64)> {
+        let inner = self.inner.lock();
+        let mut ids: Vec<_> = inner.viewers.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .filter_map(|id| inner.viewers.get(&id))
+            .map(|viewer| (viewer.generation, viewer.next_sequence))
+            .collect()
     }
 }
 

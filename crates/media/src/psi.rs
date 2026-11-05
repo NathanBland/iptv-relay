@@ -71,6 +71,16 @@ impl PatPmtTracker {
             .zip(self.last_program_number)
     }
 
+    /// Returns the PCR PID of the most recently validated PMT.
+    pub(crate) fn pcr_pid(&self) -> Option<u16> {
+        let (section, _) = self.completed_pmt()?;
+        // PMT layout: 8 header bytes, then 3 reserved bits and a 13-bit PCR PID.
+        let high = *section.get(8)?;
+        let low = *section.get(9)?;
+        let pid = (u16::from(high & 0x1f) << 8) | u16::from(low);
+        (pid != 0x1fff).then_some(pid)
+    }
+
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
