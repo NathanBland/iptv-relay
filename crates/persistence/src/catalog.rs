@@ -1820,7 +1820,7 @@ impl CatalogRepository {
     /// # Errors
     ///
     /// Returns [`PersistenceError::Database`] when the query fails.
-    #[allow(clippy::missing_errors_doc)]
+    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
     pub async fn list_channels(
         &self,
         query: ChannelQuery,
@@ -1881,6 +1881,9 @@ impl CatalogRepository {
                 c.id,
                 c.channel_number,
                 c.name,
+                c.name AS provider_name,
+                coalesce(c.name_override, channel_alias.canonical_name, c.name) AS output_name,
+                c.name_override,
                 coalesce(c.group_name, 'Uncategorized') AS group_name,
                 c.logo_url,
                 c.enabled,
@@ -1888,6 +1891,14 @@ impl CatalogRepository {
                 coalesce(m.epg_mapped, false) AS epg_mapped
             FROM page_ids
             JOIN channels c ON c.id = page_ids.id
+            LEFT JOIN LATERAL (
+                SELECT ca.canonical_name
+                FROM channel_aliases ca
+                WHERE normalize_channel_alias_key(ca.alias) = normalize_channel_alias_key(c.name)
+                   OR normalize_channel_alias_key(ca.canonical_name) = normalize_channel_alias_key(c.name)
+                ORDER BY ca.canonical_name
+                LIMIT 1
+            ) channel_alias ON true
             LEFT JOIN (
                 SELECT channel_id, count(*) AS stream_count
                 FROM channel_streams
@@ -2484,6 +2495,9 @@ impl CatalogRepository {
                 c.id,
                 c.channel_number,
                 c.name,
+                c.name AS provider_name,
+                coalesce(c.name_override, c.name) AS output_name,
+                c.name_override,
                 coalesce(c.group_name, 'Uncategorized') AS group_name,
                 c.logo_url,
                 c.enabled,
@@ -2672,7 +2686,10 @@ impl CatalogRepository {
             SELECT
                 c.id,
                 c.channel_number,
-                coalesce(channel_alias.canonical_name, c.name) AS name,
+                coalesce(c.name_override, channel_alias.canonical_name, c.name) AS name,
+                c.name AS provider_name,
+                coalesce(c.name_override, channel_alias.canonical_name, c.name) AS output_name,
+                c.name_override,
                 coalesce(c.group_name, 'Uncategorized') AS group_name,
                 c.logo_url,
                 c.enabled,
@@ -2683,8 +2700,8 @@ impl CatalogRepository {
             LEFT JOIN LATERAL (
                 SELECT ca.canonical_name
                 FROM channel_aliases ca
-                WHERE normalize_channel_name(ca.alias) = normalize_channel_name(c.name)
-                   OR normalize_channel_name(ca.canonical_name) = normalize_channel_name(c.name)
+                WHERE normalize_channel_alias_key(ca.alias) = normalize_channel_alias_key(c.name)
+                   OR normalize_channel_alias_key(ca.canonical_name) = normalize_channel_alias_key(c.name)
                 ORDER BY ca.canonical_name
                 LIMIT 1
             ) channel_alias ON true
@@ -4194,11 +4211,21 @@ pub struct ProgrammeQuery {
     pub offset: Option<i64>,
 }
 
+/// Maximum characters in a channel name override.
+pub const MAX_CHANNEL_NAME_OVERRIDE_CHARS: usize = 200;
+
 #[derive(Clone, Debug, FromRow, Serialize)]
 pub struct ChannelRow {
     pub id: Uuid,
     pub channel_number: String,
+    /// Name for the query context. Output queries return the effective name.
     pub name: String,
+    /// Raw provider name from `channels.name`.
+    pub provider_name: String,
+    /// Effective name: override, then alias canonical name, then provider name.
+    pub output_name: String,
+    /// Operator override from `channels.name_override`, when set.
+    pub name_override: Option<String>,
     pub group_name: String,
     pub logo_url: Option<String>,
     pub enabled: bool,
@@ -5987,6 +6014,52 @@ impl CatalogRepository {
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    /// Sets or clears the operator name override of a channel.
+    ///
+    /// The value is trimmed. An empty value or `None` stores `NULL`. Returns
+    /// `Ok(false)` when the channel does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::InvalidSource`] when the trimmed value has
+    /// more than 200 characters. Returns [`PersistenceError::Database`] when
+    /// the query fails.
+    pub async fn set_channel_name_override(
+        &self,
+        channel_id: Uuid,
+        name_override: Option<&str>,
+    ) -> Result<bool, PersistenceError> {
+        let value = name_override.map(str::trim).filter(|v| !v.is_empty());
+        if value.is_some_and(|v| v.chars().count() > MAX_CHANNEL_NAME_OVERRIDE_CHARS) {
+            return Err(PersistenceError::InvalidSource(format!(
+                "channel name override must have at most {MAX_CHANNEL_NAME_OVERRIDE_CHARS} characters"
+            )));
+        }
+        let result = sqlx::query(
+            r"
+            UPDATE channels
+            SET name_override = $2,
+                updated_at = now(),
+                revision = revision + 1
+            WHERE id = $1
+              AND name_override IS DISTINCT FROM $2
+            ",
+        )
+        .bind(channel_id)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM channels WHERE id = $1)")
+                .bind(channel_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(exists)
     }
 
     /// Deletes a channel alias.

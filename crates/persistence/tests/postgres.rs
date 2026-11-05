@@ -6947,3 +6947,257 @@ async fn dead_letter_list_paginates_and_filters_by_kind_and_resolution() {
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
 }
+
+async fn insert_test_channel(pool: &sqlx::PgPool, name: &str, number: &str) -> uuid::Uuid {
+    let account_id = uuid::Uuid::now_v7();
+    let channel_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .bind(format!("Alias account {account_id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO channels (id, channel_number, name, group_name, provider_account_id, canonical_key) VALUES ($1, $2, $3, 'sports', $4, $5)",
+    )
+    .bind(channel_id)
+    .bind(number)
+    .bind(name)
+    .bind(account_id)
+    .bind(format!("key-{channel_id}"))
+    .execute(pool)
+    .await
+    .unwrap();
+    channel_id
+}
+
+#[tokio::test]
+async fn alias_renames_prefixed_provider_channel_in_output() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+
+    let channel_id = insert_test_channel(&pool, "USA: NHL NETWORK [1080p]", "9001").await;
+    catalog
+        .create_channel_alias(&CreateChannelAliasInput {
+            canonical_name: "NHL Network".to_owned(),
+            alias: "NHL Network HD".to_owned(),
+            country: None,
+            category: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .ensure_environment_output_profile(OutputProfileTokenHash::from_sha256([7_u8; 32]), 2)
+        .await
+        .unwrap();
+
+    let rows = catalog
+        .list_enabled_channels_for_output_profile(ENVIRONMENT_OUTPUT_PROFILE_ID)
+        .await
+        .unwrap();
+    let row = rows.iter().find(|row| row.id == channel_id).unwrap();
+    assert_eq!(row.name, "NHL Network");
+    assert_eq!(row.output_name, "NHL Network");
+    assert_eq!(row.provider_name, "USA: NHL NETWORK [1080p]");
+    assert_eq!(row.name_override, None);
+
+    let page = catalog
+        .list_channels(iptv_persistence::ChannelQuery::default())
+        .await
+        .unwrap();
+    let listed = page.items.iter().find(|row| row.id == channel_id).unwrap();
+    assert_eq!(listed.name, "USA: NHL NETWORK [1080p]");
+    assert_eq!(listed.output_name, "NHL Network");
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn name_override_has_precedence_over_alias_and_validates_input() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+
+    let channel_id = insert_test_channel(&pool, "USA: NHL NETWORK [1080p]", "9002").await;
+    catalog
+        .create_channel_alias(&CreateChannelAliasInput {
+            canonical_name: "NHL Network".to_owned(),
+            alias: "NHL Network HD".to_owned(),
+            country: None,
+            category: None,
+        })
+        .await
+        .unwrap();
+    catalog
+        .ensure_environment_output_profile(OutputProfileTokenHash::from_sha256([8_u8; 32]), 2)
+        .await
+        .unwrap();
+
+    assert!(
+        catalog
+            .set_channel_name_override(channel_id, Some("  My Hockey  "))
+            .await
+            .unwrap()
+    );
+    let rows = catalog
+        .list_enabled_channels_for_output_profile(ENVIRONMENT_OUTPUT_PROFILE_ID)
+        .await
+        .unwrap();
+    let row = rows.iter().find(|row| row.id == channel_id).unwrap();
+    assert_eq!(row.name, "My Hockey");
+    assert_eq!(row.name_override.as_deref(), Some("My Hockey"));
+    assert_eq!(row.provider_name, "USA: NHL NETWORK [1080p]");
+
+    // An empty value clears the override and the alias applies again.
+    catalog
+        .set_channel_name_override(channel_id, Some("   "))
+        .await
+        .unwrap();
+    let rows = catalog
+        .list_enabled_channels_for_output_profile(ENVIRONMENT_OUTPUT_PROFILE_ID)
+        .await
+        .unwrap();
+    let row = rows.iter().find(|row| row.id == channel_id).unwrap();
+    assert_eq!(row.name, "NHL Network");
+    assert_eq!(row.name_override, None);
+
+    let too_long = "x".repeat(201);
+    let error = catalog
+        .set_channel_name_override(channel_id, Some(&too_long))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PersistenceError::InvalidSource(_)));
+    assert!(
+        !catalog
+            .set_channel_name_override(uuid::Uuid::now_v7(), Some("Missing"))
+            .await
+            .unwrap()
+    );
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn reconciliation_keeps_channel_name_override() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, 'Override account', 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, record_count) VALUES ($1, $2, 'm3u', 'active', $3, 1, 1)",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .bind(snapshot_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, tvg_id, channel_number, url_template, attributes, directives, supported) VALUES ($1, $2, $3, 'k', 'NHL: 01 - Senators @ Sabres', 'nhl.01', '8.1', 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(snapshot_id)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+    let channel_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM channels WHERE provider_account_id = $1")
+            .bind(account_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    catalog
+        .set_channel_name_override(channel_id, Some("Sens vs Sabres"))
+        .await
+        .unwrap();
+
+    // The provider renames the stream. Reconciliation rewrites `name` only.
+    sqlx::query("UPDATE provider_streams SET name = 'NHL: 01 - Bruins @ Leafs' WHERE provider_account_id = $1")
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    catalog
+        .reconcile_provider_account(account_id)
+        .await
+        .unwrap();
+
+    let (name, name_override): (String, Option<String>) =
+        sqlx::query_as("SELECT name, name_override FROM channels WHERE id = $1")
+            .bind(channel_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(name, "NHL: 01 - Bruins @ Leafs");
+    assert_eq!(name_override.as_deref(), Some("Sens vs Sabres"));
+
+    drop(catalog);
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn channel_alias_key_and_override_migrations_are_idempotent() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+
+    for sql in [
+        include_str!("../../../migrations/0075_channel_alias_key.sql"),
+        include_str!("../../../migrations/0076_channel_name_override.sql"),
+        include_str!("../../../migrations/0075_channel_alias_key.sql"),
+        include_str!("../../../migrations/0076_channel_name_override.sql"),
+    ] {
+        sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+    }
+    let key: String =
+        sqlx::query_scalar("SELECT normalize_channel_alias_key('USA: NHL NETWORK [1080p]')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(key, "nhl network");
+
+    drop(pool);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
