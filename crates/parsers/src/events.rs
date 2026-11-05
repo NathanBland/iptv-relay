@@ -1,7 +1,7 @@
 use crate::{Diagnostic, DiagnosticCode, ParseError, ParseLimits, ParseStats};
-use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
-use iptv_domain::{DatePattern, EventRule, EventRuleSet};
+use iptv_domain::{DatePattern, EVENT_TITLE_METADATA_KEY, EventRule, EventRuleSet};
 use regex::Regex;
 use serde::Deserialize;
 use std::{
@@ -93,6 +93,8 @@ pub enum EventDateError {
     AmbiguousLocalTime { value: String, timezone: String },
     #[error("event date {value:?} does not exist in timezone {timezone}")]
     NonexistentLocalTime { value: String, timezone: String },
+    #[error("event time {0:?} is not a valid clock time")]
+    InvalidTime(String),
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -365,9 +367,13 @@ fn collect_regex_captures(
     };
     for name in regex.capture_names().flatten() {
         if let Some(value) = captures.name(name) {
-            values
-                .entry(name.to_owned())
-                .or_insert_with(|| value.as_str().trim().to_owned());
+            values.entry(name.to_owned()).or_insert_with(|| {
+                value
+                    .as_str()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
         }
     }
 }
@@ -515,11 +521,8 @@ fn build_event_programme(
         .checked_add_signed(duration)
         .and_then(|value| value.checked_add_signed(post_roll))
         .ok_or(EventGuideError::DateOverflow)?;
-    let title = render_event_title(
-        &matched.rule.guide.title_template,
-        source_title,
-        &matched.captures,
-    )?;
+    let title =
+        render_matched_event_title(matched, source_title, &matched.rule.guide.title_template)?;
     Ok(GeneratedProgramme {
         starts_at: event_start,
         stops_at: event_end,
@@ -619,10 +622,61 @@ fn filler(
     }
 }
 
+/// Renders a title or channel-name template for a matched event.
+///
+/// Supported fields: `{source}` and `{title}` (the provider title), `{event}`
+/// (the default title of the matched rule, for example `{away} @ {home}`), and
+/// any named regex capture.
+///
+/// The default title comes from the rule metadata key `event_title`. If the
+/// rule has no such key, `{event}` is `{away} @ {home}` when both teams are
+/// captured. Otherwise `{event}` is the provider title.
+///
+/// # Errors
+///
+/// Returns [`EventGuideError::UnknownTemplateField`] when the template, or the
+/// default title, references a field that is not available.
+pub fn render_matched_event_title(
+    matched: &MatchedEvent<'_>,
+    source_title: &str,
+    template: &str,
+) -> Result<String, EventGuideError> {
+    let default_title = matched
+        .rule
+        .metadata
+        .get(EVENT_TITLE_METADATA_KEY)
+        .map(String::as_str)
+        .filter(|value| !value.contains("{event}"))
+        .unwrap_or(
+            if matched.captures.contains_key("home") && matched.captures.contains_key("away") {
+                "{away} @ {home}"
+            } else {
+                "{source}"
+            },
+        );
+    render_event_title(template, source_title, &matched.captures, default_title)
+}
+
 fn render_event_title(
     template: &str,
     source_title: &str,
     captures: &BTreeMap<String, String>,
+    default_title: &str,
+) -> Result<String, EventGuideError> {
+    let mut rendered = render_template(template, source_title, captures, None)?;
+    if template.contains("{event}") {
+        // Render the default title once, with no further `{event}` expansion.
+        let event = render_template(default_title, source_title, captures, None)?;
+        rendered = render_template(template, source_title, captures, Some(&event))?;
+    }
+    Ok(rendered)
+}
+
+fn render_template(
+    template: &str,
+    source_title: &str,
+    captures: &BTreeMap<String, String>,
+    event: Option<&str>,
 ) -> Result<String, EventGuideError> {
     let mut rendered = String::with_capacity(template.len() + source_title.len());
     let mut remaining = template;
@@ -633,13 +687,15 @@ fn render_event_title(
             return Err(EventGuideError::UnknownTemplateField(after_open.to_owned()));
         };
         let field = &after_open[..close];
-        let value = if matches!(field, "source" | "title") {
-            source_title
-        } else {
-            captures
+        let value = match (field, event) {
+            ("source" | "title", _) => source_title,
+            ("event", Some(event)) => event,
+            // First pass only validates other fields; `{event}` is deferred.
+            ("event", None) => "",
+            _ => captures
                 .get(field)
                 .map(String::as_str)
-                .ok_or_else(|| EventGuideError::UnknownTemplateField(field.to_owned()))?
+                .ok_or_else(|| EventGuideError::UnknownTemplateField(field.to_owned()))?,
         };
         rendered.push_str(value);
         remaining = &after_open[close + 1..];
@@ -755,6 +811,114 @@ fn parse_candidate_date(
         }
     }
     Ok(None)
+}
+
+/// Longest time that a time-only event can be in the past and still count as
+/// the same local day. Later times roll to the next local day.
+const TIME_ONLY_LOOKBACK_HOURS: i64 = 12;
+
+/// Parses a clock time such as `7:30pm`, `10 PM`, or `19:30`.
+///
+/// # Errors
+///
+/// Returns [`EventDateError::InvalidTime`] when the text is not a valid time.
+pub fn parse_clock_time(value: &str) -> Result<NaiveTime, EventDateError> {
+    let invalid = || EventDateError::InvalidTime(value.to_owned());
+    let normalized = value.trim().to_ascii_lowercase().replace(' ', "");
+    let (digits, meridiem) = if let Some(rest) = normalized.strip_suffix("am") {
+        (rest, Some(false))
+    } else if let Some(rest) = normalized.strip_suffix("pm") {
+        (rest, Some(true))
+    } else {
+        (normalized.as_str(), None)
+    };
+    let (hour, minute) = match digits.split_once(':') {
+        Some((hour, minute)) => (hour, minute),
+        None if meridiem.is_some() => (digits, "0"),
+        None => return Err(invalid()),
+    };
+    let hour: u32 = hour.parse().map_err(|_| invalid())?;
+    let minute: u32 = minute.parse().map_err(|_| invalid())?;
+    let hour = match meridiem {
+        Some(pm) => {
+            if !(1..=12).contains(&hour) {
+                return Err(invalid());
+            }
+            hour % 12 + if pm { 12 } else { 0 }
+        }
+        None => hour,
+    };
+    NaiveTime::from_hms_opt(hour, minute, 0).ok_or_else(invalid)
+}
+
+/// Resolves a time-only event name to a UTC start instant.
+///
+/// The date is the local date of `reference` in `timezone`. If that start is
+/// more than 12 hours before `reference`, the date is the next local day. This
+/// handles a late scan with an early-morning event. The function is pure and
+/// uses no clock.
+///
+/// # Errors
+///
+/// Returns [`EventDateError`] for an invalid time, an unknown timezone, or a
+/// local time that does not exist or is ambiguous (daylight saving change).
+pub fn resolve_time_only_start(
+    time: &str,
+    reference: DateTime<Utc>,
+    timezone: &str,
+) -> Result<DateTime<Utc>, EventDateError> {
+    let clock = parse_clock_time(time)?;
+    let tz =
+        Tz::from_str(timezone).map_err(|_| EventDateError::UnknownTimezone(timezone.to_owned()))?;
+    let date = reference.with_timezone(&tz).date_naive();
+    let resolve = |date: NaiveDate| -> Result<DateTime<Utc>, EventDateError> {
+        let naive = date.and_time(clock);
+        match tz.from_local_datetime(&naive) {
+            LocalResult::Single(value) => Ok(value.with_timezone(&Utc)),
+            LocalResult::Ambiguous(_, _) => Err(EventDateError::AmbiguousLocalTime {
+                value: naive.to_string(),
+                timezone: tz.name().to_owned(),
+            }),
+            LocalResult::None => Err(EventDateError::NonexistentLocalTime {
+                value: naive.to_string(),
+                timezone: tz.name().to_owned(),
+            }),
+        }
+    };
+    let today = resolve(date)?;
+    if today < reference - Duration::hours(TIME_ONLY_LOOKBACK_HOURS) {
+        let tomorrow = date.succ_opt().ok_or_else(|| EventDateError::InvalidDate {
+            value: date.to_string(),
+            format: "next local day".to_owned(),
+        })?;
+        return resolve(tomorrow);
+    }
+    Ok(today)
+}
+
+impl MatchedEvent<'_> {
+    /// Returns the start instant, resolving a time-only match when needed.
+    ///
+    /// A match with `starts_at` returns that value. A match with a `time`
+    /// capture and no date resolves through [`resolve_time_only_start`] in
+    /// `timezone`. Otherwise the result is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventDateError`] when the time cannot be resolved.
+    pub fn resolve_start(
+        &self,
+        reference: DateTime<Utc>,
+        timezone: &str,
+    ) -> Result<Option<DateTime<Utc>>, EventDateError> {
+        if self.starts_at.is_some() {
+            return Ok(self.starts_at);
+        }
+        self.captures
+            .get("time")
+            .map(|time| resolve_time_only_start(time, reference, timezone))
+            .transpose()
+    }
 }
 
 fn parse_event_local_datetime(
@@ -1570,5 +1734,217 @@ mod tests {
         .unwrap();
         assert_eq!(outside.len(), 1);
         assert_eq!(outside[0].kind, GeneratedProgrammeKind::Filler);
+    }
+
+    const LIVE_TITLES: &str = include_str!("../../../tests/fixtures/events/live-titles.json");
+
+    #[test]
+    fn builtin_rules_match_live_provider_titles() {
+        let fixture: serde_json::Value = serde_json::from_str(LIVE_TITLES).unwrap();
+        let timezone = fixture["timezone"].as_str().unwrap();
+        let reference: DateTime<Utc> = fixture["reference"].as_str().unwrap().parse().unwrap();
+        let mut rules = builtin_sports_event_rules();
+        for rule in &mut rules.0 {
+            rule.timezone = timezone.to_owned();
+        }
+        let compiled = CompiledEventRules::new(rules).unwrap();
+        for entry in fixture["titles"].as_array().unwrap() {
+            let name = entry["name"].as_str().unwrap();
+            let candidate = EventCandidate {
+                name,
+                group: None,
+                epg_title: None,
+                categories: &[],
+                metadata: &EMPTY_METADATA,
+            };
+            let matched = compiled.first_match(&candidate).unwrap();
+            if entry["no_match"].as_bool() == Some(true) {
+                assert!(matched.is_none(), "{name} must not match");
+                continue;
+            }
+            let mut matched = matched.unwrap_or_else(|| panic!("{name} must match"));
+            let text = |key: &str| entry[key].as_str().map(str::to_owned);
+            assert_eq!(
+                matched.captures.get("home"),
+                text("home").as_ref(),
+                "{name}"
+            );
+            assert_eq!(
+                matched.captures.get("away"),
+                text("away").as_ref(),
+                "{name}"
+            );
+            assert_eq!(
+                matched.captures.get("league"),
+                text("league").as_ref(),
+                "{name}"
+            );
+            assert_eq!(
+                matched.captures.get("time"),
+                text("time").as_ref(),
+                "{name}"
+            );
+            let expected_start: DateTime<Utc> =
+                entry["starts_at"].as_str().unwrap().parse().unwrap();
+            if entry["time"].is_null() {
+                assert_eq!(matched.starts_at, Some(expected_start), "{name}");
+            } else {
+                assert_eq!(matched.starts_at, None, "{name}");
+                let resolved = matched.resolve_start(reference, timezone).unwrap();
+                assert_eq!(resolved, Some(expected_start), "{name}");
+                matched.starts_at = resolved;
+            }
+            let title = render_matched_event_title(&matched, name, "{event}").unwrap();
+            assert_eq!(title, entry["event"].as_str().unwrap(), "{name}");
+            let guide = generate_event_guide(
+                &matched,
+                name,
+                expected_start - Duration::hours(1),
+                expected_start + Duration::hours(4),
+            )
+            .unwrap();
+            assert!(guide.iter().any(|item| item.title == title), "{name}");
+        }
+    }
+
+    #[test]
+    fn event_field_uses_rule_default_title_and_rejects_unknown_fields() {
+        let compiled = CompiledEventRules::new(builtin_sports_event_rules()).unwrap();
+        let candidate = EventCandidate {
+            name: "Broncos vs Chiefs 2026-09-13 18:20",
+            group: None,
+            epg_title: None,
+            categories: &[],
+            metadata: &EMPTY_METADATA,
+        };
+        let matched = compiled.first_match(&candidate).unwrap().unwrap();
+        let name = candidate.name;
+        assert_eq!(
+            render_matched_event_title(&matched, name, "{event} [{league}]"),
+            Err(EventGuideError::UnknownTemplateField("league".to_owned()))
+        );
+        assert_eq!(
+            render_matched_event_title(&matched, name, "Live: {event}").unwrap(),
+            "Live: Broncos vs Chiefs"
+        );
+        assert_eq!(
+            render_matched_event_title(&matched, name, "{nope} {event}"),
+            Err(EventGuideError::UnknownTemplateField("nope".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parses_clock_times() {
+        for (text, hour, minute) in [
+            ("7:30pm", 19, 30),
+            ("10pm", 22, 0),
+            ("12am", 0, 0),
+            ("12:15 PM", 12, 15),
+            ("19:30", 19, 30),
+        ] {
+            let time = parse_clock_time(text).unwrap();
+            assert_eq!(
+                (time.format("%H").to_string(), time.format("%M").to_string()),
+                (format!("{hour:02}"), format!("{minute:02}")),
+                "{text}"
+            );
+        }
+        for text in ["", "13pm", "0am", "7:60pm", "7", "noon"] {
+            assert!(parse_clock_time(text).is_err(), "{text}");
+        }
+    }
+
+    fn resolve(time: &str, reference: &str) -> Result<String, EventDateError> {
+        resolve_time_only_start(time, reference.parse().unwrap(), "America/New_York")
+            .map(|value| value.to_rfc3339())
+    }
+
+    #[test]
+    fn time_only_resolves_on_reference_local_date() {
+        // Standard time (EST, UTC-5) after the 2026-11-01 change.
+        assert_eq!(
+            resolve("7:30pm", "2026-11-04T15:00:00Z").unwrap(),
+            "2026-11-05T00:30:00+00:00"
+        );
+        // Daylight time (EDT, UTC-4) before the change.
+        assert_eq!(
+            resolve("7:30pm", "2026-10-20T15:00:00Z").unwrap(),
+            "2026-10-20T23:30:00+00:00"
+        );
+        // The reference local date is 2026-11-03, not the UTC date.
+        assert_eq!(
+            resolve("10pm", "2026-11-04T02:00:00Z").unwrap(),
+            "2026-11-04T03:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn time_only_rolls_to_next_day_after_lookback() {
+        // 23:50 ET scan, 1am event: today's 1am is 22 hours old, use tomorrow.
+        assert_eq!(
+            resolve("1:00am", "2026-11-05T04:50:00Z").unwrap(),
+            "2026-11-05T06:00:00+00:00"
+        );
+        // 22:00 ET scan, 7pm event started 3 hours ago: keep today.
+        assert_eq!(
+            resolve("7pm", "2026-11-05T03:00:00Z").unwrap(),
+            "2026-11-05T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn time_only_handles_daylight_saving_transitions() {
+        // Spring forward 2026-03-08: 02:30 does not exist.
+        assert!(matches!(
+            resolve("2:30am", "2026-03-08T12:00:00Z"),
+            Err(EventDateError::NonexistentLocalTime { .. })
+        ));
+        // 3am exists and is EDT.
+        assert_eq!(
+            resolve("3:00am", "2026-03-08T12:00:00Z").unwrap(),
+            "2026-03-08T07:00:00+00:00"
+        );
+        // Fall back 2026-11-01: 01:30 happens twice.
+        assert!(matches!(
+            resolve("1:30am", "2026-11-01T12:00:00Z"),
+            Err(EventDateError::AmbiguousLocalTime { .. })
+        ));
+        // Evening after fall back is EST.
+        assert_eq!(
+            resolve("8pm", "2026-11-01T12:00:00Z").unwrap(),
+            "2026-11-02T01:00:00+00:00"
+        );
+        // Evening after spring forward is EDT.
+        assert_eq!(
+            resolve("8pm", "2026-03-08T12:00:00Z").unwrap(),
+            "2026-03-09T00:00:00+00:00"
+        );
+        assert!(matches!(
+            resolve_time_only_start("7pm", Utc::now(), "Nowhere/City"),
+            Err(EventDateError::UnknownTimezone(_))
+        ));
+        assert!(matches!(
+            resolve("bad", "2026-11-04T15:00:00Z"),
+            Err(EventDateError::InvalidTime(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_start_prefers_explicit_date_and_returns_none_without_time() {
+        let compiled = CompiledEventRules::new(builtin_sports_event_rules()).unwrap();
+        let reference: DateTime<Utc> = "2026-11-04T15:00:00Z".parse().unwrap();
+        let dated = EventCandidate {
+            name: "Broncos vs Chiefs 2026-09-13 18:20",
+            group: None,
+            epg_title: None,
+            categories: &[],
+            metadata: &EMPTY_METADATA,
+        };
+        let matched = compiled.first_match(&dated).unwrap().unwrap();
+        assert_eq!(
+            matched.resolve_start(reference, "UTC").unwrap(),
+            matched.starts_at
+        );
+        assert!(matched.starts_at.is_some());
     }
 }
