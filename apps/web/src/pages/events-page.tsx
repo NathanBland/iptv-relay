@@ -9,7 +9,7 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { apiClient } from '@/lib/api/client'
 import { apiQueries } from '@/lib/api/queries'
-import type { CreateEventTemplateInput, EventChannel, EventTemplate, EventTemplateSuggestion, IptvApiClient, UpdateEventTemplateInput } from '@/lib/api/types'
+import type { CreateEventTemplateInput, EventChannel, EventScanResult, EventTemplate, EventTemplateSuggestion, IptvApiClient, UpdateEventTemplateInput } from '@/lib/api/types'
 import { eventTemplateDefaults, eventTemplateSchema } from '@/lib/validation'
 
 const channelTones: Record<EventChannel['state'], 'success' | 'info' | 'warning' | 'neutral'> = {
@@ -27,6 +27,46 @@ function formatTimestamp(value: string | null): string {
     dateStyle: 'medium',
     timeStyle: 'short',
   })
+}
+
+export function ScanReportPanel({ report, templateId }: { report: EventScanResult; templateId: string }) {
+  // Show the reasons for this template and the reasons that name no template.
+  const skips = report.skips.filter((skip) => skip.templateId === null || skip.templateId === templateId)
+  const showSkips = report.matched === 0 || report.skipped > 0
+  return (
+    <section aria-label="Scan report" className="rounded-lg border border-white/8 bg-ink-950/50 p-4">
+      <p className="text-xs font-medium text-slate-300">Scan report</p>
+      <p className="mt-1 text-xs text-slate-400">{report.message}</p>
+      <dl className="mt-2 grid grid-cols-2 gap-2 text-xs text-slate-400 sm:grid-cols-5">
+        <div><dt className="text-slate-500">Scanned</dt><dd>{report.channelsScanned}</dd></div>
+        <div><dt className="text-slate-500">Matched</dt><dd>{report.matched}</dd></div>
+        <div><dt className="text-slate-500">Scheduled</dt><dd>{report.scheduled}</dd></div>
+        <div><dt className="text-slate-500">Skipped</dt><dd>{report.skipped}</dd></div>
+        <div><dt className="text-slate-500">Pruned</dt><dd>{report.pruned}</dd></div>
+      </dl>
+      {showSkips ? (
+        skips.length === 0 ? (
+          <p className="mt-3 text-xs text-slate-500">
+            {report.matched === 0
+              ? 'No stream name matched this template. No skip reason was recorded.'
+              : 'No skip reason was recorded.'}
+          </p>
+        ) : (
+          <div className="mt-3">
+            <p className="text-xs font-medium text-slate-300">Skip reasons</p>
+            <ul className="mt-1 space-y-1">
+              {skips.map((skip, index) => (
+                <li key={`${skip.channelId ?? 'template'}-${index}`} className="text-xs text-amber-300">
+                  {skip.streamName ? <span className="text-slate-400">{skip.streamName}: </span> : null}
+                  {skip.reason}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )
+      ) : null}
+    </section>
+  )
 }
 
 export interface RulePreviewMatch {
@@ -74,6 +114,7 @@ export function previewEventRule(
 function TemplateCard({
   template,
   channels,
+  report,
   onScan,
   onEdit,
   scanning,
@@ -87,6 +128,7 @@ function TemplateCard({
 }: {
   template: EventTemplate
   channels: EventChannel[]
+  report?: EventScanResult | undefined
   onScan: () => void
   onEdit: () => void
   scanning: boolean
@@ -201,6 +243,7 @@ function TemplateCard({
               : null}
           />
         ) : null}
+        {report ? <ScanReportPanel report={report} templateId={template.id} /> : null}
         {channels.length === 0 ? (
           <p className="rounded-lg border border-white/8 bg-white/3 px-4 py-3 text-center text-xs text-slate-500">
             No event channels found. Scan provider streams to detect events.
@@ -226,11 +269,14 @@ function TemplateCard({
                     </span>
                     <Badge tone={channelTones[channel.state]}>{channel.state}</Badge>
                   </div>
+                  <p className="mt-1 truncate text-xs text-slate-300">
+                    Channel: {channel.outputName ?? 'Unknown channel'}
+                  </p>
                   <p className="mt-1 truncate text-xs text-slate-500">
                     {channel.rawStreamName ?? 'No source stream'}
                   </p>
                   <p className="mt-1 text-xs text-slate-400">
-                    Slot {channel.slotNumber} · {formatTimestamp(channel.eventStart)}
+                    Starts {formatTimestamp(channel.eventStart)}
                   </p>
                 </div>
               </li>
@@ -364,6 +410,7 @@ function SuggestionCard({
 export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
   const queryClient = useQueryClient()
   const [scanningId, setScanningId] = useState<string | null>(null)
+  const [scanReports, setScanReports] = useState<Record<string, EventScanResult>>({})
   const [showTemplateForm, setShowTemplateForm] = useState(false)
   const [editingTemplate, setEditingTemplate] = useState<EventTemplate | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
@@ -379,7 +426,8 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
     mutationFn: (templateId: string) => client.scanEventTemplate(templateId),
     onMutate: (templateId) => setScanningId(templateId),
     onSettled: () => setScanningId(null),
-    onSuccess: () => {
+    onSuccess: (report, templateId) => {
+      setScanReports((current) => ({ ...current, [templateId]: report }))
       void queryClient.invalidateQueries({ queryKey: ['event-channels'] })
       void queryClient.invalidateQueries({ queryKey: ['events'] })
     },
@@ -552,6 +600,7 @@ export function EventsPage({ client = apiClient }: { client?: IptvApiClient }) {
               key={template.id}
               template={template}
               channels={channels.filter((channel) => channel.templateId === template.id)}
+              report={scanReports[template.id]}
               onScan={() => scanMutation.mutate(template.id)}
               onEdit={() => { setEditingTemplate(template); setShowTemplateForm(true) }}
               scanning={scanningId === template.id || scanMutation.isPending}

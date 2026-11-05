@@ -1,7 +1,7 @@
 import type {
   Channel,
   EffectiveSetting,
-  EventChannel,
+  DynamicEvent,
   Job,
   OperatorApiToken,
   OperatorOverridesResponse,
@@ -206,7 +206,7 @@ export const mockOperatorApiTokens: OperatorApiToken[] = [
   },
 ]
 
-export const mockEvents: EventChannel[] = []
+export const mockEvents: DynamicEvent[] = []
 
 export const mockSessions: Session[] = [
   {

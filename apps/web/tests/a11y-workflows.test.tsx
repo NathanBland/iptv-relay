@@ -126,8 +126,8 @@ describe('management workflow accessibility', () => {
       { id: 'nfl', name: 'nfl', displayName: 'NFL events', matchRegex: '(?<home>.+) vs (?<away>.+)', channelNameFormat: '{home} vs {away}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([
-      { id: 'event-1', templateId: 'nfl', channelId: null, slotNumber: 1, eventTitle: 'Broncos game', eventStart: timestamp, eventEnd: null, rawStreamName: 'NFL 08/19 1:00 PM Broncos vs Chiefs', state: 'scheduled' },
-      { id: 'event-2', templateId: 'nfl', channelId: null, slotNumber: 2, eventTitle: null, eventStart: null, eventEnd: null, rawStreamName: 'NBA Finals Game 5', state: 'hidden' },
+      { id: 'event-1', templateId: 'nfl', channelId: null, slotNumber: 1, eventTitle: 'Broncos game', eventStart: timestamp, eventEnd: null, rawStreamName: 'NFL 08/19 1:00 PM Broncos vs Chiefs', outputName: null, state: 'scheduled' },
+      { id: 'event-2', templateId: 'nfl', channelId: null, slotNumber: 2, eventTitle: null, eventStart: null, eventEnd: null, rawStreamName: 'NBA Finals Game 5', outputName: null, state: 'hidden' },
     ])
 
     renderWithQuery(<EventsPage client={client} />)

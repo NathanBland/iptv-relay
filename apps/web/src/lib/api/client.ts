@@ -23,7 +23,9 @@ import type {
   CreateEventTemplateInput,
   CreateLineupTemplateInput,
   EffectiveSettingsResponse,
+  DynamicEvent,
   EventChannel,
+  EventScanResult,
   EventTemplate,
   EventTemplateSuggestion,
   Group,
@@ -754,8 +756,8 @@ export class FetchIptvApiClient implements IptvApiClient {
     }
   }
 
-  async getEvents(): Promise<EventChannel[]> {
-    return this.request(API_PATHS.events, (value) => asObjectArray<EventChannel>(value, 'Events response'))
+  async getEvents(): Promise<DynamicEvent[]> {
+    return this.request(API_PATHS.events, (value) => asObjectArray<DynamicEvent>(value, 'Events response'))
   }
 
   async getEventTemplates(): Promise<EventTemplate[]> {
@@ -789,8 +791,8 @@ export class FetchIptvApiClient implements IptvApiClient {
     return this.request(`${API_PATHS.eventChannels}${qs}`, (value) => asObjectArray<EventChannel>(value, 'Event channels response'))
   }
 
-  async scanEventTemplate(id: string): Promise<SaveResult> {
-    return this.request(`${API_PATHS.eventTemplates}/${encodeURIComponent(id)}/scan`, (value) => asObject<SaveResult>(value, 'Scan response'), {
+  async scanEventTemplate(id: string): Promise<EventScanResult> {
+    return this.request(`${API_PATHS.eventTemplates}/${encodeURIComponent(id)}/scan`, (value) => asObject<EventScanResult>(value, 'Scan response'), {
       method: 'POST',
       body: JSON.stringify({}),
     })
@@ -1422,7 +1424,7 @@ export class MockIptvApiClient implements IptvApiClient {
 
   async resolveReview(_channelId: string, _accept: boolean, _epgChannelId?: string): Promise<void> {}
 
-  async getEvents(): Promise<EventChannel[]> {
+  async getEvents(): Promise<DynamicEvent[]> {
     return []
   }
 
@@ -1470,8 +1472,8 @@ export class MockIptvApiClient implements IptvApiClient {
     return []
   }
 
-  async scanEventTemplate(_id: string): Promise<SaveResult> {
-    return { ok: true, message: 'Scan complete.' }
+  async scanEventTemplate(_id: string): Promise<EventScanResult> {
+    return { ok: true, message: 'Scan complete.', channelsScanned: 0, matched: 0, scheduled: 0, skipped: 0, pruned: 0, skips: [] }
   }
 
   async suggestEventTemplates(): Promise<EventTemplateSuggestion[]> {

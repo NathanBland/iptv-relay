@@ -445,7 +445,43 @@ export interface EventChannel {
   eventStart: string | null
   eventEnd: string | null
   rawStreamName: string | null
+  /** Output name of the target channel. */
+  outputName: string | null
   state: 'scheduled' | 'live' | 'ended' | 'hidden'
+}
+
+/** Item of `GET /api/v1/events`. */
+export interface DynamicEvent {
+  id: string
+  group: string
+  rawTitle: string
+  programmeTitle: string
+  channelSlot: string
+  channelId: string | null
+  outputName: string | null
+  start: string | null
+  end: string | null
+  state: EventChannel['state']
+  template: string
+}
+
+export interface EventScanSkip {
+  templateId: string | null
+  channelId: string | null
+  streamName: string
+  reason: string
+}
+
+/** Result of `POST /api/v1/event-templates/{id}/scan`. */
+export interface EventScanResult {
+  ok: boolean
+  message: string
+  channelsScanned: number
+  matched: number
+  scheduled: number
+  skipped: number
+  pruned: number
+  skips: EventScanSkip[]
 }
 
 export interface LineupTemplate {
@@ -752,13 +788,13 @@ export interface IptvApiClient {
   setChannelEpgMapping(channelId: string, epgChannelId: string): Promise<void>
   removeChannelEpgMapping(channelId: string): Promise<void>
   resolveReview(channelId: string, accept: boolean, epgChannelId?: string): Promise<void>
-  getEvents(): Promise<EventChannel[]>
+  getEvents(): Promise<DynamicEvent[]>
   getEventTemplates(): Promise<EventTemplate[]>
   createEventTemplate(input: CreateEventTemplateInput): Promise<EventTemplate>
   updateEventTemplate(id: string, input: UpdateEventTemplateInput): Promise<EventTemplate>
   deleteEventTemplate(id: string): Promise<void>
   getEventChannels(templateId?: string): Promise<EventChannel[]>
-  scanEventTemplate(id: string): Promise<SaveResult>
+  scanEventTemplate(id: string): Promise<EventScanResult>
   suggestEventTemplates(): Promise<EventTemplateSuggestion[]>
   getLineupTemplates(): Promise<LineupTemplate[]>
   createLineupTemplate(input: CreateLineupTemplateInput): Promise<LineupTemplate>
