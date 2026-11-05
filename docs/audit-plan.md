@@ -32,7 +32,7 @@ Redaction: this document replaces the output token in all URLs with `<token>`. I
 | F6 | `GET /api/v1/events` returns a shape that the web client does not expect. | Low | WP7 |
 | F7 | No sports metadata enrichment exists. | Feature | WP8a, WP8b |
 | F8 | XMLTV output does not mark sports programmes. The omission of `sub-title` is possibly intentional. | Medium | WP8b |
-| F9 | The runtime does not read any of the nine operator settings. | Medium | WP6, and the v0.2.19 ring fix |
+| F9 | The runtime does not read six of the nine operator settings. v0.2.19 fixed the other three. | Medium | WP6 |
 | F10 | Short-EPG refresh jobs fail. Guide coverage is 5.5 %. | Medium | WP10 |
 | F11 | `/api/v1/system` reports `providerLimit: 0` when no session is active. | Low | WP6 |
 | F12 | The Xtream source timezone is `UTC`, but the provider publishes US Eastern times. | Medium | Operator action, WP4 |
@@ -278,9 +278,9 @@ The schema has nine keys. `load_operator_setting_overrides` has two callers only
 
 | Key | State |
 |-----|-------|
-| `media.ring.duration_seconds` | The v0.2.19 session on `main` fixes this key now. |
-| `media.ring.max_bytes` | The v0.2.19 session on `main` fixes this key now. |
-| `media.viewer.start_delay_seconds` | Not read. |
+| `media.ring.duration_seconds` | Fixed in v0.2.19 (`RingPolicy::from_settings`, commit `36b2c1f`). |
+| `media.ring.max_bytes` | Fixed in v0.2.19. |
+| `media.viewer.start_delay_seconds` | Fixed in v0.2.19 (ring pre-roll). |
 | `media.recovery.window_seconds` | Not read. |
 | `media.adapter` | Not read. The live instance has the global override `"media.adapter":"ffmpeg"`. The runtime uses the per-stream `input_adapter` column instead (`crates/api/src/lib.rs:7079`). |
 | `ingest.max_download_bytes` | Not read. |
@@ -343,14 +343,14 @@ Recommendation: use Option A. It keeps the current Jellyfin setup and gives corr
 | Sports | new crate `crates/sports/` | WP8a |
 | Worker | `apps/server/src/main.rs` | WP4 |
 
-Dependency on the v0.2.19 ring fix: the session on `main` edits `crates/api/src/lib.rs` (router, `configuration_control_routes`, and the stream source spec near line 7000 to 7400) and `crates/media/src/session.rs`. No package in this plan edits `default_ring` or `into_byte_stream`. Start the API lane only after v0.2.19 is on `main`. Then rebase on it.
+Dependency on the v0.2.19 ring fix (status: shipped in v0.2.19 and v0.2.20, now on `main`): the session on `main` edits `crates/api/src/lib.rs` (router, `configuration_control_routes`, and the stream source spec near line 7000 to 7400) and `crates/media/src/session.rs`. No package in this plan edits `default_ring` or `into_byte_stream`. Start the API lane only after v0.2.19 is on `main`. Then rebase on it.
 
 Migration numbers: the last migration is `0074`. The v0.2.19 diff adds no migration. Assign the numbers at merge time, in lane order: WP3 takes `0075` and `0076`, WP4 takes `0077`, WP8b takes `0078` and later. Check `ls migrations` before each merge. Follow the migration rules in `AGENTS.md`.
 
 ### 4.2 Execution order
 
 ```text
-Wave 0: v0.2.19 ring fix (other session, on main)
+Wave 0: v0.2.19 ring fix (done, on main)
 Wave 1 (parallel): WP1 (API+Web lanes)   WP2 (Parser lane)   WP3 (Persistence lane)   WP8a (Sports lane)   WP10 (read-only)
 Wave 2 (parallel): WP4 (Persistence + Worker; needs WP2, WP3)   WP5 (API + Web; needs WP1, WP3)
 Wave 3:            WP7 (API + Web; needs WP4, WP5)
@@ -369,7 +369,7 @@ Wave 5 (parallel): WP6 (API + media/ingest; needs WP8b to clear the API lane)   
 | WP3 | Sonnet | The plan gives the schema and the query change. |
 | WP4 | Opus | Data model change, scheduler hook, and data repair. It crosses persistence, worker, and parser. |
 | WP5 | Sonnet | One endpoint and one UI control, to a clear specification. |
-| WP6 | Opus | The requirements are not clear. Each setting needs a decision: connect it, or remove it. It crosses media, ingest, and API state. |
+| WP6 | Sonnet | The operator decided to connect all keys, and v0.2.19 gives a pattern to copy. Escalate to Opus if `media.recovery.window_seconds` needs changes in the session recovery logic. |
 | WP7 | Sonnet | Handler and UI changes to a clear specification. |
 | WP8a | Sonnet | New pure crate with fixtures. Section F7 gives the matching rules. |
 | WP8b | Sonnet | Integration to the F7 specification. Escalate to Opus if Jellyfin parses the XMLTV elements differently from the specification. |
@@ -470,7 +470,7 @@ Test plan:
 - A Vitest component test.
 - After deployment: rename one channel, then confirm the new name in `playlist.m3u`, `hdhr/lineup.json`, and `xmltv.xml`.
 
-#### WP6. Operator settings wiring (Opus)
+#### WP6. Operator settings wiring (Sonnet)
 
 - Findings: F9 (except the ring keys) and F11.
 - Files: `crates/domain/src/config.rs`, `crates/api/src/lib.rs` (state and startup, `system_info_value`), `crates/media/src/recovery.rs`, `crates/ingest/src/*` (limits), `apps/server/src/main.rs` (if the worker reads ingest limits).
@@ -478,7 +478,12 @@ Test plan:
 
 Brief:
 
-> Section F9 of `docs/audit-plan.md` lists nine operator settings that the runtime never reads. The v0.2.19 release connects the two `media.ring.*` keys. Read how it does this, and use the same pattern. For each other key, decide one action: connect the key to the runtime with its `applyRequirement` semantics (`immediate` or `reimport`), or remove the key from the schema with a clear note. Recommendation: connect `media.viewer.start_delay_seconds`, `media.recovery.window_seconds`, `ingest.max_download_bytes`, and `ingest.max_m3u_line_bytes`. Remove `media.adapter`, or make it the default value for streams without an explicit adapter. Make the template defaults for duration and filler title come from `events.*`. Ask the operator before you remove a key. Also fix F11: compute `providerLimit` from the database sources when no session is active. Done when each kept key has a test that proves a changed override changes the runtime behavior.
+> Operator decision (2026-11-04): make every operator setting work. Do not remove a key. v0.2.19 connected `media.ring.duration_seconds`, `media.ring.max_bytes`, and `media.viewer.start_delay_seconds` through `RingPolicy::from_settings` in `crates/api/src/lib.rs` (commit `36b2c1f`). Read that code and use the same pattern for the six other keys. Respect each key's `applyRequirement` (`immediate` or `reimport`).
+> - `media.recovery.window_seconds`: use it as the recovery window in `crates/media/src/recovery.rs`.
+> - `media.adapter`: use it as the default input adapter for streams that have no explicit `input_adapter`. A per-stream value has precedence.
+> - `ingest.max_download_bytes` and `ingest.max_m3u_line_bytes`: pass them to the ingest limits for each source refresh.
+> - `events.inferred_duration_seconds` and `events.filler_title`: use them as defaults when a template has no value of its own.
+> Also fix F11: compute `providerLimit` from the database sources when no session is active. Do not change `into_byte_stream` or the ring code. Done when each of the six keys has a test that proves a changed override changes the runtime behavior.
 
 Test plan: one test for each connected key, and one API test for `providerLimit` with no session.
 
