@@ -2,6 +2,7 @@
 
 mod catalog;
 mod cleanup;
+mod event_scan;
 mod outbox;
 
 use std::{fmt, str::FromStr, time::Duration};
@@ -41,6 +42,11 @@ pub use catalog::{
     UserRow,
 };
 pub use cleanup::{IngestCleanupRepository, IngestCleanupStats};
+pub use event_scan::{
+    BUILTIN_EVENT_TEMPLATE_ID, EventChannelState, EventScanReport, EventScanSettings,
+    EventScanSkip, MAX_EVENT_SCAN_SKIPS, compile_template_regex, resolve_event_timezone,
+    stable_event_channel_name,
+};
 
 /// Embedded database migrations for the service schema.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
