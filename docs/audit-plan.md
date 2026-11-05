@@ -36,6 +36,7 @@ Redaction: this document replaces the output token in all URLs with `<token>`. I
 | F10 | Short-EPG refresh jobs fail. Guide coverage is 5.5 %. | Medium | WP10 |
 | F11 | `/api/v1/system` reports `providerLimit: 0` when no session is active. | Low | WP6 |
 | F12 | The Xtream source timezone is `UTC`, but the provider publishes US Eastern times. | Medium | Operator action, WP4 |
+| F13 | Jellyfin shows 1080p and 20 Mbps for all relay channels, because the HDHomeRun lineup has no quality fields. | Medium | WP11 |
 
 ## 3. Findings
 
@@ -303,6 +304,29 @@ This finding is out of the requested scope. WP10 is an investigation package.
 
 The Xtream source has `"timezone": "UTC"`. The provider names use US Eastern time (F4 B6). Operator action: set the source timezone to `America/New_York` in the **Sources** tab after WP4 makes the scan read it.
 
+### F13. Jellyfin shows the wrong stream quality for relay channels
+
+The parent session verified this finding on 2026-11-04 against relay v0.2.20.
+
+Evidence:
+
+- Real stream: a 60 second pull of channel 16968 (`CAN: SPORTSNET WEST [1080p]`) is 1280x720 H.264 at 29.97 fps, with AAC audio at about 212 kbps. The total is about 3.2 Mbps. Thus the `[1080p]` tag in the provider name is also wrong.
+- Jellyfin's "Live stream opened" log for that channel reports 1920x1080, 59.94 fps, `BitRate 20000000`, a total bitrate of `20095812`, and a cap of `30000000`. These values are placeholders, not probe results.
+- `/out/<token>/hdhr/lineup.json` gives each channel only `GuideName`, `GuideNumber`, `ImageURL`, and `URL` (`HdhrChannel` in `crates/api/src/lib.rs`, handler `hdhr_lineup` at line 7370).
+
+Root cause: Jellyfin's HDHomeRun tuner (`HdHomerunHost.GetMediaSource`) uses `channelInfo.IsHD ?? true`. `IsHD` comes from the lineup `HD` field. `VideoCodec` and `AudioCodec` also come from the lineup. When the lineup has no `HD` field, Jellyfin gives each channel fixed HD values: 1080p and 20 Mbps in Jellyfin 10.x (12.4), or 15 Mbps on the current master branch. SD channels get about 2 Mbps.
+
+Impact: Jellyfin uses these values for direct-play decisions, transcode decisions, and bandwidth limits. Thus Jellyfin can transcode or limit a client without a real need.
+
+Data gap: the relay has columns for probe results on `provider_streams` (`video_codec`, `video_width`, `video_height`, `video_fps`, `audio_codec`, `bitrate_kbps`). The health-check job writes them through `update_stream_health_and_rank` (`apps/server/src/main.rs:1904`). But all 44,608 live streams have the health status `unknown`. Thus the relay has no real quality data now.
+
+Fix options:
+
+- **Option A (relay change, recommended).** Add `HD` (`1` or `0`), `VideoCodec`, and `AudioCodec` to each lineup entry. Use only measured stream data. Do not use the `[720p]` or `[1080p]` name tags. If no measured data exists for a channel, omit the three fields. Jellyfin then keeps its current default. To get measured data without extra provider connections, record the codec and resolution passively when a viewer opens a stream.
+- **Option B (Jellyfin configuration only).** Add the relay to Jellyfin as an M3U tuner with `/out/<token>/playlist.m3u`, not as an HDHomeRun tuner. Jellyfin then probes the real stream when it opens it. This option needs no code change. Disadvantages: the operator must set up the tuner again, enter the 3-connection limit manually, and map the guide again.
+
+Recommendation: use Option A. It keeps the current Jellyfin setup and gives correct values to all HDHomeRun clients. Option B is an immediate workaround that the operator can apply before Option A ships.
+
 ## 4. Work packages
 
 ### 4.1 Shared-file lanes
@@ -311,8 +335,9 @@ The Xtream source has `"timezone": "UTC"`. The provider names use US Eastern tim
 
 | Lane | Files | Packages, in order |
 |------|-------|--------------------|
-| API | `crates/api/src/lib.rs`, `tests/fixtures/openapi.json` | WP1, WP5, WP7, WP8b, WP6 |
-| Persistence | `crates/persistence/src/catalog.rs`, `crates/persistence/tests/postgres.rs`, new files in `migrations/` | WP3, WP4, WP8b |
+| API | `crates/api/src/lib.rs`, `tests/fixtures/openapi.json` | WP1, WP11a, WP5, WP7, WP8b, WP6 |
+| Persistence | `crates/persistence/src/catalog.rs`, `crates/persistence/tests/postgres.rs`, new files in `migrations/` | WP3, WP11a, WP4, WP8b |
+| Media | `crates/media/src/*`, `apps/server/src/main.rs` (health-check code only) | WP11b |
 | Web | `apps/web/src/lib/api/client.ts`, `apps/web/src/lib/api/types.ts` | WP1, WP5, WP7 |
 | Parser | `crates/domain/src/events.rs`, `crates/parsers/src/events.rs`, `tests/fixtures/events/` | WP2 |
 | Sports | new crate `crates/sports/` | WP8a |
@@ -330,6 +355,8 @@ Wave 1 (parallel): WP1 (API+Web lanes)   WP2 (Parser lane)   WP3 (Persistence la
 Wave 2 (parallel): WP4 (Persistence + Worker; needs WP2, WP3)   WP5 (API + Web; needs WP1, WP3)
 Wave 3:            WP7 (API + Web; needs WP4, WP5)
 Wave 4:            WP8b (API + Persistence; needs WP4, WP7, WP8a)
+Wave 1b: WP11a (API + Persistence; after WP1 and WP3; small)
+Wave 1c: WP11b (Media; after v0.2.19; parallel with Wave 2)
 Wave 5 (parallel): WP6 (API + media/ingest; needs WP8b to clear the API lane)   WP9 (optional; after WP8b)
 ```
 
@@ -348,6 +375,8 @@ Wave 5 (parallel): WP6 (API + media/ingest; needs WP8b to clear the API lane)   
 | WP8b | Sonnet | Integration to the F7 specification. Escalate to Opus if Jellyfin parses the XMLTV elements differently from the specification. |
 | WP9 | Sonnet | Image composition with a known library. |
 | WP10 | Sonnet | Read-only investigation. |
+| WP11a | Haiku | Small, mechanical change to the lineup JSON, with a clear specification and tests. |
+| WP11b | Sonnet | Passive capture of stream data in the media path. It must not open extra provider connections. |
 
 ### 4.4 Package briefs
 
@@ -516,6 +545,37 @@ Brief:
 Brief:
 
 > Investigate why all 17 `refresh-xtream-short-epg` jobs are dead letters ("HTTP source returned an unsuccessful status" and "source artifact contained no usable records"). Investigate why only 17 of 310 enabled channels have an EPG mapping. Use only `GET` requests against the live instance (`/api/v1/dead-letters`, `/api/v1/jobs`, `/api/v1/epg/*`), and read the code in `apps/server/src/main.rs` and `crates/ingest`. Do not open streams and do not call provider endpoints. Write the root cause and a proposed fix package. Do not change code.
+
+#### WP11a. HDHomeRun lineup quality fields (Haiku)
+
+- Findings: F13 (Option A, lineup part).
+- Files: `crates/api/src/lib.rs` (`HdhrChannel`, `hdhr_lineup`, lineup tests), `crates/persistence/src/catalog.rs` (`list_enabled_channels_for_output_profile` and its row struct).
+- Depends on: WP1 and WP3, because they edit the same files.
+
+Brief:
+
+> In `list_enabled_channels_for_output_profile`, also return `video_codec`, `video_height`, and `audio_codec` of the channel's primary provider stream (the `channel_streams` row with the lowest priority value). Use the `provider_streams` columns that exist. Add a migration only if a column is missing. Add three optional fields to `HdhrChannel` with these JSON names: `HD`, `VideoCodec`, `AudioCodec`. Use `#[serde(skip_serializing_if = "Option::is_none")]` for each field. Set `HD` to `1` when `video_height >= 720`, `0` when it is lower, and omit it when it is unknown. Map codecs to HDHomeRun values: `h264` to `H264`, `hevc` to `HEVC`, `mpeg2video` to `MPEG2`, `aac` to `AAC`, `ac3` to `AC3`, `eac3` to `EAC3`, `mp2` to `MPEG`. Omit unknown codecs. Do not read the quality tag in the channel name. Add tests: (1) a 720p H.264 and AAC stream gives `"HD":1,"VideoCodec":"H264","AudioCodec":"AAC"`; (2) a 480p stream gives `"HD":0`; (3) a stream without data gives none of the three keys. Done when the tests and `cargo clippy` pass.
+
+Test plan:
+
+- Unit tests for the JSON shape.
+- After deployment, and after WP11b gives data: in Jellyfin, refresh the tuner, open channel 16968, and confirm that the "Live stream opened" log shows `IsHD` false or a lower bitrate.
+- Before WP11b: confirm that the lineup output does not change for channels without data.
+
+#### WP11b. Passive stream data capture (Sonnet)
+
+- Findings: F13 (Option A, data part).
+- Files: `crates/media/src/*` (session start path, outside `into_byte_stream` and `default_ring`), `apps/server/src/main.rs` (health-check code only), `crates/persistence/src/catalog.rs` (one new update method, or a call to `update_stream_health`).
+- Depends on: v0.2.19 on `main`. It can run at the same time as WP11a.
+
+Brief:
+
+> Relay lineups need real codec and resolution data for each provider stream, but all 44,608 streams have the health status `unknown`. The provider allows only 3 connections, so do not add probes that open new provider connections. First find out why the health-check job (`apps/server/src/main.rs`, near `update_stream_health_and_rank` at line 1904) never stores results. Report whether it is disabled, always skipped, or failing. Then add passive capture: when a viewer session opens a provider stream, read the codec, width, height, frame rate, and audio codec from the first part of the MPEG-TS data that the session already receives. Store the values with `update_stream_health`. Store them at most one time per stream in each 24 hours. Do not change `into_byte_stream` or `default_ring`. Do not set the health status to `alive` from passive data unless the existing rules allow it. Done when a test with a recorded 720p H.264 and AAC TS sample stores the correct values, and the session test suite passes.
+
+Test plan:
+
+- A unit test with a short recorded TS sample in `tests/fixtures/`.
+- After deployment, play one channel, then run `GET /api/v1/streams/health` and confirm that the stream has codec and resolution data.
 
 ## 5. Verification after all packages
 
