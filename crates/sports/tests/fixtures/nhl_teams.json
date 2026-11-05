@@ -1,0 +1,1292 @@
+{
+  "sports": [
+    {
+      "leagues": [
+        {
+          "teams": [
+            {
+              "team": {
+                "id": "25",
+                "location": "Anaheim",
+                "name": "Ducks",
+                "nickname": "Anaheim",
+                "abbreviation": "ANA",
+                "displayName": "Anaheim Ducks",
+                "shortDisplayName": "Ducks",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/ana.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/ana.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/ana.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "1",
+                "location": "Boston",
+                "name": "Bruins",
+                "nickname": "Boston",
+                "abbreviation": "BOS",
+                "displayName": "Boston Bruins",
+                "shortDisplayName": "Bruins",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/bos.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/bos.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/bos.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "2",
+                "location": "Buffalo",
+                "name": "Sabres",
+                "nickname": "Buffalo",
+                "abbreviation": "BUF",
+                "displayName": "Buffalo Sabres",
+                "shortDisplayName": "Sabres",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/buf.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/buf.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/buf.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "3",
+                "location": "Calgary",
+                "name": "Flames",
+                "nickname": "Calgary",
+                "abbreviation": "CGY",
+                "displayName": "Calgary Flames",
+                "shortDisplayName": "Flames",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/cgy.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/cgy.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/cgy.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "7",
+                "location": "Carolina",
+                "name": "Hurricanes",
+                "nickname": "Carolina",
+                "abbreviation": "CAR",
+                "displayName": "Carolina Hurricanes",
+                "shortDisplayName": "Hurricanes",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/car.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/car.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/car.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "4",
+                "location": "Chicago",
+                "name": "Blackhawks",
+                "nickname": "Chicago",
+                "abbreviation": "CHI",
+                "displayName": "Chicago Blackhawks",
+                "shortDisplayName": "Blackhawks",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/chi.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/chi.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/chi.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "17",
+                "location": "Colorado",
+                "name": "Avalanche",
+                "nickname": "Colorado",
+                "abbreviation": "COL",
+                "displayName": "Colorado Avalanche",
+                "shortDisplayName": "Avalanche",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/col.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/col.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/col.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "29",
+                "location": "Columbus",
+                "name": "Blue Jackets",
+                "nickname": "Columbus",
+                "abbreviation": "CBJ",
+                "displayName": "Columbus Blue Jackets",
+                "shortDisplayName": "Blue Jackets",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/cbj.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/cbj.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/cbj.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "9",
+                "location": "Dallas",
+                "name": "Stars",
+                "nickname": "Dallas",
+                "abbreviation": "DAL",
+                "displayName": "Dallas Stars",
+                "shortDisplayName": "Stars",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/dal.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/dal.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/dal.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "5",
+                "location": "Detroit",
+                "name": "Red Wings",
+                "nickname": "Detroit",
+                "abbreviation": "DET",
+                "displayName": "Detroit Red Wings",
+                "shortDisplayName": "Red Wings",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/det.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/det.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/det.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "6",
+                "location": "Edmonton",
+                "name": "Oilers",
+                "nickname": "Edmonton",
+                "abbreviation": "EDM",
+                "displayName": "Edmonton Oilers",
+                "shortDisplayName": "Oilers",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/edm.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/edm.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/edm.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "26",
+                "location": "Florida",
+                "name": "Panthers",
+                "nickname": "Florida",
+                "abbreviation": "FLA",
+                "displayName": "Florida Panthers",
+                "shortDisplayName": "Panthers",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/fla.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/fla.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/fla.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "8",
+                "location": "Los Angeles",
+                "name": "Kings",
+                "nickname": "Los Angeles",
+                "abbreviation": "LA",
+                "displayName": "Los Angeles Kings",
+                "shortDisplayName": "Kings",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/la.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/la.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/la.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "30",
+                "location": "Minnesota",
+                "name": "Wild",
+                "nickname": "Minnesota",
+                "abbreviation": "MIN",
+                "displayName": "Minnesota Wild",
+                "shortDisplayName": "Wild",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/min.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/min.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/min.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "10",
+                "location": "Montreal",
+                "name": "Canadiens",
+                "nickname": "Montreal",
+                "abbreviation": "MTL",
+                "displayName": "Montreal Canadiens",
+                "shortDisplayName": "Canadiens",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/mtl.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/mtl.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/mtl.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "27",
+                "location": "Nashville",
+                "name": "Predators",
+                "nickname": "Nashville",
+                "abbreviation": "NSH",
+                "displayName": "Nashville Predators",
+                "shortDisplayName": "Predators",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/nsh.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/nsh.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/nsh.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "11",
+                "location": "New Jersey",
+                "name": "Devils",
+                "nickname": "New Jersey",
+                "abbreviation": "NJ",
+                "displayName": "New Jersey Devils",
+                "shortDisplayName": "Devils",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/nj.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/nj.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/nj.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "12",
+                "location": "New York",
+                "name": "Islanders",
+                "nickname": "New York",
+                "abbreviation": "NYI",
+                "displayName": "New York Islanders",
+                "shortDisplayName": "Islanders",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/nyi.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/nyi.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/nyi.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "13",
+                "location": "New York",
+                "name": "Rangers",
+                "nickname": "New York",
+                "abbreviation": "NYR",
+                "displayName": "New York Rangers",
+                "shortDisplayName": "Rangers",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/nyr.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/nyr.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/nyr.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "14",
+                "location": "Ottawa",
+                "name": "Senators",
+                "nickname": "Ottawa",
+                "abbreviation": "OTT",
+                "displayName": "Ottawa Senators",
+                "shortDisplayName": "Senators",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/ott.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/ott.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/ott.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "15",
+                "location": "Philadelphia",
+                "name": "Flyers",
+                "nickname": "Philadelphia",
+                "abbreviation": "PHI",
+                "displayName": "Philadelphia Flyers",
+                "shortDisplayName": "Flyers",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/phi.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/phi.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/phi.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "16",
+                "location": "Pittsburgh",
+                "name": "Penguins",
+                "nickname": "Pittsburgh",
+                "abbreviation": "PIT",
+                "displayName": "Pittsburgh Penguins",
+                "shortDisplayName": "Penguins",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/pit.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/pit.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/pit.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "18",
+                "location": "San Jose",
+                "name": "Sharks",
+                "nickname": "San Jose",
+                "abbreviation": "SJ",
+                "displayName": "San Jose Sharks",
+                "shortDisplayName": "Sharks",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/sj.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/sj.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/sj.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "124292",
+                "location": "Seattle",
+                "name": "Kraken",
+                "nickname": "Seattle",
+                "abbreviation": "SEA",
+                "displayName": "Seattle Kraken",
+                "shortDisplayName": "Kraken",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/sea.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/sea.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/sea.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "19",
+                "location": "St. Louis",
+                "name": "Blues",
+                "nickname": "St. Louis",
+                "abbreviation": "STL",
+                "displayName": "St. Louis Blues",
+                "shortDisplayName": "Blues",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/stl.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/stl.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/stl.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "20",
+                "location": "Tampa Bay",
+                "name": "Lightning",
+                "nickname": "Tampa Bay",
+                "abbreviation": "TB",
+                "displayName": "Tampa Bay Lightning",
+                "shortDisplayName": "Lightning",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/tb.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/tb.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/tb.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "21",
+                "location": "Toronto",
+                "name": "Maple Leafs",
+                "nickname": "Toronto",
+                "abbreviation": "TOR",
+                "displayName": "Toronto Maple Leafs",
+                "shortDisplayName": "Maple Leafs",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/tor.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/tor.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/tor.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "129764",
+                "location": "Utah",
+                "name": "Mammoth",
+                "nickname": "Utah",
+                "abbreviation": "UTAH",
+                "displayName": "Utah Mammoth",
+                "shortDisplayName": "Mammoth",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/utah.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/utah.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/utah.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "22",
+                "location": "Vancouver",
+                "name": "Canucks",
+                "nickname": "Vancouver",
+                "abbreviation": "VAN",
+                "displayName": "Vancouver Canucks",
+                "shortDisplayName": "Canucks",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/van.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/van.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/van.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "37",
+                "location": "Vegas",
+                "name": "Golden Knights",
+                "nickname": "Vegas",
+                "abbreviation": "VGK",
+                "displayName": "Vegas Golden Knights",
+                "shortDisplayName": "Golden Knights",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/vgk.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/vgk.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/vgk.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "23",
+                "location": "Washington",
+                "name": "Capitals",
+                "nickname": "Washington",
+                "abbreviation": "WSH",
+                "displayName": "Washington Capitals",
+                "shortDisplayName": "Capitals",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/wsh.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/wsh.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/wsh.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            },
+            {
+              "team": {
+                "id": "28",
+                "location": "Winnipeg",
+                "name": "Jets",
+                "nickname": "Winnipeg",
+                "abbreviation": "WPG",
+                "displayName": "Winnipeg Jets",
+                "shortDisplayName": "Jets",
+                "logos": [
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/wpg.png",
+                    "rel": [
+                      "full",
+                      "default"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500-dark/wpg.png",
+                    "rel": [
+                      "full",
+                      "dark"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  },
+                  {
+                    "href": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/wpg.png",
+                    "rel": [
+                      "full",
+                      "scoreboard"
+                    ],
+                    "width": 500,
+                    "height": 500
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

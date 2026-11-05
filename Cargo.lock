@@ -1286,6 +1286,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "iptv-sports"
+version = "0.2.20"
+dependencies = [
+ "chrono",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
