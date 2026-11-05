@@ -11,6 +11,7 @@ COPY crates/ingest/Cargo.toml crates/ingest/Cargo.toml
 COPY crates/media/Cargo.toml crates/media/Cargo.toml
 COPY crates/parsers/Cargo.toml crates/parsers/Cargo.toml
 COPY crates/persistence/Cargo.toml crates/persistence/Cargo.toml
+COPY crates/sports/Cargo.toml crates/sports/Cargo.toml
 COPY apps/server/src apps/server/src
 COPY crates/api/src crates/api/src
 COPY crates/domain/src crates/domain/src
@@ -18,6 +19,7 @@ COPY crates/ingest/src crates/ingest/src
 COPY crates/media/src crates/media/src
 COPY crates/parsers/src crates/parsers/src
 COPY crates/persistence/src crates/persistence/src
+COPY crates/sports/src crates/sports/src
 COPY migrations migrations
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 RUN cargo chef prepare --recipe-path recipe.json
