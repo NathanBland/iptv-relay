@@ -990,7 +990,7 @@ export class FetchIptvApiClient implements IptvApiClient {
   async assignStreamProfile(channelId: string, profileId: string): Promise<void> {
     return this.request(`${API_PATHS.channels}/${encodeURIComponent(channelId)}/stream-profile`, () => undefined, {
       method: 'POST',
-      body: JSON.stringify({ stream_profile_id: profileId }),
+      body: JSON.stringify({ streamProfileId: profileId }),
     })
   }
 

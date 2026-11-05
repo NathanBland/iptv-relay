@@ -25,12 +25,12 @@
       },
       "AssignStreamProfileRequest": {
         "properties": {
-          "stream_profile_id": {
+          "streamProfileId": {
             "type": "string"
           }
         },
         "required": [
-          "stream_profile_id"
+          "streamProfileId"
         ],
         "type": "object"
       },
@@ -82,20 +82,20 @@
       },
       "BestStreamResponse": {
         "properties": {
-          "channel_id": {
+          "channelId": {
             "type": "string"
           },
-          "channel_name": {
+          "channelName": {
             "type": "string"
           },
-          "failover_count": {
+          "failoverCount": {
             "format": "int32",
             "type": "integer"
           },
-          "health_status": {
+          "healthStatus": {
             "type": "string"
           },
-          "last_failover_at": {
+          "lastFailoverAt": {
             "type": [
               "string",
               "null"
@@ -105,43 +105,43 @@
             "format": "int32",
             "type": "integer"
           },
-          "provider_account_id": {
+          "providerAccountId": {
             "type": "string"
           },
-          "provider_stream_id": {
+          "providerStreamId": {
             "type": "string"
           },
-          "quality_rank": {
+          "qualityRank": {
             "format": "int32",
             "type": "integer"
           },
-          "stream_name": {
+          "streamName": {
             "type": "string"
           },
-          "url_template": {
+          "urlTemplate": {
             "type": "string"
           },
-          "video_codec": {
+          "videoCodec": {
             "type": [
               "string",
               "null"
             ]
           },
-          "video_fps": {
+          "videoFps": {
             "format": "double",
             "type": [
               "number",
               "null"
             ]
           },
-          "video_height": {
+          "videoHeight": {
             "format": "int32",
             "type": [
               "integer",
               "null"
             ]
           },
-          "video_width": {
+          "videoWidth": {
             "format": "int32",
             "type": [
               "integer",
@@ -150,16 +150,16 @@
           }
         },
         "required": [
-          "channel_id",
-          "channel_name",
-          "provider_stream_id",
-          "stream_name",
+          "channelId",
+          "channelName",
+          "providerStreamId",
+          "streamName",
           "priority",
-          "quality_rank",
-          "health_status",
-          "failover_count",
-          "url_template",
-          "provider_account_id"
+          "qualityRank",
+          "healthStatus",
+          "failoverCount",
+          "urlTemplate",
+          "providerAccountId"
         ],
         "type": "object"
       },
@@ -187,7 +187,7 @@
           "alias": {
             "type": "string"
           },
-          "canonical_name": {
+          "canonicalName": {
             "type": "string"
           },
           "category": {
@@ -202,7 +202,7 @@
               "null"
             ]
           },
-          "created_at": {
+          "createdAt": {
             "type": "string"
           },
           "id": {
@@ -211,9 +211,9 @@
         },
         "required": [
           "id",
-          "canonical_name",
+          "canonicalName",
           "alias",
-          "created_at"
+          "createdAt"
         ],
         "type": "object"
       },
@@ -352,7 +352,7 @@
           "alias": {
             "type": "string"
           },
-          "canonical_name": {
+          "canonicalName": {
             "type": "string"
           },
           "category": {
@@ -369,7 +369,7 @@
           }
         },
         "required": [
-          "canonical_name",
+          "canonicalName",
           "alias"
         ],
         "type": "object"
@@ -504,7 +504,7 @@
       },
       "CreateRecordingRequest": {
         "properties": {
-          "channel_id": {
+          "channelId": {
             "type": "string"
           },
           "description": {
@@ -513,22 +513,22 @@
               "null"
             ]
           },
-          "ends_at": {
+          "endsAt": {
             "type": "string"
           },
-          "programme_id": {
+          "programmeId": {
             "type": [
               "string",
               "null"
             ]
           },
-          "rule_id": {
+          "ruleId": {
             "type": [
               "string",
               "null"
             ]
           },
-          "starts_at": {
+          "startsAt": {
             "type": "string"
           },
           "title": {
@@ -536,38 +536,38 @@
           }
         },
         "required": [
-          "channel_id",
+          "channelId",
           "title",
-          "starts_at",
-          "ends_at"
+          "startsAt",
+          "endsAt"
         ],
         "type": "object"
       },
       "CreateRecordingRuleRequest": {
         "properties": {
-          "category_filter": {
+          "categoryFilter": {
             "type": [
               "string",
               "null"
             ]
           },
-          "channel_id": {
+          "channelId": {
             "type": "string"
           },
-          "end_padding_minutes": {
+          "endPaddingMinutes": {
             "format": "int32",
             "type": [
               "integer",
               "null"
             ]
           },
-          "keep_until": {
+          "keepUntil": {
             "type": [
               "string",
               "null"
             ]
           },
-          "max_recordings": {
+          "maxRecordings": {
             "format": "int32",
             "type": [
               "integer",
@@ -577,20 +577,20 @@
           "name": {
             "type": "string"
           },
-          "rule_type": {
+          "ruleType": {
             "type": [
               "string",
               "null"
             ]
           },
-          "start_padding_minutes": {
+          "startPaddingMinutes": {
             "format": "int32",
             "type": [
               "integer",
               "null"
             ]
           },
-          "title_filter": {
+          "titleFilter": {
             "type": [
               "string",
               "null"
@@ -599,39 +599,75 @@
         },
         "required": [
           "name",
-          "channel_id"
+          "channelId"
         ],
         "type": "object"
       },
       "CreateSourceRequest": {
         "properties": {
+          "alternativeBaseUrls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "endpoint": {
-            "type": "string"
+            "description": "Use `endpoint` for M3U, XMLTV, and network-tuner sources.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
           },
           "kind": {
             "type": "string"
           },
+          "maxConnections": {
+            "format": "int32",
+            "type": "integer"
+          },
           "name": {
             "type": "string"
+          },
+          "password": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
+          },
+          "serverUrl": {
+            "description": "Use `serverUrl`, `username`, and `password` for a standard Xtream source.\nKeep `endpoint` for an advanced, complete `player_api.php` URL.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
           },
           "timezone": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
           }
         },
         "required": [
           "name",
-          "kind",
-          "endpoint"
+          "kind"
         ],
         "type": "object"
       },
       "CreateStreamProfileRequest": {
         "properties": {
           "arguments": {},
-          "buffer_seconds": {
+          "bufferSeconds": {
             "format": "float",
             "type": [
               "number",
@@ -647,7 +683,7 @@
           "name": {
             "type": "string"
           },
-          "profile_type": {
+          "profileType": {
             "type": [
               "string",
               "null"
@@ -659,7 +695,7 @@
               "null"
             ]
           },
-          "user_agent": {
+          "userAgent": {
             "type": [
               "string",
               "null"
@@ -673,7 +709,7 @@
       },
       "CreateUserRequest": {
         "properties": {
-          "display_name": {
+          "displayName": {
             "type": "string"
           },
           "password": {
@@ -691,8 +727,75 @@
         },
         "required": [
           "username",
-          "display_name",
+          "displayName",
           "password"
+        ],
+        "type": "object"
+      },
+      "DeadLetterResponse": {
+        "properties": {
+          "attempt_count": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error_category": {
+            "type": "string"
+          },
+          "error_message": {
+            "type": "string"
+          },
+          "first_failed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "last_failed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "max_attempts": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "original_job_id": {
+            "type": "string"
+          },
+          "payload": {},
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "original_job_id",
+          "kind",
+          "payload",
+          "error_category",
+          "error_message",
+          "attempt_count",
+          "max_attempts",
+          "first_failed_at",
+          "last_failed_at",
+          "created_at"
         ],
         "type": "object"
       },
@@ -1899,10 +2002,10 @@
       },
       "RecordingResponse": {
         "properties": {
-          "channel_id": {
+          "channelId": {
             "type": "string"
           },
-          "created_at": {
+          "createdAt": {
             "type": "string"
           },
           "description": {
@@ -1911,29 +2014,29 @@
               "null"
             ]
           },
-          "duration_seconds": {
+          "durationSeconds": {
             "format": "int32",
             "type": [
               "integer",
               "null"
             ]
           },
-          "ends_at": {
+          "endsAt": {
             "type": "string"
           },
-          "error_message": {
+          "errorMessage": {
             "type": [
               "string",
               "null"
             ]
           },
-          "file_path": {
+          "filePath": {
             "type": [
               "string",
               "null"
             ]
           },
-          "file_size_bytes": {
+          "fileSizeBytes": {
             "format": "int64",
             "type": [
               "integer",
@@ -1943,19 +2046,19 @@
           "id": {
             "type": "string"
           },
-          "programme_id": {
+          "programmeId": {
             "type": [
               "string",
               "null"
             ]
           },
-          "rule_id": {
+          "ruleId": {
             "type": [
               "string",
               "null"
             ]
           },
-          "starts_at": {
+          "startsAt": {
             "type": "string"
           },
           "status": {
@@ -1964,50 +2067,50 @@
           "title": {
             "type": "string"
           },
-          "updated_at": {
+          "updatedAt": {
             "type": "string"
           }
         },
         "required": [
           "id",
-          "channel_id",
+          "channelId",
           "title",
-          "starts_at",
-          "ends_at",
+          "startsAt",
+          "endsAt",
           "status",
-          "created_at",
-          "updated_at"
+          "createdAt",
+          "updatedAt"
         ],
         "type": "object"
       },
       "RecordingRuleResponse": {
         "properties": {
-          "category_filter": {
+          "categoryFilter": {
             "type": [
               "string",
               "null"
             ]
           },
-          "channel_id": {
+          "channelId": {
             "type": "string"
           },
-          "created_at": {
+          "createdAt": {
             "type": "string"
           },
           "enabled": {
             "type": "boolean"
           },
-          "end_padding_minutes": {
+          "endPaddingMinutes": {
             "format": "int32",
             "type": "integer"
           },
           "id": {
             "type": "string"
           },
-          "keep_until": {
+          "keepUntil": {
             "type": "string"
           },
-          "max_recordings": {
+          "maxRecordings": {
             "format": "int32",
             "type": [
               "integer",
@@ -2017,34 +2120,34 @@
           "name": {
             "type": "string"
           },
-          "rule_type": {
+          "ruleType": {
             "type": "string"
           },
-          "start_padding_minutes": {
+          "startPaddingMinutes": {
             "format": "int32",
             "type": "integer"
           },
-          "title_filter": {
+          "titleFilter": {
             "type": [
               "string",
               "null"
             ]
           },
-          "updated_at": {
+          "updatedAt": {
             "type": "string"
           }
         },
         "required": [
           "id",
           "name",
-          "channel_id",
-          "rule_type",
-          "start_padding_minutes",
-          "end_padding_minutes",
-          "keep_until",
+          "channelId",
+          "ruleType",
+          "startPaddingMinutes",
+          "endPaddingMinutes",
+          "keepUntil",
           "enabled",
-          "created_at",
-          "updated_at"
+          "createdAt",
+          "updatedAt"
         ],
         "type": "object"
       },
@@ -2066,7 +2169,7 @@
             "format": "int64",
             "type": "integer"
           },
-          "total_bytes": {
+          "totalBytes": {
             "format": "int64",
             "type": "integer"
           }
@@ -2076,7 +2179,7 @@
           "recording",
           "completed",
           "failed",
-          "total_bytes"
+          "totalBytes"
         ],
         "type": "object"
       },
@@ -2186,7 +2289,7 @@
       },
       "ResolveAliasResponse": {
         "properties": {
-          "canonical_name": {
+          "canonicalName": {
             "type": [
               "string",
               "null"
@@ -2340,6 +2443,12 @@
           "gateway": {
             "type": "string"
           },
+          "gitHash": {
+            "type": "string"
+          },
+          "gitTag": {
+            "type": "string"
+          },
           "vlc": {
             "type": [
               "string",
@@ -2348,7 +2457,9 @@
           }
         },
         "required": [
-          "gateway"
+          "gateway",
+          "gitHash",
+          "gitTag"
         ],
         "type": "object"
       },
@@ -2369,9 +2480,24 @@
       },
       "SessionResponse": {
         "properties": {
+          "adapter": {
+            "type": "string"
+          },
+          "baseServer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "capacityPackets": {
             "minimum": 0,
             "type": "integer"
+          },
+          "channelName": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "configuredGeneration": {
             "format": "int64",
@@ -2387,6 +2513,12 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "firstFailure": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "lagEvents": {
             "format": "int64",
@@ -2456,6 +2588,7 @@
         "required": [
           "providerPoolId",
           "sourceId",
+          "adapter",
           "configuredGeneration",
           "upstreamGeneration",
           "state",
@@ -2589,6 +2722,23 @@
       },
       "SourceResponse": {
         "properties": {
+          "alternativeBaseUrls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cbConsecutiveFailures": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "cbOpenedAt": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "channels": {
             "minimum": 0,
             "type": "integer"
@@ -2645,7 +2795,9 @@
           "refreshIntervalSeconds",
           "maxConnections",
           "timezone",
-          "enabled"
+          "enabled",
+          "cbConsecutiveFailures",
+          "alternativeBaseUrls"
         ],
         "type": "object"
       },
@@ -2717,90 +2869,90 @@
       },
       "StreamHealthItem": {
         "properties": {
-          "audio_channels": {
+          "audioChannels": {
             "format": "int32",
             "type": [
               "integer",
               "null"
             ]
           },
-          "audio_codec": {
+          "audioCodec": {
             "type": [
               "string",
               "null"
             ]
           },
-          "audio_sample_rate": {
+          "audioSampleRate": {
             "format": "int32",
             "type": [
               "integer",
               "null"
             ]
           },
-          "bitrate_kbps": {
+          "bitrateKbps": {
             "format": "int32",
             "type": [
               "integer",
               "null"
             ]
           },
-          "group_name": {
+          "groupName": {
             "type": [
               "string",
               "null"
             ]
           },
-          "health_checked_at": {
+          "healthCheckedAt": {
             "type": [
               "string",
               "null"
             ]
           },
-          "health_error": {
+          "healthError": {
             "type": [
               "string",
               "null"
             ]
           },
-          "health_status": {
+          "healthStatus": {
             "type": "string"
           },
-          "provider_account_id": {
+          "providerAccountId": {
             "type": "string"
           },
-          "provider_stream_id": {
+          "providerStreamId": {
             "type": "string"
           },
-          "stream_name": {
+          "streamName": {
             "type": "string"
           },
-          "video_codec": {
+          "videoCodec": {
             "type": [
               "string",
               "null"
             ]
           },
-          "video_fps": {
+          "videoFps": {
             "format": "double",
             "type": [
               "number",
               "null"
             ]
           },
-          "video_height": {
+          "videoHeight": {
             "format": "int32",
             "type": [
               "integer",
               "null"
             ]
           },
-          "video_resolution": {
+          "videoResolution": {
             "type": [
               "string",
               "null"
             ]
           },
-          "video_width": {
+          "videoWidth": {
             "format": "int32",
             "type": [
               "integer",
@@ -2809,10 +2961,10 @@
           }
         },
         "required": [
-          "provider_stream_id",
-          "stream_name",
-          "health_status",
-          "provider_account_id"
+          "providerStreamId",
+          "streamName",
+          "healthStatus",
+          "providerAccountId"
         ],
         "type": "object"
       },
@@ -2869,7 +3021,7 @@
       "StreamProfileResponse": {
         "properties": {
           "arguments": {},
-          "buffer_seconds": {
+          "bufferSeconds": {
             "format": "float",
             "type": "number"
           },
@@ -2879,7 +3031,7 @@
               "null"
             ]
           },
-          "created_at": {
+          "createdAt": {
             "type": "string"
           },
           "enabled": {
@@ -2891,7 +3043,7 @@
           "name": {
             "type": "string"
           },
-          "profile_type": {
+          "profileType": {
             "type": "string"
           },
           "referer": {
@@ -2900,10 +3052,10 @@
               "null"
             ]
           },
-          "updated_at": {
+          "updatedAt": {
             "type": "string"
           },
-          "user_agent": {
+          "userAgent": {
             "type": [
               "string",
               "null"
@@ -2913,12 +3065,12 @@
         "required": [
           "id",
           "name",
-          "profile_type",
+          "profileType",
           "arguments",
-          "buffer_seconds",
+          "bufferSeconds",
           "enabled",
-          "created_at",
-          "updated_at"
+          "createdAt",
+          "updatedAt"
         ],
         "type": "object"
       },
@@ -3015,6 +3167,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "deadLetterCount": {
+            "minimum": 0,
+            "type": "integer"
+          },
           "guideCoverage": {
             "format": "double",
             "type": "number"
@@ -3047,6 +3203,7 @@
           "guideCoverage",
           "providerConnections",
           "providerLimit",
+          "deadLetterCount",
           "uptimeSeconds",
           "versions"
         ],
@@ -3227,6 +3384,15 @@
       },
       "UpdateSourceRequest": {
         "properties": {
+          "alternativeBaseUrls": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "enabled": {
             "type": [
               "boolean",
@@ -3251,7 +3417,7 @@
       },
       "UpdateUserRequest": {
         "properties": {
-          "display_name": {
+          "displayName": {
             "type": [
               "string",
               "null"
@@ -3280,10 +3446,10 @@
       },
       "UserResponse": {
         "properties": {
-          "created_at": {
+          "createdAt": {
             "type": "string"
           },
-          "display_name": {
+          "displayName": {
             "type": "string"
           },
           "enabled": {
@@ -3292,7 +3458,7 @@
           "id": {
             "type": "string"
           },
-          "last_login_at": {
+          "lastLoginAt": {
             "type": [
               "string",
               "null"
@@ -3301,7 +3467,7 @@
           "role": {
             "type": "string"
           },
-          "updated_at": {
+          "updatedAt": {
             "type": "string"
           },
           "username": {
@@ -3311,11 +3477,11 @@
         "required": [
           "id",
           "username",
-          "display_name",
+          "displayName",
           "role",
           "enabled",
-          "created_at",
-          "updated_at"
+          "createdAt",
+          "updatedAt"
         ],
         "type": "object"
       }
@@ -3328,7 +3494,7 @@
       "name": "MIT"
     },
     "title": "iptv-api",
-    "version": "0.1.0"
+    "version": "0.2.20"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -4658,6 +4824,301 @@
         },
         "tags": [
           "stream-profiles"
+        ]
+      }
+    },
+    "/api/v1/dead-letters": {
+      "get": {
+        "operationId": "list_dead_letters",
+        "parameters": [
+          {
+            "description": "Filter by job kind",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by error category",
+            "in": "query",
+            "name": "error_category",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Show only unresolved entries",
+            "in": "query",
+            "name": "unresolved_only",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Page size, default 50",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Zero-based page offset",
+            "in": "query",
+            "name": "offset",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/DeadLetterResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "dead-letters"
+        ]
+      }
+    },
+    "/api/v1/dead-letters/{id}": {
+      "get": {
+        "operationId": "get_dead_letter",
+        "parameters": [
+          {
+            "description": "Dead letter entry ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeadLetterResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "dead-letters"
+        ]
+      }
+    },
+    "/api/v1/dead-letters/{id}/close": {
+      "post": {
+        "operationId": "close_dead_letter",
+        "parameters": [
+          {
+            "description": "Dead letter entry ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveResult"
+                }
+              }
+            },
+            "description": "Entry closed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "dead-letters"
+        ]
+      }
+    },
+    "/api/v1/dead-letters/{id}/replay": {
+      "post": {
+        "operationId": "replay_dead_letter",
+        "parameters": [
+          {
+            "description": "Dead letter entry ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveResult"
+                }
+              }
+            },
+            "description": "Entry replayed as a new job"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "dead-letters"
         ]
       }
     },
@@ -6744,6 +7205,70 @@
         ]
       }
     },
+    "/api/v1/sessions/{provider_pool_id}/{source_id}/{generation}/terminate": {
+      "post": {
+        "operationId": "terminate_session",
+        "parameters": [
+          {
+            "description": "Provider pool identifier",
+            "in": "path",
+            "name": "provider_pool_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stable source identifier",
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Configured session generation",
+            "in": "path",
+            "name": "generation",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": ""
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/api/v1/settings/effective": {
       "get": {
         "operationId": "get_effective_settings",
@@ -7973,6 +8498,67 @@
               }
             },
             "description": ""
+          }
+        },
+        "tags": [
+          "sources"
+        ]
+      }
+    },
+    "/api/v1/sources/{source_id}/circuit-breaker/reset": {
+      "post": {
+        "operationId": "reset_source_circuit_breaker",
+        "parameters": [
+          {
+            "description": "Source ID",
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveResult"
+                }
+              }
+            },
+            "description": "Circuit breaker reset"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Persistence layer unavailable"
           }
         },
         "tags": [
