@@ -31,7 +31,7 @@ Redaction: this document replaces the output token in all URLs with `<token>`. I
 | F5 | No process runs the event scan automatically. Prune uses one template's grace for all templates. | Medium | WP4, WP7 |
 | F6 | `GET /api/v1/events` returns a shape that the web client does not expect. | Low | WP7 |
 | F7 | No sports metadata enrichment exists. | Feature | WP8a, WP8b |
-| F8 | XMLTV output drops `sub-title` and does not mark sports programmes. | Medium | WP8b |
+| F8 | XMLTV output does not mark sports programmes. The omission of `sub-title` is possibly intentional. | Medium | WP8b |
 | F9 | The runtime does not read any of the nine operator settings. | Medium | WP6, and the v0.2.19 ring fix |
 | F10 | Short-EPG refresh jobs fail. Guide coverage is 5.5 %. | Medium | WP10 |
 | F11 | `/api/v1/system` reports `providerLimit: 0` when no session is active. | Low | WP6 |
@@ -255,7 +255,7 @@ Caching and limits:
 Output metadata for each event programme:
 
 - Title: `Ottawa Senators at Buffalo Sabres`.
-- Sub-title: league and venue.
+- Sub-title: do not write it. Put the league and venue in the description. See F8.
 - Description: the matchup, the broadcasters, and the source title.
 - Categories: `Sports`, `Sports event`, and the league, for example `NHL`. Jellyfin uses the `Sports` category to classify a programme as sports.
 - Programme icon: phase 1 uses the home-team logo URL. Phase 2 (WP9) serves a composite matchup image from the relay.
@@ -265,7 +265,9 @@ Store the values in `generated_programmes.metadata` (jsonb) and `categories`. Th
 
 ### F8. XMLTV output is incomplete
 
-- The XMLTV handler writes `title`, `desc`, and `category` only (`crates/api/src/lib.rs:6836` to `:6851`). `ProgrammeRow` has `subtitle`, but the handler drops it.
+- The XMLTV handler writes `title`, `desc`, and `category` only (`crates/api/src/lib.rs:6836` to `:6851`). `ProgrammeRow` has `subtitle`, but the handler does not write it.
+- The omission of `sub-title` is possibly intentional. The operator reports that `sub-title` caused Jellyfin crashes. The Git history has no record of this: the API XMLTV writer never wrote `sub-title` in any commit. Thus the code does not document the reason. Treat the omission as intentional until a test proves otherwise.
+- Fix: do not add `sub-title` to the output. Add a code comment at the XMLTV handler that records the Jellyfin crash reason. Add a test that fails if the output contains `<sub-title>`. If a later package must add `sub-title`, first reproduce the crash with a test Jellyfin instance, and find the input that causes it.
 - Generated programmes have the categories `["Dynamic event", kind]` (`catalog.rs`, `replace_generated_programmes`). Jellyfin does not classify them as sports.
 - No programme `icon`, `episode-num`, or `live` element exists.
 
@@ -487,7 +489,7 @@ Test plan: offline fixture tests for these cases: `Senators @ Sabres` gives BUF 
 
 Brief:
 
-> Connect `iptv-sports` to the WP4 scan. For each matched event with a known league, call the matcher, and store the result in `generated_programmes.metadata`. Set the title to `<Away full name> at <Home full name>`, and use `categories = ["Sports", "Sports event", <league>]`. An ESPN failure must not stop the scan. Return programme metadata from `list_programmes_for_channels`. In the XMLTV handler, write these elements in DTD order: `<sub-title>` (league and venue; also write the existing `subtitle` for imported programmes), `<desc>`, each `<category>`, `<icon src="...">` (home-team logo), `<episode-num system="original-air-date">YYYY-MM-DD</episode-num>`, and `<live/>`. Before you finish, check how Jellyfin's XMLTV parser reads `icon`, `category`, `episode-num`, and `live`, and record the result in the report. If Jellyfin does not use an element, say so. Done when an XMLTV snapshot test for one NHL event passes, and the output passes `xmllint` against the XMLTV DTD.
+> Connect `iptv-sports` to the WP4 scan. For each matched event with a known league, call the matcher, and store the result in `generated_programmes.metadata`. Set the title to `<Away full name> at <Home full name>`, and use `categories = ["Sports", "Sports event", <league>]`. An ESPN failure must not stop the scan. Return programme metadata from `list_programmes_for_channels`. In the XMLTV handler, write these elements in DTD order: `<desc>` (matchup, league, venue, broadcasters), each `<category>`, `<icon src="...">` (home-team logo), `<episode-num system="original-air-date">YYYY-MM-DD</episode-num>`, and `<live/>`. Before you finish, check how Jellyfin's XMLTV parser reads `icon`, `category`, `episode-num`, and `live`, and record the result in the report. If Jellyfin does not use an element, say so. Do not write `<sub-title>`: the operator reports that it caused Jellyfin crashes. Add a code comment with that reason and a test that fails if the output contains `<sub-title>`. Done when an XMLTV snapshot test for one NHL event passes, and the output passes `xmllint` against the XMLTV DTD.
 
 Test plan:
 
