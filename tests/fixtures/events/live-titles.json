@@ -1,0 +1,61 @@
+{
+  "description": "Live provider titles recorded 2026-11-04. Date and time are US Eastern. Time-only titles resolve against the reference instant.",
+  "timezone": "America/New_York",
+  "reference": "2026-11-04T15:00:00Z",
+  "titles": [
+    {
+      "name": "US (ESPN+ 069): Maryland Eastern Shore vs. High Point Nov 04 7:00PM ET (2026-11-04 19:00:25) [1080p]",
+      "home": "Maryland Eastern Shore",
+      "away": "High Point",
+      "league": null,
+      "separator": "vs",
+      "event": "Maryland Eastern Shore vs High Point",
+      "time": null,
+      "starts_at": "2026-11-05T00:00:00Z"
+    },
+    {
+      "name": "CA (TSN+ 007): NCAA Football: Ball State vs. Massachusetts (2026-11-04 19:00:00) [1080p]",
+      "home": "Ball State",
+      "away": "Massachusetts",
+      "league": "NCAA Football",
+      "separator": "vs",
+      "event": "Ball State vs Massachusetts",
+      "time": null,
+      "starts_at": "2026-11-05T00:00:00Z"
+    },
+    {
+      "name": "(FLSP 004): hockey:  Kingston Frontenacs vs Ottawa 67`s (Home) (2026-11-04 10:30:00) [1080p]",
+      "home": "Kingston Frontenacs",
+      "away": "Ottawa 67`s",
+      "league": "hockey",
+      "separator": "vs",
+      "event": "Kingston Frontenacs vs Ottawa 67`s",
+      "time": null,
+      "starts_at": "2026-11-04T15:30:00Z"
+    },
+    {
+      "name": "(FLSP 013): fc:  Penn State Behrend vs La Roche   Men`s (PSU Behrend vs La Roche) (2026-11-04 14:00:05) [1080p]",
+      "home": "Penn State Behrend",
+      "away": "La Roche Men`s",
+      "league": "fc",
+      "separator": "vs",
+      "event": "Penn State Behrend vs La Roche Men`s",
+      "time": null,
+      "starts_at": "2026-11-04T19:00:00Z"
+    },
+    {
+      "name": "NHL: 01 - 7:30pm Senators @ Sabres [1080p]",
+      "home": "Sabres",
+      "away": "Senators",
+      "league": "NHL",
+      "separator": "@",
+      "event": "Senators @ Sabres",
+      "time": "7:30pm",
+      "starts_at": "2026-11-05T00:30:00Z"
+    },
+    {
+      "name": "NFL : 01 - [1080p]",
+      "no_match": true
+    }
+  ]
+}

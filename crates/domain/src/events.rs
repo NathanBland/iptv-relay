@@ -177,58 +177,97 @@ impl EventRuleSet {
     }
 }
 
-/// Returns conservative built-in rules for provider titles such as
-/// `Broncos vs Chiefs (2026-09-13 18:20) FHD` and
-/// `Yankees @ Rockies 08/19/2026 07:10 PM HD`.
+/// Metadata key that holds the default title template of a rule.
 ///
-/// The rules intentionally require a recognizable date/time. Unscheduled
+/// The `{event}` title field renders this template. Built-in rules set it to
+/// `{away} @ {home}` or `{home} vs {away}`.
+pub const EVENT_TITLE_METADATA_KEY: &str = "event_title";
+
+/// Returns conservative built-in rules for provider titles such as
+/// `Broncos vs Chiefs (2026-09-13 18:20) FHD`,
+/// `Yankees @ Rockies 08/19/2026 07:10 PM HD`,
+/// `CA (TSN+ 007): NCAA Football: Ball State vs. Massachusetts (2026-11-04 19:00:00) [1080p]`,
+/// and `NHL: 01 - 7:30pm Senators @ Sabres [1080p]`.
+///
+/// Each rule accepts a provider prefix, an optional league prefix (captured as
+/// `league`), optional parenthesized suffixes, and trailing quality tags.
+/// Date rules capture the local date and time without seconds. The two
+/// time-only rules capture `time` and have no date pattern. The caller must
+/// resolve the date for these rules.
+///
+/// The rules intentionally require a recognizable date or time. Unscheduled
 /// channels therefore remain ordinary channels instead of being guessed into
 /// generated guide slots. Operators can clone and scope these defaults per
 /// channel group, then override timezone, duration, title, and filler policy.
 #[must_use]
 pub fn builtin_sports_event_rules() -> EventRuleSet {
-    const PREFIX: &str = r"(?:\[[^\]]{1,32}\]\s*|(?:event|vip|sports|slot)\s*\d*\s*[:|]\s*)*";
-    const QUALITY: &str = r"(?:\s*[-|]?\s*(?:UHD|4K|FHD|HD|SD|2160p|1080p|720p))?";
+    const PREFIX: &str = r"(?:\[[^\]]{1,32}\]\s*|(?:event|vip|sports|slot)\s*\d*\s*[:|]\s*|(?:[A-Z]{2}\s+)?\([^()]{1,32}\)\s*:\s*)*";
+    const LEAGUE: &str = r"(?:(?P<league>NCAA(?:\s+(?:Football|Basketball|Hockey|Baseball|Soccer))?|WNBA|NFL|NHL|NBA|MLB|MLS|CFL|EPL|UFC|hockey|fc|soccer|football|basketball|baseball|rugby|cricket|tennis|golf)\s*:\s*(?:[0-9]{1,3}\s*[-\u{2013}]\s*)?)?";
+    // Text between the away team and the date: a spelled date and parenthesized tags.
+    const SUFFIX: &str = r"(?:\s+[A-Za-z]{3,9}\s+[0-9]{1,2}\s+[0-9]{1,2}(?::[0-9]{2})?\s*[AP]M(?:\s+[A-Z]{2,4})?)?(?:\s+\([^()]{1,64}\))*";
+    const TRAILER: &str = r"(?:\s*[-|]?\s*(?:\[[^\]]{1,32}\]|\([^()]{1,64}\)|UHD|4K|FHD|HD|SD|2160p|1080p|720p))*\s*$";
+    const TIME: &str = r"[0-9]{1,2}(?::[0-9]{2})?\s*[ap]m";
+    // (label, date regex, trailing seconds regex, chrono format)
     let formats = [
         (
             "ISO local time",
             r"20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}",
+            r"(?::[0-9]{2})?",
             "%Y-%m-%d %H:%M",
         ),
         (
             "ISO T local time",
             r"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}",
+            r"(?::[0-9]{2})?",
             "%Y-%m-%dT%H:%M",
         ),
         (
             "US local time",
             r"[0-9]{1,2}/[0-9]{1,2}/20[0-9]{2} [0-9]{1,2}:[0-9]{2} [AP]M",
+            "",
             "%m/%d/%Y %I:%M %p",
         ),
     ];
-    let mut rules = Vec::with_capacity(formats.len() * 2);
-    for (format_index, (label, date_regex, date_format)) in formats.into_iter().enumerate() {
+    let mut rules = Vec::with_capacity(formats.len() * 2 + 2);
+    for (format_index, (label, date_regex, seconds, date_format)) in formats.into_iter().enumerate()
+    {
         rules.push(builtin_sports_rule(
             format_index * 2,
             format!("Built-in sports: vs ({label})"),
             format!(
-                r"(?i)^{PREFIX}(?P<home>.+?)\s+(?:v|vs|versus)\.?\s+(?P<away>.+?)\s+\(?(?:{date_regex})\)?{QUALITY}$"
+                r"(?i)^{PREFIX}{LEAGUE}(?P<home>.+?)\s+(?:v|vs|versus)\.?\s+(?P<away>.+?){SUFFIX}\s+\(?(?:{date_regex}){seconds}\)?{TRAILER}"
             ),
-            date_regex,
-            date_format,
+            Some((date_regex, date_format)),
             "{home} vs {away}",
         ));
         rules.push(builtin_sports_rule(
             format_index * 2 + 1,
             format!("Built-in sports: at ({label})"),
             format!(
-                r"(?i)^{PREFIX}(?P<away>.+?)\s+@\s+(?P<home>.+?)\s+\(?(?:{date_regex})\)?{QUALITY}$"
+                r"(?i)^{PREFIX}{LEAGUE}(?P<away>.+?)\s+@\s+(?P<home>.+?){SUFFIX}\s+\(?(?:{date_regex}){seconds}\)?{TRAILER}"
             ),
-            date_regex,
-            date_format,
+            Some((date_regex, date_format)),
             "{away} @ {home}",
         ));
     }
+    rules.push(builtin_sports_rule(
+        6,
+        "Built-in sports: vs (time only)".to_owned(),
+        format!(
+            r"(?i)^{PREFIX}{LEAGUE}(?P<time>{TIME})\s+(?P<home>.+?)\s+(?:v|vs|versus)\.?\s+(?P<away>.+?){SUFFIX}{TRAILER}"
+        ),
+        None,
+        "{home} vs {away}",
+    ));
+    rules.push(builtin_sports_rule(
+        7,
+        "Built-in sports: at (time only)".to_owned(),
+        format!(
+            r"(?i)^{PREFIX}{LEAGUE}(?P<time>{TIME})\s+(?P<away>.+?)\s+@\s+(?P<home>.+?){SUFFIX}{TRAILER}"
+        ),
+        None,
+        "{away} @ {home}",
+    ));
     EventRuleSet(rules)
 }
 
@@ -236,8 +275,7 @@ fn builtin_sports_rule(
     index: usize,
     name: String,
     name_regex: String,
-    date_regex: &str,
-    date_format: &str,
+    date: Option<(&str, &str)>,
     title_template: &str,
 ) -> EventRule {
     EventRule {
@@ -251,11 +289,14 @@ fn builtin_sports_rule(
             name_regex: Some(name_regex),
             ..EventMatch::default()
         },
-        date_patterns: vec![DatePattern {
-            regex: format!(r"(?i)(?P<datetime>{date_regex})"),
-            format: date_format.to_owned(),
-            timezone: None,
-        }],
+        date_patterns: date
+            .map(|(date_regex, date_format)| DatePattern {
+                regex: format!(r"(?i)(?P<datetime>{date_regex})"),
+                format: date_format.to_owned(),
+                timezone: None,
+            })
+            .into_iter()
+            .collect(),
         timezone: default_timezone(),
         lifecycle: EventLifecyclePolicy::default(),
         guide: EventGuidePolicy {
@@ -263,7 +304,10 @@ fn builtin_sports_rule(
             ..EventGuidePolicy::default()
         },
         channel: EventChannelTemplate::default(),
-        metadata: BTreeMap::new(),
+        metadata: BTreeMap::from([(
+            EVENT_TITLE_METADATA_KEY.to_owned(),
+            title_template.to_owned(),
+        )]),
     }
 }
 
@@ -310,7 +354,7 @@ mod tests {
         let first = builtin_sports_event_rules();
         let second = builtin_sports_event_rules();
         assert_eq!(first, second);
-        assert_eq!(first.len(), 6);
+        assert_eq!(first.len(), 8);
         assert_eq!(first.0[0].name, "Built-in sports: vs (ISO local time)");
         assert_eq!(first.0[1].guide.title_template, "{away} @ {home}");
         assert!(first.0.iter().all(|rule| {
@@ -319,7 +363,8 @@ mod tests {
                 && rule.guide.duration_seconds == 10_800
                 && rule.guide.filler_title == "No programs available"
                 && rule.matcher.name_regex.is_some()
-                && rule.date_patterns.len() == 1
+                && rule.date_patterns.len() == usize::from(!rule.name.ends_with("(time only)"))
+                && rule.metadata.get(EVENT_TITLE_METADATA_KEY) == Some(&rule.guide.title_template)
         }));
         assert_eq!(
             first.0[0].id.as_uuid(),

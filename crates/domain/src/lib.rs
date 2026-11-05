@@ -25,8 +25,9 @@ pub use epg::{
     Programme, ProgrammeRating,
 };
 pub use events::{
-    DatePattern, EventChannelTemplate, EventGuidePolicy, EventIdentityPolicy, EventLifecyclePolicy,
-    EventMatch, EventRule, EventRuleSet, builtin_sports_event_rules,
+    DatePattern, EVENT_TITLE_METADATA_KEY, EventChannelTemplate, EventGuidePolicy,
+    EventIdentityPolicy, EventLifecyclePolicy, EventMatch, EventRule, EventRuleSet,
+    builtin_sports_event_rules,
 };
 pub use ids::{ChannelId, EpgSourceId, EventRuleId, ProviderId, SourceId};
 pub use reconcile::{
