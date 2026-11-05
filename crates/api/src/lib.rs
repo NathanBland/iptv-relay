@@ -972,6 +972,9 @@ pub fn router(state: AppState) -> Router {
     // CompressionLayer buffers the response body, which prevents SSE events
     // from flushing and causes the session-events endpoint to time out.
     let sse_routes = sse_control_routes();
+    // Live MPEG-TS bodies also bypass compression. Gzip adds latency and CPU
+    // cost to an already compressed video stream and slows each viewer.
+    let media_routes = media_output_routes();
 
     Router::new()
         .route("/health/live", get(live))
@@ -989,6 +992,7 @@ pub fn router(state: AppState) -> Router {
         .merge(output_routes())
         .layer(CompressionLayer::new())
         .merge(sse_routes)
+        .merge(media_routes)
         .layer(CatchPanicLayer::new())
         .with_state(state)
 }
@@ -1374,11 +1378,15 @@ fn configuration_control_routes() -> Router<AppState> {
         )
 }
 
+/// Live media routes that must bypass the compression layer.
+fn media_output_routes() -> Router<AppState> {
+    Router::new().route("/out/{token}/stream/{*channel_path}", get(stream_channel))
+}
+
 fn output_routes() -> Router<AppState> {
     Router::new()
         .route("/out/{token}/playlist.m3u", get(playlist))
         .route("/out/{token}/xmltv.xml", get(xmltv))
-        .route("/out/{token}/stream/{*channel_path}", get(stream_channel))
         .route("/out/{token}/hdhr/discover.json", get(hdhr_discover))
         .route("/out/{token}/hdhr/lineup.json", get(hdhr_lineup))
         .route(
@@ -6955,7 +6963,12 @@ fn capacity_placeholder_response(
     media: HttpTsSessionManager,
     source: HttpTsSourceSpec,
 ) -> Response {
-    let ring = match default_ring(1_000_000) {
+    // The placeholder is a low-rate slate, so it does not need the live floor.
+    let placeholder_policy = RingPolicy {
+        max_bytes: 4 * 1024 * 1024,
+        ..RingPolicy::default()
+    };
+    let ring = match policy_ring(1_000_000, placeholder_policy) {
         Ok(ring) => ring,
         Err(detail) => return invalid_buffer_policy(detail),
     };
@@ -7024,7 +7037,11 @@ async fn channel_source_spec(state: &AppState, channel_id: Uuid) -> StreamResult
         .await
         .map_err(|error| Box::new(persistence_error_response(error)))?
         .ok_or_else(|| Box::new(stream_source_unavailable()))?;
-    database_source_spec(state, &plan)
+    let policy = match plan.candidates.first() {
+        Some(primary) => ring_policy(state, &primary.provider_pool_id.to_string()).await,
+        None => RingPolicy::default(),
+    };
+    database_source_spec(state, &plan, policy)
 }
 
 fn in_memory_source_spec(
@@ -7054,6 +7071,7 @@ fn in_memory_source_spec(
 fn database_source_spec(
     state: &AppState,
     plan: &ChannelPlaybackPlan,
+    policy: RingPolicy,
 ) -> StreamResult<HttpTsSourceSpec> {
     let Some(primary) = plan.candidates.first() else {
         return Err(Box::new(stream_source_unavailable()));
@@ -7074,7 +7092,8 @@ fn database_source_spec(
         .and_then(|value| u64::try_from(value).ok())
         .and_then(|value| value.checked_mul(1_000))
         .unwrap_or(4_000_000);
-    let ring = default_ring(bitrate).map_err(|detail| Box::new(invalid_buffer_policy(detail)))?;
+    let ring =
+        policy_ring(bitrate, policy).map_err(|detail| Box::new(invalid_buffer_policy(detail)))?;
     let primary_url = decrypt_stream_url(state, primary)?;
     let adapter_policy = input_adapter_policy(&primary.input_adapter)?;
     let primary_pool_id: Arc<str> = primary.provider_pool_id.to_string().into();
@@ -7287,21 +7306,102 @@ fn invalid_buffer_policy(detail: &'static str) -> Response {
     .response()
 }
 
+/// Live ring sizing from the `media.ring.*` and `media.viewer.*` settings.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RingPolicy {
+    duration: Duration,
+    max_bytes: usize,
+    pre_roll: Duration,
+}
+
+impl RingPolicy {
+    const DEFAULT_DURATION_SECONDS: u64 = 8;
+    const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
+    const DEFAULT_PRE_ROLL_SECONDS: u64 = 2;
+    /// Smallest ring for any live channel, capped by `max_bytes`.
+    ///
+    /// Many providers send 30 seconds or more of media in the first second of
+    /// a connection. A ring sized only from the estimated bitrate cannot hold
+    /// that burst, so new viewers immediately fall behind the write head.
+    const MIN_BYTES: usize = 32 * 1024 * 1024;
+
+    fn from_settings(settings: &[EffectiveSetting]) -> Self {
+        let integer = |key: &str| {
+            settings
+                .iter()
+                .find(|setting| setting.definition.key == key)
+                .and_then(|setting| setting.value.as_u64())
+        };
+        let defaults = Self::default();
+        Self {
+            duration: integer("media.ring.duration_seconds")
+                .map_or(defaults.duration, Duration::from_secs),
+            max_bytes: integer("media.ring.max_bytes")
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(defaults.max_bytes),
+            pre_roll: integer("media.viewer.start_delay_seconds")
+                .map_or(defaults.pre_roll, Duration::from_secs),
+        }
+    }
+}
+
+impl Default for RingPolicy {
+    fn default() -> Self {
+        Self {
+            duration: Duration::from_secs(Self::DEFAULT_DURATION_SECONDS),
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+            pre_roll: Duration::from_secs(Self::DEFAULT_PRE_ROLL_SECONDS),
+        }
+    }
+}
+
+/// Resolves the ring policy for one provider pool.
+///
+/// A settings failure must not stop playback, so this falls back to defaults.
+async fn ring_policy(state: &AppState, provider_id: &str) -> RingPolicy {
+    let Some(catalog) = &state.catalog_repository else {
+        return RingPolicy::default();
+    };
+    let overrides = match catalog.load_operator_setting_overrides().await {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            warn!(%error, "cannot load media settings; using default ring policy");
+            return RingPolicy::default();
+        }
+    };
+    match resolve_settings(&overrides.to_domain(provider_id, ""), provider_id, "") {
+        Ok(settings) => RingPolicy::from_settings(&settings),
+        Err(error) => {
+            warn!(%error, "invalid media settings; using default ring policy");
+            RingPolicy::default()
+        }
+    }
+}
+
 fn default_ring(estimated_bitrate_bits_per_second: u64) -> Result<MpegTsRingConfig, &'static str> {
-    const MAX_RING_BYTES: usize = 64 * 1024 * 1024;
-    let maximum_packets = MAX_RING_BYTES / iptv_media::MPEG_TS_PACKET_SIZE;
+    policy_ring(estimated_bitrate_bits_per_second, RingPolicy::default())
+}
+
+fn policy_ring(
+    estimated_bitrate_bits_per_second: u64,
+    policy: RingPolicy,
+) -> Result<MpegTsRingConfig, &'static str> {
+    let packet_size = iptv_media::MPEG_TS_PACKET_SIZE;
+    let maximum_packets = (policy.max_bytes / packet_size).max(1);
+    let minimum_packets = (RingPolicy::MIN_BYTES / packet_size).min(maximum_packets);
     let maximum_bitrate = u64::try_from(maximum_packets)
         .map_err(|_| "the ring capacity cannot be represented on this platform")?
-        .saturating_mul(iptv_media::MPEG_TS_PACKET_SIZE as u64);
+        .saturating_mul(packet_size as u64);
     let bitrate = estimated_bitrate_bits_per_second.clamp(1, maximum_bitrate);
-    let requested =
-        MpegTsRingConfig::for_bitrate(bitrate, Duration::from_secs(8), Duration::from_secs(2))
-            .map_err(|_| "the configured bitrate cannot be represented by the ring")?;
-    MpegTsRingConfig::new(
-        requested.capacity_packets().min(maximum_packets),
-        requested.pre_roll_packets().min(maximum_packets),
-    )
-    .map_err(|_| "the configured pre-roll exceeds the effective ring capacity")
+    let duration = policy.duration.max(Duration::from_secs(1));
+    let pre_roll = policy.pre_roll.min(duration);
+    let requested = MpegTsRingConfig::for_bitrate(bitrate, duration, pre_roll)
+        .map_err(|_| "the configured bitrate cannot be represented by the ring")?;
+    let capacity = requested
+        .capacity_packets()
+        .clamp(minimum_packets, maximum_packets);
+    MpegTsRingConfig::new(capacity, requested.pre_roll_packets().min(capacity))
+        .map_err(|_| "the configured pre-roll exceeds the effective ring capacity")
 }
 
 fn retryable_problem(
@@ -11757,6 +11857,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_responses_bypass_compression() {
+        let app_state = state();
+        let channel_id = Uuid::now_v7();
+        app_state
+            .catalog
+            .write()
+            .await
+            .channels
+            .push(ChannelRecord {
+                id: channel_id,
+                number: "3".into(),
+                name: "Uncompressed".into(),
+                group: None,
+                logo_url: None,
+                enabled: true,
+            });
+        let app = router(app_state);
+
+        // The control routes still compress large bodies.
+        let compressed_control = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/openapi.json")
+                    .header(header::AUTHORIZATION, "Bearer admin-secret")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            compressed_control.headers().get(header::CONTENT_ENCODING),
+            Some(&HeaderValue::from_static("gzip"))
+        );
+
+        let stream = app
+            .oneshot(
+                Request::get(format!("/out/output-secret/stream/{channel_id}.ts"))
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(stream.headers().get(header::CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
     async fn duplicate_channel_number_is_conflict() {
         let app = router(state());
         let body = r#"{"number":"7","name":"First","group":null,"logo_url":null}"#;
@@ -12064,7 +12213,8 @@ mod tests {
         };
 
         let generation = playback_generation(&plan);
-        let spec = database_source_spec(&app_state, &plan).expect("database source spec");
+        let spec = database_source_spec(&app_state, &plan, RingPolicy::default())
+            .expect("database source spec");
         assert_eq!(spec.key().source_id.as_ref(), plan.channel_id.to_string());
         assert_eq!(spec.key().generation, generation);
         assert_eq!(spec.adapter_policy(), InputAdapterPolicy::NativeTs);
@@ -12117,7 +12267,7 @@ mod tests {
                 channel_revision: candidate.channel_revision,
                 candidates: vec![candidate],
             };
-            let spec = database_source_spec(&app_state, &plan).unwrap();
+            let spec = database_source_spec(&app_state, &plan, RingPolicy::default()).unwrap();
             assert_eq!(spec.adapter_policy(), expected, "{input_adapter}");
         }
 
@@ -12129,7 +12279,7 @@ mod tests {
             channel_revision: candidate.channel_revision,
             candidates: vec![candidate],
         };
-        let response = *database_source_spec(&app_state, &plan).unwrap_err();
+        let response = *database_source_spec(&app_state, &plan, RingPolicy::default()).unwrap_err();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
@@ -12168,7 +12318,7 @@ mod tests {
             channel_revision: candidate.channel_revision,
             candidates: vec![candidate.clone()],
         };
-        let response = database_source_spec(&app_state, &plan).unwrap_err();
+        let response = database_source_spec(&app_state, &plan, RingPolicy::default()).unwrap_err();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         candidate.max_connections = 1;
@@ -12177,7 +12327,7 @@ mod tests {
             candidates: vec![candidate],
             ..plan
         };
-        let response = database_source_spec(&app_state, &plan).unwrap_err();
+        let response = database_source_spec(&app_state, &plan, RingPolicy::default()).unwrap_err();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -12190,6 +12340,71 @@ mod tests {
         let enormous = default_ring(u64::MAX).unwrap();
         assert!(enormous.capacity_bytes() <= 64 * 1024 * 1024);
         assert!(enormous.pre_roll_packets() <= enormous.capacity_packets());
+    }
+
+    #[test]
+    fn default_ring_holds_a_provider_startup_burst() {
+        // A 4 Mbps fallback estimate used to give a 4 MB ring, and a provider
+        // burst of 12 MB or more overran every new viewer.
+        let ring = default_ring(4_000_000).unwrap();
+        assert_eq!(
+            ring.capacity_packets(),
+            RingPolicy::MIN_BYTES / iptv_media::MPEG_TS_PACKET_SIZE
+        );
+        assert!(ring.pre_roll_packets() < ring.capacity_packets());
+    }
+
+    #[test]
+    fn ring_policy_reads_media_settings() {
+        let mut overrides = iptv_domain::SettingOverrides::default();
+        overrides.global.insert(
+            "media.ring.duration_seconds".to_owned(),
+            serde_json::json!(90),
+        );
+        overrides.global.insert(
+            "media.ring.max_bytes".to_owned(),
+            serde_json::json!(48 * 1024 * 1024),
+        );
+        overrides.global.insert(
+            "media.viewer.start_delay_seconds".to_owned(),
+            serde_json::json!(5),
+        );
+        let settings = resolve_settings(&overrides, "", "").unwrap();
+        let policy = RingPolicy::from_settings(&settings);
+        assert_eq!(
+            policy,
+            RingPolicy {
+                duration: Duration::from_secs(90),
+                max_bytes: 48 * 1024 * 1024,
+                pre_roll: Duration::from_secs(5),
+            }
+        );
+
+        // 90 seconds at 8 Mbps is 90 MB, so the byte ceiling applies.
+        let ring = policy_ring(8_000_000, policy).unwrap();
+        assert_eq!(
+            ring.capacity_packets(),
+            48 * 1024 * 1024 / iptv_media::MPEG_TS_PACKET_SIZE
+        );
+
+        let defaults = RingPolicy::from_settings(
+            &resolve_settings(&iptv_domain::SettingOverrides::default(), "", "").unwrap(),
+        );
+        assert_eq!(defaults, RingPolicy::default());
+    }
+
+    #[test]
+    fn ring_byte_ceiling_below_the_floor_wins() {
+        let policy = RingPolicy {
+            max_bytes: 2 * 1024 * 1024,
+            ..RingPolicy::default()
+        };
+        let ring = policy_ring(4_000_000, policy).unwrap();
+        assert_eq!(
+            ring.capacity_packets(),
+            2 * 1024 * 1024 / iptv_media::MPEG_TS_PACKET_SIZE
+        );
+        assert!(ring.pre_roll_packets() <= ring.capacity_packets());
     }
 
     #[tokio::test]

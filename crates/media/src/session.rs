@@ -1562,12 +1562,14 @@ impl ViewerHandle {
                         registration.update(generation, cursor.next_sequence());
                         yield bytes;
                     }
-                    RingRead::Lagged {
-                        skipped_packets, ..
-                    } => {
+                    RingRead::Lagged { .. } => {
+                        // The cursor already moved forward to the next safe
+                        // PAT/PMT boundary. Skip the lost media and keep the
+                        // HTTP body open: a live viewer prefers a short gap
+                        // to a disconnect, and a provider startup burst can
+                        // briefly outrun any downstream reader.
                         session_guard.diagnostics.record_lag();
                         registration.update(cursor.generation(), cursor.next_sequence());
-                        Err(ViewerStreamError::Lagged { skipped_packets })?;
                     }
                     RingRead::GenerationBoundary {
                         generation,
@@ -2457,8 +2459,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_viewer_surfaces_lag_generation_close_and_redacted_debug() {
-        let (viewer, ring, diagnostics) = local_viewer(2, 2);
+    async fn local_viewer_skips_lag_generation_close_and_redacted_debug() {
+        let (viewer, ring, diagnostics) = local_viewer(3, 3);
         assert_eq!(viewer.session_key().source_id.as_ref(), "local");
         assert_eq!(viewer.lease_id(), 7);
         assert_eq!(viewer.session_snapshot().viewer_count, 1);
@@ -2468,14 +2470,23 @@ mod tests {
         drop(fork);
         assert_eq!(viewer.session_snapshot().viewer_count, 1);
 
-        ring.push(&(0..5_u32).flat_map(packet).collect::<Vec<_>>())
+        // Packets 0..6 are PAT, PMT, media 2, PAT, PMT, media 5. The ring
+        // keeps only the last three, so the viewer at sequence 0 lags.
+        ring.push(&(0..6_u32).flat_map(packet).collect::<Vec<_>>())
             .unwrap();
         let mut stream = viewer.into_byte_stream();
         assert!(format!("{stream:?}").contains("ViewerByteStream"));
-        assert!(matches!(
-            stream.next().await,
-            Some(Err(ViewerStreamError::Lagged { skipped_packets: 3 }))
-        ));
+        let mut delivered = Vec::new();
+        while !media_labels(&delivered).contains(&5) {
+            let item = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("a lagged viewer resumes instead of stalling")
+                .expect("a lagged viewer stays open")
+                .expect("a lagged viewer is not an error");
+            delivered.extend_from_slice(&item);
+        }
+        assert_eq!(packet_pid(&delivered[..MPEG_TS_PACKET_SIZE]), 0);
+        assert!(!media_labels(&delivered).contains(&2));
         assert_eq!(diagnostics.snapshot(ring.snapshot()).ring_lag_events, 1);
         drop(stream);
 
