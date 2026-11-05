@@ -8,8 +8,8 @@ use chrono::{DateTime, Duration, Utc};
 use chrono_tz::Tz;
 use iptv_domain::builtin_sports_event_rules;
 use iptv_parsers::{
-    CompiledEventRules, EventCandidate, EventGuideInput, GeneratedProgramme,
-    GeneratedProgrammeKind, generate_event_schedule,
+    CompiledEventRules, EventCandidate, GeneratedProgramme, GeneratedProgrammeKind,
+    generate_event_guide,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -18,6 +18,12 @@ use std::{collections::BTreeMap, fmt, future::Future, pin::Pin};
 use uuid::Uuid;
 
 use crate::PersistenceError;
+use crate::event_scan::{
+    BUILTIN_EVENT_TEMPLATE_ID, EventChannelState, EventScanReport, EventScanSettings,
+    compile_template_regex, plan_event_channel_guide, resolve_event_timezone, slot_number,
+    stable_event_channel_name,
+};
+use regex::Regex;
 
 const DEFAULT_PAGE_SIZE: i64 = 100;
 const MAX_PAGE_SIZE: i64 = 500;
@@ -1882,7 +1888,7 @@ impl CatalogRepository {
                 c.channel_number,
                 c.name,
                 c.name AS provider_name,
-                coalesce(c.name_override, channel_alias.canonical_name, c.name) AS output_name,
+                coalesce(c.name_override, channel_alias.canonical_name, c.event_name, c.name) AS output_name,
                 c.name_override,
                 coalesce(c.group_name, 'Uncategorized') AS group_name,
                 c.logo_url,
@@ -1994,7 +2000,7 @@ impl CatalogRepository {
                 FROM generated_programmes gp
                 JOIN event_channels ec ON ec.id = gp.event_channel_id
                 JOIN channels c ON c.id = gp.channel_id
-                WHERE c.enabled AND ec.state = 'scheduled'
+                WHERE c.enabled AND ec.state IN ('scheduled', 'live', 'ended')
             )
             SELECT count(*) FROM programme_rows
             WHERE ($1::uuid IS NULL OR channel_id = $1)
@@ -2032,7 +2038,7 @@ impl CatalogRepository {
                 FROM generated_programmes gp
                 JOIN event_channels ec ON ec.id = gp.event_channel_id
                 JOIN channels c ON c.id = gp.channel_id
-                WHERE c.enabled AND ec.state = 'scheduled'
+                WHERE c.enabled AND ec.state IN ('scheduled', 'live', 'ended')
             )
             SELECT * FROM programme_rows
             WHERE ($1::uuid IS NULL OR channel_id = $1)
@@ -2101,9 +2107,21 @@ impl CatalogRepository {
         let guide_mapped_count: i64 = sqlx::query_scalar(
             r"
             SELECT count(*)
-            FROM channel_epg_mappings m
-            JOIN channels c ON c.id = m.channel_id
+            FROM channels c
             WHERE c.enabled
+              AND (
+                  EXISTS (
+                      SELECT 1 FROM channel_epg_mappings m
+                      WHERE m.channel_id = c.id
+                  )
+                  OR EXISTS (
+                      SELECT 1
+                      FROM generated_programmes gp
+                      JOIN event_channels ec ON ec.id = gp.event_channel_id
+                      WHERE gp.channel_id = c.id
+                        AND ec.state IN ('scheduled', 'live', 'ended')
+                  )
+              )
             ",
         )
         .fetch_one(&self.pool)
@@ -2496,7 +2514,7 @@ impl CatalogRepository {
                 c.channel_number,
                 c.name,
                 c.name AS provider_name,
-                coalesce(c.name_override, c.name) AS output_name,
+                coalesce(c.name_override, c.event_name, c.name) AS output_name,
                 c.name_override,
                 coalesce(c.group_name, 'Uncategorized') AS group_name,
                 c.logo_url,
@@ -2686,9 +2704,9 @@ impl CatalogRepository {
             SELECT
                 c.id,
                 c.channel_number,
-                coalesce(c.name_override, channel_alias.canonical_name, c.name) AS name,
+                coalesce(c.name_override, channel_alias.canonical_name, c.event_name, c.name) AS name,
                 c.name AS provider_name,
-                coalesce(c.name_override, channel_alias.canonical_name, c.name) AS output_name,
+                coalesce(c.name_override, channel_alias.canonical_name, c.event_name, c.name) AS output_name,
                 c.name_override,
                 coalesce(c.group_name, 'Uncategorized') AS group_name,
                 c.logo_url,
@@ -2820,7 +2838,7 @@ impl CatalogRepository {
                 JOIN event_channels ec ON ec.id = gp.event_channel_id
                 JOIN channels c ON c.id = gp.channel_id
                 WHERE gp.channel_id = ANY($1)
-                  AND ec.state = 'scheduled'
+                  AND ec.state IN ('scheduled', 'live', 'ended')
             )
             SELECT * FROM imported_programmes
             UNION ALL
@@ -3090,7 +3108,10 @@ impl CatalogRepository {
         Ok(rows)
     }
 
-    /// Inserts or updates an event channel for a template and slot.
+    /// Inserts or updates the event channel of a template and a target channel.
+    ///
+    /// The key is `(template_id, channel_id)`. `slot` is the legacy slot
+    /// number. The scan stores the parsed slot, or 0 when the title has none.
     ///
     /// # Errors
     ///
@@ -3099,6 +3120,7 @@ impl CatalogRepository {
     pub async fn upsert_event_channel(
         &self,
         template_id: Uuid,
+        channel_id: Uuid,
         slot: i32,
         title: Option<&str>,
         start: Option<DateTime<Utc>>,
@@ -3106,296 +3128,327 @@ impl CatalogRepository {
         raw_name: &str,
         state: &str,
     ) -> Result<EventChannelRow, PersistenceError> {
-        let row = sqlx::query_as::<_, EventChannelRow>(
-            r"
-            INSERT INTO event_channels
-                (template_id, slot_number, event_title, event_start, event_end,
-                 raw_stream_name, state)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (template_id, slot_number) DO UPDATE SET
-                event_title = EXCLUDED.event_title,
-                event_start = EXCLUDED.event_start,
-                event_end = EXCLUDED.event_end,
-                raw_stream_name = EXCLUDED.raw_stream_name,
-                state = EXCLUDED.state,
-                updated_at = now()
-            RETURNING id, template_id, channel_id, slot_number, event_title,
-                      event_start, event_end, raw_stream_name, state
-            ",
+        let mut connection = self.pool.acquire().await?;
+        upsert_event_channel_row(
+            &mut connection,
+            &EventChannelUpsert {
+                template_id,
+                channel_id,
+                slot,
+                title,
+                start,
+                end,
+                raw_name,
+                state,
+            },
         )
-        .bind(template_id)
-        .bind(slot)
-        .bind(title)
-        .bind(start)
-        .bind(end)
-        .bind(raw_name)
-        .bind(state)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row)
+        .await
     }
 
-    /// Scans provider streams and replaces only successful generated guides.
+    /// Scans enabled channels for one template and returns the scheduled count.
     ///
-    /// A source title must match both the stored template and one built-in
-    /// sports rule. A scan with no valid schedules preserves prior output.
+    /// This is the legacy form of [`Self::scan_event_channels_report`].
     ///
     /// # Errors
     ///
-    /// Returns [`PersistenceError::Database`] when any query fails.
-    #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
+    /// Returns [`PersistenceError::SourceNotFound`] for an unknown template and
+    /// [`PersistenceError::Database`] when a query fails.
+    #[allow(clippy::missing_errors_doc)]
     pub async fn scan_event_channels(&self, template_id: Uuid) -> Result<u64, PersistenceError> {
-        let template = sqlx::query_as::<_, EventTemplateRow>(
-            r"
-            SELECT id, name, display_name, match_regex, channel_name_format,
-                   group_name, event_duration_hours, past_date_grace_hours,
-                   future_date_days, timezone, filler_title, enabled
-            FROM event_templates
-            WHERE id = $1
-            ",
-        )
-        .bind(template_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(PersistenceError::SourceNotFound(template_id))?;
-        if !template.enabled {
-            return Ok(0);
-        }
-
-        let stream_matches = sqlx::query_as::<_, EventStreamMatch>(
-            r"
-            SELECT ps.name, ps.group_name, (
-                SELECT COALESCE(
-                    NULLIF(
-                        substring(ps.name FROM '([0-9]+)\\s*(?:vs|@|at)[-[:space:]]')::int,
-                        0
-                    ),
-                    NULLIF(
-                        substring(ps.name FROM '(?:Event|GAME|MATCH)\\s*([0-9]+)')::int,
-                        0
-                    ),
-                    NULLIF(
-                        substring(ps.name FROM '([0-9]+)$')::int,
-                        0
-                    ),
-                    1
-                )
-            ) AS slot
-            FROM provider_streams ps
-            JOIN source_snapshots ss ON ss.id = ps.snapshot_id
-            WHERE ss.status = 'active'
-              AND ps.supported
-              AND ps.name ~ $1
-            ",
-        )
-        .bind(&template.match_regex)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut rules = builtin_sports_event_rules();
-        let duration_seconds = u64::try_from(template.event_duration_hours.max(1))
-            .unwrap_or(u64::MAX)
-            .saturating_mul(3_600);
-        for rule in &mut rules.0 {
-            rule.timezone.clone_from(&template.timezone);
-            rule.guide.duration_seconds = duration_seconds;
-            rule.guide.filler_title.clone_from(&template.filler_title);
-            rule.guide
-                .title_template
-                .clone_from(&template.channel_name_format);
-        }
-        let compiled = CompiledEventRules::new(rules)
-            .map_err(|error| PersistenceError::InvalidSource(error.to_string()))?;
-        let metadata = BTreeMap::new();
-        let mut matched_by_slot = BTreeMap::new();
-        for stream in stream_matches {
-            let candidate = EventCandidate {
-                name: &stream.name,
-                group: stream.group_name.as_deref(),
-                epg_title: None,
-                categories: &[],
-                metadata: &metadata,
-            };
-            let Ok(Some(event_match)) = compiled.first_match(&candidate) else {
-                continue;
-            };
-            matched_by_slot
-                .entry(stream.slot.max(1))
-                .or_insert_with(Vec::new)
-                .push((stream.name, event_match));
-        }
-        let mut updated = 0_u64;
-        for (slot, matched) in matched_by_slot {
-            let inputs = matched
-                .iter()
-                .map(|(source_title, matched)| EventGuideInput {
-                    matched,
-                    source_title,
-                })
-                .collect::<Vec<_>>();
-            let Some(first_start) = matched.iter().filter_map(|(_, item)| item.starts_at).min()
-            else {
-                continue;
-            };
-            let Some(last_start) = matched.iter().filter_map(|(_, item)| item.starts_at).max()
-            else {
-                continue;
-            };
-            let window_start = first_start
-                .checked_sub_signed(Duration::hours(i64::from(
-                    template.past_date_grace_hours.max(0),
-                )))
-                .unwrap_or(first_start);
-            let window_end = last_start
-                .checked_add_signed(Duration::hours(i64::from(
-                    template.event_duration_hours.max(1),
-                )))
-                .and_then(|time| {
-                    time.checked_add_signed(Duration::days(i64::from(
-                        template.future_date_days.max(0),
-                    )))
-                })
-                .unwrap_or(last_start);
-            let Ok(schedule) =
-                generate_event_schedule(&inputs, window_start, window_end, &template.filler_title)
-            else {
-                continue;
-            };
-            let Some(event) = schedule
-                .iter()
-                .find(|programme| programme.kind == GeneratedProgrammeKind::Event)
-            else {
-                continue;
-            };
-            let channel_id: Option<Uuid> = sqlx::query_scalar(
-                r"
-                SELECT id FROM channels
-                WHERE coalesce(group_name, 'Uncategorized') = $1 AND enabled
-                ORDER BY channel_number
-                LIMIT 1
-                ",
-            )
-            .bind(&template.group_name)
-            .fetch_optional(&self.pool)
-            .await?;
-            let Some(channel_id) = channel_id else {
-                continue;
-            };
-            let existing_event_channel_id: Option<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM event_channels WHERE template_id = $1 AND slot_number = $2",
-            )
-            .bind(template.id)
-            .bind(slot)
-            .fetch_optional(&self.pool)
-            .await?;
-            let event_channel_id = if let Some(id) = existing_event_channel_id {
-                id
-            } else {
-                self.upsert_event_channel(
-                    template.id,
-                    slot,
-                    Some(&event.title),
-                    Some(event.starts_at),
-                    Some(event.stops_at),
-                    &event.source_title,
-                    "scheduled",
-                )
-                .await?
-                .id
-            };
-            if !self
-                .replace_generated_programmes(event_channel_id, channel_id, &template, &schedule)
-                .await?
-            {
-                continue;
-            }
-            self.upsert_event_channel(
-                template.id,
-                slot,
-                Some(&event.title),
-                Some(event.starts_at),
-                Some(event.stops_at),
-                &event.source_title,
-                "scheduled",
-            )
-            .await?;
-            sqlx::query(
-                "UPDATE event_channels SET channel_id = $2, updated_at = now() WHERE id = $1",
-            )
-            .bind(event_channel_id)
-            .bind(channel_id)
-            .execute(&self.pool)
-            .await?;
-            updated = updated.saturating_add(1);
-        }
-        Ok(updated)
+        Ok(self
+            .scan_event_channels_report(template_id, Utc::now(), &EventScanSettings::default())
+            .await?
+            .legacy_count())
     }
 
-    /// Scans every enabled dynamic-event template after provider reconciliation.
+    /// Scans enabled channels and writes the guides that one template owns.
+    ///
+    /// All enabled templates take part in the ownership decision, so the
+    /// result agrees with a full scan. The writes and the report include only
+    /// the channels that `template_id` owns. A disabled template gives an
+    /// empty report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::SourceNotFound`] for an unknown template and
+    /// [`PersistenceError::Database`] when a query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn scan_event_channels_report(
+        &self,
+        template_id: Uuid,
+        now: DateTime<Utc>,
+        settings: &EventScanSettings,
+    ) -> Result<EventScanReport, PersistenceError> {
+        let enabled: Option<bool> =
+            sqlx::query_scalar("SELECT enabled FROM event_templates WHERE id = $1")
+                .bind(template_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        match enabled {
+            None => Err(PersistenceError::SourceNotFound(template_id)),
+            Some(false) => Ok(EventScanReport::default()),
+            Some(true) => self.run_event_scan(Some(template_id), now, settings).await,
+        }
+    }
+
+    /// Scans every enabled channel with all enabled templates.
+    ///
+    /// Returns the number of channels that received event programmes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when a query fails.
     #[allow(clippy::missing_errors_doc)]
     pub async fn scan_all_event_channels(&self) -> Result<u64, PersistenceError> {
-        let templates = self
-            .list_event_templates(EventTemplateQuery { enabled_only: true })
-            .await?;
-        let mut updated = 0_u64;
-        for template in templates {
-            updated = updated.saturating_add(self.scan_event_channels(template.id).await?);
-        }
-        Ok(updated)
+        Ok(self
+            .scan_all_event_channels_at(Utc::now(), &EventScanSettings::default())
+            .await?
+            .legacy_count())
     }
 
-    async fn replace_generated_programmes(
+    /// Scans every enabled channel at `now` and returns the scan report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when a query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn scan_all_event_channels_at(
         &self,
-        event_channel_id: Uuid,
-        channel_id: Uuid,
-        template: &EventTemplateRow,
-        schedule: &[GeneratedProgramme],
-    ) -> Result<bool, PersistenceError> {
-        let mut transaction = self.pool.begin().await?;
-        let starts_at = schedule
-            .iter()
-            .map(|programme| programme.starts_at)
-            .collect::<Vec<_>>();
-        let stops_at = schedule
-            .iter()
-            .map(|programme| programme.stops_at)
-            .collect::<Vec<_>>();
-        let overlaps: bool = sqlx::query_scalar(
+        now: DateTime<Utc>,
+        settings: &EventScanSettings,
+    ) -> Result<EventScanReport, PersistenceError> {
+        self.run_event_scan(None, now, settings).await
+    }
+
+    /// Scans all channels, then prunes each template with its own grace.
+    ///
+    /// The worker calls this after each provider reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when a query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn refresh_event_guides(
+        &self,
+        now: DateTime<Utc>,
+        settings: &EventScanSettings,
+    ) -> Result<EventScanReport, PersistenceError> {
+        let mut report = self.scan_all_event_channels_at(now, settings).await?;
+        report.pruned = self.prune_all_event_channels_at(now).await?;
+        Ok(report)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_event_scan(
+        &self,
+        only_template: Option<Uuid>,
+        now: DateTime<Utc>,
+        settings: &EventScanSettings,
+    ) -> Result<EventScanReport, PersistenceError> {
+        let mut templates = self
+            .list_event_templates(EventTemplateQuery { enabled_only: true })
+            .await?;
+        // Operator templates come first. The built-in template is the fallback.
+        templates.sort_by(|left, right| {
+            (left.id == BUILTIN_EVENT_TEMPLATE_ID, &left.name)
+                .cmp(&(right.id == BUILTIN_EVENT_TEMPLATE_ID, &right.name))
+        });
+        let region_timezone: Option<String> = sqlx::query_scalar(
+            "SELECT timezone FROM region_settings ORDER BY updated_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let candidates = sqlx::query_as::<_, EventScanCandidate>(
             r"
-            SELECT EXISTS (
-                SELECT 1
-                FROM generated_programmes existing
-                CROSS JOIN unnest($3::timestamptz[], $4::timestamptz[])
-                    AS incoming(starts_at, stops_at)
-                WHERE existing.channel_id = $1
-                  AND existing.event_channel_id <> $2
-                  AND existing.starts_at < incoming.stops_at
-                  AND incoming.starts_at < existing.stops_at
-            )
+            SELECT c.id AS channel_id,
+                   ps.name AS stream_name,
+                   ps.group_name,
+                   pa.source_timezone,
+                   coalesce(ss.activated_at, ss.fetched_at) AS snapshot_at
+            FROM channels c
+            JOIN channel_streams cs ON cs.channel_id = c.id
+            JOIN provider_streams ps ON ps.id = cs.provider_stream_id
+            JOIN source_snapshots ss ON ss.id = ps.snapshot_id
+            JOIN provider_accounts pa ON pa.id = ps.provider_account_id
+            WHERE c.enabled
+              AND ss.status = 'active'
+              AND ps.supported
+            ORDER BY c.id, cs.priority
             ",
         )
-        .bind(channel_id)
-        .bind(event_channel_id)
-        .bind(&starts_at)
-        .bind(&stops_at)
-        .fetch_one(&mut *transaction)
+        .fetch_all(&self.pool)
         .await?;
-        if overlaps {
-            transaction.rollback().await?;
-            return Ok(false);
+
+        let mut report = EventScanReport::default();
+        let mut scanner = EventChannelScanner {
+            templates: &templates,
+            regexes: Vec::with_capacity(templates.len()),
+            rules: BTreeMap::new(),
+            region_timezone: region_timezone.as_deref(),
+            now,
+            settings,
+        };
+        for template in &templates {
+            match compile_template_regex(&template.match_regex) {
+                Ok(regex) => scanner.regexes.push(Some(regex)),
+                Err(error) => {
+                    report.skip(
+                        Some(template.id),
+                        None,
+                        "",
+                        format!("matchRegex is not a valid Rust regex: {error}"),
+                    );
+                    scanner.regexes.push(None);
+                }
+            }
         }
-        sqlx::query("DELETE FROM generated_programmes WHERE event_channel_id = $1")
-            .bind(event_channel_id)
+
+        let in_scope = |template_id: Uuid| only_template.is_none_or(|id| id == template_id);
+        let mut planned = Vec::new();
+        let mut start = 0;
+        while start < candidates.len() {
+            let channel_id = candidates[start].channel_id;
+            let end = candidates[start..]
+                .iter()
+                .position(|candidate| candidate.channel_id != channel_id)
+                .map_or(candidates.len(), |offset| start + offset);
+            report.channels_scanned = report.channels_scanned.saturating_add(1);
+            match scanner.evaluate(&candidates[start..end], &mut report) {
+                ChannelScanOutcome::NoMatch => {}
+                ChannelScanOutcome::Skipped(template_id) => {
+                    if in_scope(template_id) {
+                        report.matched = report.matched.saturating_add(1);
+                        report.skipped = report.skipped.saturating_add(1);
+                    }
+                }
+                ChannelScanOutcome::Planned(plan) => planned.push(*plan),
+            }
+            start = end;
+        }
+
+        // Channels that a template owns. Cleanup does not touch these.
+        let owned: Vec<Uuid> = planned.iter().map(|plan| plan.channel_id).collect();
+        for plan in &planned {
+            if !in_scope(plan.template.id) {
+                continue;
+            }
+            report.matched = report.matched.saturating_add(1);
+            self.write_event_channel_guide(plan).await?;
+            if plan.state == EventChannelState::Hidden {
+                report.skipped = report.skipped.saturating_add(1);
+                report.skip(
+                    Some(plan.template.id),
+                    Some(plan.channel_id),
+                    &plan.raw_stream_name,
+                    "event ended before the guide window".to_owned(),
+                );
+            } else {
+                report.scheduled = report.scheduled.saturating_add(1);
+            }
+        }
+        report
+            .skips
+            .retain(|skip| skip.template_id.is_none_or(&in_scope));
+        self.clear_unowned_event_channels(&owned, only_template)
+            .await?;
+        Ok(report)
+    }
+
+    /// Hides the event channels, and removes the programmes and stable names,
+    /// of channels that no template owns now.
+    async fn clear_unowned_event_channels(
+        &self,
+        owned: &[Uuid],
+        only_template: Option<Uuid>,
+    ) -> Result<(), PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            r"
+            UPDATE channels c
+            SET event_name = NULL, revision = c.revision + 1, updated_at = now()
+            WHERE c.event_name IS NOT NULL
+              AND NOT (c.id = ANY($1))
+              AND (
+                  $2::uuid IS NULL
+                  OR EXISTS (
+                      SELECT 1 FROM event_channels ec
+                      WHERE ec.channel_id = c.id AND ec.template_id = $2
+                  )
+              )
+            ",
+        )
+        .bind(owned)
+        .bind(only_template)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r"
+            DELETE FROM generated_programmes
+            WHERE NOT (channel_id = ANY($1))
+              AND ($2::uuid IS NULL OR template_id = $2)
+            ",
+        )
+        .bind(owned)
+        .bind(only_template)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            r"
+            UPDATE event_channels
+            SET state = 'hidden', updated_at = now()
+            WHERE state <> 'hidden'
+              AND (channel_id IS NULL OR NOT (channel_id = ANY($1)))
+              AND ($2::uuid IS NULL OR template_id = $2)
+            ",
+        )
+        .bind(owned)
+        .bind(only_template)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Replaces the event channel row, the programmes, and the stable name of
+    /// one channel in one transaction.
+    async fn write_event_channel_guide(
+        &self,
+        plan: &PlannedEventChannel<'_>,
+    ) -> Result<(), PersistenceError> {
+        let mut transaction = self.pool.begin().await?;
+        // A channel has one owner template. Remove rows of earlier owners.
+        sqlx::query("DELETE FROM event_channels WHERE channel_id = $1 AND template_id <> $2")
+            .bind(plan.channel_id)
+            .bind(plan.template.id)
             .execute(&mut *transaction)
             .await?;
-        for programme in schedule {
+        let row = upsert_event_channel_row(
+            &mut transaction,
+            &EventChannelUpsert {
+                template_id: plan.template.id,
+                channel_id: plan.channel_id,
+                slot: plan.slot,
+                title: Some(&plan.event.title),
+                start: Some(plan.event.starts_at),
+                end: Some(plan.event.stops_at),
+                raw_name: &plan.raw_stream_name,
+                state: plan.state.as_str(),
+            },
+        )
+        .await?;
+        sqlx::query("DELETE FROM generated_programmes WHERE channel_id = $1")
+            .bind(plan.channel_id)
+            .execute(&mut *transaction)
+            .await?;
+        for programme in &plan.programmes {
             let kind = match programme.kind {
                 GeneratedProgrammeKind::Event => "event",
                 GeneratedProgrammeKind::Filler => "filler",
             };
             let rule_name = if programme.kind == GeneratedProgrammeKind::Filler {
-                format!("{} filler", template.display_name)
+                format!("{} filler", plan.template.display_name)
             } else {
-                template.display_name.clone()
+                plan.template.display_name.clone()
             };
             sqlx::query(
                 r"
@@ -3408,10 +3461,10 @@ impl CatalogRepository {
                 ",
             )
             .bind(Uuid::now_v7())
-            .bind(event_channel_id)
-            .bind(channel_id)
-            .bind(template.id)
-            .bind(template.id)
+            .bind(row.id)
+            .bind(plan.channel_id)
+            .bind(plan.template.id)
+            .bind(plan.template.id)
             .bind(rule_name)
             .bind(&programme.stable_event_key)
             .bind(&programme.source_title)
@@ -3420,15 +3473,33 @@ impl CatalogRepository {
             .bind(programme.stops_at)
             .bind(&programme.title)
             .bind(json!(["Dynamic event", kind]))
-            .bind(json!({"template": template.name, "sourceTitle": programme.source_title}))
+            .bind(json!({
+                "template": plan.template.name,
+                "sourceTitle": programme.source_title,
+                "stableName": plan.stable_name,
+            }))
             .execute(&mut *transaction)
             .await?;
         }
+        sqlx::query(
+            r"
+            UPDATE channels
+            SET event_name = $2, revision = revision + 1, updated_at = now()
+            WHERE id = $1 AND event_name IS DISTINCT FROM $2
+            ",
+        )
+        .bind(plan.channel_id)
+        .bind(plan.stable_name.as_deref())
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
-        Ok(true)
+        Ok(())
     }
 
     /// Marks event channels as hidden when their end time plus grace has passed.
+    ///
+    /// This legacy form applies one grace to all templates. The worker uses
+    /// [`Self::prune_event_channels_for_template`] with each template's grace.
     ///
     /// # Errors
     ///
@@ -3451,6 +3522,90 @@ impl CatalogRepository {
         .await?
         .rows_affected();
         Ok(rows)
+    }
+
+    /// Sets the state of each event channel of a template from the time.
+    ///
+    /// The state is `scheduled` before the start, `live` during the event,
+    /// `ended` after the stop, and `hidden` after the stop plus the template
+    /// grace (`past_date_grace_hours`, at least 1 hour). Returns the number of
+    /// event channels that changed to `hidden`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::SourceNotFound`] for an unknown template and
+    /// [`PersistenceError::Database`] when a query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn prune_event_channels_for_template(
+        &self,
+        template_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<u64, PersistenceError> {
+        let grace_hours: i32 =
+            sqlx::query_scalar("SELECT past_date_grace_hours FROM event_templates WHERE id = $1")
+                .bind(template_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or(PersistenceError::SourceNotFound(template_id))?;
+        let states: Vec<String> = sqlx::query_scalar(
+            r"
+            UPDATE event_channels ec
+            SET state = next.state, updated_at = now()
+            FROM (
+                SELECT id,
+                       CASE
+                           WHEN $2 < event_start THEN 'scheduled'
+                           WHEN $2 < event_end THEN 'live'
+                           WHEN $2 < event_end + make_interval(hours => $3::int) THEN 'ended'
+                           ELSE 'hidden'
+                       END AS state
+                FROM event_channels
+                WHERE template_id = $1
+                  AND state <> 'hidden'
+                  AND event_start IS NOT NULL
+                  AND event_end IS NOT NULL
+            ) next
+            WHERE ec.id = next.id AND ec.state <> next.state
+            RETURNING ec.state
+            ",
+        )
+        .bind(template_id)
+        .bind(now)
+        .bind(grace_hours.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(
+            u64::try_from(states.iter().filter(|state| *state == "hidden").count())
+                .unwrap_or(u64::MAX),
+        )
+    }
+
+    /// Prunes the event channels of every template with its own grace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when a query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn prune_all_event_channels_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<u64, PersistenceError> {
+        let templates = self
+            .list_event_templates(EventTemplateQuery::default())
+            .await?;
+        let mut hidden = 0_u64;
+        for template in templates {
+            match self
+                .prune_event_channels_for_template(template.id, now)
+                .await
+            {
+                Ok(count) => hidden = hidden.saturating_add(count),
+                // A concurrent delete removed the template. Its rows are gone.
+                Err(PersistenceError::SourceNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(hidden)
     }
 
     /// Lists all lineup templates ordered by name.
@@ -4353,11 +4508,266 @@ struct ReconcileCountRow {
     channels: i64,
 }
 
+/// One stream of one enabled channel, from the scan prefilter query.
 #[derive(Debug, FromRow)]
-struct EventStreamMatch {
-    name: String,
+struct EventScanCandidate {
+    channel_id: Uuid,
+    stream_name: String,
     group_name: Option<String>,
+    source_timezone: Option<String>,
+    snapshot_at: Option<DateTime<Utc>>,
+}
+
+/// The guide that the scan plans for one channel.
+#[derive(Debug)]
+struct PlannedEventChannel<'a> {
+    channel_id: Uuid,
+    template: &'a EventTemplateRow,
     slot: i32,
+    raw_stream_name: String,
+    stable_name: Option<String>,
+    event: GeneratedProgramme,
+    state: EventChannelState,
+    programmes: Vec<GeneratedProgramme>,
+}
+
+#[derive(Debug)]
+enum ChannelScanOutcome<'a> {
+    /// No template and sports rule matched a stream of the channel.
+    NoMatch,
+    /// A template matched, but the scan could not plan a guide.
+    Skipped(Uuid),
+    Planned(Box<PlannedEventChannel<'a>>),
+}
+
+/// Applies the enabled templates to the streams of one channel.
+struct EventChannelScanner<'a> {
+    templates: &'a [EventTemplateRow],
+    /// Compiled `matchRegex` of each template. `None` for an invalid regex.
+    regexes: Vec<Option<Regex>>,
+    /// Compiled built-in rules for each template index and timezone.
+    rules: BTreeMap<(usize, &'static str), Result<CompiledEventRules, String>>,
+    region_timezone: Option<&'a str>,
+    now: DateTime<Utc>,
+    settings: &'a EventScanSettings,
+}
+
+impl<'a> EventChannelScanner<'a> {
+    /// Returns the plan of the first stream and template that match.
+    ///
+    /// Streams are in priority order. Templates are in scan order: operator
+    /// templates first, then the built-in template.
+    fn evaluate(
+        &mut self,
+        streams: &[EventScanCandidate],
+        report: &mut EventScanReport,
+    ) -> ChannelScanOutcome<'a> {
+        let metadata = BTreeMap::new();
+        for stream in streams {
+            for (index, template) in self.templates.iter().enumerate() {
+                let Some(Some(regex)) = self.regexes.get(index) else {
+                    continue;
+                };
+                if !regex.is_match(&stream.stream_name) {
+                    continue;
+                }
+                let timezone = resolve_event_timezone(
+                    &template.timezone,
+                    stream.source_timezone.as_deref(),
+                    self.region_timezone,
+                );
+                let rules = self
+                    .rules
+                    .entry((index, timezone.name()))
+                    .or_insert_with(|| compile_template_rules(template, timezone));
+                let rules = match rules {
+                    Ok(rules) => &*rules,
+                    Err(error) => {
+                        report.skip(
+                            Some(template.id),
+                            Some(stream.channel_id),
+                            &stream.stream_name,
+                            format!("built-in sports rules did not compile: {error}"),
+                        );
+                        continue;
+                    }
+                };
+                let candidate = EventCandidate {
+                    name: &stream.stream_name,
+                    group: stream.group_name.as_deref(),
+                    epg_title: None,
+                    categories: &[],
+                    metadata: &metadata,
+                };
+                let matched = match rules.first_match(&candidate) {
+                    Ok(Some(matched)) => matched,
+                    Ok(None) => {
+                        if template.id != BUILTIN_EVENT_TEMPLATE_ID {
+                            report.skip(
+                                Some(template.id),
+                                Some(stream.channel_id),
+                                &stream.stream_name,
+                                "matchRegex matches, but no built-in sports rule matches"
+                                    .to_owned(),
+                            );
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        report.skip(
+                            Some(template.id),
+                            Some(stream.channel_id),
+                            &stream.stream_name,
+                            format!("event date is not valid: {error}"),
+                        );
+                        continue;
+                    }
+                };
+                return match plan_event_channel(
+                    stream,
+                    template,
+                    timezone,
+                    matched,
+                    self.now,
+                    self.settings,
+                ) {
+                    Ok(plan) => ChannelScanOutcome::Planned(Box::new(plan)),
+                    Err(reason) => {
+                        report.skip(
+                            Some(template.id),
+                            Some(stream.channel_id),
+                            &stream.stream_name,
+                            reason,
+                        );
+                        ChannelScanOutcome::Skipped(template.id)
+                    }
+                };
+            }
+        }
+        ChannelScanOutcome::NoMatch
+    }
+}
+
+/// Plans the guide of one channel from a matched stream.
+fn plan_event_channel<'a>(
+    stream: &EventScanCandidate,
+    template: &'a EventTemplateRow,
+    timezone: Tz,
+    mut matched: iptv_parsers::MatchedEvent<'_>,
+    now: DateTime<Utc>,
+    settings: &EventScanSettings,
+) -> Result<PlannedEventChannel<'a>, String> {
+    // Resolve a time-only or spelled date from the snapshot date.
+    let reference = stream.snapshot_at.unwrap_or(now);
+    let starts_at = matched
+        .resolve_start(reference, timezone.name())
+        .map_err(|error| format!("event time is not valid: {error}"))?
+        .ok_or_else(|| "the stream name has no event start time".to_owned())?;
+    matched.starts_at = Some(starts_at);
+    let window_start = starts_at
+        .checked_sub_signed(Duration::days(1))
+        .unwrap_or(starts_at);
+    let window_end = starts_at
+        .checked_add_signed(Duration::days(30))
+        .unwrap_or(starts_at);
+    let event = generate_event_guide(&matched, &stream.stream_name, window_start, window_end)
+        .map_err(|error| format!("event guide is not valid: {error}"))?
+        .into_iter()
+        .find(|programme| programme.kind == GeneratedProgrammeKind::Event)
+        .ok_or_else(|| "event guide has no event programme".to_owned())?;
+    let future_limit =
+        now.checked_add_signed(Duration::days(i64::from(template.future_date_days.max(0))));
+    if future_limit.is_some_and(|limit| event.starts_at > limit) {
+        return Err(format!(
+            "event starts more than {} days in the future",
+            template.future_date_days.max(0)
+        ));
+    }
+    let grace = Duration::hours(i64::from(template.past_date_grace_hours.max(1)));
+    let state = EventChannelState::at(event.starts_at, event.stops_at, grace, now);
+    let programmes = if state == EventChannelState::Hidden {
+        Vec::new()
+    } else {
+        plan_event_channel_guide(&event, timezone, now, grace, settings)
+    };
+    Ok(PlannedEventChannel {
+        channel_id: stream.channel_id,
+        template,
+        slot: slot_number(&matched.captures),
+        raw_stream_name: stream.stream_name.clone(),
+        stable_name: stable_event_channel_name(&matched.captures, &stream.stream_name),
+        event,
+        state,
+        programmes,
+    })
+}
+
+/// Compiles the built-in sports rules with the settings of one template.
+fn compile_template_rules(
+    template: &EventTemplateRow,
+    timezone: Tz,
+) -> Result<CompiledEventRules, String> {
+    let mut rules = builtin_sports_event_rules();
+    let duration_seconds = u64::try_from(template.event_duration_hours.max(1))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(3_600);
+    let title_template = if template.channel_name_format.trim().is_empty() {
+        "{event}"
+    } else {
+        template.channel_name_format.as_str()
+    };
+    for rule in &mut rules.0 {
+        timezone.name().clone_into(&mut rule.timezone);
+        rule.guide.duration_seconds = duration_seconds;
+        title_template.clone_into(&mut rule.guide.title_template);
+    }
+    CompiledEventRules::new(rules).map_err(|error| error.to_string())
+}
+
+struct EventChannelUpsert<'a> {
+    template_id: Uuid,
+    channel_id: Uuid,
+    slot: i32,
+    title: Option<&'a str>,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    raw_name: &'a str,
+    state: &'a str,
+}
+
+async fn upsert_event_channel_row(
+    connection: &mut sqlx::PgConnection,
+    input: &EventChannelUpsert<'_>,
+) -> Result<EventChannelRow, PersistenceError> {
+    let row = sqlx::query_as::<_, EventChannelRow>(
+        r"
+        INSERT INTO event_channels
+            (template_id, channel_id, slot_number, event_title, event_start, event_end,
+             raw_stream_name, state)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (template_id, channel_id) DO UPDATE SET
+            slot_number = EXCLUDED.slot_number,
+            event_title = EXCLUDED.event_title,
+            event_start = EXCLUDED.event_start,
+            event_end = EXCLUDED.event_end,
+            raw_stream_name = EXCLUDED.raw_stream_name,
+            state = EXCLUDED.state,
+            updated_at = now()
+        RETURNING id, template_id, channel_id, slot_number, event_title,
+                  event_start, event_end, raw_stream_name, state
+        ",
+    )
+    .bind(input.template_id)
+    .bind(input.channel_id)
+    .bind(input.slot)
+    .bind(input.title)
+    .bind(input.start)
+    .bind(input.end)
+    .bind(input.raw_name)
+    .bind(input.state)
+    .fetch_one(connection)
+    .await?;
+    Ok(row)
 }
 
 #[derive(Debug, FromRow)]
@@ -4451,9 +4861,10 @@ fn build_suggestion_config(
     let display_name = group_key.to_owned();
     // Build a regex that matches the league prefix plus vs/@ pattern.
     let match_regex = if group_key == "Sports" {
-        r"(?i).*\b(?:vs\.?|versus|@|at)\b.*".to_owned()
+        r"(?i).*(?:\bvs\.?|\bversus\b|@|\bat\b).*".to_owned()
     } else {
-        format!(r"(?i)\b{group_key}\b.*\b(?:vs\.?|versus|@|at)\b.*")
+        let league = regex::escape(group_key);
+        format!(r"(?i)\b{league}\b.*(?:\bvs\.?|\bversus\b|@|\bat\b).*")
     };
     let group_name = "Sports".to_owned();
     let _ = samples;
@@ -6676,8 +7087,8 @@ impl CatalogRepository {
             JOIN source_snapshots ss ON ss.id = ps.snapshot_id
             WHERE ss.status = 'active'
               AND ps.supported
-              AND ps.name ~ '(?i)(?:vs\.?|versus|@|\bat\b)'
-              AND ps.name ~ '(?i)(?:20[0-9]{2}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/20[0-9]{2})'
+              AND ps.name ~ '(?i)(?:vs\.?|versus|@|\yat\y)'
+              AND ps.name ~ '(?i)(?:20[0-9]{2}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}|[0-9]{1,2}:[0-9]{2}|start:)'
             ORDER BY ps.name
             ",
         )

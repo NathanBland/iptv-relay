@@ -19,7 +19,7 @@ use iptv_media::{
 use iptv_persistence::NewJob;
 use iptv_persistence::{
     CatalogRepository, DEFAULT_RECONCILIATION_BATCH_SIZE, Database, EpgMappingStats,
-    IngestCleanupRepository, JobRecord, JobRepository, MasterKey,
+    EventScanSettings, IngestCleanupRepository, JobRecord, JobRepository, MasterKey,
     ProviderReconciliationFinalization, ProviderReconciliationPhase,
     ProviderReconciliationProgress, ProviderReconciliationUpdate, ReconcileStats, SourceKind,
     SourceRepository, StreamHealthUpdate, StreamProbeTargetRow,
@@ -1209,6 +1209,27 @@ async fn run_provider_reconciliation_partition_job(
     }
 }
 
+/// Scans event channels and prunes ended events after a catalog publication.
+///
+/// A scan error does not fail the refresh job. The published catalog and the
+/// guide mappings stay valid, and the next refresh scans again.
+async fn refresh_event_guides_after_publication(catalog: &CatalogRepository) {
+    match catalog
+        .refresh_event_guides(chrono::Utc::now(), &EventScanSettings::default())
+        .await
+    {
+        Ok(report) => info!(
+            channels_scanned = report.channels_scanned,
+            matched = report.matched,
+            scheduled = report.scheduled,
+            skipped = report.skipped,
+            pruned = report.pruned,
+            "event guide scan completed"
+        ),
+        Err(error) => warn!(%error, "event guide scan failed; the refresh job continues"),
+    }
+}
+
 /// Finalizes complete provider candidates, then runs serial guide work.
 #[allow(clippy::too_many_lines)]
 async fn run_provider_reconciliation_finalizer_job(
@@ -1322,7 +1343,7 @@ async fn run_provider_reconciliation_finalizer_job(
             // Only the finalizer that atomically published the catalog starts
             // EPG reconciliation. Partition workers never mutate guide rows.
             catalog.reconcile_epg_mappings().await?;
-            catalog.scan_all_event_channels().await?;
+            refresh_event_guides_after_publication(catalog).await;
             jobs.complete_reconciliation_parent(
                 parent_job_id,
                 run_id,
@@ -1363,7 +1384,7 @@ async fn run_provider_reconciliation_finalizer_job(
             )
             .await?;
             catalog.reconcile_epg_mappings().await?;
-            catalog.scan_all_event_channels().await?;
+            refresh_event_guides_after_publication(catalog).await;
             jobs.complete_reconciliation_parent(
                 parent_job_id,
                 run_id,
@@ -6460,8 +6481,11 @@ mod tests {
         };
         let suffix = Uuid::now_v7();
         let event_group = format!("Worker events {suffix}");
+        // The event starts in the future, so that the scan schedules it.
+        let event_start =
+            (chrono::Utc::now() + chrono::Duration::hours(12)).format("%Y-%m-%d %H:%M");
         let playlist = format!(
-            "#EXTM3U\n#EXTINF:-1 tvg-id=\"coverage-local-{suffix}\" group-title=\"{event_group}\",Event 7: Broncos vs Chiefs 2026-09-14 00:20 HD\nhttp://provider.invalid/live.ts\n"
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"coverage-local-{suffix}\" group-title=\"{event_group}\",Event 7: Broncos vs Chiefs {event_start} HD\nhttp://provider.invalid/live.ts\n"
         );
         let parsed = iptv_parsers::parse_m3u(
             std::io::Cursor::new(&playlist),

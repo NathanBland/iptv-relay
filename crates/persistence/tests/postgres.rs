@@ -6,14 +6,15 @@ use std::{
 
 use chrono::{Duration, TimeZone, Utc};
 use iptv_persistence::{
-    CatalogRepository, CreateChannelAliasInput, CreateEventTemplate, CreateRecordingInput,
-    CreateRecordingRuleInput, CreateStreamProfileInput, CreateUserInput, Database,
-    ENVIRONMENT_OUTPUT_PROFILE_ID, ENVIRONMENT_OUTPUT_PROFILE_NAME, EventTemplateQuery,
-    EventTemplateUpdate, JobRepository, MasterKey, NewJob, NewSource, OperatorSettingOverrides,
-    OutputProfileTokenHash, PersistenceError, ProgrammeQuery, ProviderReconciliationFinalization,
-    ProviderReconciliationPhase, ProviderReconciliationProgress, ProviderReconciliationUpdate,
-    SourceKind, SourceRefreshScheduleResult, SourceRepository, SourceUpdate, StreamHealthUpdate,
-    UpdateUserInput,
+    BUILTIN_EVENT_TEMPLATE_ID, CatalogRepository, CreateChannelAliasInput, CreateEventTemplate,
+    CreateRecordingInput, CreateRecordingRuleInput, CreateStreamProfileInput, CreateUserInput,
+    Database, ENVIRONMENT_OUTPUT_PROFILE_ID, ENVIRONMENT_OUTPUT_PROFILE_NAME, EventScanSettings,
+    EventTemplateQuery, EventTemplateUpdate, JobRepository, MasterKey, NewJob, NewSource,
+    OperatorSettingOverrides, OutputProfileTokenHash, PersistenceError, ProgrammeQuery,
+    ProviderReconciliationFinalization, ProviderReconciliationPhase,
+    ProviderReconciliationProgress, ProviderReconciliationUpdate, SourceKind,
+    SourceRefreshScheduleResult, SourceRepository, SourceUpdate, StreamHealthUpdate,
+    UpdateUserInput, compile_template_regex,
 };
 use serde_json::{Value, json};
 
@@ -3551,35 +3552,6 @@ async fn event_template_and_channel_lifecycle_work() {
         Err(PersistenceError::SourceNotFound(_))
     ));
 
-    let start = Utc::now() - Duration::hours(3);
-    let end = start + Duration::hours(1);
-    let event = catalog
-        .upsert_event_channel(
-            template.id,
-            7,
-            Some("Home vs Away"),
-            Some(start),
-            Some(end),
-            "Provider event 7",
-            "scheduled",
-        )
-        .await
-        .unwrap();
-    let changed = catalog
-        .upsert_event_channel(
-            template.id,
-            7,
-            Some("Away at Home"),
-            Some(start),
-            Some(end),
-            "Updated provider event 7",
-            "active",
-        )
-        .await
-        .unwrap();
-    assert_eq!(changed.id, event.id);
-    assert_eq!(changed.state, "active");
-
     let channel_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO channels
@@ -3594,9 +3566,39 @@ async fn event_template_and_channel_lifecycle_work() {
     .execute(database.pool())
     .await
     .unwrap();
-    sqlx::query("UPDATE event_channels SET channel_id = $2, state = 'scheduled' WHERE id = $1")
+    let start = Utc::now() - Duration::hours(3);
+    let end = start + Duration::hours(1);
+    let event = catalog
+        .upsert_event_channel(
+            template.id,
+            channel_id,
+            7,
+            Some("Home vs Away"),
+            Some(start),
+            Some(end),
+            "Provider event 7",
+            "scheduled",
+        )
+        .await
+        .unwrap();
+    let changed = catalog
+        .upsert_event_channel(
+            template.id,
+            channel_id,
+            7,
+            Some("Away at Home"),
+            Some(start),
+            Some(end),
+            "Updated provider event 7",
+            "active",
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed.id, event.id);
+    assert_eq!(changed.state, "active");
+
+    sqlx::query("UPDATE event_channels SET state = 'scheduled' WHERE id = $1")
         .bind(event.id)
-        .bind(channel_id)
         .execute(database.pool())
         .await
         .unwrap();
@@ -3637,12 +3639,13 @@ async fn event_template_and_channel_lifecycle_work() {
         .await
         .unwrap();
     assert_eq!(events.len(), 1);
+    assert_eq!(catalog.prune_past_event_channels(0).await.unwrap(), 1);
+    // The channel has no matching provider stream, so the scan schedules nothing.
     assert_eq!(catalog.scan_event_channels(template.id).await.unwrap(), 0);
     assert!(matches!(
         catalog.scan_event_channels(uuid::Uuid::now_v7()).await,
         Err(PersistenceError::SourceNotFound(_))
     ));
-    assert_eq!(catalog.prune_past_event_channels(0).await.unwrap(), 1);
     let events = catalog.list_event_channels(None).await.unwrap();
     assert!(
         events
@@ -3756,70 +3759,49 @@ async fn event_template_partial_update_persists_enabled_and_optional_fields() {
     drop_isolated_schema(&admin, &schema).await;
 }
 
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn event_scan_persists_idempotent_non_overlapping_generated_guides() {
-    let Some(database_url) = database_url() else {
-        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
-        return;
-    };
-    let (admin, database, schema) = isolated_database(&database_url).await;
-    let catalog = CatalogRepository::new(database.pool().clone());
-    let suffix = uuid::Uuid::now_v7();
-    let group = format!("Dynamic events {suffix}");
-    let channel_id = uuid::Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO channels
-            (id, channel_number, name, group_name, managed_by, canonical_key)
-         VALUES ($1, '700', 'Dynamic event channel', $2, 'event', $3)",
-    )
-    .bind(channel_id)
-    .bind(&group)
-    .bind(format!("dynamic-{suffix}"))
-    .execute(database.pool())
-    .await
-    .unwrap();
-    let template = catalog
-        .create_event_template(CreateEventTemplate {
-            name: format!("generated-{suffix}"),
-            display_name: "Generated sports".to_owned(),
-            match_regex: "Broncos|Rams".to_owned(),
-            channel_name_format: "{home} vs {away}".to_owned(),
-            group_name: group.clone(),
-            event_duration_hours: 3,
-            past_date_grace_hours: 1,
-            future_date_days: 1,
-            timezone: "America/Denver".to_owned(),
-            filler_title: "Off air".to_owned(),
-        })
-        .await
-        .unwrap();
+fn utc(value: &str) -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+/// Inserts an active snapshot with one supported stream for each name, and
+/// one enabled channel for each stream. Returns the channel IDs in order.
+async fn seed_event_channels(
+    pool: &sqlx::PgPool,
+    source_timezone: &str,
+    activated_at: chrono::DateTime<Utc>,
+    names: &[&str],
+) -> Vec<uuid::Uuid> {
     let account_id = uuid::Uuid::now_v7();
     let snapshot_id = uuid::Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO provider_accounts (id, name, source_type, base_url_template)
-         VALUES ($1, $2, 'm3u', 'https://provider.test/')",
+        "INSERT INTO provider_accounts
+            (id, name, source_type, base_url_template, source_timezone)
+         VALUES ($1, $2, 'm3u', 'https://provider.test/', $3)",
     )
     .bind(account_id)
-    .bind(format!("generated-{suffix}"))
-    .execute(database.pool())
+    .bind(format!("events-{account_id}"))
+    .bind(source_timezone)
+    .execute(pool)
     .await
     .unwrap();
     sqlx::query(
         "INSERT INTO source_snapshots
             (id, provider_account_id, kind, status, checksum_sha256, byte_count, activated_at)
-         VALUES ($1, $2, 'm3u', 'active', $3, 1, now())",
+         VALUES ($1, $2, 'm3u', 'active', $3, 1, $4)",
     )
     .bind(snapshot_id)
     .bind(account_id)
-    .bind(format!("generated-{suffix}"))
-    .execute(database.pool())
+    .bind(format!("events-{snapshot_id}"))
+    .bind(activated_at)
+    .execute(pool)
     .await
     .unwrap();
-    for (stable_key, name) in [
-        ("first", "Event 7: Broncos vs Chiefs 2026-09-14 00:20 HD"),
-        ("second", "Event 7: Rams vs Seahawks 2026-09-14 05:20 HD"),
-    ] {
+    let mut channel_ids = Vec::with_capacity(names.len());
+    for (index, name) in names.iter().enumerate() {
+        let stream_id = uuid::Uuid::now_v7();
+        let channel_id = uuid::Uuid::now_v7();
         sqlx::query(
             "INSERT INTO provider_streams
                 (id, snapshot_id, provider_account_id, stable_key, name, group_name,
@@ -3827,149 +3809,496 @@ async fn event_scan_persists_idempotent_non_overlapping_generated_guides() {
              VALUES ($1, $2, $3, $4, $5, 'Sports', 'https://provider.test/stream',
                      '{}'::jsonb, '[]'::jsonb, true)",
         )
-        .bind(uuid::Uuid::now_v7())
+        .bind(stream_id)
         .bind(snapshot_id)
         .bind(account_id)
-        .bind(stable_key)
+        .bind(format!("event-{index}"))
+        .bind(*name)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO channels (id, channel_number, name) VALUES ($1, $2, $3)")
+            .bind(channel_id)
+            .bind(format!("{}", 900 + index))
+            .bind(*name)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO channel_streams (channel_id, provider_stream_id, priority)
+             VALUES ($1, $2, 0)",
+        )
+        .bind(channel_id)
+        .bind(stream_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        channel_ids.push(channel_id);
+    }
+    channel_ids
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn event_scan_schedules_live_titles_with_stable_names_and_filler() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let now = utc("2026-11-04T15:00:00Z");
+    // Titles from tests/fixtures/events/live-titles.json. The MLB title has
+    // dates on the reference day, so that the event is in the guide window.
+    let names = [
+        "US (ESPN+ 069): Maryland Eastern Shore vs. High Point Nov 04 7:00PM ET (2026-11-04 19:00:25) [1080p]",
+        "CA (TSN+ 007): NCAA Football: Ball State vs. Massachusetts (2026-11-04 19:00:00) [1080p]",
+        "(FLSP 004): hockey:  Kingston Frontenacs vs Ottawa 67`s (Home) (2026-11-04 10:30:00) [1080p]",
+        "NHL: 01 - 7:30pm Senators @ Sabres [1080p]",
+        "NFL : 01 - [1080p]",
+        "Detroit Pistons vs Philadelphia 76ers @ Nov 4 7:00 PM :NBA  01 [1080p]",
+        "MLB 01:  Brewers x Rays start:2026-11-04 20:00:00 stop:2026-11-04 23:13:20 [1080p]",
+    ];
+    let channels = seed_event_channels(&pool, "America/New_York", now, &names).await;
+    let [espn, tsn, flsp, nhl, nfl, nba, mlb] = channels[..] else {
+        unreachable!("seven channels");
+    };
+    let settings = EventScanSettings::default();
+
+    let report = catalog
+        .scan_all_event_channels_at(now, &settings)
+        .await
+        .unwrap();
+    assert_eq!(report.channels_scanned, 7);
+    assert_eq!(report.matched, 6, "{report:?}");
+    assert_eq!(report.scheduled, 6, "{report:?}");
+    assert_eq!(report.skipped, 0, "{report:?}");
+    assert_eq!(report.legacy_count(), 6);
+
+    // Stable output names. The empty slot keeps its provider name.
+    let output_names: std::collections::BTreeMap<_, _> = catalog
+        .list_enabled_channels()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.id, row.output_name))
+        .collect();
+    for (channel_id, expected) in [
+        (espn, "ESPN+ 069"),
+        (tsn, "TSN+ 007"),
+        (flsp, "FLSP 004"),
+        (nhl, "NHL 01"),
+        (nfl, "NFL : 01 - [1080p]"),
+        (nba, "NBA 01"),
+        (mlb, "MLB 01"),
+    ] {
+        assert_eq!(output_names[&channel_id], expected);
+    }
+
+    // Event programmes are on the correct channels at the correct UTC times.
+    let mut first_guides = Vec::new();
+    for (channel_id, title, starts_at, stops_at) in [
+        (
+            nhl,
+            "Senators @ Sabres",
+            "2026-11-05T00:30:00Z",
+            "2026-11-05T03:30:00Z",
+        ),
+        (
+            nba,
+            "Detroit Pistons vs Philadelphia 76ers",
+            "2026-11-05T00:00:00Z",
+            "2026-11-05T03:00:00Z",
+        ),
+        (
+            tsn,
+            "Ball State vs Massachusetts",
+            "2026-11-05T00:00:00Z",
+            "2026-11-05T03:00:00Z",
+        ),
+        (
+            flsp,
+            "Kingston Frontenacs vs Ottawa 67`s",
+            "2026-11-04T15:30:00Z",
+            "2026-11-04T18:30:00Z",
+        ),
+        // The stop: time sets the end of the event.
+        (
+            mlb,
+            "Brewers vs Rays",
+            "2026-11-05T01:00:00Z",
+            "2026-11-05T04:13:20Z",
+        ),
+    ] {
+        let guide = catalog
+            .list_programmes_for_channels(&[channel_id])
+            .await
+            .unwrap();
+        let events: Vec<_> = guide
+            .iter()
+            .filter(|programme| programme.category_list().contains(&"event".to_owned()))
+            .collect();
+        assert_eq!(events.len(), 1, "{title}: {guide:?}");
+        assert_eq!(events[0].title, title);
+        assert_eq!(events[0].starts_at, utc(starts_at), "{title}");
+        assert_eq!(events[0].stops_at, utc(stops_at), "{title}");
+
+        // Filler fills each gap from the current hour to the end of the grace.
+        assert_eq!(guide.first().unwrap().starts_at, now, "{title}");
+        assert!(
+            guide
+                .windows(2)
+                .all(|pair| pair[0].stops_at == pair[1].starts_at),
+            "{title}: {guide:?}"
+        );
+        assert_eq!(guide.last().unwrap().title, "Event ended", "{title}");
+        assert_eq!(
+            guide.last().unwrap().stops_at,
+            utc(stops_at) + Duration::hours(4),
+            "{title}"
+        );
+        assert!(
+            guide
+                .first()
+                .unwrap()
+                .title
+                .starts_with(&format!("Upcoming: {title}, Nov 4 ")),
+            "{title}: {}",
+            guide.first().unwrap().title
+        );
+        first_guides.push((channel_id, guide));
+    }
+    let nhl_guide = &first_guides[0].1;
+    assert_eq!(
+        nhl_guide[0].title,
+        "Upcoming: Senators @ Sabres, Nov 4 7:30 PM EST"
+    );
+    let espn_guide = catalog.list_programmes_for_channels(&[espn]).await.unwrap();
+    assert!(espn_guide.iter().any(|programme| programme.title
+        == "Maryland Eastern Shore vs High Point"
+        && programme.starts_at == utc("2026-11-05T00:00:00Z")));
+
+    // The empty slot has no programmes.
+    assert!(
+        catalog
+            .list_programmes_for_channels(&[nfl])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A second scan at the same time gives the same guide.
+    let second = catalog
+        .scan_all_event_channels_at(now, &settings)
+        .await
+        .unwrap();
+    assert_eq!(second, report);
+    for (channel_id, guide) in &first_guides {
+        let again = catalog
+            .list_programmes_for_channels(&[*channel_id])
+            .await
+            .unwrap();
+        assert_eq!(
+            guide
+                .iter()
+                .map(|programme| (&programme.title, programme.starts_at, programme.stops_at))
+                .collect::<Vec<_>>(),
+            again
+                .iter()
+                .map(|programme| (&programme.title, programme.starts_at, programme.stops_at))
+                .collect::<Vec<_>>()
+        );
+    }
+    let event_rows = catalog
+        .list_event_channels(Some(BUILTIN_EVENT_TEMPLATE_ID))
+        .await
+        .unwrap();
+    assert_eq!(event_rows.len(), 6);
+    assert!(event_rows.iter().all(|row| row.state == "scheduled"));
+
+    // Later, the state follows the time. The NBA game is live, and the
+    // hockey game ended more than the 4 hour grace before.
+    let later = utc("2026-11-05T01:00:00Z");
+    let refreshed = catalog
+        .refresh_event_guides(later, &settings)
+        .await
+        .unwrap();
+    assert_eq!(refreshed.matched, 6, "{refreshed:?}");
+    let states: std::collections::BTreeMap<_, _> = catalog
+        .list_event_channels(Some(BUILTIN_EVENT_TEMPLATE_ID))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.channel_id.unwrap(), row.state))
+        .collect();
+    assert_eq!(states[&nba], "live");
+    assert_eq!(states[&flsp], "hidden");
+    assert!(
+        catalog
+            .list_programmes_for_channels(&[flsp])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let nba_guide = catalog.list_programmes_for_channels(&[nba]).await.unwrap();
+    assert_eq!(nba_guide[0].title, "Detroit Pistons vs Philadelphia 76ers");
+    assert_eq!(nba_guide.last().unwrap().title, "Event ended");
+
+    // Guide coverage counts generated programmes.
+    let counts = catalog.system_counts().await.unwrap();
+    assert_eq!(counts.channels, 7);
+    assert!(counts.guide_coverage > 70.0, "{counts:?}");
+
+    drop(catalog);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn event_scan_prefers_operator_templates_and_reports_skips() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let now = utc("2026-11-04T15:00:00Z");
+    let names = [
+        "NHL: 01 - 7:30pm Senators @ Sabres [1080p]",
+        "NHL: 02 - Rangers maybe later [1080p]",
+    ];
+    let channels = seed_event_channels(&pool, "America/New_York", now, &names).await;
+    let template = catalog
+        .create_event_template(CreateEventTemplate {
+            name: "nhl".to_owned(),
+            display_name: "NHL".to_owned(),
+            // The PostgreSQL word boundary \y works as the Rust \b.
+            match_regex: r"^NHL\y".to_owned(),
+            channel_name_format: "{away} at {home}".to_owned(),
+            group_name: "Hockey".to_owned(),
+            event_duration_hours: 2,
+            past_date_grace_hours: 1,
+            future_date_days: 7,
+            timezone: "UTC".to_owned(),
+            filler_title: "Off air".to_owned(),
+        })
+        .await
+        .unwrap();
+    let report = catalog
+        .scan_event_channels_report(template.id, now, &EventScanSettings::default())
+        .await
+        .unwrap();
+    assert_eq!(report.matched, 1, "{report:?}");
+    assert_eq!(report.scheduled, 1, "{report:?}");
+    assert_eq!(report.skips.len(), 1, "{report:?}");
+    assert_eq!(report.skips[0].channel_id, Some(channels[1]));
+    assert_eq!(report.skips[0].template_id, Some(template.id));
+    let guide = catalog
+        .list_programmes_for_channels(&[channels[0]])
+        .await
+        .unwrap();
+    let event = guide
+        .iter()
+        .find(|programme| programme.category_list().contains(&"event".to_owned()))
+        .unwrap();
+    // The template sets the title format and the duration.
+    assert_eq!(event.title, "Senators at Sabres");
+    assert_eq!(event.starts_at, utc("2026-11-05T00:30:00Z"));
+    assert_eq!(event.stops_at, utc("2026-11-05T02:30:00Z"));
+    assert_eq!(
+        catalog
+            .list_event_channels(Some(template.id))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // An invalid regex gives a template skip and does not stop the scan.
+    sqlx::query("UPDATE event_templates SET match_regex = '(' WHERE id = $1")
+        .bind(template.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let report = catalog
+        .scan_all_event_channels_at(now, &EventScanSettings::default())
+        .await
+        .unwrap();
+    assert!(
+        report
+            .skips
+            .iter()
+            .any(|skip| skip.template_id == Some(template.id) && skip.channel_id.is_none()),
+        "{report:?}"
+    );
+    // The built-in template now owns the channel.
+    let owners = catalog.list_event_channels(None).await.unwrap();
+    assert!(owners.iter().any(|row| {
+        row.template_id == BUILTIN_EVENT_TEMPLATE_ID
+            && row.channel_id == Some(channels[0])
+            && row.state == "scheduled"
+    }));
+    assert!(
+        owners
+            .iter()
+            .all(|row| { row.template_id != template.id || row.state == "hidden" })
+    );
+    let guide = catalog
+        .list_programmes_for_channels(&[channels[0]])
+        .await
+        .unwrap();
+    assert!(
+        guide
+            .iter()
+            .any(|programme| programme.title == "Senators @ Sabres")
+    );
+
+    drop(catalog);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn event_template_regex_repair_migration_is_idempotent() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let rust_id = uuid::Uuid::now_v7();
+    let postgres_id = uuid::Uuid::now_v7();
+    for (id, name, pattern) in [
+        (rust_id, "rust-dialect", r"(?i)\bNHL\b.*\b(?:vs|at)\b"),
+        (
+            postgres_id,
+            "postgres-dialect",
+            r"(?i)\yNHL\y.*\m(?:vs|at)\M",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO event_templates
+                (id, name, display_name, match_regex, channel_name_format, group_name,
+                 event_duration_hours, past_date_grace_hours, future_date_days, timezone,
+                 filler_title, enabled)
+             VALUES ($1, $2, $2, $3, '{event}', 'Sports', 3, 4, 7, 'UTC', 'Off air', true)",
+        )
+        .bind(id)
         .bind(name)
-        .execute(database.pool())
+        .bind(pattern)
+        .execute(&pool)
         .await
         .unwrap();
     }
-
-    assert_eq!(catalog.scan_event_channels(template.id).await.unwrap(), 1);
-    let first = catalog
-        .list_programmes_for_channels(&[channel_id])
+    let migration = include_str!("../../../migrations/0077_event_channels_by_channel.sql");
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+    for id in [rust_id, postgres_id] {
+        let pattern: String =
+            sqlx::query_scalar("SELECT match_regex FROM event_templates WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pattern, r"(?i)\bNHL\b.*\b(?:vs|at)\b");
+        let regex = compile_template_regex(&pattern).unwrap();
+        assert!(regex.is_match("NHL: 01 - Senators at Sabres"));
+        assert!(!regex.is_match("NHLX: 01 - Senators at Sabres"));
+    }
+    let builtin: i64 = sqlx::query_scalar("SELECT count(*) FROM event_templates WHERE id = $1")
+        .bind(BUILTIN_EVENT_TEMPLATE_ID)
+        .fetch_one(&pool)
         .await
         .unwrap();
-    let api_programmes = catalog
-        .list_programmes(ProgrammeQuery {
-            channel_id: Some(channel_id),
-            limit: Some(100),
-            now: Some(
-                chrono::DateTime::parse_from_rfc3339("2026-09-13T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&chrono::Utc),
-            ),
-            ..ProgrammeQuery::default()
-        })
+    assert_eq!(builtin, 1);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn output_profile_lineup_uses_primary_stream_quality() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let account_id = uuid::Uuid::now_v7();
+    let snapshot_id = uuid::Uuid::now_v7();
+    let channel_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, name, source_type, base_url_template)
+         VALUES ($1, 'quality', 'm3u', 'https://provider.test/')",
+    )
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO source_snapshots
+            (id, provider_account_id, kind, status, checksum_sha256, byte_count, activated_at)
+         VALUES ($1, $2, 'm3u', 'active', 'quality', 1, now())",
+    )
+    .bind(snapshot_id)
+    .bind(account_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO channels (id, channel_number, name) VALUES ($1, '5', 'Quality')")
+        .bind(channel_id)
+        .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        api_programmes.total,
-        i64::try_from(first.len()).expect("programme count fits in i64")
-    );
-    assert!(
-        api_programmes
-            .items
-            .iter()
-            .any(|programme| programme.title == "Broncos vs Chiefs")
-    );
-    assert_eq!(first.len(), 5);
-    assert_eq!(
-        first
-            .iter()
-            .filter(|programme| programme.title == "Off air")
-            .count(),
-        3
-    );
-    assert!(
-        first
-            .windows(2)
-            .all(|pair| pair[0].stops_at == pair[1].starts_at)
-    );
-    assert!(
-        first
-            .windows(2)
-            .all(|pair| pair[0].stops_at <= pair[1].starts_at)
-    );
-    let event_titles: Vec<_> = first
-        .iter()
-        .filter(|programme| programme.category_list().contains(&"event".to_owned()))
-        .map(|programme| programme.title.as_str())
-        .collect();
-    assert_eq!(event_titles, ["Broncos vs Chiefs", "Rams vs Seahawks"]);
-    let first_event = first
-        .iter()
-        .find(|programme| programme.title == "Broncos vs Chiefs")
-        .expect("first event programme");
-    assert_eq!(
-        first_event.starts_at,
-        chrono::DateTime::parse_from_rfc3339("2026-09-14T06:20:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc)
-    );
-    assert!(first.iter().all(|programme| {
-        programme.description.is_some()
-            && programme
-                .source_name
-                .as_deref()
-                .is_some_and(|name| name.contains("Generated"))
-    }));
-
-    let conflicting_template = catalog
-        .create_event_template(CreateEventTemplate {
-            name: format!("conflicting-{suffix}"),
-            display_name: "Conflicting sports".to_owned(),
-            match_regex: "Broncos|Rams".to_owned(),
-            channel_name_format: "{home} vs {away}".to_owned(),
-            group_name: group,
-            event_duration_hours: 3,
-            past_date_grace_hours: 1,
-            future_date_days: 1,
-            timezone: "UTC".to_owned(),
-            filler_title: "No programs available".to_owned(),
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        catalog
-            .scan_event_channels(conflicting_template.id)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        catalog
-            .list_programmes_for_channels(&[channel_id])
-            .await
-            .unwrap()
-            .iter()
-            .map(|programme| (&programme.title, programme.starts_at, programme.stops_at))
-            .collect::<Vec<_>>(),
-        first
-            .iter()
-            .map(|programme| (&programme.title, programme.starts_at, programme.stops_at))
-            .collect::<Vec<_>>()
-    );
-
-    assert_eq!(catalog.scan_all_event_channels().await.unwrap(), 1);
-    let second = catalog
-        .list_programmes_for_channels(&[channel_id])
-        .await
-        .unwrap();
-    assert_eq!(
-        first
-            .iter()
-            .map(|programme| (&programme.title, programme.starts_at, programme.stops_at))
-            .collect::<Vec<_>>(),
-        second
-            .iter()
-            .map(|programme| (&programme.title, programme.starts_at, programme.stops_at))
-            .collect::<Vec<_>>()
-    );
-
-    sqlx::query("DELETE FROM provider_streams WHERE snapshot_id = $1")
+    // Insert the backup stream first, so that insert order cannot select it.
+    for (priority, key, height, video, audio) in [
+        (1, "backup", 480, "mpeg2video", "mp2"),
+        (0, "primary", 1080, "h264", "aac"),
+    ] {
+        let stream_id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO provider_streams
+                (id, snapshot_id, provider_account_id, stable_key, name, group_name,
+                 url_template, video_height, video_codec, audio_codec, supported)
+             VALUES ($1, $2, $3, $4, $4, 'news', 'https://provider.test/s', $5, $6, $7, true)",
+        )
+        .bind(stream_id)
         .bind(snapshot_id)
-        .execute(database.pool())
+        .bind(account_id)
+        .bind(key)
+        .bind(height)
+        .bind(video)
+        .bind(audio)
+        .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(catalog.scan_event_channels(template.id).await.unwrap(), 0);
-    let preserved = catalog
-        .list_programmes_for_channels(&[channel_id])
+        sqlx::query(
+            "INSERT INTO channel_streams (channel_id, provider_stream_id, priority)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(channel_id)
+        .bind(stream_id)
+        .bind(priority)
+        .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(preserved.len(), second.len());
+    }
+    catalog
+        .ensure_environment_output_profile(OutputProfileTokenHash::from_sha256([9_u8; 32]), 2)
+        .await
+        .unwrap();
+    let lineup = catalog
+        .list_enabled_channels_for_output_profile(ENVIRONMENT_OUTPUT_PROFILE_ID)
+        .await
+        .unwrap();
+    let row = lineup.iter().find(|row| row.id == channel_id).unwrap();
+    assert_eq!(row.stream_count, 2);
+    assert_eq!(row.video_height, Some(1080));
+    assert_eq!(row.video_codec.as_deref(), Some("h264"));
+    assert_eq!(row.audio_codec.as_deref(), Some("aac"));
     drop(catalog);
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
