@@ -317,7 +317,7 @@ fn is_matching_pmt(section: &[u8], expected_program: u16) -> bool {
     offset == streams_end
 }
 
-fn mpeg_crc32(bytes: &[u8]) -> u32 {
+pub(crate) fn mpeg_crc32(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     for &byte in bytes {
         crc ^= u32::from(byte) << 24;

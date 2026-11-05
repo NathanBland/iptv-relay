@@ -354,58 +354,38 @@ impl FfmpegInputAdapter {
         self.command(input).spawn(ring_config)
     }
 
-    /// Starts a fixed MPEG-TS placeholder for a client that waits for capacity.
+    /// Returns the fixed command of one stream slate.
+    #[must_use]
+    pub fn slate_command(
+        self,
+        kind: crate::slate::SlateKind,
+        countdown_seconds: u32,
+        profile: &crate::slate::SlateProfile,
+    ) -> AuditedProcessCommand {
+        AuditedProcessCommand {
+            adapter: ProcessAdapterKind::Ffmpeg,
+            executable: ProcessAdapterKind::Ffmpeg.executable(),
+            arguments: crate::slate::ffmpeg_arguments(kind, countdown_seconds, profile),
+        }
+    }
+
+    /// Starts a fixed MPEG-TS stream slate.
     ///
-    /// The placeholder contains H.264 video, AAC audio, and a capacity message.
+    /// The slate has video and audio that agree with `profile` and shows the
+    /// message of `kind`.
     ///
     /// # Errors
     ///
     /// Returns a redacted spawn or setup error.
-    pub fn start_capacity_placeholder(
+    pub fn start_slate(
         self,
+        kind: crate::slate::SlateKind,
+        countdown_seconds: u32,
+        profile: &crate::slate::SlateProfile,
         ring_config: MpegTsRingConfig,
     ) -> Result<ProcessInputSession, ProcessAdapterError> {
-        AuditedProcessCommand {
-            adapter: ProcessAdapterKind::Ffmpeg,
-            executable: ProcessAdapterKind::Ffmpeg.executable(),
-            arguments: vec![
-                "-hide_banner".into(),
-                "-loglevel".into(),
-                "error".into(),
-                "-nostdin".into(),
-                "-re".into(),
-                "-f".into(),
-                "lavfi".into(),
-                "-i".into(),
-                "color=c=0x08111f:s=1280x720:r=30".into(),
-                "-f".into(),
-                "lavfi".into(),
-                "-i".into(),
-                "anullsrc=channel_layout=stereo:sample_rate=48000".into(),
-                "-vf".into(),
-                "drawtext=text='No more slots available':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2".into(),
-                "-c:v".into(),
-                "libx264".into(),
-                "-preset".into(),
-                "ultrafast".into(),
-                "-tune".into(),
-                "zerolatency".into(),
-                "-pix_fmt".into(),
-                "yuv420p".into(),
-                "-g".into(),
-                "30".into(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                "96k".into(),
-                "-muxdelay".into(),
-                "0".into(),
-                "-f".into(),
-                "mpegts".into(),
-                "pipe:1".into(),
-            ],
-        }
-        .spawn(ring_config)
+        self.slate_command(kind, countdown_seconds, profile)
+            .spawn(ring_config)
     }
 }
 

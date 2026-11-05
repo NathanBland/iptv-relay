@@ -7519,6 +7519,49 @@ pub struct RegionFilterStats {
     pub disabled: i64,
 }
 
+/// The last measured media profile of one provider stream.
+#[derive(Clone, Debug, Default, FromRow, Serialize)]
+pub struct StreamMediaProfileRow {
+    pub video_codec: Option<String>,
+    pub video_width: Option<i32>,
+    pub video_height: Option<i32>,
+    pub video_fps: Option<f64>,
+    pub audio_codec: Option<String>,
+    pub audio_channels: Option<i32>,
+    pub audio_sample_rate: Option<i32>,
+}
+
+impl CatalogRepository {
+    /// Reads the last measured media profile of one provider stream.
+    ///
+    /// The stream slates use this profile. The method only reads data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a persistence error when the query fails.
+    pub async fn stream_media_profile(
+        &self,
+        provider_stream_id: Uuid,
+    ) -> Result<Option<StreamMediaProfileRow>, PersistenceError> {
+        Ok(sqlx::query_as::<_, StreamMediaProfileRow>(
+            r"
+            SELECT video_codec,
+                   video_width,
+                   video_height,
+                   video_fps::double precision AS video_fps,
+                   audio_codec,
+                   audio_channels,
+                   audio_sample_rate
+              FROM provider_streams
+             WHERE id = $1
+            ",
+        )
+        .bind(provider_stream_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
