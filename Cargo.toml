@@ -15,6 +15,7 @@ members = [
   "crates/media",
   "crates/parsers",
   "crates/persistence",
+  "crates/sports",
 ]
 resolver = "2"
 
