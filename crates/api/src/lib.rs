@@ -7542,6 +7542,7 @@ async fn hdhr_device(State(state): State<AppState>, Path(token): Path<String>) -
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct StreamHealthItem {
     provider_stream_id: String,
     stream_name: String,
@@ -7611,6 +7612,7 @@ impl From<iptv_persistence::StreamHealthStats> for StreamHealthStatsResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct BestStreamResponse {
     channel_id: String,
     channel_name: String,
@@ -7847,6 +7849,7 @@ async fn best_stream_for_channel(
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct UserResponse {
     id: String,
     username: String,
@@ -7874,6 +7877,7 @@ impl From<iptv_persistence::UserRow> for UserResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct CreateUserRequest {
     username: String,
     display_name: String,
@@ -7882,6 +7886,7 @@ struct CreateUserRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct UpdateUserRequest {
     display_name: Option<String>,
     password: Option<String>,
@@ -8090,6 +8095,7 @@ async fn delete_user(
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct ChannelAliasResponse {
     id: String,
     canonical_name: String,
@@ -8119,6 +8125,7 @@ struct ChannelAliasPageResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct CreateChannelAliasRequest {
     canonical_name: String,
     alias: String,
@@ -8127,6 +8134,7 @@ struct CreateChannelAliasRequest {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct ResolveAliasResponse {
     canonical_name: Option<String>,
     input: String,
@@ -8488,6 +8496,7 @@ async fn apply_region_filter(
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct RecordingRuleResponse {
     id: String,
     name: String,
@@ -8525,6 +8534,7 @@ impl From<iptv_persistence::RecordingRuleRow> for RecordingRuleResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct CreateRecordingRuleRequest {
     name: String,
     channel_id: String,
@@ -8538,6 +8548,7 @@ struct CreateRecordingRuleRequest {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct RecordingResponse {
     id: String,
     rule_id: Option<String>,
@@ -8579,6 +8590,7 @@ impl From<iptv_persistence::RecordingRow> for RecordingResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct CreateRecordingRequest {
     rule_id: Option<String>,
     channel_id: String,
@@ -8596,6 +8608,7 @@ struct RecordingPageResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct RecordingStatsResponse {
     scheduled: i64,
     recording: i64,
@@ -8927,6 +8940,7 @@ async fn recording_stats(State(state): State<AppState>, headers: HeaderMap) -> R
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct StreamProfileResponse {
     id: String,
     name: String,
@@ -8960,6 +8974,7 @@ impl From<iptv_persistence::StreamProfileRow> for StreamProfileResponse {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct CreateStreamProfileRequest {
     name: String,
     profile_type: Option<String>,
@@ -8971,6 +8986,7 @@ struct CreateStreamProfileRequest {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 struct AssignStreamProfileRequest {
     stream_profile_id: String,
 }
@@ -12664,7 +12680,7 @@ mod tests {
             .oneshot(admin_request(
                 "POST",
                 "/api/v1/users",
-                Some(r#"{"username":"route-user","display_name":"Route user","password":"password","role":"invalid"}"#.to_owned()),
+                Some(r#"{"username":"route-user","displayName":"Route user","password":"password","role":"invalid"}"#.to_owned()),
             ))
             .await
             .unwrap();
@@ -12674,7 +12690,7 @@ mod tests {
             .oneshot(admin_request(
                 "POST",
                 "/api/v1/users",
-                Some(r#"{"username":"route-user","display_name":"Route user","password":"password","role":"viewer"}"#.to_owned()),
+                Some(r#"{"username":"route-user","displayName":"Route user","password":"password","role":"viewer"}"#.to_owned()),
             ))
             .await
             .unwrap();
@@ -12687,7 +12703,7 @@ mod tests {
                 "PATCH",
                 format!("/api/v1/users/{user_id}"),
                 Some(
-                    r#"{"display_name":"Updated user","role":"operator","enabled":false}"#
+                    r#"{"displayName":"Updated user","role":"operator","enabled":false}"#
                         .to_owned(),
                 ),
             ))
@@ -12710,7 +12726,7 @@ mod tests {
             .oneshot(admin_request(
                 "POST",
                 "/api/v1/channel-aliases",
-                Some(r#"{"canonical_name":"Route Channel","alias":"Route Channel HD","country":"US","category":"test"}"#.to_owned()),
+                Some(r#"{"canonicalName":"Route Channel","alias":"Route Channel HD","country":"US","category":"test"}"#.to_owned()),
             ))
             .await
             .unwrap();
@@ -12743,7 +12759,7 @@ mod tests {
             .oneshot(admin_request(
                 "POST",
                 "/api/v1/recordings/rules",
-                Some(r#"{"name":"Bad","channel_id":"invalid","rule_type":"wrong"}"#.to_owned()),
+                Some(r#"{"name":"Bad","channelId":"invalid","ruleType":"wrong"}"#.to_owned()),
             ))
             .await
             .unwrap();
@@ -12753,7 +12769,7 @@ mod tests {
             .oneshot(admin_request(
                 "POST",
                 "/api/v1/recordings/rules",
-                Some(format!(r#"{{"name":"Route rule","channel_id":"{channel_id}","rule_type":"series","keep_until":"forever"}}"#)),
+                Some(format!(r#"{{"name":"Route rule","channelId":"{channel_id}","ruleType":"series","keepUntil":"forever"}}"#)),
             ))
             .await
             .unwrap();
@@ -12765,7 +12781,7 @@ mod tests {
             .oneshot(admin_request(
                 "POST",
                 "/api/v1/recordings",
-                Some(format!(r#"{{"rule_id":"{rule_id}","channel_id":"{channel_id}","title":"Route recording","description":"test","starts_at":"2026-01-01T00:00:00Z","ends_at":"2026-01-01T01:00:00Z"}}"#)),
+                Some(format!(r#"{{"ruleId":"{rule_id}","channelId":"{channel_id}","title":"Route recording","description":"test","startsAt":"2026-01-01T00:00:00Z","endsAt":"2026-01-01T01:00:00Z"}}"#)),
             ))
             .await
             .unwrap();
@@ -12908,7 +12924,7 @@ mod tests {
             .oneshot(admin_request(
                 "POST",
                 "/api/v1/stream-profiles",
-                Some(r#"{"name":"Bad profile","profile_type":"bad"}"#.to_owned()),
+                Some(r#"{"name":"Bad profile","profileType":"bad"}"#.to_owned()),
             ))
             .await
             .unwrap();
@@ -12918,7 +12934,7 @@ mod tests {
             .oneshot(admin_request(
                 "POST",
                 "/api/v1/stream-profiles",
-                Some(r#"{"name":"Route profile","profile_type":"ffmpeg","command":"ffmpeg","arguments":["-i"],"buffer_seconds":2.5,"user_agent":"Route"}"#.to_owned()),
+                Some(r#"{"name":"Route profile","profileType":"ffmpeg","command":"ffmpeg","arguments":["-i"],"bufferSeconds":2.5,"userAgent":"Route"}"#.to_owned()),
             ))
             .await
             .unwrap();
@@ -12931,7 +12947,7 @@ mod tests {
             .oneshot(admin_request(
                 "POST",
                 format!("/api/v1/channels/{channel_id}/stream-profile"),
-                Some(format!(r#"{{"stream_profile_id":"{profile_id}"}}"#)),
+                Some(format!(r#"{{"streamProfileId":"{profile_id}"}}"#)),
             ))
             .await
             .unwrap();
@@ -13174,6 +13190,61 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    #[test]
+    fn openapi_component_property_names_use_camel_case() {
+        // Schemas that intentionally keep snake_case property names. Add a name here only
+        // after checking every consumer of that schema.
+        // - DeadLetterResponse: operator scripts and docs read these keys.
+        // - ChannelRecord, CreateChannelRequest: `logo_url` is not in the F1 casing table.
+        //   Changing it needs a separate decision (see status/WP1.md).
+        const SNAKE_CASE_ALLOW_LIST: &[&str] = &[
+            "DeadLetterResponse",
+            "ChannelRecord",
+            "CreateChannelRequest",
+        ];
+
+        fn collect_snake_case_properties(
+            value: &serde_json::Value,
+            path: &str,
+            found: &mut Vec<String>,
+        ) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        if let ("properties", serde_json::Value::Object(properties)) =
+                            (key.as_str(), child)
+                        {
+                            for name in properties.keys().filter(|name| name.contains('_')) {
+                                found.push(format!("{path}.{name}"));
+                            }
+                        }
+                        collect_snake_case_properties(child, &format!("{path}/{key}"), found);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        collect_snake_case_properties(item, path, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let document = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = document["components"]["schemas"].as_object().unwrap();
+        let mut found = Vec::new();
+        for (schema_name, schema) in schemas {
+            if SNAKE_CASE_ALLOW_LIST.contains(&schema_name.as_str()) {
+                continue;
+            }
+            collect_snake_case_properties(schema, schema_name, &mut found);
+        }
+        assert!(
+            found.is_empty(),
+            "OpenAPI properties must use camelCase: {found:?}"
+        );
     }
 
     #[test]
@@ -13736,30 +13807,30 @@ mod tests {
         }));
         assert_deserializes::<TriggerHealthCheckRequest>(serde_json::json!({"limit": 50}));
         assert_deserializes::<CreateUserRequest>(serde_json::json!({
-            "username": "operator", "display_name": "Operator", "password": "password", "role": "operator"
+            "username": "operator", "displayName": "Operator", "password": "password", "role": "operator"
         }));
         assert_deserializes::<UpdateUserRequest>(serde_json::json!({
-            "display_name": "Operator", "password": "password", "role": "admin", "enabled": true
+            "displayName": "Operator", "password": "password", "role": "admin", "enabled": true
         }));
         assert_deserializes::<CreateChannelAliasRequest>(serde_json::json!({
-            "canonical_name": "Channel", "alias": "Channel HD", "country": "US", "category": "News"
+            "canonicalName": "Channel", "alias": "Channel HD", "country": "US", "category": "News"
         }));
         assert_deserializes::<CreateRecordingRuleRequest>(serde_json::json!({
-            "name": "Rule", "channel_id": id, "rule_type": "series", "title_filter": "Title",
-            "category_filter": "News", "start_padding_minutes": 1, "end_padding_minutes": 1,
-            "max_recordings": 5, "keep_until": "forever"
+            "name": "Rule", "channelId": id, "ruleType": "series", "titleFilter": "Title",
+            "categoryFilter": "News", "startPaddingMinutes": 1, "endPaddingMinutes": 1,
+            "maxRecordings": 5, "keepUntil": "forever"
         }));
         assert_deserializes::<CreateRecordingRequest>(serde_json::json!({
-            "rule_id": id, "channel_id": id, "programme_id": id, "title": "Recording",
-            "description": "Description", "starts_at": "2026-01-01T00:00:00Z",
-            "ends_at": "2026-01-01T01:00:00Z"
+            "ruleId": id, "channelId": id, "programmeId": id, "title": "Recording",
+            "description": "Description", "startsAt": "2026-01-01T00:00:00Z",
+            "endsAt": "2026-01-01T01:00:00Z"
         }));
         assert_deserializes::<CreateStreamProfileRequest>(serde_json::json!({
-            "name": "Profile", "profile_type": "ffmpeg", "command": "ffmpeg", "arguments": ["-i"],
-            "buffer_seconds": 1.0, "user_agent": "Agent", "referer": "https://gateway.test"
+            "name": "Profile", "profileType": "ffmpeg", "command": "ffmpeg", "arguments": ["-i"],
+            "bufferSeconds": 1.0, "userAgent": "Agent", "referer": "https://gateway.test"
         }));
         assert_deserializes::<AssignStreamProfileRequest>(
-            serde_json::json!({"stream_profile_id": id}),
+            serde_json::json!({"streamProfileId": id}),
         );
     }
 
