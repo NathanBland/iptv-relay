@@ -6843,6 +6843,7 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
             }
             body.push_str("</channel>\n");
         }
+        let mut spans_by_channel: HashMap<Uuid, Vec<GuideSpan>> = HashMap::new();
         for programme in &programmes {
             // Resolve the channel UUID from the mapping row instead of a
             // name scan so the lookup stays constant time per programme.
@@ -6853,6 +6854,10 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
             else {
                 continue;
             };
+            spans_by_channel
+                .entry(channel.id)
+                .or_default()
+                .push((programme.starts_at, programme.stops_at));
             write!(
                 &mut body,
                 "  <programme channel=\"{}\" start=\"{}\" stop=\"{}\"><title>{}</title>",
@@ -6871,6 +6876,13 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
                     .expect("writing to a String cannot fail");
             }
             body.push_str("</programme>\n");
+        }
+        let now = Utc::now();
+        for channel in &channels {
+            let spans = spans_by_channel
+                .get(&channel.id)
+                .map_or(&[][..], Vec::as_slice);
+            write_no_program_placeholders(&mut body, channel.id, now, spans);
         }
         body.push_str("</tv>\n");
         return no_store_response(text_response("application/xml; charset=utf-8", body));
@@ -6905,6 +6917,13 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
         .filter(|programme| enabled.contains(&programme.channel_id))
         .collect();
     programmes.sort_by_key(|programme| (programme.channel_id, programme.starts_at));
+    let mut spans_by_channel: HashMap<Uuid, Vec<GuideSpan>> = HashMap::new();
+    for programme in &programmes {
+        spans_by_channel
+            .entry(programme.channel_id)
+            .or_default()
+            .push((programme.starts_at, programme.stops_at));
+    }
     for programme in programmes {
         write!(
             &mut body,
@@ -6924,6 +6943,13 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
                 .expect("writing to a String cannot fail");
         }
         body.push_str("</programme>\n");
+    }
+    let now = Utc::now();
+    for channel in catalog.channels.iter().filter(|channel| channel.enabled) {
+        let spans = spans_by_channel
+            .get(&channel.id)
+            .map_or(&[][..], Vec::as_slice);
+        write_no_program_placeholders(&mut body, channel.id, now, spans);
     }
     body.push_str("</tv>\n");
     no_store_response(text_response("application/xml; charset=utf-8", body))
@@ -9437,6 +9463,91 @@ fn no_store_response(mut response: Response) -> Response {
 
 fn m3u_escape(value: &str) -> String {
     value.replace(['\r', '\n'], " ").replace('"', "'")
+}
+
+/// Title of the placeholder programme that fills a guide gap.
+const NO_PROGRAM_TITLE: &str = "No program available";
+/// Category of the placeholder programme that fills a guide gap.
+const NO_PROGRAM_CATEGORY: &str = "No program";
+/// Hours before the current time that the XMLTV guide window covers.
+const GUIDE_WINDOW_PAST_HOURS: i64 = 6;
+/// Hours after the current time that the XMLTV guide window covers.
+const GUIDE_WINDOW_FUTURE_HOURS: i64 = 48;
+/// Longest placeholder programme, in hours.
+const NO_PROGRAM_MAX_BLOCK_HOURS: i64 = 2;
+
+/// A start and stop time of one guide programme.
+type GuideSpan = (DateTime<Utc>, DateTime<Utc>);
+
+/// Returns the placeholder blocks that fill the guide gaps in `spans`.
+///
+/// Only gaps of one minute or more get a placeholder. Each block is at most
+/// two hours long and ends on a whole hour, or at the end of its gap. Real
+/// programmes in `spans` are never covered.
+fn no_program_blocks(now: DateTime<Utc>, spans: &[GuideSpan]) -> Vec<GuideSpan> {
+    let window_start = now - chrono::Duration::hours(GUIDE_WINDOW_PAST_HOURS);
+    let window_end = now + chrono::Duration::hours(GUIDE_WINDOW_FUTURE_HOURS);
+    let mut sorted = spans.to_vec();
+    sorted.sort_by_key(|(start, _)| *start);
+
+    let mut gaps = Vec::new();
+    let mut cursor = window_start;
+    for (start, stop) in sorted {
+        if cursor >= window_end {
+            break;
+        }
+        if start > cursor {
+            gaps.push((cursor, start.min(window_end)));
+        }
+        cursor = cursor.max(stop);
+    }
+    if cursor < window_end {
+        gaps.push((cursor, window_end));
+    }
+
+    let minimum_gap = chrono::Duration::minutes(1);
+    let maximum_block = chrono::Duration::hours(NO_PROGRAM_MAX_BLOCK_HOURS);
+    let mut blocks = Vec::new();
+    for (gap_start, gap_end) in gaps {
+        let mut block_start = gap_start;
+        while gap_end - block_start >= minimum_gap {
+            // The whole hour at or before `block_start + 2h` lies after `block_start`,
+            // so every block has a positive length.
+            let hour_limit = floor_to_hour(block_start + maximum_block);
+            let block_end = gap_end.min(hour_limit);
+            blocks.push((block_start, block_end));
+            block_start = block_end;
+        }
+    }
+    blocks
+}
+
+/// Returns the whole hour at or before `value`.
+fn floor_to_hour(value: DateTime<Utc>) -> DateTime<Utc> {
+    let seconds = value.timestamp();
+    DateTime::from_timestamp(seconds - seconds.rem_euclid(3600), 0).unwrap_or(value)
+}
+
+/// Writes a "No program available" placeholder for each guide gap of one channel.
+///
+/// The placeholder has no description and no `<sub-title>`. The operator reports
+/// that `<sub-title>` crashed Jellyfin. The placeholders are generated for the
+/// output only and are never stored.
+fn write_no_program_placeholders(
+    body: &mut String,
+    channel_id: Uuid,
+    now: DateTime<Utc>,
+    spans: &[GuideSpan],
+) {
+    for (start, stop) in no_program_blocks(now, spans) {
+        writeln!(
+            body,
+            "  <programme channel=\"{channel_id}\" start=\"{}\" stop=\"{}\"><title>{NO_PROGRAM_TITLE}</title><category>{NO_PROGRAM_CATEGORY}</category></programme>",
+            start.format("%Y%m%d%H%M%S %z"),
+            stop.format("%Y%m%d%H%M%S %z"),
+        )
+        .expect("writing to a String cannot fail");
+    }
 }
 
 fn xml_escape(value: &str) -> String {
@@ -14302,5 +14413,174 @@ mod tests {
         assert_eq!(completed.percent, 100);
         assert_eq!(completed.bytes_downloaded, 4096);
         assert_eq!(completed.records_processed, 7);
+    }
+
+    fn guide_time(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("valid RFC 3339 test time")
+            .with_timezone(&Utc)
+    }
+
+    /// Fixed "now" that is not on the hour: the window is 06:30Z to 12:30Z + 48h.
+    fn guide_now() -> DateTime<Utc> {
+        guide_time("2026-11-05T12:30:00Z")
+    }
+
+    fn assert_blocks_are_valid(blocks: &[(DateTime<Utc>, DateTime<Utc>)]) {
+        for (start, stop) in blocks {
+            let length = *stop - *start;
+            assert!(
+                length >= chrono::Duration::minutes(1),
+                "block too short: {start} {stop}"
+            );
+            assert!(
+                length <= chrono::Duration::hours(2),
+                "block too long: {start} {stop}"
+            );
+            assert!(*start < *stop);
+        }
+        for pair in blocks.windows(2) {
+            assert!(pair[0].1 <= pair[1].0, "blocks overlap: {pair:?}");
+        }
+    }
+
+    #[test]
+    fn channel_without_programmes_gets_placeholders_for_full_window() {
+        let now = guide_now();
+        let blocks = no_program_blocks(now, &[]);
+
+        assert_eq!(
+            blocks.first().map(|b| b.0),
+            Some(guide_time("2026-11-05T06:30:00Z"))
+        );
+        assert_eq!(
+            blocks.last().map(|b| b.1),
+            Some(guide_time("2026-11-07T12:30:00Z"))
+        );
+        assert_blocks_are_valid(&blocks);
+        for pair in blocks.windows(2) {
+            assert_eq!(
+                pair[0].1, pair[1].0,
+                "placeholder blocks must be contiguous"
+            );
+        }
+        let covered = blocks
+            .iter()
+            .fold(chrono::Duration::zero(), |total, (s, e)| total + (*e - *s));
+        assert_eq!(covered, chrono::Duration::hours(54));
+    }
+
+    #[test]
+    fn blocks_are_at_most_two_hours_and_end_on_the_hour() {
+        let blocks = no_program_blocks(guide_now(), &[]);
+
+        assert_blocks_are_valid(&blocks);
+        // Every block end except the window end falls on a whole hour.
+        let window_end = guide_time("2026-11-07T12:30:00Z");
+        for (_, stop) in &blocks {
+            if *stop != window_end {
+                assert_eq!(
+                    stop.timestamp().rem_euclid(3600),
+                    0,
+                    "block end not on the hour: {stop}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_programme_gets_placeholders_before_and_after() {
+        let now = guide_now();
+        let programme = (
+            guide_time("2026-11-05T09:00:00Z"),
+            guide_time("2026-11-05T10:00:00Z"),
+        );
+        let blocks = no_program_blocks(now, &[programme]);
+
+        assert_blocks_are_valid(&blocks);
+        assert_eq!(
+            blocks.first().map(|b| b.0),
+            Some(guide_time("2026-11-05T06:30:00Z"))
+        );
+        assert_eq!(
+            blocks.last().map(|b| b.1),
+            Some(guide_time("2026-11-07T12:30:00Z"))
+        );
+        assert!(
+            blocks.iter().any(|(_, stop)| *stop == programme.0),
+            "no placeholder before"
+        );
+        assert!(
+            blocks.iter().any(|(start, _)| *start == programme.1),
+            "no placeholder after"
+        );
+        for (start, stop) in &blocks {
+            let overlaps = *start < programme.1 && programme.0 < *stop;
+            assert!(
+                !overlaps,
+                "placeholder overlaps the real programme: {start} {stop}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjacent_programmes_get_no_placeholder_between_them() {
+        let now = guide_now();
+        let first = (
+            guide_time("2026-11-05T09:00:00Z"),
+            guide_time("2026-11-05T10:00:00Z"),
+        );
+        let second = (
+            guide_time("2026-11-05T10:00:00Z"),
+            guide_time("2026-11-05T11:00:00Z"),
+        );
+        let blocks = no_program_blocks(now, &[second, first]);
+
+        assert_blocks_are_valid(&blocks);
+        assert!(
+            blocks
+                .iter()
+                .all(|(start, stop)| *stop <= first.0 || *start >= second.1),
+            "placeholder found between adjacent programmes: {blocks:?}"
+        );
+        assert!(blocks.iter().any(|(_, stop)| *stop == first.0));
+        assert!(blocks.iter().any(|(start, _)| *start == second.1));
+    }
+
+    #[test]
+    fn gap_shorter_than_one_minute_gets_no_placeholder() {
+        let now = guide_now();
+        let first = (
+            guide_time("2026-11-05T09:00:00Z"),
+            guide_time("2026-11-05T10:00:00Z"),
+        );
+        let second = (
+            guide_time("2026-11-05T10:00:30Z"),
+            guide_time("2026-11-05T11:00:00Z"),
+        );
+        let blocks = no_program_blocks(now, &[first, second]);
+
+        // The 30 second gap between 10:00:00 and 10:00:30 must get no block.
+        assert!(
+            !blocks
+                .iter()
+                .any(|(start, stop)| *start < second.0 && *stop > first.1)
+        );
+    }
+
+    #[test]
+    fn placeholder_xml_has_title_and_category_but_no_description_or_sub_title() {
+        let channel_id = Uuid::nil();
+        let mut body = String::new();
+        let now = guide_now();
+        write_no_program_placeholders(&mut body, channel_id, now, &[]);
+
+        assert!(body.contains(
+            "<title>No program available</title><category>No program</category></programme>"
+        ));
+        assert!(body.contains(&format!("channel=\"{channel_id}\"")));
+        assert!(!body.contains("<desc>"));
+        assert!(!body.contains("<sub-title>"));
+        assert!(body.contains("start=\"20261105063000 +0000\""));
     }
 }
