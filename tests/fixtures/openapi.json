@@ -316,10 +316,25 @@
           "name": {
             "type": "string"
           },
+          "nameOverride": {
+            "description": "Operator override. Null when none is set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "number": {
             "type": "string"
           },
+          "outputName": {
+            "description": "Name in the playlist, guide and tuner output.",
+            "type": "string"
+          },
           "primaryCodec": {
+            "type": "string"
+          },
+          "providerName": {
+            "description": "Name that the provider sends.",
             "type": "string"
           },
           "state": {
@@ -337,6 +352,8 @@
           "id",
           "number",
           "name",
+          "providerName",
+          "outputName",
           "group",
           "tvgId",
           "streams",
@@ -2617,6 +2634,18 @@
         ],
         "type": "object"
       },
+      "SetChannelNameRequest": {
+        "properties": {
+          "nameOverride": {
+            "description": "New output name. Null or an empty string removes the override.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SetEnabledRequest": {
         "properties": {
           "enabled": {
@@ -3503,7 +3532,7 @@
       "name": "MIT"
     },
     "title": "iptv-api",
-    "version": "0.2.20"
+    "version": "0.3.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -4617,6 +4646,77 @@
         },
         "tags": [
           "guide"
+        ]
+      }
+    },
+    "/api/v1/channels/{channel_id}/name": {
+      "patch": {
+        "operationId": "set_channel_name",
+        "parameters": [
+          {
+            "description": "Channel identifier",
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetChannelNameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelResponse"
+                }
+              }
+            },
+            "description": "Channel with the updated output name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "tags": [
+          "channels"
         ]
       }
     },

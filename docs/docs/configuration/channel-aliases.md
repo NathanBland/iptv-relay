@@ -67,6 +67,41 @@ curl -X DELETE http://localhost:8080/api/v1/channel-aliases/{alias_id} \
   -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN"
 ```
 
+## Name precedence
+
+The relay chooses the output name of a channel in this order:
+
+1. The name override that an operator sets on the channel.
+2. The canonical name of a matching alias.
+3. The stable event name of a dynamic event channel.
+4. The provider name.
+
+The playlist, the guide, and the tuner lineup use the output name.
+
+## Rename a channel
+
+To change the output name of one channel, set a name override. A name override has precedence over an alias.
+
+1. Open the **Channels** page.
+2. Select the pencil icon next to the channel name.
+3. Enter the new name.
+4. Select **Save**.
+
+The **Channels** page shows the output name first. It shows the provider name on a second line when the two names are different.
+
+To remove a name override, select **Reset**. The channel then uses the alias, the stable event name, or the provider name.
+
+Use the API to set a name override:
+
+```bash
+curl -X PATCH http://localhost:8080/api/v1/channels/{channel_id}/name \
+  -H "Authorization: Bearer $IPTV_ADMIN_BOOTSTRAP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"nameOverride": "Local News"}'
+```
+
+A name override has a maximum of 200 characters. A provider refresh does not change a name override.
+
 ## Channel aliases page
 
 The `/channel-aliases` page provides:
