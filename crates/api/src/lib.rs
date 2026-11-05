@@ -552,6 +552,12 @@ struct ChannelResponse {
     id: String,
     number: String,
     name: String,
+    /// Name that the provider sends.
+    provider_name: String,
+    /// Name in the playlist, guide and tuner output.
+    output_name: String,
+    /// Operator override. Null when none is set.
+    name_override: Option<String>,
     group: String,
     tvg_id: String,
     streams: usize,
@@ -961,8 +967,8 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, reset_source_circuit_breaker, list_groups, list_jobs, cancel_job, list_dead_letters, get_dead_letter, replay_dead_letter, close_dead_letter, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, terminate_session, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
-    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SupportLogEntry, SupportBundleResponse, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
+    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, reset_source_circuit_breaker, list_groups, list_jobs, cancel_job, list_dead_letters, get_dead_letter, replay_dead_letter, close_dead_letter, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_channel_name, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, terminate_session, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SupportLogEntry, SupportBundleResponse, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, SetChannelNameRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -1201,6 +1207,10 @@ fn guide_control_routes() -> Router<AppState> {
         .route(
             "/api/v1/channels/{channel_id}/enabled",
             axum::routing::patch(set_channel_enabled),
+        )
+        .route(
+            "/api/v1/channels/{channel_id}/name",
+            axum::routing::patch(set_channel_name),
         )
         .route(
             "/api/v1/groups/{group_name}/enabled",
@@ -4295,6 +4305,9 @@ async fn list_channels(
                 id: channel.id.to_string(),
                 number: channel.number.clone(),
                 name: channel.name.clone(),
+                provider_name: channel.name.clone(),
+                output_name: channel.name.clone(),
+                name_override: None,
                 group: channel
                     .group
                     .clone()
@@ -4329,6 +4342,9 @@ fn channel_response_from_row(row: &iptv_persistence::ChannelRow) -> ChannelRespo
         id: row.id.to_string(),
         number: row.channel_number.clone(),
         name: row.name.clone(),
+        provider_name: row.provider_name.clone(),
+        output_name: row.output_name.clone(),
+        name_override: row.name_override.clone(),
         group: row.group_name.clone(),
         tvg_id: row.channel_number.clone(),
         streams: usize::try_from(row.stream_count).unwrap_or(usize::MAX),
@@ -4564,6 +4580,62 @@ async fn set_channel_enabled(
         .into_response()
     } else {
         not_found()
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SetChannelNameRequest {
+    /// New output name. Null or an empty string removes the override.
+    name_override: Option<String>,
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/channels/{channel_id}/name",
+    tag = "channels",
+    params(("channel_id" = String, Path, description = "Channel identifier")),
+    request_body = SetChannelNameRequest,
+    responses(
+        (status = 200, body = ChannelResponse, description = "Channel with the updated output name"),
+        (status = 401, body = ProblemDetails),
+        (status = 404, body = ProblemDetails),
+        (status = 422, body = ProblemDetails)
+    )
+)]
+async fn set_channel_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(request): Json<SetChannelNameRequest>,
+) -> Response {
+    if let Some(response) = require_admin_mutation(&state, &headers) {
+        return response;
+    }
+    let Some(uuid) = Uuid::parse_str(&channel_id).ok() else {
+        return not_found();
+    };
+    let Some(catalog) = &state.catalog_repository else {
+        return ProblemDetails::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database-required",
+            "Database required",
+            "channel names can change only when a database is configured",
+        )
+        .response();
+    };
+    match catalog
+        .set_channel_name_override(uuid, request.name_override.as_deref())
+        .await
+    {
+        Ok(false) => return not_found(),
+        Ok(true) => {}
+        Err(error) => return persistence_error_response(error),
+    }
+    match catalog.get_channel(uuid).await {
+        Ok(Some(row)) => Json(channel_response_from_row(&row)).into_response(),
+        Ok(None) => not_found(),
+        Err(error) => persistence_error_response(error),
     }
 }
 
@@ -6849,7 +6921,11 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
             let Some(channel) = programme
                 .channel_id
                 .and_then(|id| channel_by_id.get(&id).copied())
-                .or_else(|| channels.iter().find(|c| c.name == programme.channel_name))
+                .or_else(|| {
+                    channels
+                        .iter()
+                        .find(|c| c.provider_name == programme.channel_name)
+                })
             else {
                 continue;
             };
@@ -12914,6 +12990,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(disabled.status(), StatusCode::OK);
+        let renamed = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                format!("/api/v1/channels/{channel_id}/name"),
+                Some(r#"{"nameOverride":"  Renamed  "}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let renamed: serde_json::Value =
+            serde_json::from_str(&response_text(renamed).await).unwrap();
+        assert_eq!(renamed["outputName"], "Renamed");
+        assert_eq!(renamed["nameOverride"], "Renamed");
+        assert_eq!(renamed["providerName"], "Database Channel");
+        let listed = app
+            .clone()
+            .oneshot(admin_request(
+                "GET",
+                "/api/v1/channels?search=Database",
+                None,
+            ))
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&response_text(listed).await).unwrap();
+        assert_eq!(listed["items"][0]["outputName"], "Renamed");
+        let reset = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                format!("/api/v1/channels/{channel_id}/name"),
+                Some(r#"{"nameOverride":null}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        let reset: serde_json::Value = serde_json::from_str(&response_text(reset).await).unwrap();
+        assert_eq!(reset["outputName"], "Database Channel");
+        assert!(reset["nameOverride"].is_null());
+        let too_long = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                format!("/api/v1/channels/{channel_id}/name"),
+                Some(format!(r#"{{"nameOverride":"{}"}}"#, "x".repeat(201))),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(too_long.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let missing = app
+            .clone()
+            .oneshot(admin_request(
+                "PATCH",
+                format!("/api/v1/channels/{}/name", Uuid::now_v7()),
+                Some(r#"{"nameOverride":"x"}"#.to_owned()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         let group_enabled = app
             .clone()
             .oneshot(admin_request(
@@ -13587,6 +13721,9 @@ mod tests {
         let channel = ChannelResponse {
             id: id.clone(),
             number: "1".to_owned(),
+            provider_name: "Channel".to_owned(),
+            output_name: "Channel".to_owned(),
+            name_override: None,
             name: "Channel".to_owned(),
             group: "Group".to_owned(),
             tvg_id: "tvg".to_owned(),

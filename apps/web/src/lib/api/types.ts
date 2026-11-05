@@ -74,6 +74,9 @@ export interface Channel {
   id: string
   number: string
   name: string
+  providerName: string
+  outputName: string
+  nameOverride: string | null
   group: string
   tvgId: string
   streams: number
@@ -735,6 +738,7 @@ export interface IptvApiClient {
   getChannels(query?: ChannelQuery): Promise<ChannelPage>
   getChannelPreview(channelId: string): Promise<ChannelPreview>
   setChannelEnabled(channelId: string, enabled: boolean): Promise<SaveResult>
+  setChannelName(channelId: string, nameOverride: string | null): Promise<Channel>
   setGroupEnabled(groupName: string, enabled: boolean): Promise<SaveResult>
   setAllGroupsEnabled(enabled: boolean): Promise<SaveResult>
   getProgrammes(query?: ProgrammeQuery): Promise<ProgrammePage>

@@ -1935,6 +1935,47 @@ impl CatalogRepository {
         })
     }
 
+    /// Reads one canonical channel with the same name fields as `list_channels`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    pub async fn get_channel(
+        &self,
+        channel_id: Uuid,
+    ) -> Result<Option<ChannelRow>, PersistenceError> {
+        let row = sqlx::query_as::<_, ChannelRow>(
+            r"
+            SELECT
+                c.id,
+                c.channel_number,
+                c.name,
+                c.name AS provider_name,
+                coalesce(c.name_override, channel_alias.canonical_name, c.event_name, c.name) AS output_name,
+                c.name_override,
+                coalesce(c.group_name, 'Uncategorized') AS group_name,
+                c.logo_url,
+                c.enabled,
+                (SELECT count(*) FROM channel_streams cs WHERE cs.channel_id = c.id) AS stream_count,
+                EXISTS (SELECT 1 FROM channel_epg_mappings m WHERE m.channel_id = c.id) AS epg_mapped
+            FROM channels c
+            LEFT JOIN LATERAL (
+                SELECT ca.canonical_name
+                FROM channel_aliases ca
+                WHERE normalize_channel_alias_key(ca.alias) = normalize_channel_alias_key(c.name)
+                   OR normalize_channel_alias_key(ca.canonical_name) = normalize_channel_alias_key(c.name)
+                ORDER BY ca.canonical_name
+                LIMIT 1
+            ) channel_alias ON true
+            WHERE c.id = $1
+            ",
+        )
+        .bind(channel_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Lists distinct channel groups with total and enabled channel counts.
     ///
     /// # Errors

@@ -612,6 +612,13 @@ export class FetchIptvApiClient implements IptvApiClient {
     })
   }
 
+  async setChannelName(channelId: string, nameOverride: string | null): Promise<Channel> {
+    return this.request(`${API_PATHS.channels}/${encodeURIComponent(channelId)}/name`, (value) => asObject<Channel>(value, 'Channel name response'), {
+      method: 'PATCH',
+      body: JSON.stringify({ nameOverride }),
+    })
+  }
+
   async setGroupEnabled(groupName: string, enabled: boolean): Promise<SaveResult> {
     return this.request(`${API_PATHS.groups}/${encodeURIComponent(groupName)}/enabled`, (value) => asObject<SaveResult>(value, 'Group enabled response'), {
       method: 'PATCH',
@@ -1321,6 +1328,15 @@ export class MockIptvApiClient implements IptvApiClient {
 
   async setChannelEnabled(_channelId: string, _enabled: boolean): Promise<SaveResult> {
     return { ok: true, message: 'Channel updated.' }
+  }
+
+  async setChannelName(channelId: string, nameOverride: string | null): Promise<Channel> {
+    const channel = mockChannels.find((item) => item.id === channelId)
+    if (!channel) throw new IptvApiError({ type: 'not-found', title: 'Not found', status: 404, detail: 'Channel not found' })
+    const trimmed = nameOverride?.trim() || null
+    channel.nameOverride = trimmed
+    channel.outputName = trimmed ?? channel.providerName
+    return { ...channel }
   }
 
   async setGroupEnabled(_groupName: string, _enabled: boolean): Promise<SaveResult> {

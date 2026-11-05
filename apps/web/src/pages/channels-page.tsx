@@ -11,7 +11,7 @@ import {
   useTable,
   type SortingState,
 } from '@tanstack/react-table'
-import { ArrowUpDown, ChevronLeft, ChevronRight, Eye, Power, Search } from 'lucide-react'
+import { ArrowUpDown, ChevronLeft, ChevronRight, Eye, Pencil, Power, Search } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { HealthBadge } from '@/components/health-badge'
 import { LoadingPage } from '@/components/loading-page'
@@ -39,6 +39,73 @@ const channelTableFeatures = tableFeatures({
 const columnHelper = createColumnHelper<typeof channelTableFeatures, Channel>()
 
 const PAGE_SIZE = 50
+
+export function ChannelNameCell({
+  channel,
+  pending,
+  onRename,
+}: {
+  channel: Channel
+  pending: boolean
+  onRename: (channelId: string, nameOverride: string | null) => void
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(channel.nameOverride ?? channel.outputName)
+  const save = () => {
+    const value = draft.trim()
+    onRename(channel.id, value === '' || value === channel.providerName ? null : value)
+    setEditing(false)
+  }
+  if (editing) {
+    return (
+      <form
+        className="flex flex-wrap items-center gap-2"
+        onSubmit={(event) => { event.preventDefault(); save() }}
+      >
+        <Input
+          aria-label={`Output name for ${channel.providerName}`}
+          className="h-8 w-56"
+          maxLength={200}
+          value={draft}
+          autoFocus
+          onChange={(event) => setDraft(event.target.value)}
+        />
+        <Button type="submit" size="sm" disabled={pending}>Save</Button>
+        <Button type="button" variant="ghost" size="sm" onClick={() => setEditing(false)}>Cancel</Button>
+      </form>
+    )
+  }
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <p className="font-medium text-white">{channel.outputName}</p>
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label={`Rename ${channel.outputName}`}
+          onClick={() => { setDraft(channel.nameOverride ?? channel.outputName); setEditing(true) }}
+        >
+          <Pencil aria-hidden="true" className="size-3" />
+        </Button>
+        {channel.nameOverride !== null && (
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={pending}
+            aria-label={`Reset name of ${channel.outputName}`}
+            onClick={() => onRename(channel.id, null)}
+          >
+            Reset
+          </Button>
+        )}
+      </div>
+      {channel.providerName !== channel.outputName && (
+        <p className="text-xs text-slate-500">Provider: {channel.providerName}</p>
+      )}
+      <p className="mt-1 font-mono text-[0.68rem] text-slate-600">{channel.tvgId}</p>
+    </div>
+  )
+}
 
 export function ChannelsPage({ client = apiClient }: { client?: IptvApiClient }) {
   const [searchInput, setSearchInput] = useState('')
@@ -76,6 +143,14 @@ export function ChannelsPage({ client = apiClient }: { client?: IptvApiClient })
     },
   })
 
+  const channelRename = useMutation({
+    mutationFn: ({ channelId, nameOverride }: { channelId: string; nameOverride: string | null }) =>
+      client.setChannelName(channelId, nameOverride),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['channels'] })
+    },
+  })
+
   const groupToggle = useMutation({
     mutationFn: ({ groupName, enabled }: { groupName: string; enabled: boolean }) =>
       client.setGroupEnabled(groupName, enabled),
@@ -88,7 +163,13 @@ export function ChannelsPage({ client = apiClient }: { client?: IptvApiClient })
 
   const columns = useMemo(() => columnHelper.columns([
     columnHelper.accessor('number', { header: 'No.', cell: (info) => <span className="font-mono text-slate-400">{info.getValue()}</span> }),
-    columnHelper.accessor('name', { header: 'Channel', cell: (info) => <div><p className="font-medium text-white">{info.getValue()}</p><p className="mt-1 font-mono text-[0.68rem] text-slate-600">{info.row.original.tvgId}</p></div> }),
+    columnHelper.accessor('outputName', { header: 'Channel', cell: (info) => (
+      <ChannelNameCell
+        channel={info.row.original}
+        pending={channelRename.isPending}
+        onRename={(channelId, nameOverride) => channelRename.mutate({ channelId, nameOverride })}
+      />
+    ) }),
     columnHelper.accessor('group', { header: 'Group', cell: (info) => <Badge>{info.getValue()}</Badge> }),
     columnHelper.accessor('streams', { header: 'Streams', cell: (info) => `${info.getValue()} alternates` }),
     columnHelper.accessor('primaryCodec', { header: 'Primary', cell: (info) => <div><p>{info.getValue()}</p><p className="text-xs text-slate-500">{formatBitrate(info.row.original.bitrateKbps)}</p></div> }),
@@ -98,7 +179,7 @@ export function ChannelsPage({ client = apiClient }: { client?: IptvApiClient })
         variant={info.getValue() ? 'ghost' : 'secondary'}
         size="sm"
         disabled={channelToggle.isPending}
-        aria-label={info.getValue() ? `Disable ${info.row.original.name}` : `Enable ${info.row.original.name}`}
+        aria-label={info.getValue() ? `Disable ${info.row.original.outputName}` : `Enable ${info.row.original.outputName}`}
         onClick={() => channelToggle.mutate({ channelId: info.row.original.id, enabled: !info.getValue() })}
       >
         <Power aria-hidden="true" className={`size-4 ${info.getValue() ? 'text-emerald-400' : 'text-slate-500'}`} />
@@ -110,15 +191,15 @@ export function ChannelsPage({ client = apiClient }: { client?: IptvApiClient })
         variant="ghost"
         size="sm"
         disabled={info.row.original.state === 'offline' || !info.row.original.enabled}
-        aria-label={`Preview ${info.row.original.name}`}
+        aria-label={`Preview ${info.row.original.outputName}`}
         onClick={() => setPreviewChannels((current) => current.some((channel) => channel.id === info.row.original.id)
           ? current
-          : [...current, { id: info.row.original.id, name: info.row.original.name }])}
+          : [...current, { id: info.row.original.id, name: info.row.original.outputName }])}
       >
         <Eye aria-hidden="true" className="size-4" />
       </Button>
     ) }),
-  ]), [channelToggle])
+  ]), [channelToggle, channelRename])
   const table = useTable({
     features: channelTableFeatures,
     data: channels,
@@ -141,6 +222,11 @@ export function ChannelsPage({ client = apiClient }: { client?: IptvApiClient })
           onClose={() => setPreviewChannels((current) => current.filter((item) => item.id !== channel.id))}
         />
       ))}
+      {channelRename.isError && (
+        <p role="alert" className="mb-3 text-sm text-red-400">
+          {channelRename.error instanceof Error ? channelRename.error.message : 'The channel name did not change.'}
+        </p>
+      )}
       <Card>
         <div className="flex flex-col justify-between gap-3 border-b border-white/8 p-4 sm:flex-row sm:items-center">
           <div className="flex flex-1 flex-col gap-2 sm:flex-row sm:items-center">
