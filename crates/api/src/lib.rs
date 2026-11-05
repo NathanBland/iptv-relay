@@ -6989,24 +6989,7 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
                 .entry(channel.id)
                 .or_default()
                 .push((programme.starts_at, programme.stops_at));
-            write!(
-                &mut body,
-                "  <programme channel=\"{}\" start=\"{}\" stop=\"{}\"><title>{}</title>",
-                channel.id,
-                programme.starts_at.format("%Y%m%d%H%M%S %z"),
-                programme.stops_at.format("%Y%m%d%H%M%S %z"),
-                xml_escape(&programme.title),
-            )
-            .expect("writing to a String cannot fail");
-            if let Some(description) = &programme.description {
-                write!(&mut body, "<desc>{}</desc>", xml_escape(description))
-                    .expect("writing to a String cannot fail");
-            }
-            for category in programme.category_list() {
-                write!(&mut body, "<category>{}</category>", xml_escape(&category))
-                    .expect("writing to a String cannot fail");
-            }
-            body.push_str("</programme>\n");
+            write_programme_row(&mut body, channel.id, programme);
         }
         let now = Utc::now();
         for channel in &channels {
@@ -9639,6 +9622,57 @@ fn no_program_blocks(now: DateTime<Utc>, spans: &[GuideSpan]) -> Vec<GuideSpan> 
 fn floor_to_hour(value: DateTime<Utc>) -> DateTime<Utc> {
     let seconds = value.timestamp();
     DateTime::from_timestamp(seconds - seconds.rem_euclid(3600), 0).unwrap_or(value)
+}
+
+/// Writes one `<programme>` element for a database programme row.
+///
+/// The elements follow the XMLTV DTD order: `title`, `desc`, `category`,
+/// `icon`, `episode-num`, `live`.
+///
+/// Do not write `<sub-title>`. The operator reports that it crashed Jellyfin.
+/// The Git history has no record of the exact input. A test fails when the
+/// output has `<sub-title>`. Reproduce the crash on a test Jellyfin instance
+/// before you add the element.
+///
+/// A sports programme has the home-team logo as `icon`, the event date as
+/// `episode-num` and `<live/>`. Jellyfin reads `icon` as the programme image,
+/// each `category` as a genre (the category `Sports` sets the sports flag), and
+/// `<live/>` as the live flag. Jellyfin ignores the `original-air-date`
+/// episode system. The element stays for other XMLTV clients.
+fn write_programme_row(
+    body: &mut String,
+    channel_id: Uuid,
+    programme: &iptv_persistence::ProgrammeRow,
+) {
+    write!(
+        body,
+        "  <programme channel=\"{channel_id}\" start=\"{}\" stop=\"{}\"><title>{}</title>",
+        programme.starts_at.format("%Y%m%d%H%M%S %z"),
+        programme.stops_at.format("%Y%m%d%H%M%S %z"),
+        xml_escape(&programme.title),
+    )
+    .expect("writing to a String cannot fail");
+    if let Some(description) = &programme.description {
+        write!(body, "<desc>{}</desc>", xml_escape(description))
+            .expect("writing to a String cannot fail");
+    }
+    for category in programme.category_list() {
+        write!(body, "<category>{}</category>", xml_escape(&category))
+            .expect("writing to a String cannot fail");
+    }
+    if let Some(sports) = programme.sports() {
+        if let Some(icon) = sports.icon_url() {
+            write!(body, "<icon src=\"{}\"/>", xml_escape(icon))
+                .expect("writing to a String cannot fail");
+        }
+        write!(
+            body,
+            "<episode-num system=\"original-air-date\">{}</episode-num><live/>",
+            sports.local_date.format("%Y-%m-%d")
+        )
+        .expect("writing to a String cannot fail");
+    }
+    body.push_str("</programme>\n");
 }
 
 /// Writes a "No program available" placeholder for each guide gap of one channel.
@@ -14923,5 +14957,101 @@ mod tests {
         assert!(!body.contains("<desc>"));
         assert!(!body.contains("<sub-title>"));
         assert!(body.contains("start=\"20261105063000 +0000\""));
+    }
+
+    fn nhl_programme_row() -> iptv_persistence::ProgrammeRow {
+        let info = serde_json::json!({
+            "league": "NHL",
+            "localDate": "2026-11-04",
+            "eventId": "401",
+            "home": {
+                "name": "Buffalo Sabres", "shortName": "Sabres", "abbreviation": "BUF",
+                "logoUrl": "https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/buf.png"
+            },
+            "away": {"name": "Ottawa Senators", "shortName": "Senators", "abbreviation": "OTT"},
+            "venue": "KeyBank Center",
+            "broadcasters": ["ESPN+", "MSGB"],
+            "timeConflict": false
+        });
+        iptv_persistence::ProgrammeRow {
+            id: "p".to_owned(),
+            channel_id: None,
+            channel_name: "NHL 01".to_owned(),
+            title: "Ottawa Senators at Buffalo Sabres".to_owned(),
+            subtitle: Some("must not be written".to_owned()),
+            description: Some(
+                "Ottawa Senators at Buffalo Sabres. League: NHL. Venue: KeyBank Center. Broadcast: ESPN+, MSGB."
+                    .to_owned(),
+            ),
+            categories: serde_json::json!(["Sports", "Sports event", "NHL"]),
+            starts_at: "2026-11-05T00:30:00Z".parse().unwrap(),
+            stops_at: "2026-11-05T03:30:00Z".parse().unwrap(),
+            source_name: None,
+            metadata: Some(serde_json::json!({"sports": info})),
+        }
+    }
+
+    const NHL_PROGRAMME_XML: &str = "  <programme channel=\"c1\" start=\"20261105003000 +0000\" stop=\"20261105033000 +0000\"><title>Ottawa Senators at Buffalo Sabres</title><desc>Ottawa Senators at Buffalo Sabres. League: NHL. Venue: KeyBank Center. Broadcast: ESPN+, MSGB.</desc><category>Sports</category><category>Sports event</category><category>NHL</category><icon src=\"https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/buf.png\"/><episode-num system=\"original-air-date\">2026-11-04</episode-num><live/></programme>\n";
+
+    #[test]
+    fn sports_programme_xml_snapshot_has_dtd_order_and_no_sub_title() {
+        let mut body = String::new();
+        write_programme_row(&mut body, Uuid::nil(), &nhl_programme_row());
+        let expected = NHL_PROGRAMME_XML.replace("c1", &Uuid::nil().to_string());
+        assert_eq!(body, expected);
+        assert!(!body.contains("<sub-title"));
+    }
+
+    #[test]
+    fn imported_programme_xml_has_no_sports_elements() {
+        let mut row = nhl_programme_row();
+        row.metadata = None;
+        row.categories = serde_json::json!(["News"]);
+        let mut body = String::new();
+        write_programme_row(&mut body, Uuid::nil(), &row);
+        assert!(!body.contains("<icon") && !body.contains("<live/>"));
+        assert!(!body.contains("episode-num") && !body.contains("<sub-title"));
+    }
+
+    #[test]
+    fn sports_xmltv_document_passes_xmllint() {
+        use std::{io::Write as _, process::Command};
+        let dir = std::env::temp_dir().join(format!("iptv-xmltv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let channel = "c1";
+        let now = guide_now();
+        let mut body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tv generator-info-name=\"IPTV Gateway\">\n  <channel id=\"{channel}\"><display-name>NHL 01</display-name></channel>\n"
+        );
+        body.push_str(NHL_PROGRAMME_XML);
+        write_no_program_placeholders(&mut body, Uuid::nil(), now, &[]);
+        body = body.replace(&Uuid::nil().to_string(), channel);
+        body.push_str("</tv>\n");
+        let xml = dir.join("guide.xml");
+        std::fs::File::create(&xml)
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
+        let dtd = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/xmltv-subset.dtd");
+        let output = match Command::new("xmllint")
+            .arg("--noout")
+            .arg("--dtdvalid")
+            .arg(&dtd)
+            .arg(&xml)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("xmllint is not available ({error}); skipping DTD validation");
+                return;
+            }
+        };
+        assert!(
+            output.status.success(),
+            "xmllint failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

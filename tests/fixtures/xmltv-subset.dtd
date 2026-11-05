@@ -1,0 +1,22 @@
+<!-- Subset of the XMLTV DTD that the relay writes.
+     The element order of "programme" follows the XMLTV DTD.
+     Extension: "live?" follows "episode-num*". The XMLTV DTD has no "live"
+     element, but Jellyfin.XmlTv reads it (ProcessLive sets IsLive). -->
+<!ELEMENT tv (channel*, programme*)>
+<!ATTLIST tv generator-info-name CDATA #IMPLIED>
+<!ELEMENT channel (display-name+, icon*)>
+<!ATTLIST channel id CDATA #REQUIRED>
+<!ELEMENT display-name (#PCDATA)>
+<!ELEMENT programme (title+, sub-title*, desc*, category*, icon*, episode-num*, live?)>
+<!ATTLIST programme start CDATA #REQUIRED
+                    stop CDATA #IMPLIED
+                    channel CDATA #REQUIRED>
+<!ELEMENT title (#PCDATA)>
+<!ELEMENT sub-title (#PCDATA)>
+<!ELEMENT desc (#PCDATA)>
+<!ELEMENT category (#PCDATA)>
+<!ELEMENT icon EMPTY>
+<!ATTLIST icon src CDATA #REQUIRED>
+<!ELEMENT episode-num (#PCDATA)>
+<!ATTLIST episode-num system CDATA "onscreen">
+<!ELEMENT live EMPTY>

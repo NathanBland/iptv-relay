@@ -25,12 +25,14 @@ pub const MAX_EVENT_SCAN_SKIPS: usize = 200;
 /// Text settings for the event filler programmes.
 ///
 /// WP6 connects these values to the operator settings.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct EventScanSettings {
     /// Prefix of the filler title before an event, for example `Upcoming`.
     pub upcoming_prefix: String,
     /// Filler title after an event.
     pub ended_title: String,
+    /// ESPN client. `None` turns the sports enrichment off.
+    pub sports: Option<iptv_sports::EspnClient>,
 }
 
 impl Default for EventScanSettings {
@@ -38,6 +40,7 @@ impl Default for EventScanSettings {
         Self {
             upcoming_prefix: "Upcoming".to_owned(),
             ended_title: "Event ended".to_owned(),
+            sports: None,
         }
     }
 }
