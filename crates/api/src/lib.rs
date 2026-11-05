@@ -7477,6 +7477,108 @@ struct HdhrChannel {
     url: String,
     #[serde(rename = "ImageURL", skip_serializing_if = "Option::is_none")]
     image_url: Option<String>,
+    /// `1` for 720p and higher, `0` for lower. Omitted when the height is unknown.
+    #[serde(rename = "HD", skip_serializing_if = "Option::is_none")]
+    hd: Option<u8>,
+    #[serde(rename = "VideoCodec", skip_serializing_if = "Option::is_none")]
+    video_codec: Option<&'static str>,
+    #[serde(rename = "AudioCodec", skip_serializing_if = "Option::is_none")]
+    audio_codec: Option<&'static str>,
+}
+
+/// Quality fields for one lineup entry, taken from measured stream data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct HdhrQuality {
+    hd: Option<u8>,
+    video_codec: Option<&'static str>,
+    audio_codec: Option<&'static str>,
+}
+
+/// Maps measured stream data to `HDHomeRun` lineup quality fields.
+///
+/// Unknown codecs and unknown heights produce no value, so the caller omits the field.
+/// The channel name is never read.
+fn hdhr_quality(
+    video_codec: Option<&str>,
+    video_height: Option<i32>,
+    audio_codec: Option<&str>,
+) -> HdhrQuality {
+    let hd = video_height.map(|height| u8::from(height >= 720));
+    let video_codec = video_codec.and_then(|codec| match codec.to_ascii_lowercase().as_str() {
+        "h264" => Some("H264"),
+        "hevc" => Some("HEVC"),
+        "mpeg2video" => Some("MPEG2"),
+        _ => None,
+    });
+    let audio_codec = audio_codec.and_then(|codec| match codec.to_ascii_lowercase().as_str() {
+        "aac" => Some("AAC"),
+        "ac3" => Some("AC3"),
+        "eac3" => Some("EAC3"),
+        "mp2" => Some("MPEG"),
+        _ => None,
+    });
+    HdhrQuality {
+        hd,
+        video_codec,
+        audio_codec,
+    }
+}
+
+#[cfg(test)]
+mod hdhr_lineup_quality_tests {
+    use super::*;
+
+    fn lineup_entry(quality: HdhrQuality) -> serde_json::Value {
+        let channel = HdhrChannel {
+            guide_number: "16968".to_owned(),
+            guide_name: "Test Channel".to_owned(),
+            url: "https://relay.example/out/token/stream/1.ts".to_owned(),
+            image_url: None,
+            hd: quality.hd,
+            video_codec: quality.video_codec,
+            audio_codec: quality.audio_codec,
+        };
+        serde_json::to_value(channel).expect("lineup entry serializes")
+    }
+
+    #[test]
+    fn hdhr_lineup_reports_720p_h264_and_aac_as_hd() {
+        let quality = hdhr_quality(Some("h264"), Some(720), Some("aac"));
+        let entry = lineup_entry(quality);
+
+        assert_eq!(entry["HD"], serde_json::json!(1));
+        assert_eq!(entry["VideoCodec"], serde_json::json!("H264"));
+        assert_eq!(entry["AudioCodec"], serde_json::json!("AAC"));
+    }
+
+    #[test]
+    fn hdhr_lineup_reports_480p_as_not_hd() {
+        let quality = hdhr_quality(Some("h264"), Some(480), Some("aac"));
+        let entry = lineup_entry(quality);
+
+        assert_eq!(entry["HD"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn hdhr_lineup_omits_quality_keys_without_stream_data() {
+        let quality = hdhr_quality(None, None, None);
+        let entry = lineup_entry(quality);
+        let object = entry.as_object().expect("lineup entry is an object");
+
+        assert!(!object.contains_key("HD"));
+        assert!(!object.contains_key("VideoCodec"));
+        assert!(!object.contains_key("AudioCodec"));
+        assert!(object.contains_key("GuideNumber"));
+    }
+
+    #[test]
+    fn hdhr_quality_omits_unknown_codecs_and_ignores_channel_name_tags() {
+        let quality = hdhr_quality(Some("vp9"), Some(1080), Some("opus"));
+
+        assert_eq!(quality.hd, Some(1));
+        assert_eq!(quality.video_codec, None);
+        assert_eq!(quality.audio_codec, None);
+    }
 }
 
 async fn hdhr_lineup(State(state): State<AppState>, Path(token): Path<String>) -> Response {
@@ -7498,14 +7600,24 @@ async fn hdhr_lineup(State(state): State<AppState>, Path(token): Path<String>) -
         };
         let channels = channels
             .into_iter()
-            .map(|channel| HdhrChannel {
-                guide_number: channel.channel_number,
-                guide_name: channel.name,
-                url: format!(
-                    "{}/out/{}/stream/{}.ts",
-                    state.public_base_url, token, channel.id
-                ),
-                image_url: channel.logo_url,
+            .map(|channel| {
+                let quality = hdhr_quality(
+                    channel.video_codec.as_deref(),
+                    channel.video_height,
+                    channel.audio_codec.as_deref(),
+                );
+                HdhrChannel {
+                    guide_number: channel.channel_number,
+                    guide_name: channel.name,
+                    url: format!(
+                        "{}/out/{}/stream/{}.ts",
+                        state.public_base_url, token, channel.id
+                    ),
+                    image_url: channel.logo_url,
+                    hd: quality.hd,
+                    video_codec: quality.video_codec,
+                    audio_codec: quality.audio_codec,
+                }
             })
             .collect::<Vec<_>>();
         return no_store_response(Json(channels).into_response());
@@ -7523,6 +7635,9 @@ async fn hdhr_lineup(State(state): State<AppState>, Path(token): Path<String>) -
                 state.public_base_url, token, channel.id
             ),
             image_url: channel.logo_url.clone(),
+            hd: None,
+            video_codec: None,
+            audio_codec: None,
         })
         .collect();
     no_store_response(Json(channels).into_response())
