@@ -1521,6 +1521,13 @@ impl ViewerHandle {
         Self::new(Arc::clone(&self.session))
     }
 
+    /// Opens an independent read cursor on the shared ring without registering
+    /// a viewer. The cursor does not keep the session alive. Passive sampling
+    /// uses it and opens no provider connection.
+    pub fn passive_cursor(&self) -> crate::RingCursor {
+        self.session.ring.subscribe()
+    }
+
     pub fn session_key(&self) -> &HttpTsSessionKey {
         &self.session.key
     }

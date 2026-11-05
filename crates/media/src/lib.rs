@@ -6,6 +6,7 @@
 
 pub mod broker;
 pub mod credential_broker;
+pub mod passive;
 pub mod probe;
 pub mod process;
 mod psi;
@@ -19,6 +20,7 @@ pub use credential_broker::{
     CredentialBroker, CredentialBrokerEndpoint, CredentialBrokerError, HlsBrokerConfig,
     HlsBrokerConfigError,
 };
+pub use passive::{PassiveStreamAnalyzer, StreamMetadata, sample_cursor_metadata};
 pub use probe::{
     StreamProbe, StreamProbeFailure, StreamProbeOutcome, StreamProbeQuality, StreamProbeSpec,
 };

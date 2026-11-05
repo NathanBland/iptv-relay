@@ -5168,6 +5168,66 @@ impl CatalogRepository {
         Ok(rows != 0)
     }
 
+    /// Stores passively measured stream data without changing the health
+    /// status.
+    ///
+    /// The update runs only when the stream has no measured size, or when the
+    /// last health or passive update is older than `min_age_seconds`. A stream
+    /// in `checking` status is left alone. The method returns `true` when it
+    /// stored the data. It re-ranks the channel streams after a stored update.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when a query fails.
+    #[allow(clippy::missing_errors_doc)]
+    pub async fn record_passive_stream_info(
+        &self,
+        update: &StreamHealthUpdate,
+        min_age_seconds: i64,
+    ) -> Result<bool, PersistenceError> {
+        let rows = sqlx::query(
+            r"
+            UPDATE provider_streams SET
+                health_checked_at = now(),
+                video_codec = $2,
+                video_resolution = $3,
+                video_width = $4,
+                video_height = $5,
+                video_fps = $6,
+                audio_codec = $7,
+                audio_channels = $8,
+                audio_sample_rate = $9
+            WHERE id = $1
+              AND health_status <> 'checking'
+              AND (
+                  video_width IS NULL
+                  OR health_checked_at IS NULL
+                  OR health_checked_at < now() - make_interval(secs => $10::double precision)
+              )
+            ",
+        )
+        .bind(update.provider_stream_id)
+        .bind(update.video_codec.as_deref())
+        .bind(update.video_resolution.as_deref())
+        .bind(update.video_width)
+        .bind(update.video_height)
+        .bind(update.video_fps)
+        .bind(update.audio_codec.as_deref())
+        .bind(update.audio_channels)
+        .bind(update.audio_sample_rate)
+        .bind(min_age_seconds)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            return Ok(false);
+        }
+        for channel_id in self.channels_for_stream(update.provider_stream_id).await? {
+            self.rank_channel_streams_by_quality(channel_id).await?;
+        }
+        Ok(true)
+    }
+
     /// Releases a health-probe claim when admission is unavailable.
     ///
     /// The update affects only the claim made by the current probe attempt.

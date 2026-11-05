@@ -90,7 +90,7 @@ pub enum StreamProbeOutcome {
 }
 
 /// Maps an MPEG-TS stream type to a codec name.
-fn codec_name_for_stream_type(stream_type: u8) -> Option<&'static str> {
+pub(crate) fn codec_name_for_stream_type(stream_type: u8) -> Option<&'static str> {
     match stream_type {
         0x01 => Some("mpeg1-video"),
         0x02 => Some("mpeg2-video"),

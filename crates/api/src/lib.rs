@@ -2,6 +2,7 @@
 
 mod auth;
 mod oidc;
+mod passive_capture;
 
 pub use auth::hash_admin_password;
 pub use oidc::OidcConfig;
@@ -6951,7 +6952,14 @@ async fn open_channel_response(state: &AppState, channel_id: Uuid) -> Response {
         Err(response) => return *response,
     };
     match state.media.try_open(spec.clone()).await {
-        Ok(viewer) => mpeg_ts_response(viewer),
+        Ok(viewer) => {
+            passive_capture::spawn_passive_capture(
+                state.catalog_repository.as_ref(),
+                channel_id,
+                &viewer,
+            );
+            mpeg_ts_response(viewer)
+        }
         Err(SessionStartError::Provider(AcquireError::AtCapacity { .. })) => {
             capacity_placeholder_response(state.media.clone(), spec)
         }
