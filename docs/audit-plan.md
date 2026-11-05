@@ -39,6 +39,7 @@ Redaction: this document replaces the output token in all URLs with `<token>`. I
 | F13 | Jellyfin shows 1080p and 20 Mbps for all relay channels, because the HDHomeRun lineup has no quality fields. | Medium | WP11 |
 | F14 | The provider sends live data in bursts with gaps of up to 27 s. The relay forwards the bursts without pacing, so transcoding clients run dry. | High | WP12 |
 | F15 | A stream that cannot start (pool full, provider error) gives an untested slate or an HTTP error. Jellyfin can fail to open the channel. | Medium | WP13 |
+| F16 | 45 enabled channels carry the event, or an empty slot, in the channel name. The served guide has no programme for any of them, and their names change each day. | High | WP2b, WP4 |
 
 ## 3. Findings
 
@@ -329,6 +330,42 @@ Fix options:
 
 Recommendation: use Option A. It keeps the current Jellyfin setup and gives correct values to all HDHomeRun clients. Option B is an immediate workaround that the operator can apply before Option A ships.
 
+### F16. Event channels need guide data from their names
+
+The low guide coverage (F10) is mostly correct for team and regional channels. But the event channels are a different case. Their names contain the event and the start time. Jellyfin cannot read this information from a name, so the relay must put it in the guide and the channel data that it serves.
+
+Evidence from the served `/out/<token>/xmltv.xml` (310 channels, 683 programmes), captured 2026-11-04:
+
+| Name format | Channels | With a programme | Example |
+|-------------|----------|------------------|---------|
+| Matchup, date, then league and slot | 12 | 0 | `Detroit Pistons vs Philadelphia 76ers @ Nov 4 7:00 PM :NBA  01 [1080p]` |
+| League and slot, then time only | 5 | 0 | `NHL: 03 - 10pm Sharks @ Kings [1080p]` |
+| Explicit date and time | 2 | 0 | `MLB 01:  Brewers x Rays start:2026-10-28 00:00:00 stop:2026-10-28 07:13:20 [1080p]` |
+| Empty slot | 26 | 0 | `NHL: 05 - [1080p]` |
+| Other (team, regional, national) | 265 | 17 | `USA: DETROIT SPORTSNET [1080p]` |
+
+Defects:
+
+1. The event scan (F4) produces no programme for these channels.
+2. WP2 does not cover two of the formats:
+   - In `A vs B @ Nov 4 7:00 PM :NBA 01`, the `@` separates the matchup from the date. It does not mean "at". The `vs` order does not give home and away, so ESPN must decide.
+   - `MLB 01:  Brewers x Rays start:... stop:...` uses `x` as the separator, and it gives an explicit stop time.
+3. The provider changes the channel name for each event. Thus Jellyfin shows a different channel name each day, and the slot number is the only stable part.
+4. An empty slot has no programme. Jellyfin shows no guide data for it.
+5. 293 of 310 channels have no programme at all. This includes the 265 team, regional, and national channels with no XMLTV match.
+
+Operator rule (2026-11-04):
+
+- If a channel has no time or event in its name, and no programme in XMLTV, keep the channel name.
+- Serve the programme "No program available" for that channel until it has real programmes.
+- Fill each gap in a channel's guide the same way.
+
+Fix:
+
+- WP2b: parse the two missing formats.
+- WP4: run event detection on all enabled channels automatically, give each event channel a stable name, and add event filler programmes. The WP4 brief lists the details.
+- WP14: fill each guide gap on each enabled channel with "No program available".
+
 ### F14. Bursty provider delivery stalls transcoding clients
 
 The parent session measured this finding on 2026-11-04 against v0.2.20.
@@ -380,12 +417,12 @@ Mitigations:
 
 | Lane | Files | Packages, in order |
 |------|-------|--------------------|
-| API | `crates/api/src/lib.rs` (except the stream handler functions), `tests/fixtures/openapi.json` | WP1, WP11a, WP5, WP7, WP8b, WP6 |
+| API | `crates/api/src/lib.rs` (except the stream handler functions), `tests/fixtures/openapi.json` | WP1, WP11a, WP14, WP5, WP7, WP8b, WP6 |
 | Persistence | `crates/persistence/src/catalog.rs`, `crates/persistence/tests/postgres.rs`, new files in `migrations/` | WP3, WP11a, WP4, WP8b |
 | Media | `crates/media/src/*` (including `session.rs` `into_byte_stream` and `ring.rs`), `apps/server/src/main.rs` (health-check code only) | WP11b, WP12, WP13, WP6 |
 | Stream handlers | `crates/api/src/lib.rs` functions `stream_channel`, `open_channel_response`, `capacity_placeholder_response`, `RingPolicy`, and the passive capture hook | WP12, WP13, WP6 |
 | Web | `apps/web/src/lib/api/client.ts`, `apps/web/src/lib/api/types.ts` | WP1, WP5, WP7 |
-| Parser | `crates/domain/src/events.rs`, `crates/parsers/src/events.rs`, `tests/fixtures/events/` | WP2 |
+| Parser | `crates/domain/src/events.rs`, `crates/parsers/src/events.rs`, `tests/fixtures/events/` | WP2, WP2b |
 | Sports | new crate `crates/sports/` | WP8a |
 | Worker | `apps/server/src/main.rs` | WP4 |
 
@@ -399,8 +436,10 @@ Migration numbers: the last migration is `0074`. The v0.2.19 diff adds no migrat
 Wave 0: v0.2.19 ring fix (done, on main)
 Wave 1 (done):     WP1, WP2, WP3, WP8a, WP10, WP11b  -> merged on claude/audit-integration
 Wave 2a:           WP11a (API + Persistence; small)
+                   WP2b (Parser; small; parallel with WP11a)
+                   WP14 (API; small; after WP11a)
                    WP12 (Media + Stream handlers; parallel with WP11a, WP4, WP5)
-Wave 2b (parallel): WP4 (Persistence + Worker)   WP5 (API + Web)   WP12 continues
+Wave 2b (parallel): WP4 (Persistence + Worker; needs WP2b)   WP5 (API + Web)   WP12 continues
 Wave 3 (parallel):  WP7 (API + Web; needs WP4, WP5)   WP13 (Media + Stream handlers; needs WP11b, WP12)
 Wave 4:             WP8b (API + Persistence; needs WP4, WP7, WP8a)
 Wave 5 (parallel):  WP6 (API + Media + Stream handlers; needs WP8b, WP12, WP13)   WP9 (optional; after WP8b)
@@ -412,6 +451,8 @@ Wave 5 (parallel):  WP6 (API + Media + Stream handlers; needs WP8b, WP12, WP13) 
 |---------|-------|--------|
 | WP1 | Haiku | Mechanical attribute and test changes. The plan lists each struct. |
 | WP2 | Sonnet | Regex and parser work with clear fixtures. |
+| WP2b | Sonnet | Two more title formats, with the same fixture approach as WP2. |
+| WP14 | Haiku | Small gap-fill function in the XMLTV output, with clear rules and tests. |
 | WP3 | Sonnet | The plan gives the schema and the query change. |
 | WP4 | Opus | Data model change, scheduler hook, and data repair. It crosses persistence, worker, and parser. |
 | WP5 | Sonnet | One endpoint and one UI control, to a clear specification. |
@@ -477,11 +518,48 @@ Brief:
 
 Test plan: the three PostgreSQL tests above, plus a migration rerun test that applies the two new migrations twice.
 
+#### WP2b. Additional event title formats (Sonnet)
+
+- Findings: F16.
+- Files: `crates/domain/src/events.rs`, `crates/parsers/src/events.rs`, `tests/fixtures/events/live-titles.json`.
+- Depends on: WP2 (done). Start from `claude/audit-integration`.
+
+Brief:
+
+> Extend the built-in sports rules from WP2 for two more live formats. Read section F16 of `docs/audit-plan.md` first.
+> (1) `Detroit Pistons vs Philadelphia 76ers @ Nov 4 7:00 PM :NBA  01 [1080p]`: the `@` separates the matchup from the date, and it does not mean "at". Capture both teams, the separator `vs` (no home or away), the month, day, time, the league `NBA`, and the slot `01`. Resolve the year from the reference date.
+> (2) `MLB 01:  Brewers x Rays start:2026-10-28 00:00:00 stop:2026-10-28 07:13:20 [1080p]`: capture the league, the slot, both teams with the separator `x` (no home or away), the start, and the stop.
+> (3) For all rules, capture `league` and `slot` when the name has them, because WP4 makes the stable channel name from them.
+> Add fixtures with the expected values for each format. Make sure that `A @ B` in the WP2 formats still means "A at B". Write each new capture name in the status file for WP4. Done when the fixture tests, fmt, and clippy pass.
+
+Test plan: fixture tests for both formats, and the WP2 fixtures unchanged.
+
+#### WP14. "No program available" guide placeholder (Haiku)
+
+- Findings: F16 (operator rule).
+- Files: `crates/api/src/lib.rs` (the XMLTV handler `xmltv` and a new gap-fill helper), tests in the same file.
+- Depends on: WP11a (API lane). Start from `claude/audit-integration`.
+
+Brief:
+
+> In the XMLTV output (`/out/<token>/xmltv.xml`), make sure that each enabled channel has a programme for each minute of the guide window. Read section F16 of `docs/audit-plan.md` first.
+> (1) Compute the guide window from the existing programme query range (default: 6 hours in the past to 48 hours in the future, if the handler has no range).
+> (2) For each channel, sort its programmes, and fill each gap of 1 minute or more with a programme titled "No program available". Split long gaps into blocks of at most 2 hours, aligned to the hour.
+> (3) Add `<category>` "No program" to the placeholder, and no description. Do not change the channel name.
+> (4) Do not store placeholders in the database. Generate them only in the output.
+> (5) A real programme always has precedence. If WP4 or a later refresh adds programmes, the placeholders for that time disappear.
+> Add tests: a channel with no programmes gets placeholders for the full window; a channel with one programme gets placeholders before and after it; adjacent programmes give no placeholder. Done when the tests, fmt, and clippy pass.
+
+Test plan:
+
+- Unit tests as listed.
+- After deployment: in Jellyfin, refresh the guide data, and confirm that a team channel shows "No program available".
+
 #### WP4. Event scan engine and scheduling (Opus)
 
 - Findings: F4 B1, B4, B5, B6, and F5 (scan and scheduling).
 - Files: `crates/persistence/src/catalog.rs` (`scan_event_channels`, `scan_all_event_channels`, `upsert_event_channel`, `prune_past_event_channels`, `suggest_event_templates`, `build_suggestion_config`), new migration `0077_event_channels_by_channel.sql`, `apps/server/src/main.rs` (`run_provider_reconciliation_finalizer_job`), `crates/persistence/tests/postgres.rs`, `docs/docs/configuration/dynamic-events.md`.
-- Depends on: WP2 and WP3.
+- Depends on: WP2, WP2b, and WP3.
 
 Brief:
 
@@ -493,7 +571,12 @@ Brief:
 > (5) Return a scan report with the matched, scheduled, and skipped counts, and the skip reasons. Keep `SaveResult.message` for compatibility.
 > (6) Call `scan_all_event_channels` and then prune for each template, with that template's grace, at the end of `run_provider_reconciliation_finalizer_job`. Log errors. Do not fail the job because of a scan error.
 > (7) Set `state` from the time: `scheduled` before the start, `live` during the event, `ended` after it, and `hidden` after the grace. Change the output query to include `live`.
-> Do not edit `crates/api/src/lib.rs`; WP7 owns the handler changes. Update `docs/docs/configuration/dynamic-events.md` in STE. Done when a PostgreSQL test with the six live titles from WP2 produces event programmes on the correct channels at the correct UTC times, and a second scan run is idempotent.
+> (8) Section F16: detect events on all enabled channels automatically. Use the built-in sports rules even when no operator template matches. Add a built-in template that is enabled by default, or an equal code path. Each refresh must give a programme to each of the 19 event channels in F16 without operator setup.
+> (9) Give each channel with a parsed event a stable output name from the league and slot, for example `NBA 01` or `NHL 03`. Use this precedence: `name_override`, then the alias, then the stable event name, then the provider name. A channel with no parsed event (for example an empty slot) keeps its provider name (operator rule in F16). Keep the channel id and `tvg-id` stable. Record in the status file whether the name change between an empty slot and an event confuses Jellyfin.
+> (10) Add event filler programmes on event channels. Before the event: "Upcoming: <title>, <local start time>". After the event: "Event ended". Do not add filler to empty slots; WP14 gives them "No program available". Use `events.filler_title` for the event filler text when WP6 connects it.
+> (11) Use the explicit stop time when the name gives one (`stop:`). Otherwise use the template duration or `events.inferred_duration_seconds`.
+> (12) Count generated programmes in the guide coverage value of `/api/v1/system`.
+> Do not edit `crates/api/src/lib.rs`, except for item (12); WP7 owns the other handler changes. Update `docs/docs/configuration/dynamic-events.md` in STE. Done when a PostgreSQL test with the live titles from WP2 and WP2b produces event programmes on the correct channels at the correct UTC times, the stable names are correct, the filler fills each gap, and a second scan run is idempotent.
 
 Test plan:
 
