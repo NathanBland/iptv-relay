@@ -630,9 +630,37 @@ struct DynamicEventResponse {
     raw_title: String,
     programme_title: String,
     channel_slot: String,
-    start: DateTime<Utc>,
+    channel_id: Option<String>,
+    /// Output name of the target channel.
+    output_name: Option<String>,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
     state: String,
     template: String,
+}
+
+/// One channel that matched a template but received no guide.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct EventScanSkipResponse {
+    template_id: Option<String>,
+    channel_id: Option<String>,
+    stream_name: String,
+    reason: String,
+}
+
+/// Result of one event scan.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct EventScanResponse {
+    ok: bool,
+    message: String,
+    channels_scanned: u64,
+    matched: u64,
+    scheduled: u64,
+    skipped: u64,
+    pruned: u64,
+    skips: Vec<EventScanSkipResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -728,6 +756,8 @@ struct EventChannelResponse {
     event_start: Option<DateTime<Utc>>,
     event_end: Option<DateTime<Utc>>,
     raw_stream_name: Option<String>,
+    /// Output name of the target channel.
+    output_name: Option<String>,
     state: String,
 }
 
@@ -968,7 +998,7 @@ impl ProblemDetails {
 #[derive(Debug, OpenApi)]
 #[openapi(
     paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, reset_source_circuit_breaker, list_groups, list_jobs, cancel_job, list_dead_letters, get_dead_letter, replay_dead_letter, close_dead_letter, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_channel_name, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, terminate_session, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
-    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SupportLogEntry, SupportBundleResponse, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, SetChannelNameRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
+    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SupportLogEntry, SupportBundleResponse, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, SetChannelNameRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventScanResponse, EventScanSkipResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -5489,7 +5519,10 @@ fn dynamic_event_from_row(
         raw_title: row.raw_stream_name.clone().unwrap_or_default(),
         programme_title: row.event_title.clone().unwrap_or_default(),
         channel_slot: format!("{}", row.slot_number),
-        start: row.event_start.unwrap_or_else(Utc::now),
+        channel_id: row.channel_id.map(|id| id.to_string()),
+        output_name: row.output_name.clone(),
+        start: row.event_start,
+        end: row.event_end,
         state: row.state.clone(),
         template: template_names
             .get(&row.template_id)
@@ -5702,7 +5735,7 @@ async fn list_event_channels(
     path = "/api/v1/event-templates/{template_id}/scan",
     tag = "guide",
     params(("template_id" = String, Path, description = "Event template UUID")),
-    responses((status = 200, body = SaveResult), (status = 401, body = ProblemDetails), (status = 404, body = ProblemDetails))
+    responses((status = 200, body = EventScanResponse), (status = 401, body = ProblemDetails), (status = 404, body = ProblemDetails))
 )]
 async fn scan_event_channels(
     State(state): State<AppState>,
@@ -5724,14 +5757,43 @@ async fn scan_event_channels(
     let Some(catalog) = &state.catalog_repository else {
         return persistence_unavailable();
     };
-    match catalog.scan_event_channels(id).await {
-        Ok(count) => Json(SaveResult {
-            ok: true,
-            message: format!("Scanned {count} event channels"),
-        })
-        .into_response(),
+    match catalog
+        .scan_event_channels_report(
+            id,
+            Utc::now(),
+            &iptv_persistence::EventScanSettings::default(),
+        )
+        .await
+    {
+        Ok(report) => Json(event_scan_response(report)).into_response(),
         Err(PersistenceError::SourceNotFound(_)) => not_found(),
         Err(error) => persistence_error_response(error),
+    }
+}
+
+fn event_scan_response(report: iptv_persistence::EventScanReport) -> EventScanResponse {
+    let message = format!(
+        "Scanned {} channels: {} matched, {} scheduled, {} skipped",
+        report.channels_scanned, report.matched, report.scheduled, report.skipped
+    );
+    EventScanResponse {
+        ok: true,
+        message,
+        channels_scanned: report.channels_scanned,
+        matched: report.matched,
+        scheduled: report.scheduled,
+        skipped: report.skipped,
+        pruned: report.pruned,
+        skips: report
+            .skips
+            .into_iter()
+            .map(|skip| EventScanSkipResponse {
+                template_id: skip.template_id.map(|id| id.to_string()),
+                channel_id: skip.channel_id.map(|id| id.to_string()),
+                stream_name: skip.stream_name,
+                reason: skip.reason,
+            })
+            .collect(),
     }
 }
 
@@ -5762,23 +5824,16 @@ async fn prune_event_channels(
     let Some(catalog) = &state.catalog_repository else {
         return persistence_unavailable();
     };
-    let templates = match catalog
-        .list_event_templates(EventTemplateQuery::default())
+    match catalog
+        .prune_event_channels_for_template(id, Utc::now())
         .await
     {
-        Ok(rows) => rows,
-        Err(error) => return persistence_error_response(error),
-    };
-    let grace = templates
-        .iter()
-        .find(|t| t.id == id)
-        .map_or(4, |t| t.past_date_grace_hours);
-    match catalog.prune_past_event_channels(grace).await {
         Ok(count) => Json(SaveResult {
             ok: true,
             message: format!("Pruned {count} event channels"),
         })
         .into_response(),
+        Err(PersistenceError::SourceNotFound(_)) => not_found(),
         Err(error) => persistence_error_response(error),
     }
 }
@@ -5869,6 +5924,7 @@ fn event_channel_response_from_row(
         event_start: row.event_start,
         event_end: row.event_end,
         raw_stream_name: row.raw_stream_name.clone(),
+        output_name: row.output_name.clone(),
         state: row.state.clone(),
     }
 }
@@ -13208,6 +13264,165 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn postgres_event_routes_report_scan_prune_and_list() {
+        let (admin, database, schema) = isolated_database().await;
+        let pool = database.pool().clone();
+        let channel_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO channels (id, channel_number, name, name_override) VALUES ($1, '61', 'Provider Event', 'Output Event')",
+        )
+        .bind(channel_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let app = router(state_with_database(Some(database.clone())));
+        let mut template_ids = Vec::new();
+        for (name, grace) in [("short-grace", 1), ("long-grace", 100)] {
+            let body = format!(
+                r#"{{"name":"{name}","displayName":"{name}","matchRegex":"Route.*","channelNameFormat":"{{slot}}","groupName":"Events","eventDurationHours":3,"pastDateGraceHours":{grace},"futureDateDays":2}}"#
+            );
+            let response = app
+                .clone()
+                .oneshot(admin_request("POST", "/api/v1/event-templates", Some(body)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let value: serde_json::Value =
+                serde_json::from_str(&response_text(response).await).unwrap();
+            template_ids.push(Uuid::parse_str(value["id"].as_str().unwrap()).unwrap());
+        }
+        // Both events ended three hours ago. Only the short grace hides one.
+        let ended = Utc::now() - chrono::Duration::hours(3);
+        for (template_id, slot) in template_ids.iter().zip([1_i32, 2]) {
+            sqlx::query(
+                "INSERT INTO event_channels (template_id, channel_id, slot_number, event_title, event_start, event_end, raw_stream_name, state) VALUES ($1, $2, $3, 'Old game', $4, $5, 'Raw name', 'ended')",
+            )
+            .bind(template_id)
+            .bind(channel_id)
+            .bind(slot)
+            .bind(ended - chrono::Duration::hours(2))
+            .bind(ended)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // List: the event carries the target output name, the times, and the state.
+        let listed = app
+            .clone()
+            .oneshot(admin_request("GET", "/api/v1/events", None))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_str(&response_text(listed).await).unwrap();
+        let events = listed.as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["outputName"], "Output Event");
+        assert_eq!(events[0]["channelId"], channel_id.to_string());
+        assert!(events[0]["start"].is_string() && events[0]["end"].is_string());
+        assert_eq!(events[0]["state"], "ended");
+        let channels = app
+            .clone()
+            .oneshot(admin_request("GET", "/api/v1/event-channels", None))
+            .await
+            .unwrap();
+        let channels: serde_json::Value =
+            serde_json::from_str(&response_text(channels).await).unwrap();
+        assert_eq!(channels[0]["outputName"], "Output Event");
+
+        // Prune: each template uses its own grace.
+        let pruned = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                format!("/api/v1/event-templates/{}/prune", template_ids[0]),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(pruned.status(), StatusCode::OK);
+        let pruned: serde_json::Value = serde_json::from_str(&response_text(pruned).await).unwrap();
+        assert_eq!(pruned["message"], "Pruned 1 event channels");
+        let states: Vec<(Uuid, String)> =
+            sqlx::query_as("SELECT template_id, state FROM event_channels")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        for (template_id, state) in states {
+            let expected = if template_id == template_ids[0] {
+                "hidden"
+            } else {
+                "ended"
+            };
+            assert_eq!(state, expected);
+        }
+        let unknown = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                format!("/api/v1/event-templates/{}/prune", Uuid::now_v7()),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+        // Scan: the report has camelCase counts and a skip reason for a bad pattern.
+        sqlx::query("UPDATE event_templates SET match_regex = '(' WHERE id = $1")
+            .bind(template_ids[1])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let scanned = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                format!("/api/v1/event-templates/{}/scan", template_ids[1]),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(scanned.status(), StatusCode::OK);
+        let scanned: serde_json::Value =
+            serde_json::from_str(&response_text(scanned).await).unwrap();
+        assert_eq!(scanned["ok"], true);
+        for key in [
+            "channelsScanned",
+            "matched",
+            "scheduled",
+            "skipped",
+            "pruned",
+        ] {
+            assert!(scanned[key].is_u64(), "{key} in {scanned}");
+        }
+        assert_eq!(scanned["matched"], 0);
+        assert!(scanned["message"].as_str().unwrap().contains("0 matched"));
+        let skips = scanned["skips"].as_array().unwrap();
+        assert!(
+            skips
+                .iter()
+                .any(|skip| skip["templateId"] == template_ids[1].to_string()
+                    && skip["reason"].as_str().unwrap().contains("not a valid")),
+            "{scanned}"
+        );
+        let missing = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                format!("/api/v1/event-templates/{}/scan", Uuid::now_v7()),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        drop(app);
+        drop(pool);
+        drop_isolated_database(&admin, database, schema).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn postgres_template_and_stream_profile_routes_cover_crud() {
         let (admin, database, schema) = isolated_database().await;
         let pool = database.pool().clone();
@@ -13652,6 +13867,7 @@ mod tests {
         assert_schema::<ProgrammePageResponse>();
         assert_schema::<PageQuery>();
         assert_schema::<DynamicEventResponse>();
+        assert_schema::<EventScanResponse>();
         assert_schema::<EventTemplateResponse>();
         assert_schema::<CreateEventTemplateRequest>();
         assert_schema::<UpdateEventTemplateRequest>();
@@ -13822,7 +14038,10 @@ mod tests {
             raw_title: "Raw".to_owned(),
             programme_title: "Programme".to_owned(),
             channel_slot: "1".to_owned(),
-            start: now,
+            channel_id: None,
+            output_name: None,
+            start: Some(now),
+            end: None,
             state: "scheduled".to_owned(),
             template: "Template".to_owned(),
         });
@@ -13849,6 +14068,7 @@ mod tests {
             event_start: Some(now),
             event_end: Some(now),
             raw_stream_name: Some("Raw".to_owned()),
+            output_name: Some("Output".to_owned()),
             state: "scheduled".to_owned(),
         });
         assert_serializes(SessionResponse {

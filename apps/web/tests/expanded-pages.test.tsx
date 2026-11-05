@@ -36,9 +36,10 @@ describe('expanded management pages', () => {
       eventStart: index === 2 ? null : timestamp,
       eventEnd: null,
       rawStreamName: index === 1 ? null : `${state} source`,
+      outputName: index === 0 ? 'Output One' : null,
       state,
     })))
-    const scan = vi.spyOn(client, 'scanEventTemplate').mockResolvedValue({ ok: true, message: 'Scan complete.' })
+    const scan = vi.spyOn(client, 'scanEventTemplate').mockResolvedValue({ ok: true, message: 'Scan complete.', channelsScanned: 0, matched: 0, scheduled: 0, skipped: 0, pruned: 0, skips: [] })
     renderWithQuery(<EventsPage client={client} />)
     expect(await screen.findByText('NFL events')).toBeInTheDocument()
     expect(screen.getByText('Slot 4')).toBeInTheDocument()
@@ -117,7 +118,7 @@ describe('expanded management pages', () => {
       { id: 'enabled', name: 'enabled', displayName: 'NFL events', matchRegex: 'x', channelNameFormat: 'x', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([
-      { id: 'event-1', templateId: 'enabled', channelId: null, slotNumber: 1, eventTitle: 'Broncos game', eventStart: '2026-09-14T00:20:00Z', eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
+      { id: 'event-1', templateId: 'enabled', channelId: null, slotNumber: 1, eventTitle: 'Broncos game', eventStart: '2026-09-14T00:20:00Z', eventEnd: null, rawStreamName: 'Broncos source', outputName: null, state: 'scheduled' },
     ])
     const toLocaleStringSpy = vi.spyOn(Date.prototype, 'toLocaleString')
     renderWithQuery(<EventsPage client={client} />)
@@ -843,7 +844,7 @@ describe('expanded management pages', () => {
       { id: 'bad', name: 'bad', displayName: 'Bad regex', matchRegex: '(unclosed', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([
-      { id: 'event-1', templateId: 'bad', channelId: null, slotNumber: 1, eventTitle: 'Title', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
+      { id: 'event-1', templateId: 'bad', channelId: null, slotNumber: 1, eventTitle: 'Title', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', outputName: null, state: 'scheduled' },
     ])
     renderWithQuery(<EventsPage client={client} />)
     await screen.findByText('Bad regex')
@@ -866,10 +867,10 @@ describe('expanded management pages', () => {
       { id: 'empty', name: 'empty', displayName: 'Empty regex', matchRegex: '', channelNameFormat: '{event}', groupName: 'Sports', eventDurationHours: 3, pastDateGraceHours: 6, futureDateDays: 7, timezone: 'UTC', fillerTitle: 'No programs available', enabled: true },
     ])
     vi.spyOn(client, 'getEventChannels').mockResolvedValue([
-      { id: 'm1', templateId: 'match', channelId: null, slotNumber: 1, eventTitle: 'Game', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos vs Chiefs', state: 'scheduled' },
-      { id: 'm2', templateId: 'match', channelId: null, slotNumber: 2, eventTitle: 'Skip', eventStart: timestamp, eventEnd: null, rawStreamName: 'Lakers Heat', state: 'scheduled' },
-      { id: 'n1', templateId: 'nomatch', channelId: null, slotNumber: 1, eventTitle: 'Miss', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
-      { id: 'e1', templateId: 'empty', channelId: null, slotNumber: 1, eventTitle: 'Empty regex', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', state: 'scheduled' },
+      { id: 'm1', templateId: 'match', channelId: null, slotNumber: 1, eventTitle: 'Game', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos vs Chiefs', outputName: null, state: 'scheduled' },
+      { id: 'm2', templateId: 'match', channelId: null, slotNumber: 2, eventTitle: 'Skip', eventStart: timestamp, eventEnd: null, rawStreamName: 'Lakers Heat', outputName: null, state: 'scheduled' },
+      { id: 'n1', templateId: 'nomatch', channelId: null, slotNumber: 1, eventTitle: 'Miss', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', outputName: null, state: 'scheduled' },
+      { id: 'e1', templateId: 'empty', channelId: null, slotNumber: 1, eventTitle: 'Empty regex', eventStart: timestamp, eventEnd: null, rawStreamName: 'Broncos source', outputName: null, state: 'scheduled' },
     ])
     renderWithQuery(<EventsPage client={client} />)
     await screen.findByText('Matched')

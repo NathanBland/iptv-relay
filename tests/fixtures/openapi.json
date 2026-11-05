@@ -818,14 +818,34 @@
       },
       "DynamicEventResponse": {
         "properties": {
+          "channelId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "channelSlot": {
             "type": "string"
+          },
+          "end": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "group": {
             "type": "string"
           },
           "id": {
             "type": "string"
+          },
+          "outputName": {
+            "description": "Output name of the target channel.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "programmeTitle": {
             "type": "string"
@@ -835,7 +855,10 @@
           },
           "start": {
             "format": "date-time",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "state": {
             "type": "string"
@@ -850,7 +873,6 @@
           "rawTitle",
           "programmeTitle",
           "channelSlot",
-          "start",
           "state",
           "template"
         ],
@@ -1084,6 +1106,13 @@
           "id": {
             "type": "string"
           },
+          "outputName": {
+            "description": "Output name of the target channel.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rawStreamName": {
             "type": [
               "string",
@@ -1106,6 +1135,87 @@
           "templateId",
           "slotNumber",
           "state"
+        ],
+        "type": "object"
+      },
+      "EventScanResponse": {
+        "description": "Result of one event scan.",
+        "properties": {
+          "channelsScanned": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "matched": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "pruned": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scheduled": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skips": {
+            "items": {
+              "$ref": "#/components/schemas/EventScanSkipResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "message",
+          "channelsScanned",
+          "matched",
+          "scheduled",
+          "skipped",
+          "pruned",
+          "skips"
+        ],
+        "type": "object"
+      },
+      "EventScanSkipResponse": {
+        "description": "One channel that matched a template but received no guide.",
+        "properties": {
+          "channelId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "streamName": {
+            "type": "string"
+          },
+          "templateId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "streamName",
+          "reason"
         ],
         "type": "object"
       },
@@ -3532,7 +3642,7 @@
       "name": "MIT"
     },
     "title": "iptv-api",
-    "version": "0.3.0"
+    "version": "0.3.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -5937,7 +6047,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SaveResult"
+                  "$ref": "#/components/schemas/EventScanResponse"
                 }
               }
             },

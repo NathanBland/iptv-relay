@@ -3136,11 +3136,22 @@ impl CatalogRepository {
     ) -> Result<Vec<EventChannelRow>, PersistenceError> {
         let rows = sqlx::query_as::<_, EventChannelRow>(
             r"
-            SELECT id, template_id, channel_id, slot_number, event_title,
-                   event_start, event_end, raw_stream_name, state
-            FROM event_channels
-            WHERE ($1::uuid IS NULL OR template_id = $1)
-            ORDER BY template_id, slot_number
+            SELECT e.id, e.template_id, e.channel_id, e.slot_number, e.event_title,
+                   e.event_start, e.event_end, e.raw_stream_name, e.state,
+                   coalesce(c.name_override, channel_alias.canonical_name, c.event_name, c.name)
+                       AS output_name
+            FROM event_channels e
+            LEFT JOIN channels c ON c.id = e.channel_id
+            LEFT JOIN LATERAL (
+                SELECT ca.canonical_name
+                FROM channel_aliases ca
+                WHERE normalize_channel_alias_key(ca.alias) = normalize_channel_alias_key(c.name)
+                   OR normalize_channel_alias_key(ca.canonical_name) = normalize_channel_alias_key(c.name)
+                ORDER BY ca.canonical_name
+                LIMIT 1
+            ) channel_alias ON true
+            WHERE ($1::uuid IS NULL OR e.template_id = $1)
+            ORDER BY e.template_id, e.event_start NULLS LAST, e.slot_number
             ",
         )
         .bind(template_id)
@@ -4324,6 +4335,9 @@ pub struct EventChannelRow {
     pub event_end: Option<DateTime<Utc>>,
     pub raw_stream_name: Option<String>,
     pub state: String,
+    /// Output name of the target channel. Only `list_event_channels` fills it.
+    #[sqlx(default)]
+    pub output_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
