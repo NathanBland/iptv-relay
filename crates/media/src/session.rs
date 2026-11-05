@@ -189,6 +189,7 @@ pub struct HttpTsSourceSpec {
     startup_timeout: Duration,
     read_timeout: Duration,
     viewer_batch_packets: NonZeroUsize,
+    viewer_delay: Duration,
     recovery: RecoveryPolicy,
 }
 
@@ -206,6 +207,7 @@ impl fmt::Debug for HttpTsSourceSpec {
             .field("startup_timeout", &self.startup_timeout)
             .field("read_timeout", &self.read_timeout)
             .field("viewer_batch_packets", &self.viewer_batch_packets)
+            .field("viewer_delay", &self.viewer_delay)
             .field("recovery", &self.recovery)
             .finish()
     }
@@ -223,6 +225,7 @@ impl HttpTsSourceSpec {
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             read_timeout: DEFAULT_READ_TIMEOUT,
             viewer_batch_packets: DEFAULT_VIEWER_BATCH_PACKETS,
+            viewer_delay: Duration::ZERO,
             recovery: RecoveryPolicy::default(),
         }
     }
@@ -276,6 +279,13 @@ impl HttpTsSourceSpec {
         self.viewer_batch_packets = packets;
     }
 
+    /// Sets how far each viewer stays behind the newest data. Each viewer is
+    /// paced at real time from the PCR. Zero turns pacing off: viewers start
+    /// at the ring pre-roll and read as fast as data arrives.
+    pub fn set_viewer_delay(&mut self, delay: Duration) {
+        self.viewer_delay = delay;
+    }
+
     pub fn set_recovery_policy(&mut self, recovery: RecoveryPolicy) {
         self.recovery = recovery;
     }
@@ -292,6 +302,7 @@ impl PartialEq for HttpTsSourceSpec {
             && self.startup_timeout == other.startup_timeout
             && self.read_timeout == other.read_timeout
             && self.viewer_batch_packets == other.viewer_batch_packets
+            && self.viewer_delay == other.viewer_delay
             && self.recovery == other.recovery
     }
 }
@@ -584,6 +595,7 @@ struct HttpTsSession {
     lease_id: u64,
     input: SessionInput,
     viewer_batch_packets: NonZeroUsize,
+    viewer_delay: Duration,
     diagnostics: Arc<SessionDiagnostics>,
 }
 
@@ -600,7 +612,14 @@ impl fmt::Debug for HttpTsSession {
 
 impl HttpTsSession {
     fn snapshot(&self) -> HttpTsSessionSnapshot {
-        self.diagnostics.snapshot(self.ring.snapshot())
+        let mut snapshot = self.diagnostics.snapshot(self.ring.snapshot());
+        snapshot.viewer_lead_millis = self
+            .diagnostics
+            .viewer_positions()
+            .into_iter()
+            .filter_map(|(generation, sequence)| self.ring.lead_millis(generation, sequence))
+            .collect();
+        snapshot
     }
 
     fn adapter_diagnostics(&self) -> SessionAdapterDiagnostics {
@@ -826,6 +845,7 @@ async fn start_native_http_ts_session(
         lease_id,
         input: SessionInput::Native { task: abort_handle },
         viewer_batch_packets: source.viewer_batch_packets,
+        viewer_delay: source.viewer_delay,
         diagnostics,
     })
 }
@@ -866,6 +886,7 @@ async fn start_process_http_ts_session(
         lease_id,
         input: SessionInput::Process(process),
         viewer_batch_packets: source.viewer_batch_packets,
+        viewer_delay: source.viewer_delay,
         diagnostics,
     })
 }
@@ -1504,7 +1525,11 @@ impl fmt::Debug for ViewerHandle {
 
 impl ViewerHandle {
     fn new(session: Arc<HttpTsSession>) -> Self {
-        let cursor = session.ring.subscribe();
+        let cursor = if session.viewer_delay.is_zero() {
+            session.ring.subscribe()
+        } else {
+            session.ring.subscribe_with_delay(session.viewer_delay)
+        };
         let registration = session
             .diagnostics
             .register_viewer(cursor.generation(), cursor.next_sequence());
@@ -1557,15 +1582,41 @@ impl ViewerHandle {
             registration,
         } = self;
         let max_packets = session.viewer_batch_packets.get();
+        let mut pacer = (!session.viewer_delay.is_zero()).then(crate::pacing::Pacer::new);
         let inner = Box::pin(async_stream::try_stream! {
             // Holding the session here makes stream drop equivalent to viewer
             // drop. The final stream drop cancels the HTTP request.
             let session_guard = session;
             loop {
-                match cursor.next(max_packets).await? {
+                let event = if let Some(pacer) = pacer.as_mut() {
+                    if let Some(event) = cursor.try_next(max_packets)? {
+                        event
+                    } else {
+                        // The viewer caught the write head. Restart the clock
+                        // reference so a later burst plays at real time.
+                        pacer.reset();
+                        cursor.next(max_packets).await?
+                    }
+                } else {
+                    cursor.next(max_packets).await?
+                };
+                match event {
                     RingRead::Packets {
-                        generation, bytes, ..
+                        generation, first_sequence, bytes
                     } => {
+                        if let Some(pacer) = pacer.as_mut() {
+                            let hold = pacer.hold(
+                                crate::pacing::BatchPosition {
+                                    sequence: first_sequence,
+                                    ticks: session_guard.ring.ticks_at(generation, first_sequence),
+                                    byte_rate_bps: session_guard.ring.byte_rate_bps(),
+                                },
+                                tokio::time::Instant::now(),
+                            );
+                            if !hold.is_zero() {
+                                tokio::time::sleep(hold).await;
+                            }
+                        }
                         registration.update(generation, cursor.next_sequence());
                         yield bytes;
                     }
@@ -1576,6 +1627,9 @@ impl ViewerHandle {
                         // to a disconnect, and a provider startup burst can
                         // briefly outrun any downstream reader.
                         session_guard.diagnostics.record_lag();
+                        if let Some(pacer) = pacer.as_mut() {
+                            pacer.reset();
+                        }
                         registration.update(cursor.generation(), cursor.next_sequence());
                     }
                     RingRead::GenerationBoundary {
@@ -1585,6 +1639,9 @@ impl ViewerHandle {
                         // The supervisor primes each new generation to a PAT
                         // boundary before rotating the ring. Keep the HTTP body
                         // open and resume on the next packet event.
+                        if let Some(pacer) = pacer.as_mut() {
+                            pacer.reset();
+                        }
                         registration.update(generation, cursor.next_sequence());
                     }
                     RingRead::Closed {
@@ -2447,6 +2504,14 @@ mod tests {
         capacity: usize,
         pre_roll: usize,
     ) -> (ViewerHandle, MpegTsRing, Arc<SessionDiagnostics>) {
+        local_viewer_with_delay(capacity, pre_roll, Duration::ZERO)
+    }
+
+    fn local_viewer_with_delay(
+        capacity: usize,
+        pre_roll: usize,
+        viewer_delay: Duration,
+    ) -> (ViewerHandle, MpegTsRing, Arc<SessionDiagnostics>) {
         let ring = MpegTsRing::new(MpegTsRingConfig::new(capacity, pre_roll).unwrap());
         let diagnostics =
             SessionDiagnostics::new(HttpTsSessionKey::new("provider", "local", 1), None);
@@ -2460,6 +2525,7 @@ mod tests {
             lease_id: 7,
             input: SessionInput::Native { task: abort_handle },
             viewer_batch_packets: NonZeroUsize::new(2).unwrap(),
+            viewer_delay,
             diagnostics: Arc::clone(&diagnostics),
         });
         (ViewerHandle::new(session), ring, diagnostics)
@@ -4683,5 +4749,185 @@ mod tests {
         .expect("the final HLS viewer must release the process slot within two seconds");
 
         server.abort();
+    }
+
+    // ---- Paced viewer (WP12) ----
+
+    const PCR_SECOND: u64 = crate::pacing::PCR_TICKS_PER_SECOND;
+
+    /// PAT, PMT and one PCR packet each second, starting at `first_pcr`.
+    /// Each PCR packet carries the second number as its label bytes.
+    fn paced_media(first_pcr: u64, seconds: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&pat_packet());
+        bytes.extend_from_slice(&pmt_packet());
+        for second in 0..seconds {
+            let raw = (first_pcr + second * PCR_SECOND) % ((1_u64 << 33) * 300);
+            bytes.extend_from_slice(&crate::pacing::test_support::pcr_packet(
+                TEST_VIDEO_PID,
+                raw,
+                false,
+            ));
+        }
+        bytes
+    }
+
+    /// Like `paced_media`, but repeats PAT and PMT each second, as a provider does.
+    fn paced_media_with_psi(first_pcr: u64, seconds: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for second in 0..seconds {
+            bytes.extend_from_slice(&pat_packet());
+            bytes.extend_from_slice(&pmt_packet());
+            bytes.extend_from_slice(&crate::pacing::test_support::pcr_packet(
+                TEST_VIDEO_PID,
+                first_pcr + second * PCR_SECOND,
+                false,
+            ));
+        }
+        bytes
+    }
+
+    async fn next_chunk(stream: &mut ViewerByteStream) -> Bytes {
+        stream.next().await.expect("open").expect("no error")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_viewer_releases_a_burst_at_real_time() {
+        let (viewer, ring, _) = local_viewer_with_delay(4_096, 0, Duration::from_secs(30));
+        // A provider burst: 10 s of media arrives at once.
+        ring.push(&paced_media(1_000 * PCR_SECOND, 10)).unwrap();
+        let mut stream = viewer.into_byte_stream();
+        let start = tokio::time::Instant::now();
+        let mut packets = 0;
+        while packets < 12 {
+            packets += next_chunk(&mut stream).await.len() / MPEG_TS_PACKET_SIZE;
+        }
+        // The test batch holds two packets. The last batch starts at PCR 8,
+        // so it is due 8 s after the first.
+        assert_eq!(start.elapsed(), Duration::from_secs(8));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_delay_keeps_unpaced_behavior() {
+        let (viewer, ring, _) = local_viewer_with_delay(4_096, 0, Duration::ZERO);
+        ring.push(&paced_media(1_000 * PCR_SECOND, 10)).unwrap();
+        let mut stream = viewer.into_byte_stream();
+        let start = tokio::time::Instant::now();
+        let mut packets = 0;
+        while packets < 12 {
+            packets += next_chunk(&mut stream).await.len() / MPEG_TS_PACKET_SIZE;
+        }
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_viewer_follows_the_pcr_across_the_33_bit_wrap() {
+        let wrap = (1_u64 << 33) * 300;
+        let (viewer, ring, _) = local_viewer_with_delay(4_096, 0, Duration::from_secs(30));
+        ring.push(&paced_media(wrap - 3 * PCR_SECOND, 8)).unwrap();
+        let mut stream = viewer.into_byte_stream();
+        let start = tokio::time::Instant::now();
+        let mut packets = 0;
+        while packets < 10 {
+            packets += next_chunk(&mut stream).await.len() / MPEG_TS_PACKET_SIZE;
+        }
+        // The last two-packet batch starts at PCR 6, across the wrap.
+        assert_eq!(start.elapsed(), Duration::from_secs(6));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_viewer_restarts_the_clock_at_a_generation_boundary() {
+        let (viewer, ring, _) = local_viewer_with_delay(4_096, 0, Duration::from_secs(30));
+        ring.push(&paced_media(5_000 * PCR_SECOND, 3)).unwrap();
+        let mut stream = viewer.into_byte_stream();
+        let start = tokio::time::Instant::now();
+        let mut packets = 0;
+        while packets < 5 {
+            packets += next_chunk(&mut stream).await.len() / MPEG_TS_PACKET_SIZE;
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        // The new generation restarts its PCR near zero. The viewer must
+        // neither stall for hours nor release the new data in one burst.
+        ring.start_new_generation().unwrap();
+        ring.push(&paced_media(0, 3)).unwrap();
+        let resumed = tokio::time::Instant::now();
+        let mut packets = 0;
+        while packets < 5 {
+            packets += next_chunk(&mut stream).await.len() / MPEG_TS_PACKET_SIZE;
+        }
+        assert_eq!(resumed.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_joiner_starts_one_delay_behind_the_head() {
+        let (first, ring, diagnostics) = local_viewer_with_delay(4_096, 0, Duration::from_secs(10));
+        ring.push(&paced_media_with_psi(1_000 * PCR_SECOND, 40))
+            .unwrap();
+        // The late joiner shares the session and the ring. It opens no
+        // provider connection.
+        let late = first.fork();
+        let leads = {
+            let positions = diagnostics.viewer_positions();
+            positions
+                .into_iter()
+                .filter_map(|(generation, sequence)| ring.lead_millis(generation, sequence))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(leads.len(), 2);
+        assert!(
+            (9_000..=11_000).contains(&leads[1]),
+            "late joiner lead was {}",
+            leads[1]
+        );
+        // Both viewers read from the same ring.
+        assert_eq!(late.session_snapshot().viewer_count, 2);
+        let mut stream = late.into_byte_stream();
+        let chunk = next_chunk(&mut stream).await;
+        assert!(!chunk.is_empty());
+        assert_eq!(first.session_snapshot().viewer_lead_millis.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn short_startup_burst_starts_with_the_data_that_exists() {
+        let (viewer, ring, _) = local_viewer_with_delay(4_096, 0, Duration::from_secs(30));
+        ring.push(&paced_media(1_000 * PCR_SECOND, 4)).unwrap();
+        let mut stream = viewer.into_byte_stream();
+        let start = tokio::time::Instant::now();
+        let first = next_chunk(&mut stream).await;
+        assert!(!first.is_empty());
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_viewer_re_anchors_after_catching_the_head() {
+        let (viewer, ring, _) = local_viewer_with_delay(4_096, 0, Duration::from_secs(30));
+        ring.push(&paced_media(1_000 * PCR_SECOND, 2)).unwrap();
+        let mut stream = viewer.into_byte_stream();
+        let mut packets = 0;
+        while packets < 4 {
+            packets += next_chunk(&mut stream).await.len() / MPEG_TS_PACKET_SIZE;
+        }
+        // A long provider gap, then a burst. The burst must play at real time.
+        // Poll the stream through the gap, as an HTTP body does.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(20), stream.next())
+                .await
+                .is_err()
+        );
+        let mut burst = Vec::new();
+        for second in 2..6_u64 {
+            burst.extend_from_slice(&crate::pacing::test_support::pcr_packet(
+                TEST_VIDEO_PID,
+                (1_000 + second) * PCR_SECOND,
+                false,
+            ));
+        }
+        ring.push(&burst).unwrap();
+        let start = tokio::time::Instant::now();
+        let mut packets = 0;
+        while packets < 4 {
+            packets += next_chunk(&mut stream).await.len() / MPEG_TS_PACKET_SIZE;
+        }
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
     }
 }

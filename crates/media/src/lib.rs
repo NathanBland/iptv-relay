@@ -6,6 +6,7 @@
 
 pub mod broker;
 pub mod credential_broker;
+mod pacing;
 pub mod passive;
 pub mod probe;
 pub mod process;

@@ -218,8 +218,8 @@ pub fn setting_catalog() -> Vec<SettingDefinition> {
         integer_setting(
             "media.viewer.start_delay_seconds",
             "Viewer start delay",
-            "Starts new viewers behind the live write head so short network stalls can be absorbed.",
-            2,
+            "Keeps each viewer this far behind the newest data and paces output at real time, so provider gaps do not stall players. Zero turns pacing off.",
+            30,
             0,
             30,
             "seconds",

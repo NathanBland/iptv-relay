@@ -5,9 +5,12 @@ use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time::Instant};
 
-use crate::psi::PatPmtTracker;
+use crate::{
+    pacing::{PcrTimeline, duration_to_ticks, ticks_to_millis},
+    psi::PatPmtTracker,
+};
 
 pub const MPEG_TS_PACKET_SIZE: usize = 188;
 pub const DEFAULT_PRE_ROLL: Duration = Duration::from_secs(2);
@@ -160,6 +163,10 @@ struct RingState {
     next_sequence: u64,
     safe_boundaries: VecDeque<u64>,
     psi: PatPmtTracker,
+    pcr_pid: Option<u16>,
+    pcr: PcrTimeline,
+    first_write: Option<Instant>,
+    bytes_written: u64,
     closed: Option<RingCloseReason>,
 }
 
@@ -249,6 +256,10 @@ impl MpegTsRing {
                     next_sequence: 0,
                     safe_boundaries: VecDeque::new(),
                     psi: PatPmtTracker::default(),
+                    pcr_pid: None,
+                    pcr: PcrTimeline::default(),
+                    first_write: None,
+                    bytes_written: 0,
                     closed: None,
                 }),
                 changed: Notify::new(),
@@ -302,6 +313,10 @@ impl MpegTsRing {
             let sequence = state.next_sequence;
             if let Some(boundary) = state.psi.observe(packet, sequence) {
                 state.safe_boundaries.push_back(boundary);
+                state.pcr_pid = state.psi.pcr_pid();
+            }
+            if state.pcr_pid.is_some_and(|pid| packet_pid(packet) == pid) {
+                state.pcr.observe(packet, sequence);
             }
             let slot = usize::try_from(
                 sequence % u64::try_from(self.inner.config.capacity_packets).unwrap(),
@@ -314,6 +329,12 @@ impl MpegTsRing {
                 .next_sequence
                 .saturating_sub(u64::try_from(self.inner.config.capacity_packets).unwrap());
         }
+        let first_sequence = state.first_sequence;
+        state.pcr.prune(first_sequence);
+        if state.first_write.is_none() && packet_count > 0 {
+            state.first_write = Some(Instant::now());
+        }
+        state.bytes_written = state.bytes_written.saturating_add(bytes.len() as u64);
         while state
             .safe_boundaries
             .front()
@@ -361,6 +382,10 @@ impl MpegTsRing {
         state.next_sequence = 0;
         state.safe_boundaries.clear();
         state.psi.reset();
+        state.pcr_pid = None;
+        state.pcr.reset();
+        state.first_write = None;
+        state.bytes_written = 0;
         state.closed = None;
         let generation = state.generation;
         drop(state);
@@ -388,6 +413,65 @@ impl MpegTsRing {
     /// Creates a cursor at the live edge, with no retained packets replayed.
     pub fn subscribe_at_live_edge(&self) -> RingCursor {
         self.subscribe_with_pre_roll(0)
+    }
+
+    /// Creates a cursor that starts `delay` of media time behind the newest
+    /// PCR. If the ring holds less media than `delay`, the cursor starts at the
+    /// oldest retained data. Without PCR data it uses the measured byte rate,
+    /// and then the configured pre-roll.
+    pub fn subscribe_with_delay(&self, delay: Duration) -> RingCursor {
+        let packets = {
+            let state = self.inner.state.lock();
+            let retained = state.next_sequence.saturating_sub(state.first_sequence);
+            let by_clock = state.pcr.head_ticks().and_then(|head| {
+                let target = head.saturating_sub(duration_to_ticks(delay));
+                state
+                    .pcr
+                    .sequence_at_or_after(target)
+                    .map(|sequence| state.next_sequence.saturating_sub(sequence))
+            });
+            let by_rate = || {
+                byte_rate_bps(&state)
+                    .map(|rate| rate / 8 * delay.as_secs() / (MPEG_TS_PACKET_SIZE as u64))
+            };
+            by_clock
+                .or_else(by_rate)
+                .unwrap_or(self.inner.config.pre_roll_packets as u64)
+                .min(retained)
+        };
+        self.subscribe_with_pre_roll(usize::try_from(packets).unwrap_or(usize::MAX))
+    }
+
+    /// Media time of `sequence` in PCR ticks, if the PCR timeline covers it.
+    pub(crate) fn ticks_at(&self, generation: u64, sequence: u64) -> Option<u64> {
+        let state = self.inner.state.lock();
+        (state.generation == generation)
+            .then(|| state.pcr.ticks_at(sequence))
+            .flatten()
+    }
+
+    /// Measured stream rate in bits per second since the first write of this
+    /// generation. `None` until enough data and time exist for an estimate.
+    pub(crate) fn byte_rate_bps(&self) -> Option<u64> {
+        byte_rate_bps(&self.inner.state.lock())
+    }
+
+    /// Milliseconds of media between the viewer position and the newest data.
+    ///
+    /// Uses the PCR timeline, and the measured byte rate when no PCR exists.
+    pub fn lead_millis(&self, generation: u64, next_sequence: u64) -> Option<u64> {
+        let state = self.inner.state.lock();
+        if state.generation != generation {
+            return None;
+        }
+        if let (Some(head), Some(at)) = (state.pcr.head_ticks(), state.pcr.ticks_at(next_sequence))
+        {
+            return Some(ticks_to_millis(head.saturating_sub(at)));
+        }
+        let rate = byte_rate_bps(&state)?;
+        let packets = state.next_sequence.saturating_sub(next_sequence);
+        let bits = u128::from(packets) * (MPEG_TS_PACKET_SIZE as u128) * 8;
+        u64::try_from(bits * 1_000 / u128::from(rate.max(1))).ok()
     }
 
     /// Creates a cursor with a caller-selected pre-roll, capped to retained data.
@@ -553,6 +637,20 @@ impl RingCursor {
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
     }
+}
+
+fn packet_pid(packet: &[u8]) -> u16 {
+    (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2])
+}
+
+/// Average write rate of this generation. Needs 2 s of history and 1 MiB.
+fn byte_rate_bps(state: &RingState) -> Option<u64> {
+    let elapsed = state.first_write?.elapsed();
+    if elapsed < Duration::from_secs(2) || state.bytes_written < 1_048_576 {
+        return None;
+    }
+    let bits = u128::from(state.bytes_written) * 8;
+    u64::try_from(bits * 1_000_000_000 / elapsed.as_nanos().max(1)).ok()
 }
 
 fn safe_resume_position(state: &RingState, target: u64) -> (u64, bool) {

@@ -750,6 +750,9 @@ struct SessionResponse {
     lag_events: u64,
     wrap_events: u64,
     overwritten_packets: u64,
+    /// Media seconds between each viewer and the newest data, one entry for
+    /// each viewer. Empty when no viewer has timing data.
+    lead_seconds: Vec<f64>,
     reconnect_attempts: u64,
     failover_attempts: u64,
     failure_count: u64,
@@ -6120,6 +6123,11 @@ fn session_response(
         lag_events: snapshot.ring_lag_events,
         wrap_events: snapshot.ring_wrap_events,
         overwritten_packets: snapshot.overwritten_packets,
+        lead_seconds: snapshot
+            .viewer_lead_millis
+            .iter()
+            .map(|millis| Duration::from_millis(*millis).as_secs_f64())
+            .collect(),
         reconnect_attempts: snapshot.reconnect_attempts,
         failover_attempts: snapshot.failover_attempts,
         failure_count: snapshot.failure_count,
@@ -6978,6 +6986,7 @@ fn capacity_placeholder_response(
     // The placeholder is a low-rate slate, so it does not need the live floor.
     let placeholder_policy = RingPolicy {
         max_bytes: 4 * 1024 * 1024,
+        pre_roll: Duration::from_secs(2),
         ..RingPolicy::default()
     };
     let ring = match policy_ring(1_000_000, placeholder_policy) {
@@ -7119,6 +7128,7 @@ fn database_source_spec(
         ring,
     );
     spec.set_channel_name(plan.channel_name.clone());
+    spec.set_viewer_delay(policy.pre_roll);
     spec.set_adapter_policy(adapter_policy);
     if let Ok(alternatives) =
         serde_json::from_value::<Vec<String>>(primary.alternative_base_urls.clone())
@@ -7329,7 +7339,10 @@ struct RingPolicy {
 impl RingPolicy {
     const DEFAULT_DURATION_SECONDS: u64 = 8;
     const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024;
-    const DEFAULT_PRE_ROLL_SECONDS: u64 = 2;
+    const DEFAULT_PRE_ROLL_SECONDS: u64 = 30;
+    /// Shortest ring duration. A paced viewer holds `pre_roll` of media, and
+    /// the provider startup burst adds more on top of that.
+    const MIN_DURATION_SECONDS: u64 = 60;
     /// Smallest ring for any live channel, capped by `max_bytes`.
     ///
     /// Many providers send 30 seconds or more of media in the first second of
@@ -7405,7 +7418,10 @@ fn policy_ring(
         .map_err(|_| "the ring capacity cannot be represented on this platform")?
         .saturating_mul(packet_size as u64);
     let bitrate = estimated_bitrate_bits_per_second.clamp(1, maximum_bitrate);
-    let duration = policy.duration.max(Duration::from_secs(1));
+    let duration = policy
+        .duration
+        .max(Duration::from_secs(RingPolicy::MIN_DURATION_SECONDS))
+        .max(policy.pre_roll.saturating_mul(2));
     let pre_roll = policy.pre_roll.min(duration);
     let requested = MpegTsRingConfig::for_bitrate(bitrate, duration, pre_roll)
         .map_err(|_| "the configured bitrate cannot be represented by the ring")?;
@@ -9654,6 +9670,7 @@ mod tests {
             state,
             viewer_count: 2,
             upstream_generation: 3,
+            viewer_lead_millis: vec![1_500],
             ring_lag_events: 4,
             ring_wrap_events: 5,
             overwritten_packets: 6,
@@ -12371,6 +12388,27 @@ mod tests {
     }
 
     #[test]
+    fn viewer_delay_defaults_to_thirty_seconds() {
+        assert_eq!(RingPolicy::default().pre_roll, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn ring_holds_at_least_sixty_seconds_or_twice_the_delay() {
+        // 8 Mbit/s is 1 MB/s: 60 s is 60 MB, inside the 64 MiB ceiling.
+        let ring = policy_ring(8_000_000, RingPolicy::default()).unwrap();
+        assert!(ring.capacity_bytes() >= 60_000_000);
+        // A 30 s delay needs 60 s. A 40 s delay needs 80 s, so the byte
+        // ceiling then governs.
+        let long = RingPolicy {
+            pre_roll: Duration::from_secs(40),
+            max_bytes: 256 * 1024 * 1024,
+            ..RingPolicy::default()
+        };
+        let ring = policy_ring(8_000_000, long).unwrap();
+        assert!(ring.capacity_bytes() >= 80_000_000);
+    }
+
+    #[test]
     fn default_ring_holds_a_provider_startup_burst() {
         // A 4 Mbps fallback estimate used to give a 4 MB ring, and a provider
         // burst of 12 MB or more overran every new viewer.
@@ -13467,6 +13505,7 @@ mod tests {
             state: "scheduled".to_owned(),
         });
         assert_serializes(SessionResponse {
+            lead_seconds: vec![1.5],
             base_server: None,
             provider_pool_id: "pool".to_owned(),
             source_id: "source".to_owned(),

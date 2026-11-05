@@ -2531,6 +2531,14 @@
               "null"
             ]
           },
+          "leadSeconds": {
+            "description": "Media seconds between each viewer and the newest data, one entry for\neach viewer. Empty when no viewer has timing data.",
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
           "overwrittenPackets": {
             "format": "int64",
             "minimum": 0,
@@ -2598,6 +2606,7 @@
           "lagEvents",
           "wrapEvents",
           "overwrittenPackets",
+          "leadSeconds",
           "reconnectAttempts",
           "failoverAttempts",
           "failureCount",
