@@ -276,7 +276,7 @@
             "format": "uuid",
             "type": "string"
           },
-          "logo_url": {
+          "logoUrl": {
             "type": [
               "string",
               "null"
@@ -382,7 +382,7 @@
               "null"
             ]
           },
-          "logo_url": {
+          "logoUrl": {
             "type": [
               "string",
               "null"

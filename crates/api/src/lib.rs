@@ -330,11 +330,14 @@ impl fmt::Debug for ChannelStreamSource {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ChannelRecord {
     pub id: Uuid,
     pub number: String,
     pub name: String,
     pub group: Option<String>,
+    // Accept the old `logo_url` key so that saved catalog snapshots still load.
+    #[serde(alias = "logo_url")]
     pub logo_url: Option<String>,
     pub enabled: bool,
 }
@@ -350,6 +353,7 @@ pub struct ProgrammeRecord {
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateChannelRequest {
     pub number: String,
     pub name: String,
@@ -11376,7 +11380,7 @@ mod tests {
         assert_eq!(status["user"]["displayName"], "Relay operator");
 
         let channel_body =
-            r#"{"number":"99","name":"Session-created channel","group":null,"logo_url":null}"#;
+            r#"{"number":"99","name":"Session-created channel","group":null,"logoUrl":null}"#;
         let missing_csrf = app
             .clone()
             .oneshot(
@@ -11697,7 +11701,7 @@ mod tests {
                     .header(header::AUTHORIZATION, "Bearer admin-secret")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"number":"10","name":"News & Weather","group":"News","logo_url":null}"#,
+                        r#"{"number":"10","name":"News & Weather","group":"News","logoUrl":null}"#,
                     ))
                     .unwrap(),
             )
@@ -11932,7 +11936,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_channel_number_is_conflict() {
         let app = router(state());
-        let body = r#"{"number":"7","name":"First","group":null,"logo_url":null}"#;
+        let body = r#"{"number":"7","name":"First","group":null,"logoUrl":null}"#;
         for expected in [StatusCode::CREATED, StatusCode::CONFLICT] {
             let response = app
                 .clone()
@@ -13205,13 +13209,7 @@ mod tests {
         // Schemas that intentionally keep snake_case property names. Add a name here only
         // after checking every consumer of that schema.
         // - DeadLetterResponse: operator scripts and docs read these keys.
-        // - ChannelRecord, CreateChannelRequest: `logo_url` is not in the F1 casing table.
-        //   Changing it needs a separate decision (see status/WP1.md).
-        const SNAKE_CASE_ALLOW_LIST: &[&str] = &[
-            "DeadLetterResponse",
-            "ChannelRecord",
-            "CreateChannelRequest",
-        ];
+        const SNAKE_CASE_ALLOW_LIST: &[&str] = &["DeadLetterResponse"];
 
         fn collect_snake_case_properties(
             value: &serde_json::Value,
@@ -13758,7 +13756,7 @@ mod tests {
     fn api_request_models_deserialize_all_documented_fields() {
         let id = Uuid::now_v7().to_string();
         assert_deserializes::<CreateChannelRequest>(serde_json::json!({
-            "number": "1", "name": "Channel", "group": "Group", "logo_url": "https://gateway.test/logo.png"
+            "number": "1", "name": "Channel", "group": "Group", "logoUrl": "https://gateway.test/logo.png"
         }));
         assert_deserializes::<CreateSourceRequest>(serde_json::json!({
             "name": "Source", "kind": "M3U", "endpoint": "https://provider.test/list.m3u",
