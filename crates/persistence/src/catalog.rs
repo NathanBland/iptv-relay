@@ -2694,7 +2694,10 @@ impl CatalogRepository {
                 c.logo_url,
                 c.enabled,
                 coalesce(cs.stream_count, 0) AS stream_count,
-                (m.channel_id IS NOT NULL) AS epg_mapped
+                (m.channel_id IS NOT NULL) AS epg_mapped,
+                primary_stream.video_codec,
+                primary_stream.video_height,
+                primary_stream.audio_codec
             FROM output_profiles op
             JOIN channels c ON c.enabled
             LEFT JOIN LATERAL (
@@ -2705,6 +2708,14 @@ impl CatalogRepository {
                 ORDER BY ca.canonical_name
                 LIMIT 1
             ) channel_alias ON true
+            LEFT JOIN LATERAL (
+                SELECT ps.video_codec, ps.video_height, ps.audio_codec
+                FROM channel_streams cs
+                JOIN provider_streams ps ON ps.id = cs.provider_stream_id
+                WHERE cs.channel_id = c.id
+                ORDER BY cs.priority ASC
+                LIMIT 1
+            ) primary_stream ON true
             LEFT JOIN output_profile_channels opc
                 ON opc.output_profile_id = op.id AND opc.channel_id = c.id
             LEFT JOIN (
@@ -4231,6 +4242,15 @@ pub struct ChannelRow {
     pub enabled: bool,
     pub stream_count: i64,
     pub epg_mapped: bool,
+    /// Video codec of the primary stream. Set only by `list_enabled_channels_for_output_profile`.
+    #[sqlx(default)]
+    pub video_codec: Option<String>,
+    /// Video height in pixels of the primary stream. Set only by `list_enabled_channels_for_output_profile`.
+    #[sqlx(default)]
+    pub video_height: Option<i32>,
+    /// Audio codec of the primary stream. Set only by `list_enabled_channels_for_output_profile`.
+    #[sqlx(default)]
+    pub audio_codec: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
