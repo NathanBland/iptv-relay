@@ -1451,6 +1451,7 @@ fn output_routes() -> Router<AppState> {
     Router::new()
         .route("/out/{token}/playlist.m3u", get(playlist))
         .route("/out/{token}/xmltv.xml", get(xmltv))
+        .route("/out/{token}/art/{file}", get(matchup_art))
         .route("/out/{token}/hdhr/discover.json", get(hdhr_discover))
         .route("/out/{token}/hdhr/lineup.json", get(hdhr_lineup))
         .route(
@@ -6972,6 +6973,10 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
             Ok(programmes) => programmes,
             Err(error) => return persistence_error_response(error),
         };
+        let art_base = format!(
+            "{}/out/{token}/art",
+            state.public_base_url.trim_end_matches('/')
+        );
         let mut body = String::from(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tv generator-info-name=\"IPTV Gateway\">\n",
         );
@@ -7010,7 +7015,7 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
                 .entry(channel.id)
                 .or_default()
                 .push((programme.starts_at, programme.stops_at));
-            write_programme_row(&mut body, channel.id, programme);
+            write_programme_row(&mut body, channel.id, programme, Some(&art_base));
         }
         let now = Utc::now();
         for channel in &channels {
@@ -9669,6 +9674,78 @@ fn floor_to_hour(value: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::from_timestamp(seconds - seconds.rem_euclid(3600), 0).unwrap_or(value)
 }
 
+/// Returns the matchup image URL when both team logos are known.
+///
+/// `art_base` is `<public base URL>/out/<token>/art`.
+fn matchup_art_url(art_base: &str, sports: &iptv_persistence::SportsInfo) -> Option<String> {
+    sports.home.as_ref()?.logo_url.as_ref()?;
+    sports.away.as_ref()?.logo_url.as_ref()?;
+    let key = iptv_sports::art::event_key(
+        &sports.league,
+        sports.local_date,
+        sports.event_id.as_deref()?,
+    )?;
+    Some(format!("{art_base}/{key}.png"))
+}
+
+/// The directory of the matchup image cache. Set `IPTV_ART_CACHE_DIR` to change it.
+const ART_CACHE_DIR_ENV: &str = "IPTV_ART_CACHE_DIR";
+/// The size limit of the matchup image cache in MiB. Set `IPTV_ART_CACHE_MAX_MB` to change it.
+const ART_CACHE_MAX_MB_ENV: &str = "IPTV_ART_CACHE_MAX_MB";
+
+/// Returns the process-wide matchup image store.
+fn art_store() -> Option<&'static iptv_sports::art::ArtStore> {
+    static STORE: std::sync::OnceLock<Option<iptv_sports::art::ArtStore>> =
+        std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            let dir = std::env::var_os(ART_CACHE_DIR_ENV).map_or_else(
+                || std::env::temp_dir().join("iptv-relay-art"),
+                std::path::PathBuf::from,
+            );
+            let max_bytes = std::env::var(ART_CACHE_MAX_MB_ENV)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map_or(iptv_sports::art::DEFAULT_MAX_BYTES, |mb| {
+                    mb.saturating_mul(1024 * 1024)
+                });
+            let client = iptv_sports::EspnClient::new().ok()?;
+            Some(iptv_sports::art::ArtStore::new(dir, max_bytes, client))
+        })
+        .as_ref()
+}
+
+/// Serves a matchup image. The output token is the only authentication.
+async fn matchup_art(
+    State(state): State<AppState>,
+    Path((token, file)): Path<(String, String)>,
+) -> Response {
+    if let Err(response) = authorize_output(&state, &token).await {
+        return response;
+    }
+    let Some(key) = file.strip_suffix(".png") else {
+        return not_found();
+    };
+    let Some(store) = art_store() else {
+        return not_found();
+    };
+    match store.get(key).await {
+        Ok(png) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/png"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            png,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::debug!(%error, "matchup image is not available");
+            not_found()
+        }
+    }
+}
+
 /// Writes one `<programme>` element for a database programme row.
 ///
 /// The elements follow the XMLTV DTD order: `title`, `desc`, `category`,
@@ -9688,6 +9765,7 @@ fn write_programme_row(
     body: &mut String,
     channel_id: Uuid,
     programme: &iptv_persistence::ProgrammeRow,
+    art_base: Option<&str>,
 ) {
     write!(
         body,
@@ -9706,7 +9784,8 @@ fn write_programme_row(
             .expect("writing to a String cannot fail");
     }
     if let Some(sports) = programme.sports() {
-        if let Some(icon) = sports.icon_url() {
+        let art_url = art_base.and_then(|base| matchup_art_url(base, &sports));
+        if let Some(icon) = art_url.as_deref().or_else(|| sports.icon_url()) {
             write!(body, "<icon src=\"{}\"/>", xml_escape(icon))
                 .expect("writing to a String cannot fail");
         }
@@ -15269,10 +15348,76 @@ mod tests {
     #[test]
     fn sports_programme_xml_snapshot_has_dtd_order_and_no_sub_title() {
         let mut body = String::new();
-        write_programme_row(&mut body, Uuid::nil(), &nhl_programme_row());
+        write_programme_row(&mut body, Uuid::nil(), &nhl_programme_row(), None);
         let expected = NHL_PROGRAMME_XML.replace("c1", &Uuid::nil().to_string());
         assert_eq!(body, expected);
         assert!(!body.contains("<sub-title"));
+    }
+
+    #[test]
+    fn sports_icon_is_matchup_art_url_when_both_logos_are_known() {
+        let base = "https://relay.test/out/TOKEN/art";
+        let mut row = nhl_programme_row();
+        let mut body = String::new();
+        write_programme_row(&mut body, Uuid::nil(), &row, Some(base));
+        assert!(
+            body.contains(
+                "<icon src=\"https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/buf.png\"/>"
+            ),
+            "one logo only: keep the home logo"
+        );
+        row.metadata.as_mut().unwrap()["sports"]["away"]["logoUrl"] =
+            serde_json::json!("https://a.espncdn.com/i/teamlogos/nhl/500/scoreboard/ott.png");
+        let mut body = String::new();
+        write_programme_row(&mut body, Uuid::nil(), &row, Some(base));
+        assert!(body.contains(&format!("<icon src=\"{base}/NHL-20261104-401.png\"/>")));
+        assert!(!body.contains("<sub-title"));
+        let mut body = String::new();
+        write_programme_row(&mut body, Uuid::nil(), &row, None);
+        assert!(body.contains("buf.png"), "no art base: keep the home logo");
+    }
+
+    #[tokio::test]
+    async fn matchup_art_route_rejects_invalid_token() {
+        let response = router(state())
+            .oneshot(
+                Request::get("/out/wrong/art/NHL-20261104-401.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn matchup_art_route_serves_cached_png_and_rejects_bad_keys() {
+        let store = art_store().expect("art store starts");
+        store.store("NHL-20261104-9999", b"fake-png").unwrap();
+        let app = router(state());
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::get("/out/output-secret/art/NHL-20261104-9999.png")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers()[header::CONTENT_TYPE], "image/png");
+        for bad in ["not-a-key.png", "NHL-20261104-9999", "..%2Fx.png"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(format!("/out/output-secret/art/{bad}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{bad}");
+        }
     }
 
     #[test]
@@ -15281,7 +15426,7 @@ mod tests {
         row.metadata = None;
         row.categories = serde_json::json!(["News"]);
         let mut body = String::new();
-        write_programme_row(&mut body, Uuid::nil(), &row);
+        write_programme_row(&mut body, Uuid::nil(), &row, None);
         assert!(!body.contains("<icon") && !body.contains("<live/>"));
         assert!(!body.contains("episode-num") && !body.contains("<sub-title"));
     }
