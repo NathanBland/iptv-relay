@@ -17,13 +17,13 @@ axum.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
-iptv-api = { path = "../../crates/api", version = "0.4.1" }
-iptv-domain = { path = "../../crates/domain", version = "0.4.1" }
-iptv-ingest = { path = "../../crates/ingest", version = "0.4.1" }
-iptv-media = { path = "../../crates/media", version = "0.4.1" }
-iptv-parsers = { path = "../../crates/parsers", version = "0.4.1" }
-iptv-persistence = { path = "../../crates/persistence", version = "0.4.1" }
-iptv-sports = { path = "../../crates/sports", version = "0.4.1" }
+iptv-api = { path = "../../crates/api", version = "0.4.2" }
+iptv-domain = { path = "../../crates/domain", version = "0.4.2" }
+iptv-ingest = { path = "../../crates/ingest", version = "0.4.2" }
+iptv-media = { path = "../../crates/media", version = "0.4.2" }
+iptv-parsers = { path = "../../crates/parsers", version = "0.4.2" }
+iptv-persistence = { path = "../../crates/persistence", version = "0.4.2" }
+iptv-sports = { path = "../../crates/sports", version = "0.4.2" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
