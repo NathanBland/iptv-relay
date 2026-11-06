@@ -71,6 +71,61 @@ impl fmt::Debug for AuthManager {
 struct SessionRecord {
     csrf_hash: [u8; 32],
     expires_at: Instant,
+    user: Arc<SessionUser>,
+}
+
+/// The account that a browser session signs in as.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionUser {
+    pub id: String,
+    pub username: String,
+    pub display_name: String,
+    /// The operator API scopes that the session holds.
+    pub scopes: Vec<String>,
+}
+
+impl SessionUser {
+    /// The built-in operator account that signs in with the deployment password.
+    pub(crate) fn built_in_operator() -> Self {
+        Self {
+            id: "operator-1".to_owned(),
+            username: ADMIN_USERNAME.to_owned(),
+            display_name: "Relay operator".to_owned(),
+            scopes: vec![OPERATOR_TOKEN_ADMIN_SCOPE.to_owned()],
+        }
+    }
+}
+
+/// The stored credentials of an account that the users API created.
+#[derive(Clone)]
+pub(crate) struct StoredUserCredential {
+    pub user: SessionUser,
+    pub password_hash: String,
+}
+
+impl fmt::Debug for StoredUserCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredUserCredential")
+            .field("user", &self.user)
+            .field("password_hash", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Returns the session scopes for a user role, or `None` for an unknown role.
+///
+/// An `admin` holds every scope. An `operator` reads and controls the relay
+/// and its outputs, but cannot manage users or operator API tokens. A `viewer`
+/// reads the relay and its outputs.
+pub(crate) fn role_scopes(role: &str) -> Option<Vec<String>> {
+    let scopes: &[&str] = match role {
+        "admin" => &[OPERATOR_TOKEN_ADMIN_SCOPE],
+        "operator" => &[OPERATOR_TOKEN_CONTROL_SCOPE, OPERATOR_TOKEN_OUTPUT_SCOPE],
+        "viewer" => &[OPERATOR_TOKEN_READ_SCOPE, OPERATOR_TOKEN_OUTPUT_SCOPE],
+        _ => return None,
+    };
+    Some(scopes.iter().map(|scope| (*scope).to_owned()).collect())
 }
 
 #[derive(Clone, Debug)]
@@ -182,21 +237,39 @@ impl AuthManager {
         Some(self.csrf_cookie(&csrf_token, LOGIN_CSRF_TTL))
     }
 
+    /// Verifies a sign-in request.
+    ///
+    /// The username `operator` signs in with the deployment password. Every
+    /// other username signs in with `stored`, the credentials of the account
+    /// that the users API created. When no stored account matches, the check
+    /// still runs one password verification, so the response time does not
+    /// show whether the username exists.
     pub(crate) async fn verify_login(
         &self,
         headers: &HeaderMap,
         username: String,
         password: String,
+        stored: Option<StoredUserCredential>,
     ) -> Result<VerifiedLogin, LoginError> {
         let csrf_binding = self
             .csrf_binding(headers)
             .ok_or(LoginError::CsrfValidationFailed)?;
-        if password.is_empty() || password.len() > 1024 {
+        if password.is_empty() || password.len() > 1024 || username.len() > 128 {
             return Err(LoginError::InvalidCredentials);
         }
-        let username_valid = username.len() <= 128
-            && constant_time_eq(&digest(username.as_str()), &digest(ADMIN_USERNAME));
-        let expected = Arc::clone(&self.inner.password_hash);
+        let built_in = constant_time_eq(&digest(username.as_str()), &digest(ADMIN_USERNAME));
+        let candidate = if built_in {
+            None
+        } else {
+            stored.filter(|credential| credential.user.username == username)
+        };
+        let (expected, user): (Arc<str>, Option<SessionUser>) = match candidate {
+            Some(credential) => (credential.password_hash.into(), Some(credential.user)),
+            None => (
+                Arc::clone(&self.inner.password_hash),
+                built_in.then(SessionUser::built_in_operator),
+            ),
+        };
         let verified = tokio::task::spawn_blocking(move || {
             PasswordHash::new(&expected).ok().is_some_and(|hash| {
                 Argon2::default()
@@ -206,11 +279,24 @@ impl AuthManager {
         })
         .await
         .map_err(|_| LoginError::Unavailable)?;
-        if !username_valid || !verified {
-            return Err(LoginError::InvalidCredentials);
+        match user {
+            Some(user) if verified => Ok(VerifiedLogin {
+                csrf_binding,
+                user: Arc::new(user),
+            }),
+            _ => Err(LoginError::InvalidCredentials),
         }
+    }
 
-        Ok(VerifiedLogin { csrf_binding })
+    /// Returns the account of the session in the request cookies.
+    pub(crate) fn session_user(&self, headers: &HeaderMap) -> Option<SessionUser> {
+        let token = cookie(headers, SESSION_COOKIE)?;
+        let now = Instant::now();
+        let sessions = self.lock_sessions();
+        sessions
+            .get(&digest(token))
+            .filter(|session| session.expires_at > now)
+            .map(|session| session.user.as_ref().clone())
     }
 
     pub(crate) fn complete_login(
@@ -228,6 +314,7 @@ impl AuthManager {
             SessionRecord {
                 csrf_hash: digest(&csrf_token),
                 expires_at: Instant::now() + SESSION_TTL,
+                user: verified.user,
             },
         );
         drop(sessions);
@@ -269,6 +356,7 @@ impl AuthManager {
             SessionRecord {
                 csrf_hash: digest(&csrf_token),
                 expires_at: Instant::now() + SESSION_TTL,
+                user: Arc::new(SessionUser::built_in_operator()),
             },
         );
         drop(sessions);
@@ -345,6 +433,9 @@ impl AuthManager {
         let mut sessions = self.lock_sessions();
         sessions.retain(|_, session| session.expires_at > now);
         let session = sessions.get(&token_hash)?;
+        if !required_scope.is_none_or(|scope| scope_satisfied(&session.user.scopes, scope)) {
+            return None;
+        }
         if require_csrf {
             let header_csrf = headers
                 .get(CSRF_HEADER)
@@ -388,7 +479,8 @@ impl AuthManager {
                 return format!("operator-api-token:{}", record.id);
             }
         }
-        ADMIN_USERNAME.to_owned()
+        self.session_user(headers)
+            .map_or_else(|| ADMIN_USERNAME.to_owned(), |user| user.username)
     }
 
     pub(crate) fn generate_operator_token() -> Result<String, getrandom::Error> {
@@ -508,9 +600,17 @@ enum CsrfBinding {
     Session([u8; 32]),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct VerifiedLogin {
     csrf_binding: CsrfBinding,
+    user: Arc<SessionUser>,
+}
+
+impl VerifiedLogin {
+    /// The account that signed in.
+    pub(crate) fn user(&self) -> &SessionUser {
+        &self.user
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -729,6 +829,7 @@ mod tests {
                         &login_headers,
                         "operator".to_owned(),
                         "admin-password".to_owned(),
+                        None,
                     )
                     .await
                     .unwrap(),
@@ -761,6 +862,7 @@ mod tests {
                         &session_headers,
                         "operator".to_owned(),
                         "admin-password".to_owned(),
+                        None,
                     )
                     .await
                     .unwrap(),
@@ -787,5 +889,184 @@ mod tests {
                 .iter()
                 .all(|cookie| cookie.contains("; Secure"))
         );
+    }
+
+    fn login_headers(manager: &AuthManager) -> HeaderMap {
+        let csrf_cookie = manager.ensure_csrf_cookie(&HeaderMap::new()).unwrap();
+        let csrf = csrf_cookie
+            .strip_prefix("iptv_csrf=")
+            .and_then(|value| value.split(';').next())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("iptv_csrf={csrf}").parse().unwrap());
+        headers.insert(CSRF_HEADER, csrf.parse().unwrap());
+        headers
+    }
+
+    fn session_headers(session: &IssuedSession) -> HeaderMap {
+        let csrf = session
+            .csrf_cookie
+            .strip_prefix("iptv_csrf=")
+            .and_then(|value| value.split(';').next())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            format!(
+                "{}; iptv_csrf={csrf}",
+                session.session_cookie.split(';').next().unwrap()
+            )
+            .parse()
+            .unwrap(),
+        );
+        headers.insert(CSRF_HEADER, csrf.parse().unwrap());
+        headers
+    }
+
+    fn stored(username: &str, password: &str, role: &str) -> StoredUserCredential {
+        StoredUserCredential {
+            user: SessionUser {
+                id: Uuid::new_v4().to_string(),
+                username: username.to_owned(),
+                display_name: "Joel".to_owned(),
+                scopes: role_scopes(role).unwrap(),
+            },
+            password_hash: hash_admin_password(password).unwrap(),
+        }
+    }
+
+    #[test]
+    fn role_scopes_map_each_role() {
+        assert_eq!(role_scopes("admin").unwrap(), vec!["admin"]);
+        assert_eq!(role_scopes("operator").unwrap(), vec!["control", "output"]);
+        assert_eq!(role_scopes("viewer").unwrap(), vec!["read", "output"]);
+        assert_eq!(role_scopes("owner"), None);
+    }
+
+    #[tokio::test]
+    async fn stored_user_signs_in_with_its_own_password_and_role() {
+        let manager = AuthManager::new(
+            hash_admin_password("admin-password").unwrap(),
+            "bootstrap-token",
+            false,
+        );
+        let credential = stored("joel", "joel-password", "operator");
+
+        let wrong = manager
+            .verify_login(
+                &login_headers(&manager),
+                "joel".to_owned(),
+                "admin-password".to_owned(),
+                Some(credential.clone()),
+            )
+            .await;
+        assert_eq!(wrong, Err(LoginError::InvalidCredentials));
+        let unknown = manager
+            .verify_login(
+                &login_headers(&manager),
+                "joel".to_owned(),
+                "joel-password".to_owned(),
+                None,
+            )
+            .await;
+        assert_eq!(unknown, Err(LoginError::InvalidCredentials));
+        let mismatched = manager
+            .verify_login(
+                &login_headers(&manager),
+                "someone-else".to_owned(),
+                "joel-password".to_owned(),
+                Some(credential.clone()),
+            )
+            .await;
+        assert_eq!(mismatched, Err(LoginError::InvalidCredentials));
+
+        let verified = manager
+            .verify_login(
+                &login_headers(&manager),
+                "joel".to_owned(),
+                "joel-password".to_owned(),
+                Some(credential.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(verified.user(), &credential.user);
+        let session = manager.complete_login(verified).unwrap();
+        let headers = session_headers(&session);
+
+        assert_eq!(manager.session_user(&headers), Some(credential.user));
+        assert_eq!(manager.operator_token_actor(&headers), "joel");
+        assert_eq!(
+            manager.authorize_scope(&headers, true, OPERATOR_TOKEN_CONTROL_SCOPE),
+            Some(Authorization::Session)
+        );
+        assert_eq!(
+            manager.authorize_scope(&headers, false, OPERATOR_TOKEN_READ_SCOPE),
+            Some(Authorization::Session)
+        );
+        assert_eq!(
+            manager.authorize_scope(&headers, true, OPERATOR_TOKEN_ADMIN_SCOPE),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn viewer_session_cannot_control_the_relay() {
+        let manager = AuthManager::new(
+            hash_admin_password("admin-password").unwrap(),
+            "bootstrap-token",
+            false,
+        );
+        let session = manager
+            .complete_login(
+                manager
+                    .verify_login(
+                        &login_headers(&manager),
+                        "viewer".to_owned(),
+                        "viewer-password".to_owned(),
+                        Some(stored("viewer", "viewer-password", "viewer")),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        let headers = session_headers(&session);
+        assert!(
+            manager
+                .authorize_scope(&headers, false, OPERATOR_TOKEN_READ_SCOPE)
+                .is_some()
+        );
+        assert!(
+            manager
+                .authorize_scope(&headers, true, OPERATOR_TOKEN_CONTROL_SCOPE)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_username_ignores_a_stored_account() {
+        let manager = AuthManager::new(
+            hash_admin_password("admin-password").unwrap(),
+            "bootstrap-token",
+            false,
+        );
+        let impostor = manager
+            .verify_login(
+                &login_headers(&manager),
+                "operator".to_owned(),
+                "other-password".to_owned(),
+                Some(stored("operator", "other-password", "admin")),
+            )
+            .await;
+        assert_eq!(impostor, Err(LoginError::InvalidCredentials));
+        let built_in = manager
+            .verify_login(
+                &login_headers(&manager),
+                "operator".to_owned(),
+                "admin-password".to_owned(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(built_in.user(), &SessionUser::built_in_operator());
     }
 }
