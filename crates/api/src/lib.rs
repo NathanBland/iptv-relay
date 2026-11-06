@@ -3,6 +3,7 @@
 mod auth;
 mod oidc;
 mod passive_capture;
+mod rate_capture;
 
 pub use auth::hash_admin_password;
 pub use oidc::OidcConfig;
@@ -805,6 +806,17 @@ struct SessionResponse {
     /// Media seconds between each viewer and the newest data, one entry for
     /// each viewer. Empty when no viewer has timing data.
     lead_seconds: Vec<f64>,
+    /// Mean bitrate measured from the stream clock, in kilobits per second.
+    /// Absent until the session has about 10 s of media.
+    measured_bitrate_kbps: Option<u64>,
+    /// Highest bitrate over any 5 s of media, in kilobits per second.
+    peak_bitrate_kbps: Option<u64>,
+    /// How far ahead of real time the provider has delivered media, in seconds.
+    burst_seconds: Option<f64>,
+    /// Video frame rate measured from the video timestamps.
+    frame_rate: Option<f64>,
+    /// Media seconds that the ring holds at the measured peak bitrate.
+    ring_seconds: Option<f64>,
     reconnect_attempts: u64,
     failover_attempts: u64,
     failure_count: u64,
@@ -6277,6 +6289,26 @@ fn session_response(
             .iter()
             .map(|millis| Duration::from_millis(*millis).as_secs_f64())
             .collect(),
+        measured_bitrate_kbps: snapshot
+            .rates
+            .map(|rates| rates.average_bits_per_second / 1_000),
+        peak_bitrate_kbps: snapshot
+            .rates
+            .map(|rates| rates.peak_bits_per_second / 1_000),
+        burst_seconds: snapshot.rates.map(|rates| rates.burst.as_secs_f64()),
+        frame_rate: snapshot
+            .rates
+            .and_then(|rates| rates.frame_rate_millihertz)
+            .map(|millihertz| f64::from(millihertz) / 1_000.0),
+        ring_seconds: snapshot
+            .rates
+            .filter(|rates| rates.peak_bits_per_second > 0)
+            .and_then(|rates| {
+                let packets = u64::try_from(snapshot.ring.capacity_packets).ok()?;
+                let bits = packets * iptv_media::MPEG_TS_PACKET_SIZE as u64 * 8;
+                let tenths = u32::try_from(bits * 10 / rates.peak_bits_per_second).ok()?;
+                Some(f64::from(tenths) / 10.0)
+            }),
         reconnect_attempts: snapshot.reconnect_attempts,
         failover_attempts: snapshot.failover_attempts,
         failure_count: snapshot.failure_count,
@@ -7133,6 +7165,7 @@ async fn open_channel_response(state: &AppState, channel_id: Uuid) -> Response {
     let catalog = state.catalog_repository.clone();
     let hook: iptv_media::slate::ViewerHook = Arc::new(move |viewer: &ViewerHandle| {
         passive_capture::spawn_passive_capture(catalog.as_ref(), channel_id, viewer);
+        rate_capture::spawn_rate_capture(catalog.as_ref(), provider_stream_id, viewer);
     });
     let options = SlateOptions::new(profile).with_viewer_hook(hook);
     // A provider problem never becomes an HTTP error. The client receives a
@@ -7256,13 +7289,21 @@ fn database_source_spec(
         ));
     }
 
-    let bitrate = primary
-        .bitrate_kbps
-        .and_then(|value| u64::try_from(value).ok())
-        .and_then(|value| value.checked_mul(1_000))
-        .unwrap_or(4_000_000);
+    let sizing = RingSizing::from_candidate(primary);
+    if let Some(needed) = sizing.paced_bytes(policy.pre_roll)
+        && !policy.pre_roll.is_zero()
+        && needed > u64::try_from(policy.max_bytes).unwrap_or(u64::MAX)
+    {
+        warn!(
+            channel_id = %plan.channel_id,
+            needed_bytes = needed,
+            max_bytes = policy.max_bytes,
+            "the measured stream needs a larger ring than media.ring.max_bytes allows; \
+             viewers can skip ahead during long bursts"
+        );
+    }
     let ring =
-        policy_ring(bitrate, policy).map_err(|detail| Box::new(invalid_buffer_policy(detail)))?;
+        policy_ring(sizing, policy).map_err(|detail| Box::new(invalid_buffer_policy(detail)))?;
     let primary_url = decrypt_stream_url(state, primary)?;
     // A stream with the stored value `auto` has no explicit adapter. The
     // operator setting `media.adapter` applies to it. An explicit value wins.
@@ -7579,10 +7620,67 @@ fn default_ring(estimated_bitrate_bits_per_second: u64) -> Result<MpegTsRingConf
     policy_ring(estimated_bitrate_bits_per_second, RingPolicy::default())
 }
 
+/// What the relay knows about a stream's rate when it sizes the ring.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RingSizing {
+    /// The measured mean, the probe value, or the 4 Mbps fallback.
+    estimated_bits_per_second: u64,
+    /// Highest 5 s bitrate measured from earlier live sessions.
+    measured_peak_bits_per_second: Option<u64>,
+    /// Largest provider burst measured from earlier live sessions.
+    measured_burst: Option<Duration>,
+}
+
+impl From<u64> for RingSizing {
+    fn from(estimated_bits_per_second: u64) -> Self {
+        Self {
+            estimated_bits_per_second,
+            ..Self::default()
+        }
+    }
+}
+
+impl RingSizing {
+    /// Burst allowance when no burst has been measured.
+    const DEFAULT_BURST: Duration = Duration::from_secs(15);
+    /// Headroom for programmes busier than the measured peak.
+    const SAFETY_MARGIN: Duration = Duration::from_secs(15);
+
+    fn from_candidate(candidate: &ChannelPlaybackCandidateRow) -> Self {
+        let bits = |kbps: Option<i32>| {
+            kbps.and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .and_then(|value| value.checked_mul(1_000))
+        };
+        Self {
+            estimated_bits_per_second: bits(candidate.bitrate_kbps).unwrap_or(4_000_000),
+            measured_peak_bits_per_second: bits(candidate.measured_peak_kbps),
+            measured_burst: candidate
+                .measured_burst_ms
+                .and_then(|value| u64::try_from(value).ok())
+                .map(Duration::from_millis),
+        }
+    }
+
+    /// Bytes a paced viewer needs: the delay, the provider burst and a
+    /// safety margin, all at the measured peak. `None` without a measured
+    /// peak.
+    fn paced_bytes(self, pre_roll: Duration) -> Option<u64> {
+        let peak = self.measured_peak_bits_per_second?;
+        let span = pre_roll
+            .saturating_add(self.measured_burst.unwrap_or(Self::DEFAULT_BURST))
+            .saturating_add(Self::SAFETY_MARGIN);
+        let bits = u128::from(peak) * span.as_millis() / 1_000;
+        Some(u64::try_from(bits / 8).unwrap_or(u64::MAX))
+    }
+}
+
 fn policy_ring(
-    estimated_bitrate_bits_per_second: u64,
+    sizing: impl Into<RingSizing>,
     policy: RingPolicy,
 ) -> Result<MpegTsRingConfig, &'static str> {
+    let sizing = sizing.into();
+    let estimated_bitrate_bits_per_second = sizing.estimated_bits_per_second;
     let packet_size = iptv_media::MPEG_TS_PACKET_SIZE;
     let maximum_packets = (policy.max_bytes / packet_size).max(1);
     let minimum_packets = (RingPolicy::MIN_BYTES / packet_size).min(maximum_packets);
@@ -7598,13 +7696,18 @@ fn policy_ring(
     let requested = MpegTsRingConfig::for_bitrate(bitrate, duration, pre_roll)
         .map_err(|_| "the configured bitrate cannot be represented by the ring")?;
     // A paced viewer sits `pre_roll` behind the write head, and each provider
-    // burst pushes it further back. The stored or fallback bitrate is often
-    // far below the real one (a 720p60 channel runs near 8 Mbps against the
-    // 4 Mbps fallback), so a ring sized from it lets bursts overwrite the
-    // viewer. Paced rings therefore always take the full byte ceiling.
+    // burst pushes it further back. A measured peak and burst size the ring
+    // for that. Without a measurement, the estimate can be far below the real
+    // rate (a 720p60 channel runs near 8 Mbps against the 4 Mbps fallback),
+    // so the ring takes the full byte ceiling until the stream is measured.
     let capacity = if policy.pre_roll.is_zero() {
         requested
             .capacity_packets()
+            .clamp(minimum_packets, maximum_packets)
+    } else if let Some(bytes) = sizing.paced_bytes(policy.pre_roll) {
+        let packets = bytes.div_ceil(packet_size as u64);
+        usize::try_from(packets)
+            .unwrap_or(usize::MAX)
             .clamp(minimum_packets, maximum_packets)
     } else {
         maximum_packets
@@ -10173,6 +10276,7 @@ mod tests {
             key: HttpTsSessionKey::new("provider-private-id", "source-safe-id", 7),
             channel_name: Some("Channel".to_owned()),
             adapter: Some(iptv_media::SessionInputAdapter::Vlc),
+            rates: None,
             state,
             viewer_count: 2,
             upstream_generation: 3,
@@ -12749,6 +12853,8 @@ mod tests {
             quality_rank: 0,
             health_status: "alive".to_owned(),
             bitrate_kbps: Some(8_000),
+            measured_peak_kbps: None,
+            measured_burst_ms: None,
         }
     }
 
@@ -14511,6 +14617,11 @@ mod tests {
             provider_active_sessions: 1,
             provider_high_watermark: 1,
             provider_available_slots: 2,
+            measured_bitrate_kbps: Some(7_800),
+            peak_bitrate_kbps: Some(9_100),
+            burst_seconds: Some(14.25),
+            frame_rate: Some(59.94),
+            ring_seconds: Some(88.4),
         });
         assert_serializes(SaveResult {
             ok: true,

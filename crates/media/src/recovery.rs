@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use parking_lot::Mutex;
 use thiserror::Error;
 
-use crate::{HttpTsSessionKey, RingSnapshot, SessionInputAdapter};
+use crate::{HttpTsSessionKey, RingSnapshot, SessionInputAdapter, StreamRates};
 
 /// Longest recovery window. It matches the `media.recovery.window_seconds` range.
 pub const MAX_RECOVERY_WINDOW: Duration = Duration::from_mins(1);
@@ -162,6 +162,8 @@ pub struct HttpTsSessionSnapshot {
     /// Media milliseconds between each viewer and the newest data, one entry for
     /// each viewer in registration order. A viewer with no timing data has no entry.
     pub viewer_lead_millis: Vec<u64>,
+    /// Bitrate, burst and frame rate measured from the stream, when known.
+    pub rates: Option<StreamRates>,
     pub ring: RingSnapshot,
 }
 
@@ -347,6 +349,7 @@ impl SessionDiagnostics {
             first_failure: inner.first_failure,
             last_failure: inner.last_failure,
             viewer_lead_millis: Vec::new(),
+            rates: None,
             ring,
         }
     }

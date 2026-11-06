@@ -629,6 +629,7 @@ impl HttpTsSession {
             .into_iter()
             .filter_map(|(generation, sequence)| self.ring.lead_millis(generation, sequence))
             .collect();
+        snapshot.rates = self.ring.rates();
         snapshot
     }
 
@@ -1578,6 +1579,12 @@ impl ViewerHandle {
     /// uses it and opens no provider connection.
     pub fn passive_cursor(&self) -> crate::RingCursor {
         self.session.ring.subscribe()
+    }
+
+    /// Reads the session's measured rates without keeping the session or its
+    /// ring alive.
+    pub fn rate_reader(&self) -> crate::RingRateReader {
+        self.session.ring.rate_reader()
     }
 
     pub fn session_key(&self) -> &HttpTsSessionKey {
