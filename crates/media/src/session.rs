@@ -901,6 +901,23 @@ async fn start_process_http_ts_session(
     })
 }
 
+/// Fraction of the ring, in quarters, that a paced viewer may fall behind
+/// before it skips pacing to catch up.
+const CATCH_UP_QUARTERS: u64 = 3;
+
+/// True when the viewer at `sequence` is more than three quarters of the ring
+/// behind the write head. A provider burst can then overwrite it before it
+/// reads the data, so the viewer must catch up.
+fn near_overrun(ring: &MpegTsRing, generation: u64, sequence: u64) -> bool {
+    let snapshot = ring.snapshot();
+    if snapshot.generation != generation {
+        return false;
+    }
+    let behind = snapshot.next_sequence.saturating_sub(sequence);
+    let capacity = u64::try_from(snapshot.capacity_packets).unwrap_or(u64::MAX);
+    behind.saturating_mul(4) >= capacity.saturating_mul(CATCH_UP_QUARTERS)
+}
+
 fn monitor_process_input(ring: MpegTsRing, diagnostics: Arc<SessionDiagnostics>) {
     tokio::spawn(async move {
         let mut cursor = ring.subscribe_at_live_edge();
@@ -1633,7 +1650,16 @@ impl ViewerHandle {
                     RingRead::Packets {
                         generation, first_sequence, bytes
                     } => {
-                        if let Some(pacer) = pacer.as_mut() {
+                        if let Some(pacer) = pacer.as_mut()
+                            && near_overrun(&session_guard.ring, generation, first_sequence)
+                        {
+                            // The viewer is close to being overwritten. Send
+                            // at once, faster than real time, until it is back
+                            // inside the safe part of the ring. A short speed-up
+                            // is invisible to a buffering player; a lag skip
+                            // corrupts the stream.
+                            pacer.reset();
+                        } else if let Some(pacer) = pacer.as_mut() {
                             let hold = pacer.hold(
                                 crate::pacing::BatchPosition {
                                     sequence: first_sequence,
@@ -4834,6 +4860,28 @@ mod tests {
         // The test batch holds two packets. The last batch starts at PCR 8,
         // so it is due 8 s after the first.
         assert_eq!(start.elapsed(), Duration::from_secs(8));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_viewer_catches_up_before_a_burst_overwrites_it() {
+        // A 40-packet ring. The viewer is paced 1 s per PCR packet, and a
+        // second burst then leaves it 34 packets behind: past three quarters
+        // of the ring. It must send at once instead of holding, so the next
+        // burst cannot overwrite it.
+        let (viewer, ring, diagnostics) = local_viewer_with_delay(40, 0, Duration::from_secs(30));
+        ring.push(&paced_media(1_000 * PCR_SECOND, 10)).unwrap();
+        let mut stream = viewer.into_byte_stream();
+        next_chunk(&mut stream).await;
+        ring.push(&paced_media_with_psi(1_010 * PCR_SECOND, 8))
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        for _ in 0..3 {
+            next_chunk(&mut stream).await;
+        }
+        // Without catch-up, the batch that starts at PCR 1002 is due 2 s after
+        // the anchor.
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert_eq!(diagnostics.snapshot(ring.snapshot()).ring_lag_events, 0);
     }
 
     #[tokio::test(start_paused = true)]
