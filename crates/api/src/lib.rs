@@ -57,7 +57,8 @@ use uuid::Uuid;
 
 use crate::auth::{
     AuthManager, LoginError, OPERATOR_TOKEN_ADMIN_SCOPE, OPERATOR_TOKEN_CONTROL_SCOPE,
-    OPERATOR_TOKEN_OUTPUT_SCOPE, OPERATOR_TOKEN_READ_SCOPE, OperatorTokenRecord,
+    OPERATOR_TOKEN_OUTPUT_SCOPE, OPERATOR_TOKEN_READ_SCOPE, OperatorTokenRecord, SessionUser,
+    StoredUserCredential, role_scopes,
 };
 use crate::oidc::OidcError;
 
@@ -1691,9 +1692,14 @@ fn write_prometheus_counter(output: &mut String, name: &str, help: &str, value: 
 
 #[utoipa::path(get, path = "/api/v1/auth/status", tag = "authentication", responses((status = 200, body = AuthStatus)))]
 async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let authenticated = state.auth.authorize(&headers, false).is_some();
+    let user = state.auth.authorize(&headers, false).map(|_| {
+        state
+            .auth
+            .session_user(&headers)
+            .unwrap_or_else(SessionUser::built_in_operator)
+    });
     let mut response =
-        Json(auth_status_body(authenticated, state.auth.oidc_enabled())).into_response();
+        Json(auth_status_body(user.as_ref(), state.auth.oidc_enabled())).into_response();
     if let Some(cookie) = state.auth.ensure_csrf_cookie(&headers) {
         response.headers_mut().append(
             header::SET_COOKIE,
@@ -1871,11 +1877,21 @@ async fn login(
         return invalid_auth_request();
     };
     if state.auth.dev_auth_disabled() {
-        return Json(auth_status_body(true, state.auth.oidc_enabled())).into_response();
+        let user = SessionUser::built_in_operator();
+        return Json(auth_status_body(Some(&user), state.auth.oidc_enabled())).into_response();
     }
+    let stored = match stored_user_credential(&state, &request.username).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            tracing::warn!(error = %error, "sign-in could not read the user account");
+            return authentication_unavailable(
+                "the authentication service could not read the user account",
+            );
+        }
+    };
     let verified = match state
         .auth
-        .verify_login(&headers, request.username, request.password)
+        .verify_login(&headers, request.username, request.password, stored)
         .await
     {
         Ok(verified) => verified,
@@ -1898,34 +1914,32 @@ async fn login(
             .response();
         }
         Err(LoginError::Unavailable) => {
-            return ProblemDetails::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication-unavailable",
-                "Authentication unavailable",
+            return authentication_unavailable(
                 "the authentication service could not create a secure session",
-            )
-            .response();
+            );
         }
     };
-    if state.disable_bootstrap_bearer().await.is_err() {
-        return ProblemDetails::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "authentication-unavailable",
-            "Authentication unavailable",
+    let user = verified.user().clone();
+    let full_access = user
+        .scopes
+        .iter()
+        .any(|scope| scope == OPERATOR_TOKEN_ADMIN_SCOPE);
+    if full_access && state.disable_bootstrap_bearer().await.is_err() {
+        return authentication_unavailable(
             "the authentication service could not update the bootstrap authorization state",
-        )
-        .response();
+        );
+    }
+    if let (Some(catalog), Ok(id)) = (&state.catalog_repository, Uuid::parse_str(&user.id))
+        && let Err(error) = catalog.record_user_login(id).await
+    {
+        tracing::warn!(error = %error, "sign-in could not record the login time");
     }
     let session = match state.auth.complete_login(verified) {
         Ok(session) => session,
         Err(LoginError::Unavailable) => {
-            return ProblemDetails::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication-unavailable",
-                "Authentication unavailable",
+            return authentication_unavailable(
                 "the authentication service could not create a secure session",
-            )
-            .response();
+            );
         }
         Err(LoginError::CsrfValidationFailed | LoginError::InvalidCredentials) => {
             return ProblemDetails::new(
@@ -1937,7 +1951,8 @@ async fn login(
             .response();
         }
     };
-    let mut response = Json(auth_status_body(true, state.auth.oidc_enabled())).into_response();
+    let mut response =
+        Json(auth_status_body(Some(&user), state.auth.oidc_enabled())).into_response();
     response.headers_mut().append(
         header::SET_COOKIE,
         HeaderValue::from_str(&session.session_cookie).expect("generated session cookie is valid"),
@@ -2277,16 +2292,62 @@ fn operator_token_not_found() -> Response {
     .response()
 }
 
-fn auth_status_body(authenticated: bool, oidc_enabled: bool) -> AuthStatus {
+fn auth_status_body(user: Option<&SessionUser>, oidc_enabled: bool) -> AuthStatus {
     AuthStatus {
-        authenticated,
-        user: authenticated.then(|| AuthUser {
-            id: "operator-1".to_owned(),
-            username: "operator".to_owned(),
-            display_name: "Relay operator".to_owned(),
+        authenticated: user.is_some(),
+        user: user.map(|user| AuthUser {
+            id: user.id.clone(),
+            username: user.username.clone(),
+            display_name: user.display_name.clone(),
         }),
         oidc_enabled: oidc_enabled.then_some(true),
     }
+}
+
+/// Reads the stored credentials of an enabled account that the users API
+/// created. Returns `None` for the built-in operator, for an unknown or
+/// disabled account, for an unknown role, and when no database is configured.
+async fn stored_user_credential(
+    state: &AppState,
+    username: &str,
+) -> Result<Option<StoredUserCredential>, PersistenceError> {
+    let Some(catalog) = &state.catalog_repository else {
+        return Ok(None);
+    };
+    if username == "operator" || username.is_empty() || username.len() > 128 {
+        return Ok(None);
+    }
+    let Some(row) = catalog.get_user_by_username(username).await? else {
+        return Ok(None);
+    };
+    let Some(scopes) = role_scopes(&row.role).filter(|_| row.enabled) else {
+        return Ok(None);
+    };
+    let Some((id, password_hash)) = catalog.get_user_password_hash(username).await? else {
+        return Ok(None);
+    };
+    if id != row.id {
+        return Ok(None);
+    }
+    Ok(Some(StoredUserCredential {
+        user: SessionUser {
+            id: row.id.to_string(),
+            username: row.username,
+            display_name: row.display_name,
+            scopes,
+        },
+        password_hash,
+    }))
+}
+
+fn authentication_unavailable(detail: &str) -> Response {
+    ProblemDetails::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "authentication-unavailable",
+        "Authentication unavailable",
+        detail,
+    )
+    .response()
 }
 
 fn invalid_auth_request() -> Response {
@@ -8366,7 +8427,7 @@ async fn create_user(
     headers: HeaderMap,
     Json(body): Json<CreateUserRequest>,
 ) -> Response {
-    if let Some(response) = require_admin_mutation(&state, &headers) {
+    if let Some(response) = require_scope(&state, &headers, OPERATOR_TOKEN_ADMIN_SCOPE, true) {
         return response;
     }
     let Some(repo) = state.catalog_repository.as_ref() else {
@@ -8433,7 +8494,7 @@ async fn update_user(
     Path(user_id): Path<Uuid>,
     Json(body): Json<UpdateUserRequest>,
 ) -> Response {
-    if let Some(response) = require_admin_mutation(&state, &headers) {
+    if let Some(response) = require_scope(&state, &headers, OPERATOR_TOKEN_ADMIN_SCOPE, true) {
         return response;
     }
     let Some(repo) = state.catalog_repository.as_ref() else {
@@ -8502,7 +8563,7 @@ async fn delete_user(
     headers: HeaderMap,
     Path(user_id): Path<Uuid>,
 ) -> Response {
-    if let Some(response) = require_admin_mutation(&state, &headers) {
+    if let Some(response) = require_scope(&state, &headers, OPERATOR_TOKEN_ADMIN_SCOPE, true) {
         return response;
     }
     let Some(repo) = state.catalog_repository.as_ref() else {
@@ -13520,6 +13581,116 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        drop(app);
+        drop_isolated_database(&admin, database, schema).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_created_user_signs_in_with_its_role() {
+        let (admin, database, schema) = isolated_database().await;
+        let app = router(state_with_database(Some(database.clone())));
+        let created = app
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                "/api/v1/users",
+                Some(
+                    r#"{"username":"joel","displayName":"Joel","password":"joel-password","role":"operator"}"#
+                        .to_owned(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/auth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookies = response_cookies(&status);
+        let sign_in = |password: &'static str| {
+            Request::post("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, request_cookie_header(&cookies))
+                .header("x-csrf-token", cookie_value(&cookies, "iptv_csrf"))
+                .body(Body::from(format!(
+                    r#"{{"username":"joel","password":"{password}"}}"#
+                )))
+                .unwrap()
+        };
+        let rejected = app
+            .clone()
+            .oneshot(sign_in("admin-password"))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        let login = app.clone().oneshot(sign_in("joel-password")).await.unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let session_cookies = response_cookies(&login);
+        let body: serde_json::Value = serde_json::from_str(&response_text(login).await).unwrap();
+        assert_eq!(body["user"]["username"], "joel");
+        assert_eq!(body["user"]["displayName"], "Joel");
+
+        let session_request = |method: &str, uri: &str, body: Option<&str>| {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::COOKIE, request_cookie_header(&session_cookies))
+                .header("x-csrf-token", cookie_value(&session_cookies, "iptv_csrf"));
+            if body.is_some() {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+            }
+            request
+                .body(body.map_or_else(Body::empty, |body| Body::from(body.to_owned())))
+                .unwrap()
+        };
+        let status = app
+            .clone()
+            .oneshot(session_request("GET", "/api/v1/auth/status", None))
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&response_text(status).await).unwrap();
+        assert_eq!(status["authenticated"], true);
+        assert_eq!(status["user"]["username"], "joel");
+        let listed = app
+            .clone()
+            .oneshot(session_request("GET", "/api/v1/users", None))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed: serde_json::Value = serde_json::from_str(&response_text(listed).await).unwrap();
+        let joel = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|user| user["username"] == "joel")
+            .unwrap();
+        assert!(!joel["lastLoginAt"].is_null());
+        let escalation = app
+            .clone()
+            .oneshot(session_request(
+                "POST",
+                "/api/v1/users",
+                Some(r#"{"username":"joel-admin","displayName":"Joel","password":"password","role":"admin"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(escalation.status(), StatusCode::FORBIDDEN);
+
+        // An operator sign-in keeps the bootstrap bearer token working.
+        let bootstrap = app
+            .clone()
+            .oneshot(admin_request("GET", "/api/v1/users", None))
+            .await
+            .unwrap();
+        assert_eq!(bootstrap.status(), StatusCode::OK);
 
         drop(app);
         drop_isolated_database(&admin, database, schema).await;
