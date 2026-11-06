@@ -1140,7 +1140,7 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "iptv-api"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "argon2",
  "async-stream",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-domain"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "chrono",
  "serde",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-gateway"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-ingest"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "axum",
  "base64",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-live-acceptance"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-media"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "async-stream",
  "axum",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-parsers"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64",
  "chrono",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-persistence"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "iptv-sports"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "ab_glyph",
  "chrono",
