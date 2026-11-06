@@ -33,8 +33,8 @@ pub use process::{
     ProcessFailureStage, ProcessInputSession, VlcInputAdapter,
 };
 pub use recovery::{
-    HttpTsSessionSnapshot, MAX_RECOVERY_WINDOW, RecoveryConfigError, RecoveryPolicy,
-    SessionFailureKind, SessionState,
+    DEFAULT_RECOVERY_WINDOW, HttpTsSessionSnapshot, MAX_RECOVERY_WINDOW, RecoveryConfigError,
+    RecoveryPolicy, SessionFailureKind, SessionState,
 };
 pub use registry::SharedSessionRegistry;
 pub use ring::{

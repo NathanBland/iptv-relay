@@ -294,6 +294,11 @@ impl HttpTsSourceSpec {
     pub fn set_recovery_policy(&mut self, recovery: RecoveryPolicy) {
         self.recovery = recovery;
     }
+
+    /// Returns the recovery policy of this source.
+    pub fn recovery_policy(&self) -> RecoveryPolicy {
+        self.recovery
+    }
 }
 
 impl PartialEq for HttpTsSourceSpec {

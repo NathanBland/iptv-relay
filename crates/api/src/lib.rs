@@ -35,7 +35,7 @@ use iptv_domain::{
 use iptv_media::{
     AcquireError, HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSessionSnapshot,
     HttpTsSourceSpec, InputAdapterPolicy, MpegTsRingConfig, PoolSnapshot, ProviderSpec,
-    SessionFailureKind, SessionStartError, SessionState, SlotLease, ViewerHandle,
+    RecoveryPolicy, SessionFailureKind, SessionStartError, SessionState, SlotLease, ViewerHandle,
     slate::{MeasuredStreamProfile, SlateOptions, SlateProfile, SlatedOpen, open_with_slates},
 };
 use iptv_persistence::{
@@ -123,6 +123,8 @@ pub struct AppState {
     catalog_repository: Option<CatalogRepository>,
     jellyfin_setup: Arc<RwLock<JellyfinSetup>>,
     master_key: MasterKey,
+    /// ESPN client for the manual event scan. `None` in tests.
+    sports: Option<iptv_sports::EspnClient>,
 }
 
 impl fmt::Debug for AppState {
@@ -146,6 +148,7 @@ impl fmt::Debug for AppState {
             .field("catalog_repository", &self.catalog_repository)
             .field("jellyfin_setup", &self.jellyfin_setup)
             .field("master_key", &self.master_key)
+            .field("sports", &self.sports)
             .finish()
     }
 }
@@ -193,7 +196,21 @@ impl AppState {
                 &config.output_token,
             ))),
             master_key: config.master_key,
+            sports: None,
         }
+    }
+
+    /// Sets the ESPN client that manual event scans use.
+    ///
+    /// Without a client, a manual scan skips the sports enrichment.
+    #[must_use]
+    pub fn with_sports(mut self, client: iptv_sports::EspnClient) -> Self {
+        self.catalog_repository = self
+            .catalog_repository
+            .take()
+            .map(|repository| repository.with_sports(client.clone()));
+        self.sports = Some(client);
+        self
     }
 
     pub fn catalog(&self) -> Arc<RwLock<CatalogSnapshot>> {
@@ -2370,6 +2387,12 @@ async fn system_info_value(state: &AppState) -> SystemInfo {
         }
     }
     if pools.is_empty() {
+        if let Some(repository) = &state.catalog_repository {
+            match repository.provider_capacity().await {
+                Ok(capacity) => provider_limit = usize::try_from(capacity).unwrap_or(0),
+                Err(error) => warn!(%error, "cannot read provider capacity"),
+            }
+        }
         let catalog = state.catalog.read().await;
         for source in catalog.stream_sources.values() {
             if pools.insert(Arc::clone(&source.provider_pool_id))
@@ -5757,12 +5780,10 @@ async fn scan_event_channels(
     let Some(catalog) = &state.catalog_repository else {
         return persistence_unavailable();
     };
+    let mut settings = catalog.event_scan_settings().await;
+    settings.sports.clone_from(&state.sports);
     match catalog
-        .scan_event_channels_report(
-            id,
-            Utc::now(),
-            &iptv_persistence::EventScanSettings::default(),
-        )
+        .scan_event_channels_report(id, Utc::now(), &settings)
         .await
     {
         Ok(report) => Json(event_scan_response(report)).into_response(),
@@ -7238,7 +7259,12 @@ fn database_source_spec(
     let ring =
         policy_ring(bitrate, policy).map_err(|detail| Box::new(invalid_buffer_policy(detail)))?;
     let primary_url = decrypt_stream_url(state, primary)?;
-    let adapter_policy = input_adapter_policy(&primary.input_adapter)?;
+    // A stream with the stored value `auto` has no explicit adapter. The
+    // operator setting `media.adapter` applies to it. An explicit value wins.
+    let adapter_policy = match input_adapter_policy(&primary.input_adapter)? {
+        InputAdapterPolicy::Auto => policy.adapter,
+        explicit => explicit,
+    };
     let primary_pool_id: Arc<str> = primary.provider_pool_id.to_string().into();
     let mut spec = HttpTsSourceSpec::new(
         HttpTsSessionKey::new(
@@ -7252,6 +7278,11 @@ fn database_source_spec(
     spec.set_channel_name(plan.channel_name.clone());
     spec.set_viewer_delay(policy.pre_roll);
     spec.set_adapter_policy(adapter_policy);
+    // The setting range is 0..=60 seconds, so the window is always in bounds.
+    // Out-of-range values keep the default policy.
+    if let Ok(recovery) = RecoveryPolicy::with_window(policy.recovery_window) {
+        spec.set_recovery_policy(recovery);
+    }
     if let Ok(alternatives) =
         serde_json::from_value::<Vec<String>>(primary.alternative_base_urls.clone())
     {
@@ -7456,6 +7487,10 @@ struct RingPolicy {
     duration: Duration,
     max_bytes: usize,
     pre_roll: Duration,
+    /// How long viewers stay connected while the session recovers.
+    recovery_window: Duration,
+    /// Input adapter for streams that have no explicit adapter.
+    adapter: InputAdapterPolicy,
 }
 
 impl RingPolicy {
@@ -7488,6 +7523,14 @@ impl RingPolicy {
                 .unwrap_or(defaults.max_bytes),
             pre_roll: integer("media.viewer.start_delay_seconds")
                 .map_or(defaults.pre_roll, Duration::from_secs),
+            recovery_window: integer("media.recovery.window_seconds")
+                .map_or(defaults.recovery_window, Duration::from_secs),
+            adapter: settings
+                .iter()
+                .find(|setting| setting.definition.key == "media.adapter")
+                .and_then(|setting| setting.value.as_str())
+                .and_then(|value| input_adapter_policy(value).ok())
+                .unwrap_or(defaults.adapter),
         }
     }
 }
@@ -7498,6 +7541,8 @@ impl Default for RingPolicy {
             duration: Duration::from_secs(Self::DEFAULT_DURATION_SECONDS),
             max_bytes: Self::DEFAULT_MAX_BYTES,
             pre_roll: Duration::from_secs(Self::DEFAULT_PRE_ROLL_SECONDS),
+            recovery_window: iptv_media::DEFAULT_RECOVERY_WINDOW,
+            adapter: InputAdapterPolicy::Auto,
         }
     }
 }
@@ -12671,6 +12716,233 @@ mod tests {
         assert_ne!(playback_generation(&changed), generation);
     }
 
+    fn policy_with(overrides: &[(&str, serde_json::Value)]) -> RingPolicy {
+        let mut set = iptv_domain::SettingOverrides::default();
+        for (key, value) in overrides {
+            set.global.insert((*key).to_owned(), value.clone());
+        }
+        RingPolicy::from_settings(&resolve_settings(&set, "", "").unwrap())
+    }
+
+    fn single_candidate_plan(input_adapter: &str) -> ChannelPlaybackPlan {
+        let mut candidate = playback_candidate(Uuid::now_v7(), Uuid::now_v7(), 1);
+        candidate.input_adapter = input_adapter.to_owned();
+        ChannelPlaybackPlan {
+            channel_id: candidate.channel_id,
+            channel_name: candidate.channel_name.clone(),
+            channel_revision: candidate.channel_revision,
+            candidates: vec![candidate],
+        }
+    }
+
+    #[test]
+    fn media_adapter_setting_is_the_default_for_streams_without_an_explicit_adapter() {
+        let app_state = state();
+        let setting = [("media.adapter", serde_json::json!("vlc"))];
+        let policy = policy_with(&setting);
+        // `auto` is the stored value of a stream with no explicit adapter.
+        let spec =
+            database_source_spec(&app_state, &single_candidate_plan("auto"), policy).unwrap();
+        assert_eq!(spec.adapter_policy(), InputAdapterPolicy::Vlc);
+        // An explicit per-stream adapter wins over the setting.
+        let spec =
+            database_source_spec(&app_state, &single_candidate_plan("ffmpeg"), policy).unwrap();
+        assert_eq!(spec.adapter_policy(), InputAdapterPolicy::Ffmpeg);
+        // Without an override, the default stays `auto`.
+        let spec =
+            database_source_spec(&app_state, &single_candidate_plan("auto"), policy_with(&[]))
+                .unwrap();
+        assert_eq!(spec.adapter_policy(), InputAdapterPolicy::Auto);
+    }
+
+    #[test]
+    fn recovery_window_setting_sets_the_source_recovery_policy() {
+        let app_state = state();
+        let plan = single_candidate_plan("native-ts");
+        let spec = database_source_spec(&app_state, &plan, policy_with(&[])).unwrap();
+        assert_eq!(
+            spec.recovery_policy().max_window(),
+            iptv_media::DEFAULT_RECOVERY_WINDOW
+        );
+        let long = policy_with(&[("media.recovery.window_seconds", serde_json::json!(45))]);
+        let spec = database_source_spec(&app_state, &plan, long).unwrap();
+        assert_eq!(spec.recovery_policy().max_window(), Duration::from_secs(45));
+        let off = policy_with(&[("media.recovery.window_seconds", serde_json::json!(0))]);
+        let spec = database_source_spec(&app_state, &plan, off).unwrap();
+        assert!(spec.recovery_policy().max_window().is_zero());
+    }
+
+    /// Counts the requests that reach a local stand-in for the ESPN API.
+    async fn spawn_counting_espn_mock() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buffer = vec![0_u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{address}"), count)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_manual_scan_uses_the_state_sports_client_and_operator_settings() {
+        let (admin, database, schema) = isolated_database().await;
+        let pool = database.pool().clone();
+        let account_id = Uuid::now_v7();
+        let snapshot_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, name, source_type, base_url_template) VALUES ($1, 'scan-source', 'm3u', 'https://provider.test/')",
+        )
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO source_snapshots (id, provider_account_id, kind, status, checksum_sha256, byte_count, activated_at) VALUES ($1, $2, 'm3u', 'active', 'scan-checksum', 1, now())",
+        )
+        .bind(snapshot_id)
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The event starts in the future, so that the scan schedules it.
+        let start = (Utc::now() + chrono::Duration::hours(12)).format("%Y-%m-%d %H:%M:%S");
+        let stop = (Utc::now() + chrono::Duration::hours(15)).format("%Y-%m-%d %H:%M:%S");
+        let name = format!("MLB 01:  Brewers x Rays start:{start} stop:{stop} [1080p]");
+        let stream_id = Uuid::now_v7();
+        let channel_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO provider_streams (id, snapshot_id, provider_account_id, stable_key, name, group_name, url_template, attributes, directives, supported) VALUES ($1, $2, $3, 'scan-1', $4, 'Sports', 'https://provider.test/stream', '{}'::jsonb, '[]'::jsonb, true)",
+        )
+        .bind(stream_id)
+        .bind(snapshot_id)
+        .bind(account_id)
+        .bind(&name)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO channels (id, channel_number, name) VALUES ($1, '901', $2)")
+            .bind(channel_id)
+            .bind(&name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO channel_streams (channel_id, provider_stream_id, priority) VALUES ($1, $2, 0)",
+        )
+        .bind(channel_id)
+        .bind(stream_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (base_url, requests) = spawn_counting_espn_mock().await;
+        let client = iptv_sports::EspnClient::with_config(iptv_sports::EspnClientConfig {
+            base_url,
+            ..iptv_sports::EspnClientConfig::default()
+        })
+        .unwrap();
+        let app = router(state_with_database(Some(database.clone())).with_sports(client));
+        let overrides = r#"{"overrides":{"events.filler_title":"Stand by"}}"#.to_owned();
+        let response = app
+            .clone()
+            .oneshot(admin_request(
+                "PUT",
+                "/api/v1/settings/overrides/global",
+                Some(overrides),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{}",
+            response_text(response).await
+        );
+        let template_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM event_templates ORDER BY id = '8b2d571e-91de-7000-8000-00000000e000' DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let response = app
+            .oneshot(admin_request(
+                "POST",
+                format!("/api/v1/event-templates/{template_id}/scan"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: serde_json::Value =
+            serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(report["scheduled"], 1, "{report}");
+        // The scan asked the state client for sports data.
+        assert!(
+            requests.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the manual scan did not use the ESPN client"
+        );
+        // The scan used the operator filler title.
+        let ended: String = sqlx::query_scalar(
+            "SELECT title FROM generated_programmes WHERE channel_id = $1 ORDER BY starts_at DESC LIMIT 1",
+        )
+        .bind(channel_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ended, "Stand by");
+        drop_isolated_database(&admin, database, schema).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_system_provider_limit_reads_sources_when_no_session_is_active() {
+        let (admin, database, schema) = isolated_database().await;
+        let pool = database.pool().clone();
+        for (name, max_connections, enabled) in [
+            ("limit-a", 3_i32, true),
+            ("limit-b", 2, true),
+            ("limit-off", 9, false),
+        ] {
+            sqlx::query(
+                "INSERT INTO provider_accounts (id, name, source_type, base_url_template, max_connections, enabled) VALUES ($1, $2, 'm3u', 'https://provider.test/', $3, $4)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(name)
+            .bind(max_connections)
+            .bind(enabled)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let app = router(state_with_database(Some(database.clone())));
+        let response = app
+            .oneshot(admin_request("GET", "/api/v1/system", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&response_text(response).await).unwrap();
+        assert_eq!(body["providerLimit"], 5);
+        assert_eq!(body["providerConnections"], 0);
+        drop_isolated_database(&admin, database, schema).await;
+    }
+
     #[tokio::test]
     async fn database_source_spec_uses_supported_input_adapters_and_redacts_invalid_values() {
         let app_state = state();
@@ -12819,6 +13091,7 @@ mod tests {
                 duration: Duration::from_secs(90),
                 max_bytes: 48 * 1024 * 1024,
                 pre_roll: Duration::from_secs(5),
+                ..RingPolicy::default()
             }
         );
 

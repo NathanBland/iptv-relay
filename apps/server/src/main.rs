@@ -19,7 +19,7 @@ use iptv_media::{
 use iptv_persistence::NewJob;
 use iptv_persistence::{
     CatalogRepository, DEFAULT_RECONCILIATION_BATCH_SIZE, Database, EpgMappingStats,
-    EventScanSettings, IngestCleanupRepository, JobRecord, JobRepository, MasterKey,
+    IngestCleanupRepository, JobRecord, JobRepository, MasterKey,
     ProviderReconciliationFinalization, ProviderReconciliationPhase,
     ProviderReconciliationProgress, ProviderReconciliationUpdate, ReconcileStats, SourceKind,
     SourceRepository, StreamHealthUpdate, StreamProbeTargetRow,
@@ -307,7 +307,12 @@ async fn serve() -> Result<()> {
     let environment = server_environment()?;
     let bind = environment.bind;
     let config = environment.into_config(runtime_versions().await);
-    let state = AppState::new(Some(database), config);
+    let mut state = AppState::new(Some(database), config);
+    // An ESPN failure never stops a scan. Without a client, a manual scan uses parsed values.
+    match iptv_sports::EspnClient::new() {
+        Ok(client) => state = state.with_sports(client),
+        Err(error) => warn!(%error, "ESPN client did not start; manual scans skip sports data"),
+    }
     state
         .initialize_auth()
         .await
@@ -911,6 +916,7 @@ impl SourceRefresher for M3uRefresher {
                 SnapshotOwner::ProviderAccount(context.source.id),
                 IngestFormat::M3u,
             );
+            let limits = ingest_limits(context.catalog, context.source.id).await;
             let result = Ingestor::new(
                 context.protector,
                 context.control.clone(),
@@ -919,6 +925,7 @@ impl SourceRefresher for M3uRefresher {
                     reconciliation_partition_count(),
                 )),
             )
+            .with_limits(limits.artifact, limits.parse)
             .run(&request)
             .await
             .map_err(RefreshError::Ingest)?;
@@ -945,11 +952,13 @@ impl SourceRefresher for XmltvRefresher {
                 SnapshotOwner::EpgSource(context.source.id),
                 IngestFormat::Xmltv,
             );
+            let limits = ingest_limits(context.catalog, context.source.id).await;
             let result = Ingestor::new(
                 context.protector,
                 context.control.clone(),
                 context.snapshots.clone(),
             )
+            .with_limits(limits.artifact, limits.parse)
             .run(&request)
             .await
             .map_err(RefreshError::Ingest)?;
@@ -983,6 +992,7 @@ impl SourceRefresher for XtreamRefresher {
                 context.control.clone(),
                 context.protector,
                 context.snapshots,
+                ingest_limits(context.catalog, context.source.id).await,
             )
             .await?;
             let deferred = schedule_provider_reconciliation(
@@ -1214,13 +1224,68 @@ async fn run_provider_reconciliation_partition_job(
     }
 }
 
+/// Download and parse limits for one source refresh.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IngestLimits {
+    artifact: ArtifactLimits,
+    parse: iptv_parsers::ParseLimits,
+}
+
+impl IngestLimits {
+    /// Reads `ingest.max_download_bytes` and `ingest.max_m3u_line_bytes`.
+    ///
+    /// A missing key keeps the default. The decoded size limit never falls
+    /// below the download limit, so a larger download limit takes effect.
+    fn from_settings(settings: &[iptv_domain::EffectiveSetting]) -> Self {
+        let integer = |key: &str| {
+            settings
+                .iter()
+                .find(|setting| setting.definition.key == key)
+                .and_then(|setting| setting.value.as_u64())
+        };
+        let mut artifact = ArtifactLimits::default();
+        if let Some(bytes) = integer("ingest.max_download_bytes") {
+            artifact.max_download_bytes = bytes;
+            artifact.max_decoded_bytes = artifact.max_decoded_bytes.max(bytes);
+        }
+        let mut parse = iptv_parsers::ParseLimits {
+            max_input_bytes: artifact.max_decoded_bytes,
+            max_records: 2_000_000,
+            ..iptv_parsers::ParseLimits::default()
+        };
+        if let Some(bytes) =
+            integer("ingest.max_m3u_line_bytes").and_then(|v| usize::try_from(v).ok())
+        {
+            parse.max_line_bytes = bytes;
+        }
+        Self { artifact, parse }
+    }
+}
+
+/// Resolves the ingest limits of one provider from the operator settings.
+///
+/// A settings failure must not stop a refresh, so this falls back to defaults.
+async fn ingest_limits(catalog: &CatalogRepository, provider_id: Uuid) -> IngestLimits {
+    match catalog
+        .effective_settings(&provider_id.to_string(), "")
+        .await
+    {
+        Ok(settings) => IngestLimits::from_settings(&settings),
+        Err(error) => {
+            warn!(%error, "cannot load ingest settings; using default limits");
+            IngestLimits::from_settings(&[])
+        }
+    }
+}
+
 /// Scans event channels and prunes ended events after a catalog publication.
 ///
 /// A scan error does not fail the refresh job. The published catalog and the
 /// guide mappings stay valid, and the next refresh scans again.
 async fn refresh_event_guides_after_publication(catalog: &CatalogRepository) {
+    let settings = catalog.event_scan_settings().await;
     match catalog
-        .refresh_event_guides(chrono::Utc::now(), &EventScanSettings::default())
+        .refresh_event_guides(chrono::Utc::now(), &settings)
         .await
     {
         Ok(report) => info!(
@@ -1524,6 +1589,7 @@ async fn run_xtream_short_epg_refresh(
     job: &JobRecord,
 ) -> std::result::Result<IngestResult, RefreshError> {
     let source_id = source_id_from_payload(&job.payload).ok_or(RefreshError::InvalidPayload)?;
+    let limits = ingest_limits(catalog, source_id).await;
     let source = sources.load_for_job(source_id).await.map_err(|error| {
         warn!(source_id = %source_id, error = %error, "failed to load Xtream source for short EPG refresh");
         RefreshError::SourceLoad
@@ -1559,6 +1625,7 @@ async fn run_xtream_short_epg_refresh(
         endpoints.authentication_request(),
         XtreamPayloadKind::Auth,
         &source.timezone,
+        limits,
     )
     .await
     .map_err(RefreshError::Ingest)?;
@@ -1627,6 +1694,7 @@ async fn run_xtream_short_epg_refresh(
             ),
             XtreamPayloadKind::ShortEpg,
             &source.timezone,
+            limits,
         )
         .await;
         let payload = match payload {
@@ -2199,6 +2267,7 @@ async fn run_xtream_refresh(
     control: WorkerJobControl,
     protector: StreamEndpointProtector,
     snapshots: &PgSnapshotStore,
+    limits: IngestLimits,
 ) -> std::result::Result<IngestResult, RefreshError> {
     let endpoints = XtreamEndpoints::from_player_api_url(endpoint.as_str()).map_err(|error| {
         info!(source_id = %source_id, error = %error, "Xtream endpoint validation failed");
@@ -2226,6 +2295,7 @@ async fn run_xtream_refresh(
         endpoints.authentication_request(),
         XtreamPayloadKind::Auth,
         &source_timezone,
+        limits,
     )
     .await
     .map_err(RefreshError::Ingest)?;
@@ -2258,6 +2328,7 @@ async fn run_xtream_refresh(
         endpoints.live_categories_request(),
         XtreamPayloadKind::LiveCategories,
         &source_timezone,
+        limits,
     )
     .await
     {
@@ -2316,16 +2387,17 @@ async fn fetch_xtream_payload(
     request: DownloadRequest,
     kind: XtreamPayloadKind,
     source_timezone: &str,
+    limits: IngestLimits,
 ) -> std::result::Result<XtreamPayload, IngestError> {
-    let downloaded = download_http(&request, ArtifactLimits::default()).await.map_err(|error| {
+    let artifact_limits = limits.artifact;
+    let downloaded = download_http(&request, artifact_limits).await.map_err(|error| {
         info!(kind = ?kind, request = ?request, error = %error, "Xtream payload download failed");
         error
     })?;
     let downloaded_bytes = downloaded.byte_count;
-    let decoded =
-        tokio::task::spawn_blocking(move || unpack_artifact(downloaded, ArtifactLimits::default()))
-            .await
-            .map_err(|_| IngestError::ArtifactIo(std::io::Error::other("decode task failed")))??;
+    let decoded = tokio::task::spawn_blocking(move || unpack_artifact(downloaded, artifact_limits))
+        .await
+        .map_err(|_| IngestError::ArtifactIo(std::io::Error::other("decode task failed")))??;
     let decoded_bytes = decoded.decoded_byte_count;
     let checksum_sha256 = decoded.sha256.clone();
     let source_timezone = source_timezone.to_owned();
@@ -2333,7 +2405,7 @@ async fn fetch_xtream_payload(
         parse_artifact_with_source_timezone(
             &decoded,
             IngestFormat::Xtream(kind),
-            iptv_parsers::ParseLimits::default(),
+            limits.parse,
             &source_timezone,
         )
     })
@@ -3009,6 +3081,34 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ingest_limits_follow_the_operator_settings() {
+        let resolve = |overrides: &[(&str, serde_json::Value)]| {
+            let mut set = iptv_domain::SettingOverrides::default();
+            for (key, value) in overrides {
+                set.global.insert((*key).to_owned(), value.clone());
+            }
+            IngestLimits::from_settings(&iptv_domain::resolve_settings(&set, "", "").unwrap())
+        };
+        let defaults = resolve(&[]);
+        assert_eq!(defaults.artifact.max_download_bytes, 2_147_483_648);
+        assert_eq!(defaults.parse.max_line_bytes, 1_048_576);
+
+        let changed = resolve(&[
+            ("ingest.max_download_bytes", serde_json::json!(4_194_304)),
+            ("ingest.max_m3u_line_bytes", serde_json::json!(8_192)),
+        ]);
+        assert_eq!(changed.artifact.max_download_bytes, 4_194_304);
+        assert_eq!(changed.parse.max_line_bytes, 8_192);
+
+        // A download limit above the decoded limit raises the decoded limit.
+        let large = resolve(&[(
+            "ingest.max_download_bytes",
+            serde_json::json!(8_589_934_592_u64),
+        )]);
+        assert_eq!(large.artifact.max_decoded_bytes, 8_589_934_592);
+    }
     use super::*;
     use axum::{
         Json, Router,

@@ -7,7 +7,10 @@ use thiserror::Error;
 
 use crate::{HttpTsSessionKey, RingSnapshot, SessionInputAdapter};
 
-pub const MAX_RECOVERY_WINDOW: Duration = Duration::from_secs(10);
+/// Longest recovery window. It matches the `media.recovery.window_seconds` range.
+pub const MAX_RECOVERY_WINDOW: Duration = Duration::from_mins(1);
+/// Recovery window when no operator setting applies.
+pub const DEFAULT_RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionState {
@@ -47,7 +50,7 @@ pub struct RecoveryPolicy {
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum RecoveryConfigError {
-    #[error("recovery window cannot exceed ten seconds")]
+    #[error("recovery window cannot exceed sixty seconds")]
     WindowTooLarge,
     #[error("enabled recovery intervals and priming timeout must be non-zero")]
     ZeroInterval,
@@ -56,7 +59,7 @@ pub enum RecoveryConfigError {
 impl Default for RecoveryPolicy {
     fn default() -> Self {
         Self {
-            max_window: MAX_RECOVERY_WINDOW,
+            max_window: DEFAULT_RECOVERY_WINDOW,
             retry_delay: Duration::from_millis(250),
             keepalive_interval: Duration::from_millis(100),
             priming_timeout: Duration::from_secs(2),
@@ -69,7 +72,7 @@ impl RecoveryPolicy {
     ///
     /// # Errors
     ///
-    /// Returns an error if the recovery window exceeds ten seconds or an
+    /// Returns an error if the recovery window exceeds sixty seconds or an
     /// enabled recovery policy has a zero interval.
     pub fn new(
         max_window: Duration,
@@ -91,6 +94,26 @@ impl RecoveryPolicy {
             keepalive_interval,
             priming_timeout,
         })
+    }
+
+    /// Creates a policy with the default intervals and the given window.
+    ///
+    /// A zero window disables recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the window exceeds [`MAX_RECOVERY_WINDOW`].
+    pub fn with_window(window: Duration) -> Result<Self, RecoveryConfigError> {
+        if window.is_zero() {
+            return Ok(Self::disabled());
+        }
+        let defaults = Self::default();
+        Self::new(
+            window,
+            defaults.retry_delay,
+            defaults.keepalive_interval,
+            defaults.priming_timeout,
+        )
     }
 
     pub const fn disabled() -> Self {
@@ -375,11 +398,30 @@ mod tests {
     }
 
     #[test]
-    fn recovery_policy_is_bounded_to_ten_seconds() {
-        assert_eq!(RecoveryPolicy::default().max_window(), MAX_RECOVERY_WINDOW);
+    fn recovery_policy_is_bounded_to_sixty_seconds() {
+        assert_eq!(
+            RecoveryPolicy::default().max_window(),
+            DEFAULT_RECOVERY_WINDOW
+        );
+        assert_eq!(
+            RecoveryPolicy::with_window(Duration::from_secs(30))
+                .unwrap()
+                .max_window(),
+            Duration::from_secs(30)
+        );
+        assert!(
+            RecoveryPolicy::with_window(Duration::ZERO)
+                .unwrap()
+                .max_window()
+                .is_zero()
+        );
+        assert_eq!(
+            RecoveryPolicy::with_window(Duration::from_secs(61)),
+            Err(RecoveryConfigError::WindowTooLarge)
+        );
         assert_eq!(
             RecoveryPolicy::new(
-                Duration::from_secs(11),
+                Duration::from_secs(61),
                 Duration::from_millis(1),
                 Duration::from_millis(1),
                 Duration::from_millis(1),
