@@ -7665,3 +7665,127 @@ async fn event_scan_stores_sports_metadata_and_survives_espn_failure() {
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
 }
+
+#[tokio::test]
+async fn list_enabled_channels_output_name_uses_alias_precedence() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let catalog = CatalogRepository::new(database.pool().clone());
+    let channel_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO channels (id, channel_number, name, event_name) VALUES ($1, '71', 'Provider Name', 'NHL 01')",
+    )
+    .bind(channel_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let output_name = || async {
+        catalog
+            .list_enabled_channels()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == channel_id)
+            .unwrap()
+            .output_name
+    };
+    // No alias: the event name wins over the provider name.
+    assert_eq!(output_name().await, "NHL 01");
+    // An alias wins over the event name.
+    sqlx::query(
+        "INSERT INTO channel_aliases (id, canonical_name, alias) VALUES ($1, 'Canonical Name', 'Provider Name')",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(output_name().await, "Canonical Name");
+    // An operator name wins over the alias.
+    catalog
+        .set_channel_name_override(channel_id, Some("Operator Name"))
+        .await
+        .unwrap();
+    assert_eq!(output_name().await, "Operator Name");
+    drop(catalog);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
+
+#[tokio::test]
+async fn event_scan_settings_follow_operator_overrides() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let (admin, database, schema) = isolated_database(&database_url).await;
+    let pool = database.pool().clone();
+    let catalog = CatalogRepository::new(pool.clone());
+    let now = utc("2026-11-04T15:00:00Z");
+    // The title has a start time and no stop time. A template duration of
+    // zero hours means that the operator setting gives the length.
+    let names = ["Detroit Pistons vs Philadelphia 76ers @ Nov 4 7:00 PM :NBA  01 [1080p]"];
+    let channels = seed_event_channels(&pool, "America/New_York", now, &names).await;
+    sqlx::query("UPDATE event_templates SET event_duration_hours = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let scan = |catalog: &CatalogRepository| {
+        let catalog = catalog.clone();
+        let channel = channels[0];
+        async move {
+            let settings = catalog.event_scan_settings().await;
+            catalog
+                .scan_all_event_channels_at(now, &settings)
+                .await
+                .unwrap();
+            let guide = catalog
+                .list_programmes_for_channels(&[channel])
+                .await
+                .unwrap();
+            let event = guide
+                .iter()
+                .find(|programme| programme.category_list().contains(&"event".to_owned()))
+                .unwrap()
+                .clone();
+            (
+                event.stops_at - event.starts_at,
+                guide.last().unwrap().title.clone(),
+            )
+        }
+    };
+
+    // Defaults: three hours, and the standard ended title.
+    let (length, ended) = scan(&catalog).await;
+    assert_eq!(length, Duration::hours(3));
+    assert_eq!(ended, "Event ended");
+
+    // Changed overrides change the next scan.
+    let mut global = std::collections::BTreeMap::new();
+    global.insert("events.inferred_duration_seconds".to_owned(), json!(7200));
+    global.insert("events.filler_title".to_owned(), json!("Stand by"));
+    catalog
+        .replace_operator_setting_scope("global", "", &global, None, "operator")
+        .await
+        .unwrap();
+    let (length, ended) = scan(&catalog).await;
+    assert_eq!(length, Duration::hours(2));
+    assert_eq!(ended, "Stand by");
+
+    // A template with its own duration ignores the operator duration.
+    sqlx::query("UPDATE event_templates SET event_duration_hours = 4")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (length, _) = scan(&catalog).await;
+    assert_eq!(length, Duration::hours(4));
+
+    // Provider capacity counts each enabled pool once.
+    assert_eq!(catalog.provider_capacity().await.unwrap(), 1);
+    drop(catalog);
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}

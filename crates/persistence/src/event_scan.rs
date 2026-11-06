@@ -24,13 +24,15 @@ pub const MAX_EVENT_SCAN_SKIPS: usize = 200;
 
 /// Text settings for the event filler programmes.
 ///
-/// WP6 connects these values to the operator settings.
+/// [`EventScanSettings::from_settings`] reads them from the operator settings.
 #[derive(Clone, Debug)]
 pub struct EventScanSettings {
     /// Prefix of the filler title before an event, for example `Upcoming`.
     pub upcoming_prefix: String,
     /// Filler title after an event.
     pub ended_title: String,
+    /// Programme length in seconds when a template has no duration.
+    pub inferred_duration_seconds: u64,
     /// ESPN client. `None` turns the sports enrichment off.
     pub sports: Option<iptv_sports::EspnClient>,
 }
@@ -40,7 +42,43 @@ impl Default for EventScanSettings {
         Self {
             upcoming_prefix: "Upcoming".to_owned(),
             ended_title: "Event ended".to_owned(),
+            inferred_duration_seconds: DEFAULT_INFERRED_DURATION_SECONDS,
             sports: None,
+        }
+    }
+}
+
+/// Default of `events.inferred_duration_seconds` (three hours).
+pub const DEFAULT_INFERRED_DURATION_SECONDS: u64 = 10_800;
+
+impl EventScanSettings {
+    /// Builds the scan settings from resolved operator settings.
+    ///
+    /// `events.inferred_duration_seconds` is the duration of a template that
+    /// has none. An operator value of `events.filler_title` is the title of
+    /// the filler programme after an event. When the operator did not set
+    /// `events.filler_title`, the title stays `Event ended`.
+    #[must_use]
+    pub fn from_settings(settings: &[iptv_domain::EffectiveSetting]) -> Self {
+        let defaults = Self::default();
+        let find = |key: &str| {
+            settings
+                .iter()
+                .find(|setting| setting.definition.key == key)
+        };
+        Self {
+            ended_title: find("events.filler_title")
+                .filter(|setting| {
+                    setting.inherited_from != iptv_domain::InheritanceSource::SystemDefault
+                })
+                .and_then(|setting| setting.value.as_str())
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map_or(defaults.ended_title, str::to_owned),
+            inferred_duration_seconds: find("events.inferred_duration_seconds")
+                .and_then(|setting| setting.value.as_u64())
+                .unwrap_or(defaults.inferred_duration_seconds),
+            ..defaults
         }
     }
 }

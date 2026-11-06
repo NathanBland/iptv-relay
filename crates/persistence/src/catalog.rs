@@ -2565,7 +2565,7 @@ impl CatalogRepository {
                 c.channel_number,
                 c.name,
                 c.name AS provider_name,
-                coalesce(c.name_override, c.event_name, c.name) AS output_name,
+                coalesce(c.name_override, channel_alias.canonical_name, c.event_name, c.name) AS output_name,
                 c.name_override,
                 coalesce(c.group_name, 'Uncategorized') AS group_name,
                 c.logo_url,
@@ -2573,6 +2573,14 @@ impl CatalogRepository {
                 coalesce(cs.stream_count, 0) AS stream_count,
                 (m.channel_id IS NOT NULL) AS epg_mapped
             FROM channels c
+            LEFT JOIN LATERAL (
+                SELECT ca.canonical_name
+                FROM channel_aliases ca
+                WHERE normalize_channel_alias_key(ca.alias) = normalize_channel_alias_key(c.name)
+                   OR normalize_channel_alias_key(ca.canonical_name) = normalize_channel_alias_key(c.name)
+                ORDER BY ca.canonical_name
+                LIMIT 1
+            ) channel_alias ON true
             LEFT JOIN (
                 SELECT channel_id, count(*) AS stream_count
                 FROM channel_streams
@@ -3220,7 +3228,7 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn scan_event_channels(&self, template_id: Uuid) -> Result<u64, PersistenceError> {
         Ok(self
-            .scan_event_channels_report(template_id, Utc::now(), &EventScanSettings::default())
+            .scan_event_channels_report(template_id, Utc::now(), &self.event_scan_settings().await)
             .await?
             .legacy_count())
     }
@@ -3265,9 +3273,70 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn scan_all_event_channels(&self) -> Result<u64, PersistenceError> {
         Ok(self
-            .scan_all_event_channels_at(Utc::now(), &EventScanSettings::default())
+            .scan_all_event_channels_at(Utc::now(), &self.event_scan_settings().await)
             .await?
             .legacy_count())
+    }
+
+    /// Resolves the operator settings for one provider and channel group.
+    ///
+    /// Group overrides win over provider overrides. Provider overrides win
+    /// over global overrides. Global overrides win over system defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the overrides cannot load
+    /// and [`PersistenceError::InvalidSource`] when a stored value is not valid.
+    pub async fn effective_settings(
+        &self,
+        provider_id: &str,
+        group_id: &str,
+    ) -> Result<Vec<iptv_domain::EffectiveSetting>, PersistenceError> {
+        let overrides = self.load_operator_setting_overrides().await?;
+        iptv_domain::resolve_settings(
+            &overrides.to_domain(provider_id, group_id),
+            provider_id,
+            group_id,
+        )
+        .map_err(|error| PersistenceError::InvalidSource(format!("invalid settings: {error}")))
+    }
+
+    /// Builds the event scan settings from the global operator settings.
+    ///
+    /// A settings failure must not stop a scan. The result uses defaults then.
+    pub async fn event_scan_settings(&self) -> EventScanSettings {
+        match self.effective_settings("", "").await {
+            Ok(settings) => EventScanSettings::from_settings(&settings),
+            Err(error) => {
+                tracing::warn!(%error, "cannot load event settings; using defaults");
+                EventScanSettings::default()
+            }
+        }
+    }
+
+    /// Sums the connection limit of each enabled provider pool.
+    ///
+    /// Accounts that share a connection pool count once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when the query fails.
+    pub async fn provider_capacity(&self) -> Result<i64, PersistenceError> {
+        let capacity: i64 = sqlx::query_scalar(
+            r"
+            SELECT COALESCE(SUM(pool_capacity), 0)::bigint
+            FROM (
+                SELECT MAX(COALESCE(cp.max_connections, pa.max_connections)) AS pool_capacity
+                FROM provider_accounts pa
+                LEFT JOIN connection_pools cp ON cp.id = pa.connection_pool_id
+                WHERE pa.enabled
+                GROUP BY COALESCE(pa.connection_pool_id, pa.id)
+            ) pools
+            ",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(capacity)
     }
 
     /// Scans every enabled channel at `now` and returns the scan report.
@@ -4679,7 +4748,7 @@ impl<'a> EventChannelScanner<'a> {
                 let rules = self
                     .rules
                     .entry((index, timezone.name()))
-                    .or_insert_with(|| compile_template_rules(template, timezone));
+                    .or_insert_with(|| compile_template_rules(template, timezone, self.settings));
                 let rules = match rules {
                     Ok(rules) => &*rules,
                     Err(error) => {
@@ -4844,11 +4913,17 @@ async fn enrich_with_sports(
 fn compile_template_rules(
     template: &EventTemplateRow,
     timezone: Tz,
+    settings: &EventScanSettings,
 ) -> Result<CompiledEventRules, String> {
     let mut rules = builtin_sports_event_rules();
-    let duration_seconds = u64::try_from(template.event_duration_hours.max(1))
-        .unwrap_or(u64::MAX)
-        .saturating_mul(3_600);
+    // A template duration of zero hours means "no value": the operator
+    // setting `events.inferred_duration_seconds` applies.
+    let duration_seconds = u64::try_from(template.event_duration_hours)
+        .ok()
+        .filter(|hours| *hours > 0)
+        .map_or(settings.inferred_duration_seconds, |hours| {
+            hours.saturating_mul(3_600)
+        });
     let title_template = if template.channel_name_format.trim().is_empty() {
         "{event}"
     } else {
