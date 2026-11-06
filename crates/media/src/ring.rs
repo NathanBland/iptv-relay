@@ -1,6 +1,11 @@
 //! A non-blocking, packet-aligned MPEG transport stream ring.
 
-use std::{collections::VecDeque, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    fmt,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
@@ -8,8 +13,9 @@ use thiserror::Error;
 use tokio::{sync::Notify, time::Instant};
 
 use crate::{
+    meter::{RateMeter, StreamRates, is_video_stream_type},
     pacing::{PcrTimeline, duration_to_ticks, ticks_to_millis},
-    psi::PatPmtTracker,
+    psi::{PatPmtTracker, parse_pmt_elementary_streams},
 };
 
 pub const MPEG_TS_PACKET_SIZE: usize = 188;
@@ -165,6 +171,7 @@ struct RingState {
     psi: PatPmtTracker,
     pcr_pid: Option<u16>,
     pcr: PcrTimeline,
+    meter: RateMeter,
     first_write: Option<Instant>,
     bytes_written: u64,
     closed: Option<RingCloseReason>,
@@ -203,6 +210,20 @@ pub struct WriteOutcome {
     pub packets_overwritten: u64,
     pub first_sequence: u64,
     pub next_sequence: u64,
+}
+
+/// Reads the measured rates of a ring without keeping its storage alive.
+#[derive(Clone, Debug)]
+pub struct RingRateReader {
+    inner: Weak<RingInner>,
+}
+
+impl RingRateReader {
+    /// The ring's current [`StreamRates`]. `None` when the ring is gone or
+    /// has not measured enough media yet.
+    pub fn rates(&self) -> Option<StreamRates> {
+        self.inner.upgrade()?.state.lock().meter.rates()
+    }
 }
 
 /// One reader's independent position in the ring.
@@ -258,6 +279,7 @@ impl MpegTsRing {
                     psi: PatPmtTracker::default(),
                     pcr_pid: None,
                     pcr: PcrTimeline::default(),
+                    meter: RateMeter::default(),
                     first_write: None,
                     bytes_written: 0,
                     closed: None,
@@ -309,14 +331,25 @@ impl MpegTsRing {
             .ok_or(RingWriteError::SequenceExhausted)?;
 
         let old_first = state.first_sequence;
+        let now = Instant::now();
         for packet in bytes.chunks_exact(MPEG_TS_PACKET_SIZE) {
             let sequence = state.next_sequence;
             if let Some(boundary) = state.psi.observe(packet, sequence) {
                 state.safe_boundaries.push_back(boundary);
                 state.pcr_pid = state.psi.pcr_pid();
+                let video_pid = video_pid(&state.psi);
+                state.meter.set_video_pid(video_pid);
             }
-            if state.pcr_pid.is_some_and(|pid| packet_pid(packet) == pid) {
-                state.pcr.observe(packet, sequence);
+            let pid = packet_pid(packet);
+            if state.pcr_pid == Some(pid) {
+                let RingState { pcr, meter, .. } = &mut *state;
+                pcr.observe(packet, sequence);
+                if let Some(head) = pcr.head_ticks() {
+                    meter.observe_clock(head, sequence, now);
+                }
+            }
+            if state.meter.video_pid() == Some(pid) {
+                state.meter.observe_video(packet);
             }
             let slot = usize::try_from(
                 sequence % u64::try_from(self.inner.config.capacity_packets).unwrap(),
@@ -384,6 +417,7 @@ impl MpegTsRing {
         state.psi.reset();
         state.pcr_pid = None;
         state.pcr.reset();
+        state.meter = RateMeter::default();
         state.first_write = None;
         state.bytes_written = 0;
         state.closed = None;
@@ -440,6 +474,20 @@ impl MpegTsRing {
                 .min(retained)
         };
         self.subscribe_with_pre_roll(usize::try_from(packets).unwrap_or(usize::MAX))
+    }
+
+    /// Bitrate, burst and frame rate measured for the current generation.
+    ///
+    /// `None` until the generation has about 10 s of media with PCR data.
+    pub fn rates(&self) -> Option<StreamRates> {
+        self.inner.state.lock().meter.rates()
+    }
+
+    /// A handle that reads [`Self::rates`] without keeping the ring alive.
+    pub fn rate_reader(&self) -> RingRateReader {
+        RingRateReader {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     /// Media time of `sequence` in PCR ticks, if the PCR timeline covers it.
@@ -637,6 +685,15 @@ impl RingCursor {
     pub fn next_sequence(&self) -> u64 {
         self.next_sequence
     }
+}
+
+/// The PID of the first video elementary stream in the newest PMT.
+fn video_pid(psi: &PatPmtTracker) -> Option<u16> {
+    let (section, program) = psi.completed_pmt()?;
+    parse_pmt_elementary_streams(section, program)?
+        .into_iter()
+        .find(|stream| is_video_stream_type(stream.stream_type))
+        .map(|stream| stream.pid)
 }
 
 fn packet_pid(packet: &[u8]) -> u16 {

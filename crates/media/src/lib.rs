@@ -6,6 +6,7 @@
 
 pub mod broker;
 pub mod credential_broker;
+pub mod meter;
 mod pacing;
 pub mod passive;
 pub mod probe;
@@ -22,6 +23,7 @@ pub use credential_broker::{
     CredentialBroker, CredentialBrokerEndpoint, CredentialBrokerError, HlsBrokerConfig,
     HlsBrokerConfigError,
 };
+pub use meter::StreamRates;
 pub use passive::{PassiveStreamAnalyzer, StreamMetadata, sample_cursor_metadata};
 pub use probe::{
     StreamProbe, StreamProbeFailure, StreamProbeOutcome, StreamProbeQuality, StreamProbeSpec,
@@ -39,8 +41,8 @@ pub use recovery::{
 pub use registry::SharedSessionRegistry;
 pub use ring::{
     DEFAULT_PRE_ROLL, MPEG_TS_PACKET_SIZE, MpegTsRing, MpegTsRingConfig, RingCloseReason,
-    RingConfigError, RingCursor, RingRead, RingReadError, RingSnapshot, RingWriteError,
-    WriteOutcome,
+    RingConfigError, RingCursor, RingRateReader, RingRead, RingReadError, RingSnapshot,
+    RingWriteError, WriteOutcome,
 };
 pub use session::{
     HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSourceSpec, InputAdapterPolicy,

@@ -38,7 +38,7 @@ pub use catalog::{
     ProviderReconciliationRunProgress, ProviderReconciliationUpdate, ReconcileStats,
     ReconciliationRevisionRow, ReconciliationRollbackStats, RecordingRow, RecordingRuleRow,
     RecordingStats, RegionFilterStats, RegionPrefixRow, RegionSettingsRow, ReviewCandidateRow,
-    StreamHealthPage, StreamHealthRow, StreamHealthStats, StreamHealthUpdate,
+    StreamHealthPage, StreamHealthRow, StreamHealthStats, StreamHealthUpdate, StreamMeasurement,
     StreamMediaProfileRow, StreamProbeTargetRow, StreamProfileRow, SystemCounts,
     UnmappedChannelPage, UnmappedChannelRow, UpdateUserInput, UserRow,
 };

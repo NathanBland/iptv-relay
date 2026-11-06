@@ -157,6 +157,20 @@ fn audio_pes(pts: u64) -> Vec<u8> {
 /// PMT start each group of `gop` frames, and the first frame of each group is
 /// a keyframe. `skip` frames at the start are not keyframes.
 fn program(layout: InputLayout, base: u64, frames: u64, gop: u64, skip: u64) -> Vec<u8> {
+    program_with_audio_lead(layout, base, frames, gop, skip, 0)
+}
+
+/// Like [`program`], but each audio PES has a PTS `audio_lead` ticks before
+/// the video PTS of the same frame. Live muxers send audio ahead of video in
+/// this way.
+fn program_with_audio_lead(
+    layout: InputLayout,
+    base: u64,
+    frames: u64,
+    gop: u64,
+    skip: u64,
+    audio_lead: u64,
+) -> Vec<u8> {
     let mut out = Vec::new();
     let mut counters: HashMap<u16, u8> = HashMap::new();
     let mut next_cc = |pid: u16| {
@@ -199,7 +213,7 @@ fn program(layout: InputLayout, base: u64, frames: u64, gop: u64, skip: u64) -> 
             next_cc(layout.audio_pid),
             pcr,
             false,
-            &audio_pes(pts),
+            &audio_pes(pts.wrapping_sub(audio_lead) & TIMESTAMP_MASK),
         ));
         // A packet of the dropped subtitle stream.
         out.extend_from_slice(&ts_packet(0x0777, true, 0, None, false, &[0x20; 20]));
@@ -835,6 +849,61 @@ fn current_segment_continues_until_the_pending_segment_starts() {
             .collect::<Vec<_>>(),
     );
     assert_continuity(&packets);
+}
+
+#[test]
+fn spliced_audio_starts_with_the_first_video_frame() {
+    let slate = program(LAYOUT_A, 900_000, 30, 15, 0);
+    // The live audio runs one second ahead of the live video in the mux.
+    let live = program_with_audio_lead(LAYOUT_B, 50_000, 120, 60, 10, 90_000);
+    let (_, out, boundary) = splice(&slate, &live);
+    let after = parse_output(&out[boundary..]);
+    let first_video = after
+        .iter()
+        .find_map(|packet| {
+            (packet.pid == SLATE_VIDEO_PID)
+                .then_some(packet.pts)
+                .flatten()
+        })
+        .unwrap();
+    let audio: Vec<u64> = after
+        .iter()
+        .filter(|packet| packet.pid == SLATE_AUDIO_PID)
+        .filter_map(|packet| packet.pts)
+        .collect();
+    assert!(!audio.is_empty(), "live audio starts");
+    let first_audio = audio[0];
+    let ahead = first_audio.wrapping_sub(first_video) & TIMESTAMP_MASK;
+    assert!(
+        ahead < TIMESTAMP_HALF_RANGE,
+        "audio PTS {first_audio} is before the first video PTS {first_video}"
+    );
+    assert!(
+        ahead <= FRAME_TICKS,
+        "audio starts with the first video frame"
+    );
+    assert_continuity(&parse_output(&out));
+}
+
+#[test]
+fn audio_on_another_timeline_is_not_held_back() {
+    let slate = program(LAYOUT_A, 900_000, 30, 15, 0);
+    // An audio PTS 30 seconds behind the video is not a mux lead.
+    let live = program_with_audio_lead(LAYOUT_B, 50_000, 60, 30, 10, 30 * 90_000);
+    let (_, out, boundary) = splice(&slate, &live);
+    let after = parse_output(&out[boundary..]);
+    let video_start = after
+        .iter()
+        .position(|packet| packet.pid == SLATE_VIDEO_PID && packet.has_payload)
+        .unwrap();
+    let audio_start = after
+        .iter()
+        .position(|packet| packet.pid == SLATE_AUDIO_PID && packet.has_payload)
+        .unwrap();
+    assert!(
+        audio_start < video_start + 8,
+        "audio starts at the next PES"
+    );
 }
 
 #[test]

@@ -2385,7 +2385,12 @@ pub struct ChannelPlaybackCandidateRow {
     pub priority: i32,
     pub quality_rank: i32,
     pub health_status: String,
+    /// Mean bitrate measured from live sessions, or the probe value.
     pub bitrate_kbps: Option<i32>,
+    /// Highest 5 s bitrate measured from live sessions.
+    pub measured_peak_kbps: Option<i32>,
+    /// Largest provider burst measured from live sessions, in milliseconds.
+    pub measured_burst_ms: Option<i32>,
     pub alternative_base_urls: serde_json::Value,
 }
 
@@ -2410,6 +2415,8 @@ impl fmt::Debug for ChannelPlaybackCandidateRow {
             .field("quality_rank", &self.quality_rank)
             .field("health_status", &self.health_status)
             .field("bitrate_kbps", &self.bitrate_kbps)
+            .field("measured_peak_kbps", &self.measured_peak_kbps)
+            .field("measured_burst_ms", &self.measured_burst_ms)
             .finish()
     }
 }
@@ -2456,13 +2463,18 @@ impl CatalogRepository {
                 cs.priority,
                 cs.quality_rank,
                 ps.health_status,
-                ps.bitrate_kbps
+                COALESCE(sm.average_bitrate_kbps, ps.bitrate_kbps) AS bitrate_kbps,
+                sm.peak_bitrate_kbps AS measured_peak_kbps,
+                sm.burst_ms AS measured_burst_ms
                 ,pa.alternative_base_urls
             FROM channels c
             JOIN channel_streams cs ON cs.channel_id = c.id
             JOIN provider_streams ps ON ps.id = cs.provider_stream_id
             JOIN provider_accounts pa ON pa.id = ps.provider_account_id
             LEFT JOIN connection_pools cp ON cp.id = pa.connection_pool_id
+            LEFT JOIN stream_measurements sm
+                ON sm.provider_account_id = ps.provider_account_id
+               AND sm.stable_key = ps.stable_key
             JOIN source_snapshots ss ON ss.id = ps.snapshot_id
             WHERE c.id = $1
               AND c.enabled
@@ -5580,6 +5592,16 @@ pub struct StreamHealthUpdate {
     pub check_duration_ms: Option<i32>,
 }
 
+/// Rates measured from one live session of a provider stream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StreamMeasurement {
+    pub provider_stream_id: Uuid,
+    pub average_bitrate_kbps: i32,
+    pub peak_bitrate_kbps: i32,
+    pub burst_ms: i32,
+    pub frame_rate: Option<f64>,
+}
+
 /// A candidate stream for quality ranking and failover.
 #[derive(Clone, Debug, Serialize, FromRow)]
 pub struct ChannelStreamCandidateRow {
@@ -5837,7 +5859,12 @@ impl CatalogRepository {
                 video_resolution = $3,
                 video_width = $4,
                 video_height = $5,
-                video_fps = $6,
+                video_fps = COALESCE(
+                    (SELECT sm.frame_rate FROM stream_measurements sm
+                     WHERE sm.provider_account_id = provider_streams.provider_account_id
+                       AND sm.stable_key = provider_streams.stable_key),
+                    $6
+                ),
                 audio_codec = $7,
                 audio_channels = $8,
                 audio_sample_rate = $9
@@ -5868,6 +5895,75 @@ impl CatalogRepository {
         }
         for channel_id in self.channels_for_stream(update.provider_stream_id).await? {
             self.rank_channel_streams_by_quality(channel_id).await?;
+        }
+        Ok(true)
+    }
+
+    /// Merges one live measurement into the stored values for the stream.
+    ///
+    /// The stored values belong to the provider account and stable stream key,
+    /// so they survive provider refreshes. The mean bitrate moves halfway to
+    /// the new value. The peak and the burst take the larger of the new value
+    /// and 80 % of the stored value, so one quiet sample cannot shrink a ring
+    /// that a busy programme needs, but old peaks fade over time. A measured
+    /// frame rate also replaces `video_fps` on every row of the stream.
+    ///
+    /// Returns `false` when the provider stream does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::Database`] when a query fails.
+    pub async fn record_stream_measurement(
+        &self,
+        measurement: &StreamMeasurement,
+    ) -> Result<bool, PersistenceError> {
+        let rows = sqlx::query(
+            r"
+            INSERT INTO stream_measurements AS sm (
+                provider_account_id, stable_key, average_bitrate_kbps,
+                peak_bitrate_kbps, burst_ms, frame_rate
+            )
+            SELECT ps.provider_account_id, ps.stable_key, $2, $3, $4, $5::real
+            FROM provider_streams ps
+            WHERE ps.id = $1
+            ON CONFLICT (provider_account_id, stable_key) DO UPDATE SET
+                average_bitrate_kbps = GREATEST(
+                    1, ((sm.average_bitrate_kbps::bigint + EXCLUDED.average_bitrate_kbps) / 2)::integer
+                ),
+                peak_bitrate_kbps = GREATEST(
+                    EXCLUDED.peak_bitrate_kbps, (sm.peak_bitrate_kbps * 0.8)::integer
+                ),
+                burst_ms = GREATEST(EXCLUDED.burst_ms, (sm.burst_ms * 0.8)::integer),
+                frame_rate = COALESCE(EXCLUDED.frame_rate, sm.frame_rate),
+                samples = sm.samples + 1,
+                measured_at = now()
+            ",
+        )
+        .bind(measurement.provider_stream_id)
+        .bind(measurement.average_bitrate_kbps)
+        .bind(measurement.peak_bitrate_kbps)
+        .bind(measurement.burst_ms)
+        .bind(measurement.frame_rate)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            return Ok(false);
+        }
+        if let Some(frame_rate) = measurement.frame_rate {
+            sqlx::query(
+                r"
+                UPDATE provider_streams target SET video_fps = $2::real
+                FROM provider_streams source
+                WHERE source.id = $1
+                  AND target.provider_account_id = source.provider_account_id
+                  AND target.stable_key = source.stable_key
+                ",
+            )
+            .bind(measurement.provider_stream_id)
+            .bind(frame_rate)
+            .execute(&self.pool)
+            .await?;
         }
         Ok(true)
     }
@@ -8169,15 +8265,18 @@ impl CatalogRepository {
     ) -> Result<Option<StreamMediaProfileRow>, PersistenceError> {
         Ok(sqlx::query_as::<_, StreamMediaProfileRow>(
             r"
-            SELECT video_codec,
-                   video_width,
-                   video_height,
-                   video_fps::double precision AS video_fps,
-                   audio_codec,
-                   audio_channels,
-                   audio_sample_rate
-              FROM provider_streams
-             WHERE id = $1
+            SELECT ps.video_codec,
+                   ps.video_width,
+                   ps.video_height,
+                   COALESCE(sm.frame_rate, ps.video_fps)::double precision AS video_fps,
+                   ps.audio_codec,
+                   ps.audio_channels,
+                   ps.audio_sample_rate
+              FROM provider_streams ps
+              LEFT JOIN stream_measurements sm
+                ON sm.provider_account_id = ps.provider_account_id
+               AND sm.stable_key = ps.stable_key
+             WHERE ps.id = $1
             ",
         )
         .bind(provider_stream_id)
@@ -8256,6 +8355,8 @@ mod tests {
             quality_rank: 2,
             health_status: "alive".to_owned(),
             bitrate_kbps: Some(8_000),
+            measured_peak_kbps: None,
+            measured_burst_ms: None,
         };
         let rendered = format!("{candidate:?}");
         assert!(rendered.contains("<redacted>"));

@@ -581,6 +581,9 @@ const MAX_PES_STEP_TICKS: u64 = 90_000;
 const KEYFRAME_FALLBACK_TICKS: u64 = 3 * 90_000;
 /// A splice without a PCR uses the PES timestamps after this many packets.
 const NO_PCR_PACKET_BUDGET: u64 = 20_000;
+/// Audio that is more than this far before the first video frame of a splice
+/// is on a different timeline. The muxer then starts the audio at once.
+const AUDIO_GATE_LIMIT_TICKS: u64 = 10 * 90_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Role {
@@ -726,11 +729,26 @@ struct Segment {
     latest_pcr: Option<u64>,
     latest_pts: Option<u64>,
     offset: u64,
+    /// The input PTS of the first video frame of the segment. Audio starts at
+    /// the first PES at or after this time, so audio that belongs to frames
+    /// before the splice keyframe does not play over the previous segment.
+    audio_gate: Option<u64>,
     cc_delta: [Option<u8>; 3],
     role_started: [bool; 3],
 }
 
 impl Segment {
+    /// True when the audio PES in `packet` starts at or after the first video
+    /// frame of the segment.
+    fn audio_reached_gate(&self, packet: &[u8]) -> bool {
+        let (Some(gate), Some(pts)) = (self.audio_gate, read_pes_pts(packet)) else {
+            return true;
+        };
+        let ahead = pts.wrapping_sub(gate) & TIMESTAMP_MASK;
+        let behind = gate.wrapping_sub(pts) & TIMESTAMP_MASK;
+        ahead < TIMESTAMP_HALF_RANGE || behind > AUDIO_GATE_LIMIT_TICKS
+    }
+
     /// Feeds the PSI tracker. Returns a new program map when the input PMT
     /// changed.
     fn observe_psi(&mut self, packet: &[u8]) -> Option<ProgramMap> {
@@ -751,7 +769,8 @@ impl Segment {
 ///   `0x1000`. Other input streams are dropped. Null packets pass through.
 /// - Each new segment starts with a new PAT, a PMT with a new version, and an
 ///   adaptation-only packet with `discontinuity_indicator` on each stream PID.
-/// - Video starts at a keyframe. Audio starts at the next PES start.
+/// - Video starts at a keyframe. Audio starts at the first PES whose PTS is
+///   at or after the PTS of that keyframe.
 /// - PCR, PTS, and DTS values are rebased, so the first value of a new
 ///   segment comes one frame after the estimated end of the output media.
 /// - Continuity counters continue from the previous segment and keep the
@@ -894,6 +913,9 @@ impl SpliceMuxer {
         };
         if accept {
             segment.offset = self.offset_for(reference);
+            if map.video.as_ref().is_some_and(|video| video.pid == pid) {
+                segment.audio_gate = read_pes_pts(packet);
+            }
         }
         accept
     }
@@ -948,6 +970,7 @@ impl SpliceMuxer {
             segment.map = Some(map);
             segment.cc_delta = [None; 3];
             segment.role_started = [false; 3];
+            segment.audio_gate = None;
             self.pmt_version = (self.pmt_version + 1) & 0x1f;
             self.output_map.clone_from(&segment.map);
             self.write_pmt(out);
@@ -965,6 +988,9 @@ impl SpliceMuxer {
         let index = role.index();
         if !segment.role_started[index] {
             if role != Role::Pcr && !payload_unit_start(packet) {
+                return;
+            }
+            if role == Role::Audio && !segment.audio_reached_gate(packet) {
                 return;
             }
             segment.role_started[index] = true;
