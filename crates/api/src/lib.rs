@@ -7597,9 +7597,18 @@ fn policy_ring(
     let pre_roll = policy.pre_roll.min(duration);
     let requested = MpegTsRingConfig::for_bitrate(bitrate, duration, pre_roll)
         .map_err(|_| "the configured bitrate cannot be represented by the ring")?;
-    let capacity = requested
-        .capacity_packets()
-        .clamp(minimum_packets, maximum_packets);
+    // A paced viewer sits `pre_roll` behind the write head, and each provider
+    // burst pushes it further back. The stored or fallback bitrate is often
+    // far below the real one (a 720p60 channel runs near 8 Mbps against the
+    // 4 Mbps fallback), so a ring sized from it lets bursts overwrite the
+    // viewer. Paced rings therefore always take the full byte ceiling.
+    let capacity = if policy.pre_roll.is_zero() {
+        requested
+            .capacity_packets()
+            .clamp(minimum_packets, maximum_packets)
+    } else {
+        maximum_packets
+    };
     MpegTsRingConfig::new(capacity, requested.pre_roll_packets().min(capacity))
         .map_err(|_| "the configured pre-roll exceeds the effective ring capacity")
 }
@@ -13104,9 +13113,9 @@ mod tests {
     }
 
     #[test]
-    fn default_ring_is_eight_seconds_with_a_hard_byte_ceiling() {
+    fn default_ring_respects_the_hard_byte_ceiling() {
         let ordinary = default_ring(8_000_000).unwrap();
-        assert!(ordinary.capacity_bytes() < 64 * 1024 * 1024);
+        assert!(ordinary.capacity_bytes() <= 64 * 1024 * 1024);
         assert!(ordinary.pre_roll_packets() < ordinary.capacity_packets());
 
         let enormous = default_ring(u64::MAX).unwrap();
@@ -13138,12 +13147,32 @@ mod tests {
     #[test]
     fn default_ring_holds_a_provider_startup_burst() {
         // A 4 Mbps fallback estimate used to give a 4 MB ring, and a provider
-        // burst of 12 MB or more overran every new viewer.
-        let ring = default_ring(4_000_000).unwrap();
+        // burst of 12 MB or more overran every new viewer. An unpaced ring
+        // still gets at least the burst floor.
+        let unpaced = RingPolicy {
+            pre_roll: Duration::ZERO,
+            ..RingPolicy::default()
+        };
+        let ring = policy_ring(4_000_000, unpaced).unwrap();
         assert_eq!(
             ring.capacity_packets(),
             RingPolicy::MIN_BYTES / iptv_media::MPEG_TS_PACKET_SIZE
         );
+    }
+
+    #[test]
+    fn paced_ring_takes_the_byte_ceiling_whatever_the_estimate() {
+        // ESPN (720p60, about 8 Mbps) has no stored bitrate, so it used the
+        // 4 Mbps fallback and got a 32 MiB ring: about 33 s of media. With a
+        // 30 s delay plus provider bursts, the viewer was overwritten again
+        // and again and Jellyfin received corrupt packets.
+        let ring = default_ring(4_000_000).unwrap();
+        assert_eq!(
+            ring.capacity_packets(),
+            RingPolicy::DEFAULT_MAX_BYTES / iptv_media::MPEG_TS_PACKET_SIZE
+        );
+        // 64 MiB holds more than 60 s at 8 Mbps.
+        assert!(ring.capacity_bytes() * 8 / 8_000_000 >= 60);
         assert!(ring.pre_roll_packets() < ring.capacity_packets());
     }
 
