@@ -20,6 +20,7 @@ COPY crates/media/src crates/media/src
 COPY crates/parsers/src crates/parsers/src
 COPY crates/persistence/src crates/persistence/src
 COPY crates/sports/src crates/sports/src
+COPY crates/sports/assets crates/sports/assets
 COPY migrations migrations
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 RUN cargo chef prepare --recipe-path recipe.json

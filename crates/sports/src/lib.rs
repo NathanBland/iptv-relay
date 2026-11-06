@@ -3,6 +3,7 @@
 //! This crate has no dependency on persistence or the API. The matcher in
 //! [`matcher`] is pure. The client in [`client`] performs public `GET` requests.
 
+pub mod art;
 pub mod client;
 pub mod league;
 pub mod matcher;

@@ -62,9 +62,13 @@ struct Entry<T> {
 struct State {
     scoreboards: HashMap<(League, NaiveDate), Entry<Vec<EspnEvent>>>,
     teams: HashMap<League, Entry<Vec<EspnTeam>>>,
+    logos: HashMap<String, Entry<Vec<u8>>>,
     failures: u32,
     open_until: Option<Instant>,
 }
+
+/// The most logo images that the client keeps in memory.
+const MAX_CACHED_LOGOS: usize = 256;
 
 /// Cached ESPN client. Clone it to share the cache.
 #[derive(Clone)]
@@ -142,6 +146,34 @@ impl EspnClient {
         .await;
         self.record(result.is_ok());
         Ok(result?)
+    }
+
+    /// Fetch one logo image. Cached for the teams TTL.
+    ///
+    /// The caller must check that `url` is an ESPN logo URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a network failure, a bad status, or an open circuit.
+    pub async fn logo(&self, url: &str) -> Result<Arc<Vec<u8>>, EspnError> {
+        if let Some(e) = self.state.lock().logos.get(url)
+            && e.at.elapsed() < self.config.teams_ttl
+        {
+            return Ok(e.value.clone());
+        }
+        let value = Arc::new(self.get(url).await?);
+        let mut st = self.state.lock();
+        if st.logos.len() >= MAX_CACHED_LOGOS {
+            st.logos.clear();
+        }
+        st.logos.insert(
+            url.to_owned(),
+            Entry {
+                at: Instant::now(),
+                value: value.clone(),
+            },
+        );
+        Ok(value)
     }
 
     /// Fetch the events of one league on one local date. Cached for the scoreboard TTL.
