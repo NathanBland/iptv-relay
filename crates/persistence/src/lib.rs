@@ -106,6 +106,77 @@ fn is_migration_deadlock(error: &sqlx::migrate::MigrateError) -> bool {
         .is_some_and(|code| code == "40P01")
 }
 
+const MIGRATION_LOCK_POLL: Duration = Duration::from_millis(250);
+
+enum MigrationAttemptError {
+    Database(sqlx::Error),
+    Migrate(sqlx::migrate::MigrateError),
+}
+
+impl From<sqlx::Error> for MigrationAttemptError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<MigrationAttemptError> for PersistenceError {
+    fn from(error: MigrationAttemptError) -> Self {
+        match error {
+            MigrationAttemptError::Database(error) => error.into(),
+            MigrationAttemptError::Migrate(error) => error.into(),
+        }
+    }
+}
+
+/// Runs one migration attempt on `connection` and keeps the migration lock on
+/// success. The caller releases the lock or closes the connection.
+async fn migrate_on(connection: &mut sqlx::PgConnection) -> Result<(), MigrationAttemptError> {
+    let mut waited = Duration::ZERO;
+    loop {
+        let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(7283912041)")
+            .fetch_one(&mut *connection)
+            .await?;
+        if acquired {
+            break;
+        }
+        if waited.as_secs() > 0 && waited.as_millis().is_multiple_of(30_000) {
+            tracing::info!(
+                waited_seconds = waited.as_secs(),
+                "waiting for another process to finish schema migrations"
+            );
+        }
+        tokio::time::sleep(MIGRATION_LOCK_POLL).await;
+        waited += MIGRATION_LOCK_POLL;
+    }
+
+    // Create the shared extension before schema migrations. Extension creation
+    // can race when each API test uses a new schema.
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public")
+        .execute(&mut *connection)
+        .await?;
+
+    let invalid_indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT format('%I.%I', n.nspname, c.relname) \
+         FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE NOT i.indisvalid AND n.nspname = current_schema()",
+    )
+    .fetch_all(&mut *connection)
+    .await?;
+    for index in invalid_indexes {
+        tracing::warn!(%index, "dropping invalid index from an earlier failed migration");
+        sqlx::query(&format!("DROP INDEX CONCURRENTLY IF EXISTS {index}"))
+            .execute(&mut *connection)
+            .await?;
+    }
+
+    MIGRATOR
+        .run_direct(connection)
+        .await
+        .map_err(MigrationAttemptError::Migrate)
+}
+
 #[derive(Clone)]
 pub struct MasterKey([u8; 32]);
 
@@ -263,36 +334,55 @@ impl Database {
 
     /// Applies all embedded schema migrations.
     ///
+    /// Every server and worker process calls this method at startup, so it
+    /// must be safe to run concurrently and to run again after a failure:
+    ///
+    /// - The method holds one session-level advisory lock for the complete
+    ///   run. It waits with `pg_try_advisory_lock` polls instead of a blocking
+    ///   `pg_advisory_lock` call. A blocked lock query holds a snapshot, and
+    ///   `CREATE INDEX CONCURRENTLY` waits for all older snapshots, which makes
+    ///   a deadlock between processes.
+    /// - Each attempt uses its own connection. If an attempt fails, the method
+    ///   closes that connection. This releases the session locks that the
+    ///   migrator does not release when a migration fails.
+    /// - Before each attempt, the method drops invalid indexes in the current
+    ///   schema. A failed `CREATE INDEX CONCURRENTLY` leaves an invalid index,
+    ///   and `IF NOT EXISTS` would skip it on the next run.
+    ///
     /// # Errors
     ///
     /// Returns [`PersistenceError::Migration`] when a migration cannot be
-    /// applied atomically.
+    /// applied, or [`PersistenceError::Database`] when the lock or the cleanup
+    /// fails.
     pub async fn migrate(&self) -> Result<(), PersistenceError> {
-        // Create the shared extension once before schema migrations. PostgreSQL
-        // extension creation can race when each API test uses a new schema.
-        let mut connection = self.pool.acquire().await?;
-        let lock_query = sqlx::query("SELECT pg_advisory_lock(7283912041)");
-        lock_query.execute(&mut *connection).await?;
-        let extension_result =
-            sqlx::query("CREATE EXTENSION IF NOT EXISTS btree_gist WITH SCHEMA public")
-                .execute(&mut *connection)
-                .await;
-        let unlock_result = sqlx::query("SELECT pg_advisory_unlock(7283912041)")
-            .execute(&mut *connection)
-            .await;
-        extension_result?;
-        unlock_result?;
-        drop(connection);
-
         for attempt in 0..=MIGRATION_DEADLOCK_RETRIES {
-            match MIGRATOR.run(&self.pool).await {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if is_migration_deadlock(&error) && attempt < MIGRATION_DEADLOCK_RETRIES =>
-                {
-                    tokio::time::sleep(Duration::from_secs(1_u64 << attempt)).await;
+            let mut connection = self.pool.acquire().await?;
+            match migrate_on(&mut connection).await {
+                Ok(()) => {
+                    let unlocked = sqlx::query("SELECT pg_advisory_unlock(7283912041)")
+                        .execute(&mut *connection)
+                        .await;
+                    if unlocked.is_err() {
+                        // Do not return a connection that still holds the lock.
+                        let _ = sqlx::Connection::close(connection.detach()).await;
+                    }
+                    return Ok(());
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    // Closing the connection ends the session and releases every
+                    // session-level advisory lock that it holds.
+                    let _ = sqlx::Connection::close(connection.detach()).await;
+                    let retry = matches!(
+                        &error,
+                        MigrationAttemptError::Migrate(error) if is_migration_deadlock(error)
+                    );
+                    if retry && attempt < MIGRATION_DEADLOCK_RETRIES {
+                        tracing::warn!(attempt, "schema migration deadlocked; retrying");
+                        tokio::time::sleep(Duration::from_secs(1_u64 << attempt)).await;
+                        continue;
+                    }
+                    return Err(error.into());
+                }
             }
         }
         unreachable!("the migration retry loop always returns")

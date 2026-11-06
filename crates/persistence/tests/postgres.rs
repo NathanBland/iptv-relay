@@ -7789,3 +7789,79 @@ async fn event_scan_settings_follow_operator_overrides() {
     drop(database);
     drop_isolated_schema(&admin, &schema).await;
 }
+
+#[tokio::test]
+async fn postgres_concurrent_migrations_finish_and_repair_invalid_indexes() {
+    let Some(database_url) = database_url() else {
+        eprintln!("IPTV_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let admin = Database::connect(&database_url, 2).await.unwrap();
+    let schema = format!("iptv_test_{}", uuid::Uuid::now_v7().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(admin.pool())
+        .await
+        .unwrap();
+    let mut url = url::Url::parse(&database_url).unwrap();
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema},public"));
+
+    // Start several processes' worth of migrators against an empty schema, as
+    // the appliance does with one server and several workers. Each one holds
+    // extra idle pool connections, like a running process.
+    let mut migrators = Vec::new();
+    for _ in 0..6 {
+        let url = url.to_string();
+        migrators.push(tokio::spawn(async move {
+            let database = Database::connect(&url, 4).await.unwrap();
+            database.migrate().await.unwrap();
+            database
+        }));
+    }
+    let databases = tokio::time::timeout(std::time::Duration::from_mins(3), async {
+        let mut databases = Vec::new();
+        for migrator in migrators {
+            databases.push(migrator.await.unwrap());
+        }
+        databases
+    })
+    .await
+    .expect("concurrent migrations must not deadlock");
+    let database = databases.into_iter().next().unwrap();
+
+    // Simulate a failed CREATE INDEX CONCURRENTLY: the index exists but is
+    // invalid, and its migration is not recorded.
+    let index = format!("{schema}.channels_region_prefix_enabled_idx");
+    sqlx::query(&format!(
+        "UPDATE pg_index SET indisvalid = false WHERE indexrelid = '{index}'::regclass"
+    ))
+    .execute(admin.pool())
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "DELETE FROM {schema}._sqlx_migrations WHERE version = 73"
+    ))
+    .execute(admin.pool())
+    .await
+    .unwrap();
+
+    database.migrate().await.unwrap();
+
+    let valid: bool = sqlx::query_scalar(&format!(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid = '{index}'::regclass"
+    ))
+    .fetch_one(admin.pool())
+    .await
+    .unwrap();
+    assert!(valid, "the migration must rebuild the invalid index");
+    let recorded: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}._sqlx_migrations WHERE version = 73 AND success"
+    ))
+    .fetch_one(admin.pool())
+    .await
+    .unwrap();
+    assert_eq!(recorded, 1);
+
+    drop(database);
+    drop_isolated_schema(&admin, &schema).await;
+}
