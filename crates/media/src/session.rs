@@ -4,7 +4,10 @@ use std::{
     fmt,
     num::NonZeroUsize,
     pin::Pin,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU32, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -15,16 +18,18 @@ use futures_util::{Stream, StreamExt};
 use reqwest::{Client, Response, header::HeaderMap};
 use thiserror::Error;
 use tokio::{
+    sync::oneshot,
     task::AbortHandle,
     time::{Instant, MissedTickBehavior},
 };
 use tracing::{debug, info, warn};
 
 use crate::{
-    AcquireError, BrokeredInputFormat, HttpTsSessionSnapshot, MPEG_TS_PACKET_SIZE, MpegTsRing,
-    MpegTsRingConfig, PoolSnapshot, ProcessAdapterKind, ProviderSlotBroker, RecoveryPolicy,
-    RingCloseReason, RingRead, RingReadError, RingWriteError, SessionFailureKind, SessionState,
-    SharedSessionRegistry, SlotLease,
+    AcquireError, BrokeredInputFormat, BrokeredProcessInputSession, CredentialBrokerEndpoint,
+    HttpTsSessionSnapshot, MPEG_TS_PACKET_SIZE, MpegTsRing, MpegTsRingConfig, PoolSnapshot,
+    ProcessAdapterKind, ProcessExit, ProviderSlotBroker, RecoveryPolicy, RingCloseReason, RingRead,
+    RingReadError, RingWriteError, SessionFailureKind, SessionState, SharedSessionRegistry,
+    SlotLease,
     psi::PatPmtTracker,
     recovery::{SessionDiagnostics, ViewerRegistration},
 };
@@ -675,7 +680,7 @@ impl Drop for HttpTsSession {
 
 enum SessionInput {
     Native { task: AbortHandle },
-    Process(crate::LeasedBrokeredProcessInputSession),
+    Process(RestartingProcessInput),
 }
 
 impl SessionInput {
@@ -877,25 +882,45 @@ async fn start_process_http_ts_session(
         SessionInputAdapter::Vlc => ProcessAdapterKind::Vlc,
         SessionInputAdapter::NativeTs => unreachable!("native adapter uses the HTTP session"),
     };
+    let ring = MpegTsRing::new(source.ring);
     let process = process_adapter
-        .start_brokered_leased_with_format(
-            client,
-            endpoint,
+        .start_brokered_into(
+            client.clone(),
+            endpoint.clone(),
             source.process_input_format,
-            source.ring,
-            lease,
+            ring.clone(),
         )
         .await
         .map_err(|_| SessionStartError::Process { adapter })?;
     diagnostics.set_state(SessionState::Priming);
-    let ring = process.ring();
     monitor_process_input(ring.clone(), Arc::clone(&diagnostics));
+    let process_id = Arc::new(AtomicU32::new(process.process_id().unwrap_or(0)));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tokio::spawn(supervise_process_input(
+        process,
+        ProcessRestartContext {
+            adapter: process_adapter,
+            client,
+            endpoint,
+            input_format: source.process_input_format,
+            ring: ring.clone(),
+            diagnostics: Arc::clone(&diagnostics),
+            recovery: source.recovery,
+            process_id: Arc::clone(&process_id),
+        },
+        lease,
+        shutdown_rx,
+    ));
 
     Ok(HttpTsSession {
         key: source.key,
         ring,
         lease_id,
-        input: SessionInput::Process(process),
+        input: SessionInput::Process(RestartingProcessInput {
+            adapter: process_adapter,
+            process_id,
+            shutdown: Some(shutdown_tx),
+        }),
         viewer_batch_packets: source.viewer_batch_packets,
         viewer_delay: source.viewer_delay,
         diagnostics,
@@ -917,6 +942,272 @@ fn near_overrun(ring: &MpegTsRing, generation: u64, sequence: u64) -> bool {
     let behind = snapshot.next_sequence.saturating_sub(sequence);
     let capacity = u64::try_from(snapshot.capacity_packets).unwrap_or(u64::MAX);
     behind.saturating_mul(4) >= capacity.saturating_mul(CATCH_UP_QUARTERS)
+}
+
+/// The process input of a shared session.
+///
+/// A supervisor task owns the process and the provider slot. It restarts the
+/// process when the process ends on its own while viewers remain.
+struct RestartingProcessInput {
+    adapter: ProcessAdapterKind,
+    /// The current child process ID, or 0 when no child runs.
+    process_id: Arc<AtomicU32>,
+    shutdown: Option<oneshot::Sender<()>>,
+}
+
+impl RestartingProcessInput {
+    fn adapter(&self) -> ProcessAdapterKind {
+        self.adapter
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        match self.process_id.load(Ordering::Relaxed) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    /// Idempotently asks the supervisor to stop the process and close the ring.
+    fn request_shutdown(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+    }
+}
+
+/// The values that a process restart needs.
+struct ProcessRestartContext {
+    adapter: ProcessAdapterKind,
+    client: Client,
+    endpoint: CredentialBrokerEndpoint,
+    input_format: BrokeredInputFormat,
+    ring: MpegTsRing,
+    diagnostics: Arc<SessionDiagnostics>,
+    recovery: RecoveryPolicy,
+    process_id: Arc<AtomicU32>,
+}
+
+/// The longest wait between two process restart attempts.
+const PROCESS_RESTART_DELAY_MAX: Duration = Duration::from_secs(2);
+
+/// Runs the process input of a shared session until shutdown.
+///
+/// The adapter process reconnects inside itself for short upstream faults.
+/// When the process ends on its own (the provider closed the stream, or the
+/// process gave up), the session keeps its viewers: the supervisor starts a
+/// new process into a new ring generation. The restart attempts stop at the
+/// end of the recovery window. A process that ran longer than the window
+/// starts a new window when it ends.
+async fn supervise_process_input(
+    mut process: BrokeredProcessInputSession,
+    context: ProcessRestartContext,
+    lease: SlotLease,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut window_deadline: Option<Instant> = None;
+    let mut started = Instant::now();
+    loop {
+        let exit = tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                context.ring.close(RingCloseReason::Shutdown);
+                let _ = process.shutdown().await;
+                break;
+            }
+            exit = process.wait() => exit,
+        };
+        context.process_id.store(0, Ordering::Relaxed);
+        let failure = match exit {
+            Ok(ProcessExit::Completed { success: true, .. }) => SessionFailureKind::UpstreamEnded,
+            _ => SessionFailureKind::UpstreamRead,
+        };
+        context.diagnostics.record_failure(failure);
+        warn!(
+            provider_pool_id = %context.diagnostics.key().provider_pool_id,
+            source_id = %context.diagnostics.key().source_id,
+            generation = context.diagnostics.key().generation,
+            channel_name = context.diagnostics.channel_name().unwrap_or(""),
+            adapter = %context.adapter,
+            failure = ?failure,
+            viewers = context.diagnostics.has_viewers(),
+            "media session process input ended"
+        );
+        if started.elapsed() >= context.recovery.max_window() {
+            window_deadline = None;
+        }
+        let Some(next) = restart_process_input(&context, &mut window_deadline, &mut shutdown).await
+        else {
+            break;
+        };
+        context
+            .process_id
+            .store(next.process_id().unwrap_or(0), Ordering::Relaxed);
+        process = next;
+        started = Instant::now();
+    }
+    context.process_id.store(0, Ordering::Relaxed);
+    drop(lease);
+}
+
+/// Waits until every viewer has read the old generation, then starts a new
+/// one.
+///
+/// Returns `false` after it closes the ring: at shutdown or when the recovery
+/// window ends.
+async fn drain_for_new_generation(
+    context: &ProcessRestartContext,
+    deadline: Instant,
+    shutdown: &mut oneshot::Receiver<()>,
+) -> bool {
+    let ring = &context.ring;
+    let diagnostics = &context.diagnostics;
+    // Viewers first play the media that the ring still holds. Null packets
+    // keep their connections open after that. The new generation starts only
+    // when every viewer has read the old one, so no buffered media is lost.
+    let drain = ring.snapshot();
+    let mut keepalive = RecoveryKeepalive::start(
+        ring.clone(),
+        Arc::clone(diagnostics),
+        drain.generation,
+        drain.next_sequence,
+        context.recovery.keepalive_interval(),
+    );
+    diagnostics.set_state(SessionState::Recovering);
+    while !diagnostics.viewers_drained(drain.generation, drain.next_sequence) {
+        if Instant::now() >= deadline {
+            expire_process_recovery(context);
+            return false;
+        }
+        tokio::select! {
+            biased;
+            _ = &mut *shutdown => {
+                ring.close(RingCloseReason::Shutdown);
+                return false;
+            }
+            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+    push_final_keepalive_null(ring, diagnostics);
+    keepalive.stop().await;
+    if diagnostics.is_stopping() || ring.snapshot().closed.is_some() {
+        ring.close(RingCloseReason::Shutdown);
+        return false;
+    }
+    let Ok(generation) = ring.start_new_generation() else {
+        ring.close(RingCloseReason::Shutdown);
+        return false;
+    };
+    diagnostics.set_generation(generation);
+    true
+}
+
+/// Starts a new process for the viewers of an ended process input.
+///
+/// Returns `None` after it closes the ring: at shutdown, when no viewer
+/// remains, or when the recovery window ends.
+async fn restart_process_input(
+    context: &ProcessRestartContext,
+    window_deadline: &mut Option<Instant>,
+    shutdown: &mut oneshot::Receiver<()>,
+) -> Option<BrokeredProcessInputSession> {
+    let ring = &context.ring;
+    let diagnostics = &context.diagnostics;
+    if diagnostics.is_stopping() || ring.snapshot().closed.is_some() {
+        ring.close(RingCloseReason::Shutdown);
+        return None;
+    }
+    if !diagnostics.has_viewers() {
+        diagnostics.set_state(SessionState::Stopping);
+        ring.close(RingCloseReason::Shutdown);
+        info!(
+            provider_pool_id = %diagnostics.key().provider_pool_id,
+            source_id = %diagnostics.key().source_id,
+            generation = diagnostics.key().generation,
+            terminal = "viewer-drained",
+            "media session reached terminal state"
+        );
+        return None;
+    }
+    if context.recovery.max_window().is_zero() {
+        diagnostics.set_state(SessionState::Failed);
+        ring.close(RingCloseReason::EndOfStream);
+        return None;
+    }
+    let deadline =
+        *window_deadline.get_or_insert_with(|| Instant::now() + context.recovery.max_window());
+
+    if !drain_for_new_generation(context, deadline, shutdown).await {
+        return None;
+    }
+
+    let mut delay = context.recovery.retry_delay();
+    let mut first_attempt = true;
+    loop {
+        if !first_attempt {
+            tokio::select! {
+                biased;
+                _ = &mut *shutdown => {
+                    ring.close(RingCloseReason::Shutdown);
+                    return None;
+                }
+                () = sleep_until_retry(deadline, delay) => {}
+            }
+            delay = delay.saturating_mul(2).min(PROCESS_RESTART_DELAY_MAX);
+        }
+        first_attempt = false;
+        if Instant::now() >= deadline {
+            expire_process_recovery(context);
+            return None;
+        }
+        if !diagnostics.has_viewers() {
+            diagnostics.set_state(SessionState::Stopping);
+            ring.close(RingCloseReason::Shutdown);
+            return None;
+        }
+        diagnostics.record_reconnect(false);
+        debug!(
+            provider_pool_id = %diagnostics.key().provider_pool_id,
+            source_id = %diagnostics.key().source_id,
+            generation = diagnostics.key().generation,
+            adapter = %context.adapter,
+            attempts = diagnostics.reconnect_attempts(),
+            "media session process restart attempt"
+        );
+        match context
+            .adapter
+            .start_brokered_into(
+                context.client.clone(),
+                context.endpoint.clone(),
+                context.input_format,
+                ring.clone(),
+            )
+            .await
+        {
+            Ok(process) => {
+                diagnostics.set_state(SessionState::Priming);
+                return Some(process);
+            }
+            Err(_) => diagnostics.record_failure(SessionFailureKind::Http),
+        }
+    }
+}
+
+/// Closes the ring of a process input whose recovery window ended.
+fn expire_process_recovery(context: &ProcessRestartContext) {
+    let diagnostics = &context.diagnostics;
+    diagnostics.record_failure(SessionFailureKind::RecoveryExpired);
+    diagnostics.set_state(SessionState::Failed);
+    warn!(
+        provider_pool_id = %diagnostics.key().provider_pool_id,
+        source_id = %diagnostics.key().source_id,
+        generation = diagnostics.key().generation,
+        attempts = diagnostics.reconnect_attempts(),
+        terminal = "recovery-expired",
+        "media session reached terminal state"
+    );
+    context.ring.close(RingCloseReason::RecoveryExpired {
+        attempts: diagnostics.reconnect_attempts(),
+    });
 }
 
 fn monitor_process_input(ring: MpegTsRing, diagnostics: Arc<SessionDiagnostics>) {
@@ -2120,7 +2411,8 @@ mod tests {
         drop(second);
         timeout(Duration::from_secs(2), async {
             loop {
-                if state.disconnects.load(Ordering::SeqCst) == 1
+                let requests = state.requests.load(Ordering::SeqCst);
+                if state.disconnects.load(Ordering::SeqCst) == requests
                     && manager
                         .provider_snapshot("provider")
                         .unwrap()
@@ -4588,11 +4880,17 @@ mod tests {
         })
         .await
         .expect("the fixed adapter must wrap its bounded ring without exit");
-        assert_eq!(
-            state.requests.load(Ordering::SeqCst),
-            1,
-            "ring wrap must not restart the fixed adapter upstream request"
-        );
+        if upstream_is_live {
+            assert_eq!(
+                state.requests.load(Ordering::SeqCst),
+                1,
+                "ring wrap must not restart the fixed adapter upstream request"
+            );
+        } else {
+            // A finite upstream ends. The session then restarts the process for
+            // its viewers, so more than one request is correct.
+            assert!(state.requests.load(Ordering::SeqCst) >= 1);
+        }
         let diagnostic_debug = format!("{:?}", manager.list_adapter_diagnostics());
         for secret in ["provider-user", "provider-password", "provider-secret"] {
             assert!(
@@ -4605,7 +4903,8 @@ mod tests {
         drop(second);
         timeout(Duration::from_secs(2), async {
             loop {
-                if state.disconnects.load(Ordering::SeqCst) == 1
+                // Each upstream request ends with one disconnect.
+                if state.disconnects.load(Ordering::SeqCst) == state.requests.load(Ordering::SeqCst)
                     && manager
                         .provider_snapshot("provider")
                         .unwrap()
@@ -4643,6 +4942,115 @@ mod tests {
             false,
         )
         .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ended_process_input_restarts_for_remaining_viewers() {
+        use axum::{
+            Router,
+            body::Body,
+            extract::State,
+            http::StatusCode,
+            response::{IntoResponse, Response},
+            routing::get,
+        };
+        use tokio::{net::TcpListener, time::timeout};
+
+        #[derive(Clone)]
+        struct UpstreamState {
+            requests: Arc<AtomicUsize>,
+            first_request: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+            fixture: Arc<Vec<u8>>,
+        }
+
+        // The first response is finite media. The provider then refuses
+        // requests for a while, so the adapter process gives up and exits.
+        // After that the provider serves media again.
+        async fn upstream(State(state): State<UpstreamState>) -> Response {
+            state.requests.fetch_add(1, Ordering::SeqCst);
+            let first = *state
+                .first_request
+                .lock()
+                .unwrap()
+                .get_or_insert_with(std::time::Instant::now);
+            let outage = first.elapsed() > Duration::from_millis(1)
+                && first.elapsed() < Duration::from_secs(6);
+            if outage {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Response::new(Body::from(state.fixture.as_ref().clone()))
+        }
+
+        let state = UpstreamState {
+            requests: Arc::new(AtomicUsize::new(0)),
+            first_request: Arc::new(std::sync::Mutex::new(None)),
+            fixture: Arc::new(fixed_adapter_fixture()),
+        };
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/live.ts", get(upstream))
+                    .with_state(server_state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "restart-channel", 1),
+            format!("http://{address}/live.ts"),
+            MpegTsRingConfig::new(64, 0).unwrap(),
+        );
+        source.set_adapter_policy(InputAdapterPolicy::Ffmpeg);
+        let viewer = manager.open(source).await.unwrap();
+        let mut stream = viewer.into_byte_stream();
+        let reader = tokio::spawn(async move { while stream.next().await.is_some() {} });
+
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let snapshot = manager
+                    .list_snapshots()
+                    .into_iter()
+                    .next()
+                    .expect("the session must stay registered while a viewer remains");
+                if snapshot.reconnect_attempts >= 1
+                    && snapshot.ring.generation >= 1
+                    && snapshot.ring.next_sequence > 0
+                    && snapshot.ring.closed.is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "an ended process input must restart while a viewer remains; requests={}, sessions={:?}",
+                state.requests.load(Ordering::SeqCst),
+                manager.list_snapshots(),
+            )
+        });
+        assert_eq!(
+            manager
+                .provider_snapshot("provider")
+                .unwrap()
+                .active_sessions,
+            1,
+            "a restart must keep the one provider slot"
+        );
+
+        reader.abort();
+        server.abort();
     }
 
     #[cfg(unix)]

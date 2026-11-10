@@ -18,6 +18,9 @@ use crate::{
 
 /// The maximum elementary stream bytes kept for each of video and audio.
 const MAX_ES_BYTES: usize = 192 * 1024;
+/// The bytes kept from a full video buffer, so an SPS that starts at the
+/// end of the old data is still complete with the new data.
+const SPS_CARRY_BYTES: usize = 1_024;
 /// The maximum packets one ring read returns during sampling.
 const SAMPLE_READ_PACKETS: usize = 128;
 
@@ -85,9 +88,13 @@ impl PassiveStreamAnalyzer {
     }
 
     /// Returns true when no more data can improve the result.
+    ///
+    /// For AAC audio the analyzer also waits for an ADTS header, so the
+    /// sample rate and the channel count are known.
     #[must_use]
     pub fn is_done(&self) -> bool {
         self.metadata.is_complete()
+            && (self.audio_type != Some(0x0f) || self.metadata.audio_sample_rate.is_some())
     }
 
     fn observe_packet(&mut self, packet: &[u8]) {
@@ -106,7 +113,14 @@ impl PassiveStreamAnalyzer {
         let Some(payload) = packet_payload(packet) else {
             return;
         };
-        if is_video && self.metadata.video_width.is_none() && self.video_es.len() < MAX_ES_BYTES {
+        if is_video && self.metadata.video_width.is_none() {
+            // The SPS comes with a keyframe, which can be seconds of video
+            // after the sample starts. Keep only the newest bytes, so the
+            // buffer stays bounded and still holds the next SPS.
+            if self.video_es.len() + payload.len() > MAX_ES_BYTES {
+                let keep = SPS_CARRY_BYTES.min(self.video_es.len());
+                self.video_es.drain(..self.video_es.len() - keep);
+            }
             self.video_es.extend_from_slice(payload);
             if self.video_type == Some(0x1b)
                 && let Some(sps) = find_h264_sps(&self.video_es)
@@ -480,6 +494,34 @@ mod tests {
         assert_eq!(metadata.audio_codec.as_deref(), Some("aac"));
         assert_eq!(metadata.audio_channels, Some(2));
         assert_eq!(metadata.audio_sample_rate, Some(48_000));
+        assert!(analyzer.is_done());
+    }
+
+    #[test]
+    fn sps_is_found_after_more_video_than_the_buffer_holds() {
+        // A sample can start just after a keyframe. Much video then comes
+        // before the next SPS.
+        let packets: Vec<&[u8]> = FIXTURE.chunks_exact(MPEG_TS_PACKET_SIZE).collect();
+        let mut analyzer = PassiveStreamAnalyzer::new();
+        let mut next = 0;
+        while analyzer.video_pid.is_none() {
+            analyzer.push(packets[next]);
+            next += 1;
+        }
+        let pid = analyzer.video_pid.unwrap();
+        let mut filler = [0xab_u8; MPEG_TS_PACKET_SIZE];
+        filler[0] = 0x47;
+        filler[1] = u8::try_from(pid >> 8).unwrap() & 0x1f;
+        filler[2] = u8::try_from(pid & 0xff).unwrap();
+        filler[3] = 0x10;
+        for _ in 0..(MAX_ES_BYTES / 184 + 100) {
+            analyzer.push(&filler);
+        }
+        for packet in &packets[next..] {
+            analyzer.push(packet);
+        }
+        assert_eq!(analyzer.metadata().video_width, Some(1280));
+        assert_eq!(analyzer.metadata().video_height, Some(720));
         assert!(analyzer.is_done());
     }
 

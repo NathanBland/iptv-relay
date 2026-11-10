@@ -167,16 +167,33 @@ impl ProcessAdapterKind {
         input_format: BrokeredInputFormat,
         ring_config: MpegTsRingConfig,
     ) -> Result<BrokeredProcessInputSession, BrokeredProcessStartError> {
-        start_brokered(
-            client,
-            endpoint,
-            input_format,
-            ring_config,
-            |input, ring_config| match self {
-                Self::Ffmpeg => FfmpegInputAdapter::new().start(input, ring_config),
-                Self::Vlc => VlcInputAdapter::new().start(input, ring_config),
-            },
-        )
+        start_brokered(client, endpoint, input_format, |input| match self {
+            Self::Ffmpeg => FfmpegInputAdapter::new().start(input, ring_config),
+            Self::Vlc => VlcInputAdapter::new().start(input, ring_config),
+        })
+        .await
+    }
+
+    /// Starts this adapter into an existing ring.
+    ///
+    /// The ring stays open when the process ends on its own, so the caller can
+    /// restart the input for the same viewers. A shutdown request closes the
+    /// ring.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error if the broker or fixed process cannot start.
+    pub(crate) async fn start_brokered_into(
+        self,
+        client: reqwest::Client,
+        endpoint: CredentialBrokerEndpoint,
+        input_format: BrokeredInputFormat,
+        ring: MpegTsRing,
+    ) -> Result<BrokeredProcessInputSession, BrokeredProcessStartError> {
+        start_brokered(client, endpoint, input_format, |input| match self {
+            Self::Ffmpeg => FfmpegInputAdapter::new().start_into(input, ring),
+            Self::Vlc => VlcInputAdapter::new().start_into(input, ring),
+        })
         .await
     }
 
@@ -277,7 +294,14 @@ impl AuditedProcessCommand {
         self,
         ring_config: MpegTsRingConfig,
     ) -> Result<ProcessInputSession, ProcessAdapterError> {
-        spawn_command(self, ring_config)
+        spawn_command(self, MpegTsRing::new(ring_config), RingOnExit::Close)
+    }
+
+    /// Spawns the command into an existing ring that stays open when the
+    /// process ends on its own. The owner restarts the input or closes the
+    /// ring. A shutdown request still closes the ring.
+    fn spawn_into(self, ring: MpegTsRing) -> Result<ProcessInputSession, ProcessAdapterError> {
+        spawn_command(self, ring, RingOnExit::KeepOpen)
     }
 
     #[cfg(test)]
@@ -352,6 +376,15 @@ impl FfmpegInputAdapter {
         ring_config: MpegTsRingConfig,
     ) -> Result<ProcessInputSession, ProcessAdapterError> {
         self.command(input).spawn(ring_config)
+    }
+
+    /// Starts `FFmpeg` into an existing ring that stays open at process exit.
+    fn start_into(
+        self,
+        input: &InputSource,
+        ring: MpegTsRing,
+    ) -> Result<ProcessInputSession, ProcessAdapterError> {
+        self.command(input).spawn_into(ring)
     }
 
     /// Returns the fixed command of one stream slate.
@@ -431,6 +464,15 @@ impl VlcInputAdapter {
         ring_config: MpegTsRingConfig,
     ) -> Result<ProcessInputSession, ProcessAdapterError> {
         self.command(input).spawn(ring_config)
+    }
+
+    /// Starts VLC into an existing ring that stays open at process exit.
+    fn start_into(
+        self,
+        input: &InputSource,
+        ring: MpegTsRing,
+    ) -> Result<ProcessInputSession, ProcessAdapterError> {
+        self.command(input).spawn_into(ring)
     }
 }
 
@@ -653,10 +695,6 @@ impl LeasedBrokeredProcessInputSession {
         self.ring.snapshot()
     }
 
-    pub(crate) fn ring(&self) -> MpegTsRing {
-        self.ring.clone()
-    }
-
     /// Idempotently request process and broker shutdown.
     pub fn request_shutdown(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
@@ -758,11 +796,10 @@ async fn start_brokered<F>(
     client: reqwest::Client,
     endpoint: CredentialBrokerEndpoint,
     input_format: BrokeredInputFormat,
-    ring_config: MpegTsRingConfig,
     start_process: F,
 ) -> Result<BrokeredProcessInputSession, BrokeredProcessStartError>
 where
-    F: FnOnce(&InputSource, MpegTsRingConfig) -> Result<ProcessInputSession, ProcessAdapterError>,
+    F: FnOnce(&InputSource) -> Result<ProcessInputSession, ProcessAdapterError>,
 {
     let broker = match input_format {
         BrokeredInputFormat::DirectMpegTs => CredentialBroker::start(client, endpoint).await?,
@@ -770,16 +807,27 @@ where
             CredentialBroker::start_hls(client, endpoint, config).await?
         }
     };
-    let process = start_process(broker.input_source(), ring_config)?;
+    let process = start_process(broker.input_source())?;
     Ok(BrokeredProcessInputSession {
         process,
         broker: Some(broker),
     })
 }
 
+/// What the process supervisor does with the ring when the process ends on
+/// its own.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RingOnExit {
+    /// Close the ring with the exit reason.
+    Close,
+    /// Leave the ring open. The owner restarts the input or closes the ring.
+    KeepOpen,
+}
+
 fn spawn_command(
     plan: AuditedProcessCommand,
-    ring_config: MpegTsRingConfig,
+    ring: MpegTsRing,
+    on_exit: RingOnExit,
 ) -> Result<ProcessInputSession, ProcessAdapterError> {
     let adapter = plan.adapter;
     let mut command = Command::new(plan.executable);
@@ -811,14 +859,16 @@ fn spawn_command(
         .stdout
         .take()
         .ok_or(ProcessAdapterError::MissingStdout { adapter })?;
-    let ring = MpegTsRing::new(ring_config);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (completion_tx, completion_rx) = watch::channel(None);
     tokio::spawn(supervise_process(
         adapter,
         child,
         stdout,
-        ring.clone(),
+        ExitRing {
+            ring: ring.clone(),
+            on_exit,
+        },
         shutdown_rx,
         completion_tx,
     ));
@@ -832,11 +882,26 @@ fn spawn_command(
     })
 }
 
+/// The output ring of a supervised process and its exit behavior.
+struct ExitRing {
+    ring: MpegTsRing,
+    on_exit: RingOnExit,
+}
+
+impl ExitRing {
+    /// Closes the ring for a process end, unless the owner keeps it open.
+    fn close_for_exit(&self, reason: RingCloseReason) {
+        if self.on_exit == RingOnExit::Close {
+            self.ring.close(reason);
+        }
+    }
+}
+
 async fn supervise_process(
     adapter: ProcessAdapterKind,
     mut child: Child,
     mut stdout: ChildStdout,
-    ring: MpegTsRing,
+    ring: ExitRing,
     mut shutdown: oneshot::Receiver<()>,
     completion: watch::Sender<Option<ProcessExit>>,
 ) {
@@ -847,7 +912,7 @@ async fn supervise_process(
         tokio::select! {
             biased;
             _ = &mut shutdown => {
-                ring.close(RingCloseReason::Shutdown);
+                ring.ring.close(RingCloseReason::Shutdown);
                 break terminate_and_reap(&mut child).await;
             }
             read = stdout.read(&mut buffer) => {
@@ -859,7 +924,7 @@ async fn supervise_process(
                         match packetizer.push(&buffer[..count]) {
                             Ok(packets) => {
                                 if !packets.is_empty()
-                                    && ring.push(&packets).is_err()
+                                    && ring.ring.push(&packets).is_err()
                                 {
                                     break fail_and_reap(
                                         &mut child,
@@ -923,7 +988,7 @@ async fn supervise_process(
 async fn finish_naturally(
     adapter: ProcessAdapterKind,
     child: &mut Child,
-    ring: &MpegTsRing,
+    ring: &ExitRing,
     packetizer: MpegTsPacketizer,
 ) -> ProcessExit {
     if packetizer.finish().is_err() {
@@ -933,14 +998,14 @@ async fn finish_naturally(
     match child.wait().await {
         Ok(status) => {
             if status.success() {
-                ring.close(RingCloseReason::EndOfStream);
+                ring.close_for_exit(RingCloseReason::EndOfStream);
             } else {
-                ring.close(redacted_process_failure(adapter, "exited unsuccessfully"));
+                ring.close_for_exit(redacted_process_failure(adapter, "exited unsuccessfully"));
             }
             completed_exit(status)
         }
         Err(error) => {
-            ring.close(redacted_process_failure(adapter, "could not be reaped"));
+            ring.close_for_exit(redacted_process_failure(adapter, "could not be reaped"));
             ProcessExit::Failed {
                 stage: ProcessFailureStage::Wait,
                 kind: Some(error.kind()),
@@ -972,11 +1037,11 @@ async fn terminate_and_reap(child: &mut Child) -> ProcessExit {
 
 async fn fail_and_reap(
     child: &mut Child,
-    ring: &MpegTsRing,
+    ring: &ExitRing,
     stage: ProcessFailureStage,
     kind: Option<ErrorKind>,
 ) -> ProcessExit {
-    ring.close(RingCloseReason::UpstreamError(
+    ring.close_for_exit(RingCloseReason::UpstreamError(
         "process input failed; arguments redacted".into(),
     ));
     let _ = child.start_kill();
@@ -1191,7 +1256,12 @@ mod tests {
             OsStr::new("/bin/cat"),
             vec![fixture.as_os_str().to_owned()],
         );
-        let mut session = spawn_command(plan, MpegTsRingConfig::new(8, 8).unwrap()).unwrap();
+        let mut session = spawn_command(
+            plan,
+            MpegTsRing::new(MpegTsRingConfig::new(8, 8).unwrap()),
+            RingOnExit::Close,
+        )
+        .unwrap();
         let mut cursor = session.subscribe();
         let mut actual = Vec::new();
 
@@ -1230,7 +1300,12 @@ mod tests {
             OsStr::new("/bin/cat"),
             vec![fixture.as_os_str().to_owned()],
         );
-        let mut session = spawn_command(plan, MpegTsRingConfig::new(8, 8).unwrap()).unwrap();
+        let mut session = spawn_command(
+            plan,
+            MpegTsRing::new(MpegTsRingConfig::new(8, 8).unwrap()),
+            RingOnExit::Close,
+        )
+        .unwrap();
         let mut cursor = session.subscribe();
         assert_eq!(
             session.wait().await,
@@ -1257,7 +1332,12 @@ mod tests {
             OsStr::new("/bin/sleep"),
             vec!["30".into()],
         );
-        let session = spawn_command(plan, MpegTsRingConfig::new(8, 0).unwrap()).unwrap();
+        let session = spawn_command(
+            plan,
+            MpegTsRing::new(MpegTsRingConfig::new(8, 0).unwrap()),
+            RingOnExit::Close,
+        )
+        .unwrap();
         assert!(session.process_id().is_some());
 
         let exit = timeout(Duration::from_secs(2), session.shutdown())
@@ -1323,8 +1403,7 @@ mod tests {
             reqwest::Client::new(),
             endpoint,
             BrokeredInputFormat::DirectMpegTs,
-            MpegTsRingConfig::new(8, 8).unwrap(),
-            move |input, ring_config| {
+            move |input| {
                 let input_argument = input.command_argument();
                 captured_arguments
                     .lock()
@@ -1336,7 +1415,8 @@ mod tests {
                         OsStr::new("curl"),
                         vec!["--fail".into(), "--silent".into(), input_argument],
                     ),
-                    ring_config,
+                    MpegTsRing::new(MpegTsRingConfig::new(8, 8).unwrap()),
+                    RingOnExit::Close,
                 )
             },
         )
@@ -1384,8 +1464,7 @@ mod tests {
             reqwest::Client::new(),
             endpoint,
             BrokeredInputFormat::Hls(HlsBrokerConfig::default()),
-            MpegTsRingConfig::new(8, 8).unwrap(),
-            move |input, ring_config| {
+            move |input| {
                 let input_argument = input.command_argument();
                 captured_arguments
                     .lock()
@@ -1397,7 +1476,8 @@ mod tests {
                         OsStr::new("/bin/sleep"),
                         vec!["30".into()],
                     ),
-                    ring_config,
+                    MpegTsRing::new(MpegTsRingConfig::new(8, 8).unwrap()),
+                    RingOnExit::Close,
                 )
             },
         )
@@ -1472,15 +1552,15 @@ mod tests {
             reqwest::Client::new(),
             endpoint,
             BrokeredInputFormat::DirectMpegTs,
-            MpegTsRingConfig::new(8, 8).unwrap(),
-            |_input, ring_config| {
+            |_input| {
                 spawn_command(
                     AuditedProcessCommand::test_only(
                         ProcessAdapterKind::Ffmpeg,
                         OsStr::new("/bin/sleep"),
                         vec!["30".into()],
                     ),
-                    ring_config,
+                    MpegTsRing::new(MpegTsRingConfig::new(8, 8).unwrap()),
+                    RingOnExit::Close,
                 )
             },
         )
@@ -1534,7 +1614,12 @@ mod tests {
             OsStr::new("/bin/sleep"),
             vec!["30".into()],
         );
-        let session = spawn_command(plan, MpegTsRingConfig::new(8, 0).unwrap()).unwrap();
+        let session = spawn_command(
+            plan,
+            MpegTsRing::new(MpegTsRingConfig::new(8, 0).unwrap()),
+            RingOnExit::Close,
+        )
+        .unwrap();
         let mut cursor = session.subscribe();
         drop(session);
 
@@ -1558,7 +1643,12 @@ mod tests {
             OsStr::new("/definitely-missing-provider-secret"),
             vec!["provider-password".into()],
         );
-        let error = spawn_command(plan, MpegTsRingConfig::new(8, 0).unwrap()).unwrap_err();
+        let error = spawn_command(
+            plan,
+            MpegTsRing::new(MpegTsRingConfig::new(8, 0).unwrap()),
+            RingOnExit::Close,
+        )
+        .unwrap_err();
         let debug = format!("{error:?}");
         let display = error.to_string();
 
@@ -1578,7 +1668,12 @@ mod tests {
             OsStr::new("/bin/cat"),
             vec![fixture.as_os_str().to_owned()],
         );
-        let mut session = spawn_command(plan, MpegTsRingConfig::new(8, 0).unwrap()).unwrap();
+        let mut session = spawn_command(
+            plan,
+            MpegTsRing::new(MpegTsRingConfig::new(8, 0).unwrap()),
+            RingOnExit::Close,
+        )
+        .unwrap();
 
         assert_eq!(
             session.wait().await,
