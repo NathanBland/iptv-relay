@@ -9,9 +9,12 @@
 //!   real size, so bursts do not inflate the bitrate.
 //! - **Burst** is the largest swing between media time and wall-clock time.
 //!   A provider that sends 15 s of media at connect time has a burst of 15 s.
-//! - **Frame rate** is the median spacing of the video PES decode timestamps.
+//! - **Frame rate** is the mean spacing of the video PES decode timestamps.
+//!   Gaps far from the median (dropped frames, timestamp jumps) are left out.
 //!   It does not use codec header fields, so it works for MPEG-2, H.264 and
-//!   HEVC.
+//!   HEVC. The mean, not the median, is used because some providers stamp
+//!   timestamps from a coarse clock: 59.94 fps then shows as a mix of 1 530
+//!   and 1 440 tick gaps, and the median of that mix is a wrong rate.
 
 use std::{collections::VecDeque, time::Duration};
 
@@ -200,8 +203,18 @@ impl RateMeter {
         }
         let mut gaps: Vec<u32> = self.frame_gaps.iter().copied().collect();
         gaps.sort_unstable();
-        let median = u64::from(gaps[gaps.len() / 2]);
-        let measured = u32::try_from(PTS_TICKS_PER_SECOND * 1_000 / median.max(1)).ok()?;
+        let median = u64::from(gaps[gaps.len() / 2]).max(1);
+        // Use the gaps near the median. This drops doubled gaps from lost
+        // frames.
+        let (sum, count) = gaps
+            .iter()
+            .map(|gap| u64::from(*gap))
+            .filter(|gap| gap * 3 > median * 2 && gap * 2 < median * 3)
+            .fold((0_u64, 0_u64), |(sum, count), gap| (sum + gap, count + 1));
+        if count == 0 {
+            return None;
+        }
+        let measured = u32::try_from(PTS_TICKS_PER_SECOND * 1_000 * count / sum.max(1)).ok()?;
         let snapped = STANDARD_RATES_MILLIHERTZ
             .into_iter()
             .find(|rate| measured.abs_diff(*rate) * 200 <= *rate);
@@ -382,6 +395,35 @@ mod tests {
             meter_pts_only.rates().unwrap().frame_rate_millihertz,
             Some(29_970)
         );
+    }
+
+    #[test]
+    fn frame_rate_is_exact_for_coarse_provider_timestamps() {
+        // A provider stamps 59.94 fps video from a 1 kHz clock: every decode
+        // timestamp is a multiple of 90 ticks, so the gaps are a mix of
+        // 1 530 and 1 440 ticks. The median gap (1 530) is 58.82 fps.
+        let mut meter = RateMeter::default();
+        meter.set_video_pid(Some(0x100));
+        for frame in 0..200_u64 {
+            let dts = (frame * 3_003 / 2) / 90 * 90;
+            meter.observe_video(&pes_packet(0x100, dts + 3_003, Some(dts)));
+        }
+        feed(&mut meter, Instant::now(), 10, 1_000, 1);
+        assert_eq!(meter.rates().unwrap().frame_rate_millihertz, Some(59_940));
+    }
+
+    #[test]
+    fn frame_rate_ignores_dropped_frames() {
+        let mut meter = RateMeter::default();
+        meter.set_video_pid(Some(0x100));
+        let mut dts = 0_u64;
+        for frame in 0..100_u64 {
+            meter.observe_video(&pes_packet(0x100, dts, None));
+            // Every tenth frame is missing.
+            dts += if frame % 10 == 9 { 6_006 } else { 3_003 };
+        }
+        feed(&mut meter, Instant::now(), 10, 1_000, 1);
+        assert_eq!(meter.rates().unwrap().frame_rate_millihertz, Some(29_970));
     }
 
     #[test]

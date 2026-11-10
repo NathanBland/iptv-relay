@@ -563,6 +563,35 @@ fn unsupported_profile_values_fall_back_one_by_one() {
     assert_eq!(nearest_frame_rate(f64::NAN), None);
 }
 
+#[test]
+fn stored_rates_from_coarse_timestamps_snap_to_the_standard_rate() {
+    // Earlier releases stored 58.82 for 59.94 fps streams.
+    assert_eq!(
+        nearest_frame_rate(58.82),
+        Some(FrameRate::new(60_000, 1_001))
+    );
+    assert_eq!(
+        nearest_frame_rate(29.5),
+        Some(FrameRate::new(30_000, 1_001))
+    );
+    assert_eq!(nearest_frame_rate(27.0), None);
+}
+
+#[test]
+fn buffered_viewers_wait_longer_before_a_slate() {
+    let deadline = Instant::now();
+    assert_eq!(grace_limit(deadline, status(false, None)), deadline);
+    assert_eq!(
+        grace_limit(deadline, status(true, Some(1_000))),
+        deadline + BUFFERED_GRACE_EXTENSION
+    );
+    let closed = ViewerStartupStatus {
+        closed: true,
+        ..status(true, Some(1_000))
+    };
+    assert_eq!(grace_limit(deadline, closed), deadline);
+}
+
 fn argument_strings(kind: SlateKind, countdown: u32, profile: &SlateProfile) -> Vec<String> {
     ffmpeg_arguments(kind, countdown, profile)
         .into_iter()

@@ -50,7 +50,14 @@ pub const SLATE_PCR_PID: u16 = 0x102;
 /// The longest buffered lead that a new viewer waits for before live output.
 pub const SLATE_START_LEAD: Duration = Duration::from_secs(5);
 /// The time that a request waits for live media before a slate starts.
-pub const DEFAULT_SLATE_GRACE: Duration = Duration::from_millis(1_500);
+pub const DEFAULT_SLATE_GRACE: Duration = Duration::from_secs(3);
+/// The extra time after the grace that a request waits for a viewer that
+/// already has live media.
+///
+/// A slate then does not start for a stream that is almost ready. A slate
+/// with a different format than the live media causes frame repeats and
+/// missing audio in some clients.
+pub const BUFFERED_GRACE_EXTENSION: Duration = Duration::from_secs(6);
 /// The retry interval while the provider pool is full.
 pub const CAPACITY_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 /// The first retry interval after a provider or startup error.
@@ -233,7 +240,7 @@ fn nearest_frame_rate(fps: f64) -> Option<FrameRate> {
         .iter()
         .copied()
         .map(|rate| (rate, (rate.as_f64() - fps).abs() / fps))
-        .filter(|(_, error)| *error <= 0.01)
+        .filter(|(_, error)| *error <= 0.025)
         .min_by(|left, right| left.1.total_cmp(&right.1))
         .map(|(rate, _)| rate)
 }
@@ -1457,10 +1464,11 @@ pub async fn open_with_slates(
                     }
                     Readiness::Waiting { .. } => {
                         let now = Instant::now();
-                        if now >= deadline {
+                        let limit = grace_limit(deadline, viewer.startup_status());
+                        if now >= limit {
                             break LiveState::Waiting { viewer, since };
                         }
-                        tokio::time::sleep((deadline - now).min(SLATE_TICK / 2)).await;
+                        tokio::time::sleep((limit - now).min(SLATE_TICK / 2)).await;
                     }
                 }
             }
@@ -1482,6 +1490,18 @@ pub async fn open_with_slates(
         finished: false,
     };
     SlatedOpen::Slated(driver.into_stream())
+}
+
+/// The time when a request stops waiting and starts a slate.
+///
+/// A viewer that already has live media waits
+/// [`BUFFERED_GRACE_EXTENSION`] after the grace deadline.
+fn grace_limit(deadline: Instant, status: ViewerStartupStatus) -> Instant {
+    if status.buffered && !status.closed {
+        deadline + BUFFERED_GRACE_EXTENSION
+    } else {
+        deadline
+    }
 }
 
 enum LiveState {
