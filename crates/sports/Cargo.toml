@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
-iptv-domain = { path = "../domain", version = "0.4.7" }
+iptv-domain = { path = "../domain", version = "0.4.8" }
 jiff.workspace = true
 parking_lot.workspace = true
 reqwest = { workspace = true, features = ["json"] }
