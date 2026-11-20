@@ -427,6 +427,11 @@ impl MpegTsRing {
         Ok(generation)
     }
 
+    /// The capacity and pre-roll of this ring.
+    pub fn config(&self) -> MpegTsRingConfig {
+        self.inner.config
+    }
+
     /// Marks the current generation closed and wakes waiting cursors.
     pub fn close(&self, reason: RingCloseReason) -> bool {
         let mut state = self.inner.state.lock();

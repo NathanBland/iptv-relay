@@ -998,6 +998,11 @@ const PROCESS_RESTART_DELAY_MAX: Duration = Duration::from_secs(2);
 /// new process into a new ring generation. The restart attempts stop at the
 /// end of the recovery window. A process that ran longer than the window
 /// starts a new window when it ends.
+///
+/// A restart does not wait for the viewers. The new process starts at once
+/// and writes into a staging ring while the viewers play the media that the
+/// session ring still holds. The staged media then follows the old media
+/// without a gap.
 async fn supervise_process_input(
     mut process: BrokeredProcessInputSession,
     context: ProcessRestartContext,
@@ -1006,17 +1011,26 @@ async fn supervise_process_input(
 ) {
     let mut window_deadline: Option<Instant> = None;
     let mut started = Instant::now();
+    let mut forwarder: Option<StagedForwarder> = None;
     loop {
         let exit = tokio::select! {
             biased;
             _ = &mut shutdown => {
                 context.ring.close(RingCloseReason::Shutdown);
+                if let Some(forwarder) = forwarder.take() {
+                    forwarder.abort();
+                }
                 let _ = process.shutdown().await;
                 break;
             }
             exit = process.wait() => exit,
         };
         context.process_id.store(0, Ordering::Relaxed);
+        // The ended process can still have media in its staging ring. Copy
+        // all of it into the session ring before the drain target is read.
+        if let Some(forwarder) = forwarder.take() {
+            forwarder.finish().await;
+        }
         let failure = match exit {
             Ok(ProcessExit::Completed { success: true, .. }) => SessionFailureKind::UpstreamEnded,
             _ => SessionFailureKind::UpstreamRead,
@@ -1035,81 +1049,136 @@ async fn supervise_process_input(
         if started.elapsed() >= context.recovery.max_window() {
             window_deadline = None;
         }
-        let Some(next) = restart_process_input(&context, &mut window_deadline, &mut shutdown).await
+        let Some(restarted) =
+            restart_process_input(&context, &mut window_deadline, &mut shutdown).await
         else {
             break;
         };
-        context
-            .process_id
-            .store(next.process_id().unwrap_or(0), Ordering::Relaxed);
-        process = next;
+        context.process_id.store(
+            restarted.process.process_id().unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        process = restarted.process;
+        forwarder = Some(restarted.forwarder);
         started = Instant::now();
     }
     context.process_id.store(0, Ordering::Relaxed);
     drop(lease);
 }
 
-/// Waits until every viewer has read the old generation, then starts a new
-/// one.
-///
-/// Returns `false` after it closes the ring: at shutdown or when the recovery
-/// window ends.
-async fn drain_for_new_generation(
-    context: &ProcessRestartContext,
-    deadline: Instant,
-    shutdown: &mut oneshot::Receiver<()>,
-) -> bool {
-    let ring = &context.ring;
-    let diagnostics = &context.diagnostics;
-    // Viewers first play the media that the ring still holds. Null packets
-    // keep their connections open after that. The new generation starts only
-    // when every viewer has read the old one, so no buffered media is lost.
-    let drain = ring.snapshot();
-    let mut keepalive = RecoveryKeepalive::start(
-        ring.clone(),
-        Arc::clone(diagnostics),
-        drain.generation,
-        drain.next_sequence,
-        context.recovery.keepalive_interval(),
-    );
-    diagnostics.set_state(SessionState::Recovering);
-    while !diagnostics.viewers_drained(drain.generation, drain.next_sequence) {
-        if Instant::now() >= deadline {
-            expire_process_recovery(context);
-            return false;
-        }
-        tokio::select! {
-            biased;
-            _ = &mut *shutdown => {
-                ring.close(RingCloseReason::Shutdown);
-                return false;
-            }
-            () = tokio::time::sleep(Duration::from_millis(5)) => {}
-        }
-    }
-    push_final_keepalive_null(ring, diagnostics);
-    keepalive.stop().await;
-    if diagnostics.is_stopping() || ring.snapshot().closed.is_some() {
-        ring.close(RingCloseReason::Shutdown);
-        return false;
-    }
-    let Ok(generation) = ring.start_new_generation() else {
-        ring.close(RingCloseReason::Shutdown);
-        return false;
-    };
-    diagnostics.set_generation(generation);
-    true
+/// How the wait for viewers to read the old generation ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainOutcome {
+    /// Every viewer read the old generation.
+    Drained,
+    /// No viewer moved toward the drain target for the stall limit.
+    Stalled,
 }
+
+/// Waits until every viewer reads the buffered media of a generation.
+///
+/// A viewer can be far behind the live edge when the input ends, so the
+/// wait has no fixed limit. The wait stops when no viewer reads for
+/// `stall_limit`.
+async fn wait_for_viewer_drain(
+    diagnostics: &SessionDiagnostics,
+    generation: u64,
+    target_sequence: u64,
+    stall_limit: Duration,
+) -> DrainOutcome {
+    let mut progress = diagnostics.drain_progress(generation, target_sequence);
+    let mut last_progress = Instant::now();
+    while !diagnostics.viewers_drained(generation, target_sequence) {
+        let current = diagnostics.drain_progress(generation, target_sequence);
+        if current != progress {
+            progress = current;
+            last_progress = Instant::now();
+        } else if last_progress.elapsed() >= stall_limit {
+            return DrainOutcome::Stalled;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    DrainOutcome::Drained
+}
+
+/// A replacement process and the task that copies its media into the
+/// session ring.
+struct RestartedProcessInput {
+    process: BrokeredProcessInputSession,
+    forwarder: StagedForwarder,
+}
+
+/// Copies media from a staging ring into the session ring.
+struct StagedForwarder {
+    staging: MpegTsRing,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The longest wait for a forwarder to copy the tail of an ended process.
+const STAGED_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl StagedForwarder {
+    /// Starts to copy the staged media into the session ring.
+    ///
+    /// The cursor must exist before the process writes, so that the copy
+    /// starts at the first staged packet.
+    fn start(staging: MpegTsRing, cursor: crate::RingCursor, session: MpegTsRing) -> Self {
+        let task = tokio::spawn(forward_staged_packets(cursor, session));
+        Self { staging, task }
+    }
+
+    /// Closes the staging ring and waits until the remaining media is copied.
+    async fn finish(self) {
+        self.staging.close(RingCloseReason::EndOfStream);
+        let mut task = self.task;
+        if tokio::time::timeout(STAGED_FLUSH_TIMEOUT, &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
+
+    fn abort(self) {
+        self.staging.close(RingCloseReason::Shutdown);
+        self.task.abort();
+    }
+}
+
+/// Copies each staged packet into the session ring until the staging ring
+/// closes.
+async fn forward_staged_packets(mut cursor: crate::RingCursor, session: MpegTsRing) {
+    loop {
+        match cursor.next(STAGED_FORWARD_PACKETS).await {
+            Ok(RingRead::Packets { bytes, .. }) => {
+                if session.push(&bytes).is_err() {
+                    return;
+                }
+            }
+            Ok(RingRead::Lagged { .. } | RingRead::GenerationBoundary { .. }) => {}
+            Ok(RingRead::Closed { .. }) | Err(_) => return,
+        }
+    }
+}
+
+/// The largest number of packets that one forwarder read copies.
+const STAGED_FORWARD_PACKETS: usize = 256;
 
 /// Starts a new process for the viewers of an ended process input.
 ///
+/// The restart attempts and the viewer drain run at the same time. The new
+/// process writes into a staging ring. When every viewer has read the old
+/// generation, the session ring starts a new generation and a forwarder
+/// copies the staged media into it.
+///
 /// Returns `None` after it closes the ring: at shutdown, when no viewer
-/// remains, or when the recovery window ends.
+/// remains, when the viewers stop reading, or when the recovery window ends.
+#[allow(clippy::too_many_lines)]
 async fn restart_process_input(
     context: &ProcessRestartContext,
     window_deadline: &mut Option<Instant>,
     shutdown: &mut oneshot::Receiver<()>,
-) -> Option<BrokeredProcessInputSession> {
+) -> Option<RestartedProcessInput> {
     let ring = &context.ring;
     let diagnostics = &context.diagnostics;
     if diagnostics.is_stopping() || ring.snapshot().closed.is_some() {
@@ -1136,32 +1205,128 @@ async fn restart_process_input(
     let deadline =
         *window_deadline.get_or_insert_with(|| Instant::now() + context.recovery.max_window());
 
-    if !drain_for_new_generation(context, deadline, shutdown).await {
+    // Viewers first play the media that the ring still holds. Null packets
+    // keep their connections open after that. The new generation starts only
+    // when every viewer has read the old one, so no buffered media is lost.
+    let drain = ring.snapshot();
+    let mut keepalive = RecoveryKeepalive::start(
+        ring.clone(),
+        Arc::clone(diagnostics),
+        drain.generation,
+        drain.next_sequence,
+        context.recovery.keepalive_interval(),
+    );
+    diagnostics.set_state(SessionState::Recovering);
+    let drain_started = Instant::now();
+
+    let staging = MpegTsRing::new(ring.config());
+    let staged_cursor = staging.subscribe_at_live_edge();
+    let attempts = start_replacement_process(context, staging.clone(), deadline);
+    let drain_wait = wait_for_viewer_drain(
+        diagnostics,
+        drain.generation,
+        drain.next_sequence,
+        context.recovery.max_window(),
+    );
+    tokio::pin!(attempts, drain_wait);
+    let mut process: Option<BrokeredProcessInputSession> = None;
+    let mut drained = false;
+    while process.is_none() || !drained {
+        tokio::select! {
+            biased;
+            _ = &mut *shutdown => {
+                ring.close(RingCloseReason::Shutdown);
+                staging.close(RingCloseReason::Shutdown);
+                if let Some(process) = process {
+                    let _ = process.shutdown().await;
+                }
+                return None;
+            }
+            started = &mut attempts, if process.is_none() => {
+                let Some(started) = started else {
+                    staging.close(RingCloseReason::Shutdown);
+                    if diagnostics.has_viewers() {
+                        expire_process_recovery(context);
+                    } else {
+                        diagnostics.set_state(SessionState::Stopping);
+                        ring.close(RingCloseReason::Shutdown);
+                    }
+                    return None;
+                };
+                diagnostics.set_state(SessionState::Priming);
+                process = Some(started);
+            }
+            outcome = &mut drain_wait, if !drained => {
+                if outcome == DrainOutcome::Stalled {
+                    warn!(
+                        provider_pool_id = %diagnostics.key().provider_pool_id,
+                        source_id = %diagnostics.key().source_id,
+                        generation = diagnostics.key().generation,
+                        drain_millis = drain_started.elapsed().as_millis(),
+                        "media session viewers stopped reading buffered media during recovery"
+                    );
+                    staging.close(RingCloseReason::Shutdown);
+                    if let Some(process) = process {
+                        let _ = process.shutdown().await;
+                    }
+                    expire_process_recovery(context);
+                    return None;
+                }
+                drained = true;
+            }
+        }
+    }
+    let process = process?;
+
+    let drain_elapsed = drain_started.elapsed();
+    if drain_elapsed >= Duration::from_secs(1) {
+        info!(
+            provider_pool_id = %diagnostics.key().provider_pool_id,
+            source_id = %diagnostics.key().source_id,
+            generation = diagnostics.key().generation,
+            drain_millis = drain_elapsed.as_millis(),
+            staged_packets = staging.snapshot().next_sequence,
+            "media session viewers played buffered media while the new process started"
+        );
+    }
+    push_final_keepalive_null(ring, diagnostics);
+    keepalive.stop().await;
+    if diagnostics.is_stopping() || ring.snapshot().closed.is_some() || !diagnostics.has_viewers() {
+        staging.close(RingCloseReason::Shutdown);
+        let _ = process.shutdown().await;
+        diagnostics.set_state(SessionState::Stopping);
+        ring.close(RingCloseReason::Shutdown);
         return None;
     }
+    let Ok(generation) = ring.start_new_generation() else {
+        staging.close(RingCloseReason::Shutdown);
+        let _ = process.shutdown().await;
+        ring.close(RingCloseReason::Shutdown);
+        return None;
+    };
+    diagnostics.set_generation(generation);
+    let forwarder = StagedForwarder::start(staging, staged_cursor, ring.clone());
+    Some(RestartedProcessInput { process, forwarder })
+}
 
+/// Starts a replacement process into `staging`, with retries.
+///
+/// Returns `None` when the recovery window ends or no viewer remains.
+async fn start_replacement_process(
+    context: &ProcessRestartContext,
+    staging: MpegTsRing,
+    deadline: Instant,
+) -> Option<BrokeredProcessInputSession> {
+    let diagnostics = &context.diagnostics;
     let mut delay = context.recovery.retry_delay();
     let mut first_attempt = true;
     loop {
         if !first_attempt {
-            tokio::select! {
-                biased;
-                _ = &mut *shutdown => {
-                    ring.close(RingCloseReason::Shutdown);
-                    return None;
-                }
-                () = sleep_until_retry(deadline, delay) => {}
-            }
+            sleep_until_retry(deadline, delay).await;
             delay = delay.saturating_mul(2).min(PROCESS_RESTART_DELAY_MAX);
         }
         first_attempt = false;
-        if Instant::now() >= deadline {
-            expire_process_recovery(context);
-            return None;
-        }
-        if !diagnostics.has_viewers() {
-            diagnostics.set_state(SessionState::Stopping);
-            ring.close(RingCloseReason::Shutdown);
+        if Instant::now() >= deadline || !diagnostics.has_viewers() {
             return None;
         }
         diagnostics.record_reconnect(false);
@@ -1179,14 +1344,11 @@ async fn restart_process_input(
                 context.client.clone(),
                 context.endpoint.clone(),
                 context.input_format,
-                ring.clone(),
+                staging.clone(),
             )
             .await
         {
-            Ok(process) => {
-                diagnostics.set_state(SessionState::Priming);
-                return Some(process);
-            }
+            Ok(process) => return Some(process),
             Err(_) => diagnostics.record_failure(SessionFailureKind::Http),
         }
     }
@@ -5056,6 +5218,145 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::too_many_lines)]
+    async fn ended_process_input_restarts_while_a_lagging_viewer_drains() {
+        use axum::{Router, body::Body, extract::State, response::Response, routing::get};
+        use tokio::{net::TcpListener, time::timeout};
+
+        #[derive(Clone)]
+        struct UpstreamState {
+            requests: Arc<AtomicUsize>,
+            fixture: Arc<Vec<u8>>,
+        }
+
+        // The first response is finite media, so the first process ends.
+        // Each later response repeats the media and stays open, like a live
+        // provider stream.
+        async fn upstream(State(state): State<UpstreamState>) -> Response {
+            let request = state.requests.fetch_add(1, Ordering::SeqCst);
+            let media = Bytes::from(state.fixture.as_ref().clone());
+            if request == 0 {
+                return Response::new(Body::from(media));
+            }
+            let live = futures_util::stream::unfold(media, |media| async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Some((Ok::<_, std::io::Error>(media.clone()), media))
+            });
+            Response::new(Body::from_stream(live))
+        }
+
+        fn null_packets(bytes: &[u8]) -> usize {
+            bytes
+                .chunks_exact(MPEG_TS_PACKET_SIZE)
+                .filter(|packet| packet[1] & 0x1f == 0x1f && packet[2] == 0xff)
+                .count()
+        }
+
+        let fixture = fixed_adapter_fixture();
+        let fixture_nulls = null_packets(&fixture);
+        let state = UpstreamState {
+            requests: Arc::new(AtomicUsize::new(0)),
+            fixture: Arc::new(fixture),
+        };
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/live.ts", get(upstream))
+                    .with_state(server_state),
+            )
+            .await
+            .unwrap();
+        });
+
+        let manager = HttpTsSessionManager::new(Client::new());
+        manager.configure_provider(ProviderSpec::new("provider", 1));
+        let mut source = HttpTsSourceSpec::new(
+            HttpTsSessionKey::new("provider", "lagging-channel", 1),
+            format!("http://{address}/live.ts"),
+            MpegTsRingConfig::new(4096, 4096).unwrap(),
+        );
+        source.set_adapter_policy(InputAdapterPolicy::Ffmpeg);
+        let viewer = manager.open(source).await.unwrap();
+        let mut stream = viewer.into_byte_stream();
+
+        // The viewer reads nothing while the first process ends. The new
+        // process must start before the viewer reads the old media.
+        timeout(Duration::from_secs(8), async {
+            loop {
+                if state.requests.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the restart must not wait for a lagging viewer; sessions={:?}",
+                manager.list_snapshots(),
+            )
+        });
+        let waiting = manager.list_snapshots().into_iter().next().unwrap();
+        assert_eq!(
+            waiting.ring.generation, 0,
+            "the old generation must stay until the viewer reads it"
+        );
+        assert!(waiting.ring.closed.is_none());
+        // Give the new process time to stage its media.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        // The viewer now reads the old media, then the staged media.
+        let mut received = BytesMut::new();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = manager.list_snapshots().into_iter().next().unwrap();
+                if snapshot.ring.generation >= 1 && received.len() >= state.fixture.len() * 3 / 2 {
+                    break;
+                }
+                match timeout(Duration::from_millis(500), stream.next()).await {
+                    Ok(Some(Ok(bytes))) => received.extend_from_slice(&bytes),
+                    Ok(Some(Err(error))) => panic!("the viewer stream failed: {error}"),
+                    Ok(None) => panic!("the viewer stream ended"),
+                    Err(_) => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the viewer must receive the staged media; received={}, sessions={:?}",
+                received.len(),
+                manager.list_snapshots(),
+            )
+        });
+        let keepalives = null_packets(&received).saturating_sub(fixture_nulls * 2);
+        assert!(
+            keepalives <= 4,
+            "the staged media must follow the old media without a keepalive gap; keepalives={keepalives}"
+        );
+        let snapshot = manager.list_snapshots().into_iter().next().unwrap();
+        assert!(snapshot.ring.closed.is_none());
+        assert_eq!(
+            manager
+                .provider_snapshot("provider")
+                .unwrap()
+                .active_sessions,
+            1,
+            "a restart must keep the one provider slot"
+        );
+
+        drop(stream);
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)]
     async fn hls_ffmpeg_ring_wrap_does_not_restart_manifest_and_shares_one_process_slot() {
         use std::{
             collections::HashMap,
@@ -5421,5 +5722,56 @@ mod tests {
             packets += next_chunk(&mut stream).await.len() / MPEG_TS_PACKET_SIZE;
         }
         assert_eq!(start.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_drain_waits_for_a_viewer_far_behind_the_live_edge() {
+        // A viewer that is 60 seconds behind the live edge keeps reading.
+        // The drain must wait for it, even though the stall limit is 10
+        // seconds.
+        let diagnostics =
+            SessionDiagnostics::new(HttpTsSessionKey::new("pool", "lagging", 1), None);
+        let viewer = diagnostics.register_viewer(0, 0);
+        let target = 600_u64;
+        let reader = tokio::spawn(async move {
+            for sequence in 1..=target {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                viewer.update(0, sequence);
+            }
+            viewer
+        });
+        let started = Instant::now();
+        let outcome = wait_for_viewer_drain(&diagnostics, 0, target, Duration::from_secs(10)).await;
+        assert_eq!(outcome, DrainOutcome::Drained);
+        assert!(started.elapsed() >= Duration::from_mins(1));
+        drop(reader.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_drain_stops_when_viewers_stop_reading() {
+        let diagnostics =
+            SessionDiagnostics::new(HttpTsSessionKey::new("pool", "stalled", 1), None);
+        let viewer = diagnostics.register_viewer(0, 0);
+        viewer.update(0, 10);
+        let started = Instant::now();
+        let outcome = wait_for_viewer_drain(&diagnostics, 0, 100, Duration::from_secs(10)).await;
+        assert_eq!(outcome, DrainOutcome::Stalled);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_secs(10));
+        assert!(elapsed < Duration::from_secs(11));
+        drop(viewer);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_drain_ends_when_the_last_lagging_viewer_leaves() {
+        let diagnostics = SessionDiagnostics::new(HttpTsSessionKey::new("pool", "leave", 1), None);
+        let viewer = diagnostics.register_viewer(0, 5);
+        let leaver = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(viewer);
+        });
+        let outcome = wait_for_viewer_drain(&diagnostics, 0, 100, Duration::from_secs(10)).await;
+        assert_eq!(outcome, DrainOutcome::Drained);
+        leaver.await.unwrap();
     }
 }
