@@ -2,6 +2,7 @@ use crate::{
     IngestError, PreparedEpgChannel, PreparedProgramme, PreparedProviderStream, PreparedSnapshot,
     SnapshotOwner, StagedRows,
 };
+use iptv_domain::Timestamp;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::{future::Future, pin::Pin};
 use uuid::Uuid;
@@ -252,7 +253,7 @@ impl PgSnapshotStore {
                 String,
                 String,
                 i64,
-                Option<chrono::DateTime<chrono::Utc>>,
+                Option<Timestamp>,
             ),
         >(
             r"

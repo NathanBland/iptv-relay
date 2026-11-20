@@ -6,15 +6,15 @@ mod event_scan;
 mod outbox;
 mod sports_info;
 
-use std::{fmt, str::FromStr, time::Duration};
+use std::{fmt, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
-use chrono::{DateTime, Utc};
-use chrono_tz::Tz;
+use iptv_domain::{Timestamp, time::time_zone};
+use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
@@ -467,7 +467,7 @@ impl Database {
         name: &str,
         token_hash: &[u8; 32],
         scopes: &[String],
-        expires_at: Option<DateTime<Utc>>,
+        expires_at: Option<Timestamp>,
         actor: &str,
     ) -> Result<OperatorApiTokenRow, PersistenceError> {
         let mut transaction = self.pool.begin().await?;
@@ -520,7 +520,7 @@ impl Database {
         name: &str,
         token_hash: &[u8; 32],
         scopes: &[String],
-        expires_at: Option<DateTime<Utc>>,
+        expires_at: Option<Timestamp>,
         actor: &str,
     ) -> Result<Option<OperatorApiTokenRow>, PersistenceError> {
         let mut transaction = self.pool.begin().await?;
@@ -649,11 +649,11 @@ pub struct OperatorApiTokenRow {
     pub name: String,
     pub token_hash: Vec<u8>,
     pub scopes: Vec<String>,
-    pub expires_at: Option<DateTime<Utc>>,
-    pub revoked_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
+    pub revoked_at: Option<Timestamp>,
     pub created_by: String,
-    pub created_at: DateTime<Utc>,
-    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub last_used_at: Option<Timestamp>,
 }
 
 impl fmt::Debug for OperatorApiTokenRow {
@@ -765,16 +765,16 @@ pub struct SourceSummary {
     pub kind: SourceKind,
     pub state: String,
     pub channels: usize,
-    pub last_sync: DateTime<Utc>,
+    pub last_sync: Timestamp,
     pub endpoint: String,
     pub revision: i64,
     pub refresh_interval_seconds: i32,
-    pub last_refreshed_at: Option<DateTime<Utc>>,
+    pub last_refreshed_at: Option<Timestamp>,
     pub max_connections: i32,
     pub timezone: String,
     pub enabled: bool,
     pub cb_consecutive_failures: i32,
-    pub cb_opened_at: Option<DateTime<Utc>>,
+    pub cb_opened_at: Option<Timestamp>,
     pub alternative_base_urls: Vec<String>,
 }
 
@@ -815,17 +815,17 @@ struct SourceSummaryRow {
     kind: String,
     endpoint: String,
     revision: i64,
-    updated_at: DateTime<Utc>,
-    activated_at: Option<DateTime<Utc>>,
+    updated_at: Timestamp,
+    activated_at: Option<Timestamp>,
     record_count: i64,
     job_status: Option<String>,
     refresh_interval_seconds: i32,
-    last_refreshed_at: Option<DateTime<Utc>>,
+    last_refreshed_at: Option<Timestamp>,
     max_connections: i32,
     timezone: String,
     enabled: bool,
     cb_consecutive_failures: i32,
-    cb_opened_at: Option<DateTime<Utc>>,
+    cb_opened_at: Option<Timestamp>,
     alternative_base_urls: serde_json::Value,
 }
 
@@ -851,7 +851,7 @@ pub struct DueSource {
     pub id: Uuid,
     pub kind: SourceKind,
     pub refresh_interval_seconds: i32,
-    pub last_refreshed_at: Option<DateTime<Utc>>,
+    pub last_refreshed_at: Option<Timestamp>,
 }
 
 /// One Xtream live stream selected for a bounded short EPG request.
@@ -866,7 +866,7 @@ struct DueSourceRow {
     id: Uuid,
     kind: String,
     refresh_interval_seconds: i32,
-    last_refreshed_at: Option<DateTime<Utc>>,
+    last_refreshed_at: Option<Timestamp>,
 }
 
 impl DueSource {
@@ -988,7 +988,7 @@ impl SourceRepository {
         let ciphertext = self
             .cipher
             .encrypt(source.endpoint.as_bytes(), associated_data.as_bytes())?;
-        let now = Utc::now();
+        let now = Timestamp::now();
         let job_id = Uuid::now_v7();
         let correlation_id = Uuid::now_v7();
         let mut transaction = self.pool.begin().await?;
@@ -1238,7 +1238,7 @@ impl SourceRepository {
     pub async fn mark_source_refreshed(
         &self,
         source_id: Uuid,
-        refreshed_at: DateTime<Utc>,
+        refreshed_at: Timestamp,
     ) -> Result<(), PersistenceError> {
         sqlx::query("UPDATE provider_accounts SET last_refreshed_at = $2 WHERE id = $1")
             .bind(source_id)
@@ -1674,7 +1674,7 @@ fn validate_timezone(value: &str) -> Result<String, PersistenceError> {
             "timezone must be UTC or an IANA timezone".to_owned(),
         ));
     }
-    Tz::from_str(timezone).map_err(|_| {
+    time_zone(timezone).ok_or_else(|| {
         PersistenceError::InvalidSource("timezone must be a valid IANA timezone".to_owned())
     })?;
     Ok(timezone.to_owned())
@@ -1778,14 +1778,14 @@ pub struct JobRecord {
     pub progress: Value,
     pub attempts: i32,
     pub max_attempts: i32,
-    pub available_at: DateTime<Utc>,
+    pub available_at: Timestamp,
     pub locked_by: Option<String>,
-    pub locked_at: Option<DateTime<Utc>>,
-    pub heartbeat_at: Option<DateTime<Utc>>,
+    pub locked_at: Option<Timestamp>,
+    pub heartbeat_at: Option<Timestamp>,
     pub last_error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, FromRow)]
@@ -1798,11 +1798,11 @@ pub struct DeadLetterRecord {
     pub error_message: String,
     pub attempt_count: i32,
     pub max_attempts: i32,
-    pub first_failed_at: DateTime<Utc>,
-    pub last_failed_at: DateTime<Utc>,
-    pub resolved_at: Option<DateTime<Utc>>,
+    pub first_failed_at: Timestamp,
+    pub last_failed_at: Timestamp,
+    pub resolved_at: Option<Timestamp>,
     pub resolution: Option<String>,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     /// Failure stage label derived from the job's last progress checkpoint.
     ///
     /// Refresh-family jobs persist a `stage` key through `JobRepository::heartbeat`.
@@ -1824,7 +1824,7 @@ pub struct NewJob {
     pub priority: i32,
     pub payload: Value,
     pub max_attempts: i32,
-    pub available_at: DateTime<Utc>,
+    pub available_at: Timestamp,
 }
 
 /// Result data from one database-elected source refresh scheduler cycle.
@@ -1843,7 +1843,7 @@ impl NewJob {
             priority: 0,
             payload,
             max_attempts: 3,
-            available_at: Utc::now(),
+            available_at: Timestamp::now(),
         }
     }
 }
@@ -1866,7 +1866,7 @@ pub struct AuditEventRecord {
     pub resource_id: Option<Uuid>,
     pub correlation_id: Uuid,
     pub details: Value,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
 }
 
 impl Database {
@@ -3069,7 +3069,7 @@ impl JobRepository {
         } else {
             0
         };
-        let available_at = Utc::now() + chrono::Duration::seconds(delay_seconds);
+        let available_at = Timestamp::now() + SignedDuration::from_secs(delay_seconds);
         let redacted = redact_error(error_summary);
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
@@ -3752,7 +3752,7 @@ mod tests {
 
     #[test]
     fn source_rows_convert_states_counts_and_due_kinds() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         for (status, expected) in [
             (Some("queued"), "syncing"),
             (Some("running"), "syncing"),
@@ -3808,7 +3808,7 @@ mod tests {
         .unwrap();
         assert_eq!(circuit_open_summary.state, "circuit-open");
 
-        let refreshed_at = now - chrono::Duration::minutes(5);
+        let refreshed_at = now - SignedDuration::from_mins(5);
         let due = DueSource::try_from_row(&DueSourceRow {
             id: Uuid::nil(),
             kind: "xmltv".to_owned(),

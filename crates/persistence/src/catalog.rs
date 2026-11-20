@@ -4,9 +4,7 @@
 //! and binds those channels to active EPG channels. Read queries back the
 //! control API with paginated, real data.
 
-use chrono::{DateTime, Utc};
-use iptv_domain::Timestamp;
-use iptv_domain::builtin_sports_event_rules;
+use iptv_domain::{Timestamp, builtin_sports_event_rules};
 use iptv_parsers::{
     CompiledEventRules, EventCandidate, GeneratedProgramme, GeneratedProgrammeKind,
     generate_event_guide,
@@ -139,18 +137,10 @@ pub struct ProviderReconciliationPartitionResult {
     pub already_completed: bool,
 }
 
-type ProviderReconciliationPartitionRow = (
-    String,
-    String,
-    Uuid,
-    i32,
-    i64,
-    String,
-    Option<DateTime<Utc>>,
-);
+type ProviderReconciliationPartitionRow =
+    (String, String, Uuid, i32, i64, String, Option<Timestamp>);
 
-type ProviderReconciliationSnapshotRow =
-    (String, String, Option<DateTime<Utc>>, DateTime<Utc>, i64);
+type ProviderReconciliationSnapshotRow = (String, String, Option<Timestamp>, Timestamp, i64);
 
 /// Result from one attempt to publish all prepared reconciliation candidates.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,7 +205,7 @@ impl CatalogRepository {
     ) -> Result<Option<ProviderReconciliationRun>, PersistenceError> {
         let partition_count = requested_partitions.clamp(1, 64);
         let mut transaction = self.pool.begin().await?;
-        let snapshot: Option<(Uuid, String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
+        let snapshot: Option<(Uuid, String, String, Option<Timestamp>)> = sqlx::query_as(
             r"
             SELECT provider_account_id, kind, status, staged_at
             FROM source_snapshots
@@ -2025,7 +2015,7 @@ impl CatalogRepository {
             .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
         let offset = query.offset.unwrap_or(0).max(0);
-        let now = query.now.unwrap_or_else(Utc::now);
+        let now = query.now.unwrap_or_else(Timestamp::now);
         let pattern = query.search.as_deref().map(|value| {
             format!(
                 "%{}%",
@@ -3208,8 +3198,8 @@ impl CatalogRepository {
         channel_id: Uuid,
         slot: i32,
         title: Option<&str>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         raw_name: &str,
         state: &str,
     ) -> Result<EventChannelRow, PersistenceError> {
@@ -3241,7 +3231,11 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn scan_event_channels(&self, template_id: Uuid) -> Result<u64, PersistenceError> {
         Ok(self
-            .scan_event_channels_report(template_id, Utc::now(), &self.event_scan_settings().await)
+            .scan_event_channels_report(
+                template_id,
+                Timestamp::now(),
+                &self.event_scan_settings().await,
+            )
             .await?
             .legacy_count())
     }
@@ -3261,7 +3255,7 @@ impl CatalogRepository {
     pub async fn scan_event_channels_report(
         &self,
         template_id: Uuid,
-        now: DateTime<Utc>,
+        now: Timestamp,
         settings: &EventScanSettings,
     ) -> Result<EventScanReport, PersistenceError> {
         let enabled: Option<bool> =
@@ -3286,7 +3280,7 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn scan_all_event_channels(&self) -> Result<u64, PersistenceError> {
         Ok(self
-            .scan_all_event_channels_at(Utc::now(), &self.event_scan_settings().await)
+            .scan_all_event_channels_at(Timestamp::now(), &self.event_scan_settings().await)
             .await?
             .legacy_count())
     }
@@ -3360,7 +3354,7 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn scan_all_event_channels_at(
         &self,
-        now: DateTime<Utc>,
+        now: Timestamp,
         settings: &EventScanSettings,
     ) -> Result<EventScanReport, PersistenceError> {
         self.run_event_scan(None, now, settings).await
@@ -3376,7 +3370,7 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn refresh_event_guides(
         &self,
-        now: DateTime<Utc>,
+        now: Timestamp,
         settings: &EventScanSettings,
     ) -> Result<EventScanReport, PersistenceError> {
         let mut report = self.scan_all_event_channels_at(now, settings).await?;
@@ -3388,7 +3382,7 @@ impl CatalogRepository {
     async fn run_event_scan(
         &self,
         only_template: Option<Uuid>,
-        now: DateTime<Utc>,
+        now: Timestamp,
         settings: &EventScanSettings,
     ) -> Result<EventScanReport, PersistenceError> {
         let mut templates = self
@@ -3431,7 +3425,7 @@ impl CatalogRepository {
             regexes: Vec::with_capacity(templates.len()),
             rules: BTreeMap::new(),
             region_timezone: region_timezone.as_deref(),
-            now: now.into(),
+            now,
             settings,
         };
         for template in &templates {
@@ -3475,7 +3469,7 @@ impl CatalogRepository {
         if let Some(client) = settings.sports.as_ref().or(self.sports.as_ref()) {
             for plan in &mut planned {
                 if in_scope(plan.template.id) && plan.state != EventChannelState::Hidden {
-                    enrich_with_sports(plan, client, now.into(), settings).await;
+                    enrich_with_sports(plan, client, now, settings).await;
                 }
             }
         }
@@ -3583,8 +3577,8 @@ impl CatalogRepository {
                 channel_id: plan.channel_id,
                 slot: plan.slot,
                 title: Some(&plan.event.title),
-                start: Some(plan.event.starts_at.into()),
-                end: Some(plan.event.stops_at.into()),
+                start: Some(plan.event.starts_at),
+                end: Some(plan.event.stops_at),
                 raw_name: &plan.raw_stream_name,
                 state: plan.state.as_str(),
             },
@@ -3636,8 +3630,8 @@ impl CatalogRepository {
             .bind(&programme.stable_event_key)
             .bind(&programme.source_title)
             .bind(kind)
-            .bind(DateTime::<Utc>::from(programme.starts_at))
-            .bind(DateTime::<Utc>::from(programme.stops_at))
+            .bind(programme.starts_at)
+            .bind(programme.stops_at)
             .bind(&programme.title)
             .bind(match sports {
                 Some(info) => json!(info.categories()),
@@ -3705,7 +3699,7 @@ impl CatalogRepository {
     pub async fn prune_event_channels_for_template(
         &self,
         template_id: Uuid,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<u64, PersistenceError> {
         let grace_hours: i32 =
             sqlx::query_scalar("SELECT past_date_grace_hours FROM event_templates WHERE id = $1")
@@ -3754,7 +3748,7 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn prune_all_event_channels_at(
         &self,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<u64, PersistenceError> {
         let templates = self
             .list_event_templates(EventTemplateQuery::default())
@@ -4364,9 +4358,9 @@ pub struct EpgMappingRow {
     pub evidence: Value,
     pub review_status: String,
     pub reviewed_by: Option<String>,
-    pub reviewed_at: Option<DateTime<Utc>>,
+    pub reviewed_at: Option<Timestamp>,
     pub revision: i64,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     pub channel_name: String,
     pub canonical_key: Option<String>,
     pub epg_xmltv_id: Option<String>,
@@ -4401,7 +4395,7 @@ pub struct ReviewCandidateRow {
     pub method: String,
     pub confidence: f32,
     pub evidence: Value,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub epg_xmltv_id: Option<String>,
     pub epg_display_name: Option<String>,
 }
@@ -4445,8 +4439,8 @@ pub struct EventChannelRow {
     pub channel_id: Option<Uuid>,
     pub slot_number: i32,
     pub event_title: Option<String>,
-    pub event_start: Option<DateTime<Utc>>,
-    pub event_end: Option<DateTime<Utc>>,
+    pub event_start: Option<Timestamp>,
+    pub event_end: Option<Timestamp>,
     pub raw_stream_name: Option<String>,
     pub state: String,
     /// Output name of the target channel. Only `list_event_channels` fills it.
@@ -4540,10 +4534,10 @@ fn validate_event_template_timezone(value: &str) -> Result<(), PersistenceError>
 #[derive(Clone, Debug, Default)]
 pub struct ProgrammeQuery {
     pub channel_id: Option<Uuid>,
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     pub search: Option<String>,
     /// Reference instant for deterministic current-then-upcoming ordering.
-    pub now: Option<DateTime<Utc>>,
+    pub now: Option<Timestamp>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -4596,8 +4590,8 @@ pub struct ProgrammeRow {
     pub subtitle: Option<String>,
     pub description: Option<String>,
     pub categories: Value,
-    pub starts_at: DateTime<Utc>,
-    pub stops_at: DateTime<Utc>,
+    pub starts_at: Timestamp,
+    pub stops_at: Timestamp,
     pub source_name: Option<String>,
     /// Metadata of a generated programme. `None` for imported programmes.
     #[sqlx(default)]
@@ -4694,7 +4688,7 @@ struct EventScanCandidate {
     stream_name: String,
     group_name: Option<String>,
     source_timezone: Option<String>,
-    snapshot_at: Option<DateTime<Utc>>,
+    snapshot_at: Option<Timestamp>,
 }
 
 /// The guide that the scan plans for one channel.
@@ -4960,8 +4954,8 @@ struct EventChannelUpsert<'a> {
     channel_id: Uuid,
     slot: i32,
     title: Option<&'a str>,
-    start: Option<DateTime<Utc>>,
-    end: Option<DateTime<Utc>>,
+    start: Option<Timestamp>,
+    end: Option<Timestamp>,
     raw_name: &'a str,
     state: &'a str,
 }
@@ -5558,7 +5552,7 @@ pub struct StreamHealthRow {
     pub stream_name: String,
     pub group_name: Option<String>,
     pub health_status: String,
-    pub health_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub health_checked_at: Option<Timestamp>,
     pub health_error: Option<String>,
     pub video_codec: Option<String>,
     pub video_resolution: Option<String>,
@@ -5623,7 +5617,7 @@ pub struct ChannelStreamCandidateRow {
     pub video_fps: Option<f64>,
     pub video_codec: Option<String>,
     pub failover_count: i32,
-    pub last_failover_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_failover_at: Option<Timestamp>,
     pub url_template: String,
     pub provider_account_id: Uuid,
 }
@@ -6455,9 +6449,9 @@ pub struct UserRow {
     pub display_name: String,
     pub role: String,
     pub enabled: bool,
-    pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub last_login_at: Option<Timestamp>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Input for creating a user.
@@ -6717,7 +6711,7 @@ pub struct ChannelAliasRow {
     pub alias: String,
     pub country: Option<String>,
     pub category: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Input for creating a channel alias.
@@ -6931,8 +6925,8 @@ pub struct RecordingRuleRow {
     pub max_recordings: Option<i32>,
     pub keep_until: String,
     pub enabled: bool,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Input for creating a recording rule.
@@ -6958,15 +6952,15 @@ pub struct RecordingRow {
     pub programme_id: Option<Uuid>,
     pub title: String,
     pub description: Option<String>,
-    pub starts_at: chrono::DateTime<chrono::Utc>,
-    pub ends_at: chrono::DateTime<chrono::Utc>,
+    pub starts_at: Timestamp,
+    pub ends_at: Timestamp,
     pub status: String,
     pub file_path: Option<String>,
     pub file_size_bytes: Option<i64>,
     pub duration_seconds: Option<i32>,
     pub error_message: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Input for creating a recording instance.
@@ -6977,8 +6971,8 @@ pub struct CreateRecordingInput {
     pub programme_id: Option<Uuid>,
     pub title: String,
     pub description: Option<String>,
-    pub starts_at: chrono::DateTime<chrono::Utc>,
-    pub ends_at: chrono::DateTime<chrono::Utc>,
+    pub starts_at: Timestamp,
+    pub ends_at: Timestamp,
 }
 
 impl CatalogRepository {
@@ -7241,8 +7235,8 @@ pub struct StreamProfileRow {
     pub user_agent: Option<String>,
     pub referer: Option<String>,
     pub enabled: bool,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Input for creating a stream profile.
@@ -7915,7 +7909,7 @@ pub struct ReconciliationRevisionRow {
     pub actor: String,
     pub before_value: Option<Value>,
     pub after_value: Value,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Counts produced by a reconciliation rollback.
@@ -7959,7 +7953,7 @@ struct SnapshotEpgMapping {
     evidence: Value,
     review_status: String,
     reviewed_by: Option<String>,
-    reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
+    reviewed_at: Option<Timestamp>,
 }
 
 /// The captured automatic channel, stream link, and EPG mapping state for
@@ -8206,7 +8200,7 @@ pub struct OperatorSettingOverrideRow {
     pub value: Value,
     pub revision: i64,
     pub updated_by: String,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// One revision history row for an operator setting scope.
@@ -8216,7 +8210,7 @@ pub struct OperatorSettingRevisionRow {
     pub actor: String,
     pub before_value: Option<Value>,
     pub after_value: Value,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Region settings row stored in the `region_settings` table.
@@ -8226,8 +8220,8 @@ pub struct RegionSettingsRow {
     pub timezone: String,
     pub enabled_prefixes: Vec<String>,
     pub auto_detected: bool,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// A region prefix with group and channel counts.
@@ -8305,8 +8299,8 @@ mod tests {
             subtitle: None,
             description: None,
             categories: serde_json::json!(["News", "Politics"]),
-            starts_at: Utc::now(),
-            stops_at: Utc::now(),
+            starts_at: Timestamp::now(),
+            stops_at: Timestamp::now(),
             source_name: None,
             metadata: None,
         };
@@ -8326,8 +8320,8 @@ mod tests {
             subtitle: None,
             description: None,
             categories: serde_json::json!({}),
-            starts_at: Utc::now(),
-            stops_at: Utc::now(),
+            starts_at: Timestamp::now(),
+            stops_at: Timestamp::now(),
             source_name: None,
             metadata: None,
         };

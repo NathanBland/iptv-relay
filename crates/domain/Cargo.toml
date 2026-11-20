@@ -9,12 +9,16 @@ license.workspace = true
 # Temporary conversions to and from chrono for crates that are not migrated
 # yet. Remove this feature when the chrono to jiff migration ends.
 chrono = ["dep:chrono"]
+# PostgreSQL encoding and decoding of `Timestamp` through jiff-sqlx.
+sqlx = ["dep:jiff-sqlx", "dep:sqlx"]
 
 [dependencies]
 chrono = { workspace = true, optional = true }
 jiff.workspace = true
+jiff-sqlx = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+sqlx = { workspace = true, optional = true }
 thiserror.workspace = true
 url.workspace = true
 utoipa.workspace = true

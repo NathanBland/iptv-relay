@@ -4,13 +4,14 @@
 //! the variable is unset, each test prints a notice and returns early so that
 //! the suite remains runnable in environments without a database.
 
-use chrono::{Duration, Utc};
+use iptv_domain::Timestamp;
 use iptv_ingest::{
     ActivationProgress, IngestError, IngestFormat, PreparedEpgChannel, PreparedProgramme,
     PreparedProviderStream, PreparedSnapshot, ProtectedEndpoint, SnapshotOwner, StagedRows,
     XtreamPayloadKind,
 };
 use iptv_persistence::Database;
+use jiff::SignedDuration;
 use serde_json::json;
 use sqlx::PgPool;
 use std::{future::Future, pin::Pin, sync::Mutex};
@@ -57,14 +58,14 @@ fn epg_channel(xmltv_id: &str) -> PreparedEpgChannel {
 }
 
 fn programme(channel_id: Uuid, title: &str) -> PreparedProgramme {
-    let start = Utc::now();
+    let start = Timestamp::now();
     PreparedProgramme {
         id: Uuid::now_v7(),
         epg_channel_id: channel_id,
         starts_at: start,
-        stops_at: Some(start + Duration::hours(1)),
+        stops_at: Some(start + SignedDuration::from_hours(1)),
         original_start: start.to_rfc3339(),
-        original_stop: Some((start + Duration::hours(1)).to_rfc3339()),
+        original_stop: Some((start + SignedDuration::from_hours(1)).to_rfc3339()),
         title: title.to_owned(),
         subtitle: None,
         description: Some("A test programme".to_owned()),
@@ -533,7 +534,7 @@ async fn stage_commits_immutable_rows_before_atomic_activation() {
 
     assert_eq!(store.stage(&snapshot).await.expect("stage"), snapshot_id);
     assert_eq!(snapshot_status(&pool, snapshot_id).await, "staging");
-    let staged_at: Option<chrono::DateTime<chrono::Utc>> =
+    let staged_at: Option<Timestamp> =
         sqlx::query_scalar("SELECT staged_at FROM source_snapshots WHERE id = $1")
             .bind(snapshot_id)
             .fetch_one(&pool)
