@@ -1,5 +1,13 @@
 # Chrono to Jiff migration plan
 
+## Status
+
+Phases 0 to 4 are complete. The workspace has no `chrono` or `chrono-tz` dependency.
+
+Use `iptv_domain::Timestamp` for each new timestamp. Use `jiff::tz::TimeZone` for each new time zone.
+
+`deny.toml` has no chrono advisory entry. The remainder of this page is a record of the plan.
+
 ## Problem
 
 The `chrono` and `chrono-tz` maintainers stopped maintenance.

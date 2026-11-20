@@ -1,10 +1,4 @@
 [advisories]
-# The chrono maintainers stopped maintenance. The advisories report no
-# vulnerability. Remove these entries when the chrono migration is complete.
-ignore = [
-  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no known vulnerability; a migration to jiff is planned" },
-  { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained, with no known vulnerability; a migration to jiff is planned" },
-]
 
 [licenses]
 confidence-threshold = 0.8
