@@ -60,7 +60,7 @@ pub struct EventMatch {
 pub struct DatePattern {
     /// Regex with a named `datetime` capture (or one positional capture).
     pub regex: String,
-    /// Chrono format string used to parse the captured local date/time.
+    /// The `strftime` format string that parses the captured local date and time.
     pub format: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
@@ -212,7 +212,7 @@ pub fn builtin_sports_event_rules() -> EventRuleSet {
     const TRAILER: &str = r"(?:\s*[-|]?\s*(?:\[[^\]]{1,32}\]|\([^()]{1,64}\)|UHD|4K|FHD|HD|SD|2160p|1080p|720p))*\s*$";
     const TIME: &str = r"[0-9]{1,2}(?::[0-9]{2})?\s*[ap]m";
     const EXPLICIT: &str = r"20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}";
-    // (label, date regex, trailing seconds regex, chrono format)
+    // (label, date regex, trailing seconds regex, strftime format)
     let formats = [
         (
             "ISO local time",

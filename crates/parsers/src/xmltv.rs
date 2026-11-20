@@ -1,10 +1,13 @@
 use crate::{Diagnostic, DiagnosticCode, ParseError, ParseLimits, ParseStats};
-use chrono::{DateTime, FixedOffset, LocalResult, NaiveDate, Offset, TimeZone, Utc};
-use chrono_tz::Tz;
 use iptv_domain::{
     Credit, Credits, EpgChannel, EpgIcon, EpisodeNumber, ExtensionElement, LocalizedText,
     Programme, ProgrammeRating,
 };
+use iptv_domain::{
+    Timestamp,
+    time::{LocalTime, resolve_local, time_zone},
+};
+use jiff::{civil::DateTime, tz::Offset};
 use quick_xml::{
     Reader, XmlVersion,
     encoding::Decoder,
@@ -14,7 +17,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::BufRead,
-    str::FromStr,
 };
 use thiserror::Error;
 use url::Url;
@@ -31,7 +33,7 @@ pub enum TimestampPrecision {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XmltvTimestamp {
-    pub utc: DateTime<Utc>,
+    pub utc: Timestamp,
     pub precision: TimestampPrecision,
     pub offset_seconds: i32,
     pub timezone_was_implicit: bool,
@@ -940,8 +942,7 @@ pub fn parse_xmltv_timestamp_in_timezone(
     let hour = parse(8..10, 0)?;
     let minute = parse(10..12, 0)?;
     let second = parse(12..14, 0)?;
-    let naive = NaiveDate::from_ymd_opt(year, month, day)
-        .and_then(|date| date.and_hms_opt(hour, minute, second))
+    let naive = civil_datetime(year, month, day, hour, minute, second)
         .ok_or_else(|| XmltvTimestampError::InvalidDigits(digits.to_owned()))?;
 
     let timezone = parts.next();
@@ -953,7 +954,12 @@ pub fn parse_xmltv_timestamp_in_timezone(
     let timezone_was_implicit = timezone.is_none();
     let effective_timezone = timezone.unwrap_or(default_timezone);
     let (utc, offset_seconds) = match effective_timezone {
-        "Z" | "UTC" | "GMT" => (Utc.from_utc_datetime(&naive), 0),
+        "Z" | "UTC" | "GMT" => {
+            let utc = Offset::UTC
+                .to_timestamp(naive)
+                .map_err(|_| XmltvTimestampError::InvalidDigits(digits.to_owned()))?;
+            (Timestamp::from_jiff(utc), 0)
+        }
         zone if zone.starts_with(['+', '-']) => {
             let compact = zone.replace(':', "");
             if compact.len() != 5 || !compact[1..].bytes().all(|byte| byte.is_ascii_digit()) {
@@ -970,28 +976,26 @@ pub fn parse_xmltv_timestamp_in_timezone(
             }
             let sign = if compact.starts_with('-') { -1 } else { 1 };
             let seconds = sign * (hours * 3600 + minutes * 60);
-            let offset = FixedOffset::east_opt(seconds)
-                .ok_or_else(|| XmltvTimestampError::InvalidTimezone(zone.to_owned()))?;
-            let LocalResult::Single(local) = offset.from_local_datetime(&naive) else {
-                return Err(XmltvTimestampError::InvalidTimezone(zone.to_owned()));
-            };
-            (local.with_timezone(&Utc), seconds)
+            let local = Offset::from_seconds(seconds)
+                .and_then(|offset| offset.to_timestamp(naive))
+                .map_err(|_| XmltvTimestampError::InvalidTimezone(zone.to_owned()))?;
+            (Timestamp::from_jiff(local), seconds)
         }
         zone => {
-            let timezone = Tz::from_str(zone)
-                .map_err(|_| XmltvTimestampError::InvalidTimezone(zone.to_owned()))?;
-            match timezone.from_local_datetime(&naive) {
-                LocalResult::Single(value) => {
-                    let offset = value.offset().fix().local_minus_utc();
-                    (value.with_timezone(&Utc), offset)
+            let timezone = time_zone(zone)
+                .ok_or_else(|| XmltvTimestampError::InvalidTimezone(zone.to_owned()))?;
+            match resolve_local(&timezone, naive) {
+                LocalTime::Single(value) => {
+                    let offset = timezone.to_offset(value.as_jiff()).seconds();
+                    (value, offset)
                 }
-                LocalResult::Ambiguous(_, _) => {
+                LocalTime::Ambiguous => {
                     return Err(XmltvTimestampError::Ambiguous {
                         value: digits.to_owned(),
                         timezone: zone.to_owned(),
                     });
                 }
-                LocalResult::None => {
+                LocalTime::Nonexistent => {
                     return Err(XmltvTimestampError::Nonexistent {
                         value: digits.to_owned(),
                         timezone: zone.to_owned(),
@@ -1007,6 +1011,27 @@ pub fn parse_xmltv_timestamp_in_timezone(
         timezone_was_implicit,
         original,
     })
+}
+
+/// Builds a civil date and time, or returns `None` when a field is out of range.
+fn civil_datetime(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<DateTime> {
+    DateTime::new(
+        i16::try_from(year).ok()?,
+        i8::try_from(month).ok()?,
+        i8::try_from(day).ok()?,
+        i8::try_from(hour).ok()?,
+        i8::try_from(minute).ok()?,
+        i8::try_from(second).ok()?,
+        0,
+    )
+    .ok()
 }
 
 #[cfg(test)]
@@ -1486,12 +1511,11 @@ mod tests {
             let sign = if offset_hours < 0 { '-' } else { '+' };
             let source = format!("{year:04}{month:02}{day:02}{hour:02}{minute:02}00 {sign}{:02}00", offset_hours.abs());
             let parsed = parse_xmltv_timestamp(&source).expect("valid generated timestamp");
-            let expected_offset = FixedOffset::east_opt(offset_hours * 3600).unwrap();
-            let expected = expected_offset
-                .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            let expected = Offset::from_seconds(offset_hours * 3600)
                 .unwrap()
-                .with_timezone(&Utc);
-            prop_assert_eq!(parsed.utc, expected);
+                .to_timestamp(civil_datetime(year, month, day, hour, minute, 0).unwrap())
+                .unwrap();
+            prop_assert_eq!(parsed.utc, Timestamp::from_jiff(expected));
         }
     }
 }

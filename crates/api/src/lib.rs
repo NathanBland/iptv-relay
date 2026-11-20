@@ -10099,7 +10099,7 @@ fn write_programme_row(
         write!(
             body,
             "<episode-num system=\"original-air-date\">{}</episode-num><live/>",
-            sports.local_date.format("%Y-%m-%d")
+            sports.local_date.strftime("%Y-%m-%d")
         )
         .expect("writing to a String cannot fail");
     }

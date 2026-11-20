@@ -14,7 +14,7 @@
 
 use std::io::Write;
 
-use chrono::{NaiveDate, NaiveDateTime, TimeDelta};
+use jiff::{SignedDuration, civil::DateTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -189,15 +189,13 @@ pub fn generate_xmltv<W: Write>(config: ScaleXmltvConfig, mut writer: W) -> std:
         writeln!(writer, "  </channel>")?;
     }
     let channels = config.channels.max(1);
-    let base = NaiveDate::from_ymd_opt(2026, 1, 1)
-        .and_then(|date| date.and_hms_opt(0, 0, 0))
-        .expect("valid base timestamp");
+    let base = jiff::civil::date(2026, 1, 1).at(0, 0, 0, 0);
     for programme in 0..config.programmes {
         let channel = programme % channels;
         let slot = u32::try_from(programme / channels).unwrap_or(u32::MAX);
         let id = format!("ch-{channel:05}");
-        let start = base + TimeDelta::hours(i64::from(slot));
-        let stop = base + TimeDelta::hours(i64::from(slot) + 1);
+        let start = base + SignedDuration::from_hours(i64::from(slot));
+        let stop = base + SignedDuration::from_hours(i64::from(slot) + 1);
         let start = format_xmltv_timestamp(start);
         let stop = format_xmltv_timestamp(stop);
         let title = format!("Programme {programme}");
@@ -222,9 +220,9 @@ pub fn generate_xmltv<W: Write>(config: ScaleXmltvConfig, mut writer: W) -> std:
     Ok(())
 }
 
-/// Formats a [`NaiveDateTime`] as a compact XMLTV timestamp in UTC.
-fn format_xmltv_timestamp(instant: NaiveDateTime) -> String {
-    format!("{} +0000", instant.format("%Y%m%d%H%M%S"))
+/// Formats a civil [`DateTime`] as a compact XMLTV timestamp in UTC.
+fn format_xmltv_timestamp(instant: DateTime) -> String {
+    format!("{} +0000", instant.strftime("%Y%m%d%H%M%S"))
 }
 
 /// Computes the SHA-256 digest of the M3U fixture for `config`.
