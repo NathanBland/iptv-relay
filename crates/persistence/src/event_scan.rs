@@ -5,9 +5,9 @@
 
 use std::{collections::BTreeMap, sync::LazyLock};
 
-use chrono::{DateTime, Duration, DurationRound, Utc};
-use chrono_tz::Tz;
+use iptv_domain::{Timestamp, time::time_zone};
 use iptv_parsers::{GeneratedProgramme, GeneratedProgrammeKind};
+use jiff::{SignedDuration, Unit, tz::TimeZone};
 use regex::Regex;
 use serde::Serialize;
 use uuid::Uuid;
@@ -161,17 +161,17 @@ impl EventChannelState {
     /// Computes the state from the event interval, the grace, and `now`.
     #[must_use]
     pub fn at(
-        starts_at: DateTime<Utc>,
-        stops_at: DateTime<Utc>,
-        grace: Duration,
-        now: DateTime<Utc>,
+        starts_at: Timestamp,
+        stops_at: Timestamp,
+        grace: SignedDuration,
+        now: Timestamp,
     ) -> Self {
         if now < starts_at {
             Self::Scheduled
         } else if now < stops_at {
             Self::Live
         } else if stops_at
-            .checked_add_signed(grace)
+            .checked_add(grace)
             .is_some_and(|hidden_at| now < hidden_at)
         {
             Self::Ended
@@ -270,7 +270,11 @@ fn display_league(league: &str) -> String {
 /// timezone if it is not `UTC`, then the region timezone. The fallback is
 /// `UTC`.
 #[must_use]
-pub fn resolve_event_timezone(template: &str, source: Option<&str>, region: Option<&str>) -> Tz {
+pub fn resolve_event_timezone(
+    template: &str,
+    source: Option<&str>,
+    region: Option<&str>,
+) -> TimeZone {
     [
         Some(template).filter(|value| value.trim() != "UTC"),
         source.filter(|value| value.trim() != "UTC"),
@@ -278,8 +282,8 @@ pub fn resolve_event_timezone(template: &str, source: Option<&str>, region: Opti
     ]
     .into_iter()
     .flatten()
-    .find_map(|value| value.trim().parse::<Tz>().ok())
-    .unwrap_or(Tz::UTC)
+    .find_map(|value| time_zone(value.trim()))
+    .unwrap_or(TimeZone::UTC)
 }
 
 /// Parses the `slot` capture as the legacy `event_channels.slot_number`.
@@ -300,13 +304,13 @@ pub fn slot_number(captures: &BTreeMap<String, String>) -> i32 {
 #[must_use]
 pub fn plan_event_channel_guide(
     event: &GeneratedProgramme,
-    timezone: Tz,
-    now: DateTime<Utc>,
-    grace: Duration,
+    timezone: &TimeZone,
+    now: Timestamp,
+    grace: SignedDuration,
     settings: &EventScanSettings,
 ) -> Vec<GeneratedProgramme> {
     let mut programmes = Vec::with_capacity(3);
-    let window_start = now.duration_trunc(Duration::hours(1)).unwrap_or(now);
+    let window_start = now.floor(Unit::Hour).unwrap_or(now);
     if window_start < event.starts_at {
         programmes.push(GeneratedProgramme {
             starts_at: window_start,
@@ -323,8 +327,8 @@ pub fn plan_event_channel_guide(
         });
     }
     programmes.push(event.clone());
-    if grace > Duration::zero()
-        && let Some(ended_stop) = event.stops_at.checked_add_signed(grace)
+    if grace > SignedDuration::ZERO
+        && let Some(ended_stop) = event.stops_at.checked_add(grace)
     {
         programmes.push(GeneratedProgramme {
             starts_at: event.stops_at,
@@ -340,19 +344,25 @@ pub fn plan_event_channel_guide(
 
 /// Formats `Upcoming: <title>, <local start time>`.
 #[must_use]
-pub fn upcoming_title(prefix: &str, title: &str, starts_at: DateTime<Utc>, timezone: Tz) -> String {
-    let local = starts_at.with_timezone(&timezone);
-    format!("{prefix}: {title}, {}", local.format("%b %-d %-I:%M %p %Z"))
+pub fn upcoming_title(
+    prefix: &str,
+    title: &str,
+    starts_at: Timestamp,
+    timezone: &TimeZone,
+) -> String {
+    let local = starts_at.to_zoned(timezone.clone());
+    format!(
+        "{prefix}: {title}, {}",
+        local.strftime("%b %-d %-I:%M %p %Z")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn at(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .unwrap()
-            .with_timezone(&Utc)
+    fn at(value: &str) -> Timestamp {
+        value.parse().unwrap()
     }
 
     fn captures(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -415,20 +425,20 @@ mod tests {
     fn timezone_order_is_template_source_region() {
         assert_eq!(
             resolve_event_timezone("America/Denver", Some("America/New_York"), Some("UTC")),
-            chrono_tz::America::Denver
+            time_zone("America/Denver").unwrap()
         );
         assert_eq!(
             resolve_event_timezone("UTC", Some("America/New_York"), Some("America/Denver")),
-            chrono_tz::America::New_York
+            time_zone("America/New_York").unwrap()
         );
         assert_eq!(
             resolve_event_timezone("UTC", Some("UTC"), Some("America/Denver")),
-            chrono_tz::America::Denver
+            time_zone("America/Denver").unwrap()
         );
-        assert_eq!(resolve_event_timezone("UTC", None, None), Tz::UTC);
+        assert_eq!(resolve_event_timezone("UTC", None, None), TimeZone::UTC);
         assert_eq!(
             resolve_event_timezone("UTC", Some("bad"), Some("also bad")),
-            Tz::UTC
+            TimeZone::UTC
         );
     }
 
@@ -455,7 +465,7 @@ mod tests {
     fn state_follows_time() {
         let start = at("2026-11-05T00:30:00Z");
         let stop = at("2026-11-05T03:30:00Z");
-        let grace = Duration::hours(4);
+        let grace = SignedDuration::from_hours(4);
         let state = |now| EventChannelState::at(start, stop, grace, at(now));
         assert_eq!(state("2026-11-04T15:00:00Z"), EventChannelState::Scheduled);
         assert_eq!(state("2026-11-05T00:30:00Z"), EventChannelState::Live);
@@ -475,9 +485,9 @@ mod tests {
         };
         let guide = plan_event_channel_guide(
             &event,
-            chrono_tz::America::New_York,
+            &time_zone("America/New_York").unwrap(),
             at("2026-11-04T15:17:00Z"),
-            Duration::hours(4),
+            SignedDuration::from_hours(4),
             &EventScanSettings::default(),
         );
         assert_eq!(guide.len(), 3);
@@ -497,12 +507,61 @@ mod tests {
 
         let live = plan_event_channel_guide(
             &event,
-            chrono_tz::America::New_York,
+            &time_zone("America/New_York").unwrap(),
             at("2026-11-05T01:00:00Z"),
-            Duration::hours(4),
+            SignedDuration::from_hours(4),
             &EventScanSettings::default(),
         );
         assert_eq!(live.len(), 2);
         assert_eq!(live[0].kind, GeneratedProgrammeKind::Event);
+    }
+
+    #[test]
+    fn upcoming_title_uses_local_abbreviation_across_daylight_saving_changes() {
+        let denver = resolve_event_timezone("America/Denver", None, None);
+        let new_york = resolve_event_timezone("UTC", Some("America/New_York"), None);
+        let utc = resolve_event_timezone("UTC", None, None);
+        let cases = [
+            ("2026-03-08T08:59:00Z", &denver, "Mar 8 1:59 AM MST"),
+            ("2026-03-08T09:00:00Z", &denver, "Mar 8 3:00 AM MDT"),
+            ("2026-11-01T07:30:00Z", &denver, "Nov 1 1:30 AM MDT"),
+            ("2026-11-01T08:30:00Z", &denver, "Nov 1 1:30 AM MST"),
+            ("2026-03-08T06:59:00Z", &new_york, "Mar 8 1:59 AM EST"),
+            ("2026-03-08T07:00:00Z", &new_york, "Mar 8 3:00 AM EDT"),
+            ("2026-11-01T05:30:00Z", &new_york, "Nov 1 1:30 AM EDT"),
+            ("2026-11-01T06:30:00Z", &new_york, "Nov 1 1:30 AM EST"),
+            ("2026-12-31T23:05:00.5Z", &utc, "Dec 31 11:05 PM UTC"),
+            ("2026-07-04T12:00:00Z", &utc, "Jul 4 12:00 PM UTC"),
+        ];
+        for (starts_at, timezone, expected) in cases {
+            assert_eq!(
+                upcoming_title("Upcoming", "Game", at(starts_at), timezone),
+                format!("Upcoming: Game, {expected}"),
+                "{starts_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn upcoming_filler_starts_at_the_hour_across_daylight_saving_changes() {
+        let event = GeneratedProgramme {
+            starts_at: at("2026-03-08T09:30:00Z"),
+            stops_at: at("2026-03-08T12:30:00Z"),
+            title: "Game".to_owned(),
+            kind: GeneratedProgrammeKind::Event,
+            stable_event_key: None,
+            source_title: "Game".to_owned(),
+        };
+        let guide = plan_event_channel_guide(
+            &event,
+            &resolve_event_timezone("America/Denver", None, None),
+            at("2026-03-08T08:59:59.999Z"),
+            SignedDuration::from_hours(1),
+            &EventScanSettings::default(),
+        );
+        assert_eq!(guide.len(), 3);
+        assert_eq!(guide[0].starts_at.to_rfc3339(), "2026-03-08T08:00:00+00:00");
+        assert_eq!(guide[0].title, "Upcoming: Game, Mar 8 3:30 AM MDT");
+        assert_eq!(guide[2].stops_at.to_rfc3339(), "2026-03-08T13:30:00+00:00");
     }
 }

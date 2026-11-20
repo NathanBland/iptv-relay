@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use crate::time::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use url::Url;
@@ -86,9 +86,9 @@ pub struct ProgrammeRating {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct Programme {
     pub channel_id: String,
-    pub start: DateTime<Utc>,
+    pub start: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop: Option<DateTime<Utc>>,
+    pub stop: Option<Timestamp>,
     /// Literal XMLTV start value before timezone normalization.
     #[serde(default)]
     pub original_start: String,
@@ -128,15 +128,14 @@ impl Programme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn programme_intervals_are_half_open_and_forward() {
-        let start = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let start: Timestamp = "2026-01-01T12:00:00Z".parse().unwrap();
         let mut programme = Programme {
             channel_id: "example".into(),
             start,
-            stop: Some(start + chrono::Duration::hours(1)),
+            stop: Some(start + jiff::SignedDuration::from_hours(1)),
             original_start: "20260101120000 +0000".into(),
             original_stop: Some("20260101130000 +0000".into()),
             titles: vec![],

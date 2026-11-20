@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use chrono::Utc;
 use futures_util::StreamExt;
+use jiff::{Timestamp, tz::TimeZone};
 use reqwest::header::SET_COOKIE;
 
 const BASE_URL: &str = "http://127.0.0.1:8081";
@@ -377,9 +377,9 @@ async fn programmes_exist_and_overlap_now_in_denver() -> anyhow::Result<()> {
         .context("programme items missing")?;
     anyhow::ensure!(!items.is_empty(), "programme page has no items");
 
-    let now_utc = Utc::now();
-    let denver = chrono_tz::America::Denver;
-    let today_denver = now_utc.with_timezone(&denver).date_naive();
+    let now_utc = Timestamp::now();
+    let denver = TimeZone::get("America/Denver").context("load America/Denver")?;
+    let today_denver = now_utc.to_zoned(denver.clone()).date();
 
     let mut saw_current = false;
     let mut saw_today = false;
@@ -392,18 +392,14 @@ async fn programmes_exist_and_overlap_now_in_denver() -> anyhow::Result<()> {
             .as_str()
             .context("programme end is not a string")?;
 
-        let start = chrono::DateTime::parse_from_rfc3339(start_str)
-            .context("parse programme start")?
-            .with_timezone(&Utc);
-        let end = chrono::DateTime::parse_from_rfc3339(end_str)
-            .context("parse programme end")?
-            .with_timezone(&Utc);
+        let start: Timestamp = start_str.parse().context("parse programme start")?;
+        let end: Timestamp = end_str.parse().context("parse programme end")?;
 
         if start <= now_utc && now_utc < end {
             saw_current = true;
         }
 
-        if start.with_timezone(&denver).date_naive() == today_denver {
+        if start.to_zoned(denver.clone()).date() == today_denver {
             saw_today = true;
         }
     }

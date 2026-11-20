@@ -1,11 +1,12 @@
 //! Pure matcher from two team strings to an ESPN event. No I/O.
 
-use chrono::{DateTime, Duration, Utc};
+use iptv_domain::Timestamp;
+use jiff::SignedDuration;
 
 use crate::model::{EspnEvent, EspnTeam};
 
 /// Maximum difference between the parsed time and the ESPN time before a conflict is set.
-pub const CONFLICT_THRESHOLD: Duration = Duration::hours(2);
+pub const CONFLICT_THRESHOLD: SignedDuration = SignedDuration::from_hours(2);
 
 /// Minimum score for one team to count as a match.
 const MIN_TEAM_SCORE: f32 = 0.7;
@@ -38,7 +39,7 @@ pub struct MatchQuery {
     pub second_team: String,
     pub separator: Separator,
     /// Start time from the channel name, already converted to UTC.
-    pub parsed_start: Option<DateTime<Utc>>,
+    pub parsed_start: Option<Timestamp>,
 }
 
 /// A team in a match result.
@@ -66,7 +67,7 @@ impl From<&EspnTeam> for MatchedTeam {
 pub struct EventMatch {
     pub event_id: String,
     /// The ESPN start time. It always wins over the parsed time.
-    pub start_utc: DateTime<Utc>,
+    pub start_utc: Timestamp,
     pub home: MatchedTeam,
     pub away: MatchedTeam,
     pub venue: Option<String>,
@@ -156,7 +157,7 @@ pub fn find_team<'a>(teams: &'a [EspnTeam], text: &str) -> Option<(&'a EspnTeam,
 /// closest to the parsed time, then to the earliest event.
 #[must_use]
 pub fn match_event(query: &MatchQuery, events: &[EspnEvent]) -> Option<EventMatch> {
-    let mut best: Option<(EventMatch, Duration)> = None;
+    let mut best: Option<(EventMatch, SignedDuration)> = None;
     for event in events {
         let Some((conf, first_is_home)) = score_event(query, event) else {
             continue;
@@ -166,7 +167,7 @@ pub fn match_event(query: &MatchQuery, events: &[EspnEvent]) -> Option<EventMatc
             .is_some_and(|p| (p - event.start_utc).abs() > CONFLICT_THRESHOLD);
         let distance = query
             .parsed_start
-            .map_or(Duration::zero(), |p| (p - event.start_utc).abs());
+            .map_or(SignedDuration::ZERO, |p| (p - event.start_utc).abs());
         let candidate = EventMatch {
             event_id: event.id.clone(),
             start_utc: event.start_utc,
@@ -231,7 +232,6 @@ fn score_event(query: &MatchQuery, event: &EspnEvent) -> Option<(f32, bool)> {
 mod tests {
     use super::*;
     use crate::model::parse_scoreboard;
-    use chrono::TimeZone;
 
     fn events() -> Vec<EspnEvent> {
         let mut all = parse_scoreboard(include_bytes!(
@@ -247,7 +247,7 @@ mod tests {
         all
     }
 
-    fn q(a: &str, sep: Separator, b: &str, start: Option<DateTime<Utc>>) -> MatchQuery {
+    fn q(a: &str, sep: Separator, b: &str, start: Option<Timestamp>) -> MatchQuery {
         MatchQuery {
             first_team: a.into(),
             second_team: b.into(),
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(m.away.abbreviation, "OTT");
         assert_eq!(
             m.start_utc,
-            Utc.with_ymd_and_hms(2026, 11, 5, 0, 30, 0).unwrap()
+            "2026-11-05T00:30:00Z".parse::<Timestamp>().unwrap()
         );
         assert_eq!(m.venue.as_deref(), Some("KeyBank Center"));
         assert_eq!(m.broadcasters, vec!["ESPN+", "MSGB"]);
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn matching_time_is_not_a_conflict() {
-        let p = Utc.with_ymd_and_hms(2026, 11, 5, 0, 30, 0).unwrap();
+        let p = "2026-11-05T00:30:00Z".parse::<Timestamp>().unwrap();
         let m = match_event(&q("Senators", Separator::At, "Sabres", Some(p)), &events()).unwrap();
         assert!(!m.time_conflict);
     }
@@ -316,12 +316,12 @@ mod tests {
     #[test]
     fn wrong_time_sets_conflict_and_keeps_espn_time() {
         // The provider time was read as UTC: 19:30Z instead of 00:30Z the next day.
-        let p = Utc.with_ymd_and_hms(2026, 11, 4, 19, 30, 0).unwrap();
+        let p = "2026-11-04T19:30:00Z".parse::<Timestamp>().unwrap();
         let m = match_event(&q("Senators", Separator::At, "Sabres", Some(p)), &events()).unwrap();
         assert!(m.time_conflict);
         assert_eq!(
             m.start_utc,
-            Utc.with_ymd_and_hms(2026, 11, 5, 0, 30, 0).unwrap()
+            "2026-11-05T00:30:00Z".parse::<Timestamp>().unwrap()
         );
     }
 

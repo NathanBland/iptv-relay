@@ -709,7 +709,7 @@ async fn run_refresh_job(
             if execution.deferred {
                 if let Some(source_id) = source_id_from_payload(&job.payload) {
                     if let Err(error) = sources
-                        .mark_source_refreshed(source_id, chrono::Utc::now())
+                        .mark_source_refreshed(source_id, iptv_domain::Timestamp::now())
                         .await
                     {
                         warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
@@ -735,7 +735,7 @@ async fn run_refresh_job(
             jobs.succeed(job.id, worker_id).await?;
             if source_refresh && let Some(source_id) = source_id_from_payload(&job.payload) {
                 if let Err(error) = sources
-                    .mark_source_refreshed(source_id, chrono::Utc::now())
+                    .mark_source_refreshed(source_id, iptv_domain::Timestamp::now())
                     .await
                 {
                     warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
@@ -1285,7 +1285,7 @@ async fn ingest_limits(catalog: &CatalogRepository, provider_id: Uuid) -> Ingest
 async fn refresh_event_guides_after_publication(catalog: &CatalogRepository) {
     let settings = catalog.event_scan_settings().await;
     match catalog
-        .refresh_event_guides(chrono::Utc::now(), &settings)
+        .refresh_event_guides(iptv_domain::Timestamp::now(), &settings)
         .await
     {
         Ok(report) => info!(
@@ -3081,6 +3081,8 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use iptv_domain::Timestamp;
+    use jiff::SignedDuration;
 
     #[test]
     fn ingest_limits_follow_the_operator_settings() {
@@ -3565,8 +3567,8 @@ mod tests {
                 // channel_id matches that tvg-id so the catalog tvg-id
                 // reconciliation pass links the short EPG channel to the
                 // canonical channel that the live-stream snapshot produced.
-                let start = chrono::Utc::now() - chrono::Duration::minutes(5);
-                let end = chrono::Utc::now() + chrono::Duration::hours(3);
+                let start = Timestamp::now() - SignedDuration::from_mins(5);
+                let end = Timestamp::now() + SignedDuration::from_hours(3);
                 Json(serde_json::json!({
                     "epg_listings": [
                         {
@@ -6588,7 +6590,7 @@ mod tests {
         let event_group = format!("Worker events {suffix}");
         // The event starts in the future, so that the scan schedules it.
         let event_start =
-            (chrono::Utc::now() + chrono::Duration::hours(12)).format("%Y-%m-%d %H:%M");
+            (Timestamp::now() + SignedDuration::from_hours(12)).format("%Y-%m-%d %H:%M");
         let playlist = format!(
             "#EXTM3U\n#EXTINF:-1 tvg-id=\"coverage-local-{suffix}\" group-title=\"{event_group}\",Event 7: Broncos vs Chiefs {event_start} HD\nhttp://provider.invalid/live.ts\n"
         );
@@ -6945,7 +6947,7 @@ mod tests {
             .checkpoint(&progress)
             .await
             .expect("checkpoint succeeds for active job");
-        let heartbeat: Option<chrono::DateTime<chrono::Utc>> =
+        let heartbeat: Option<Timestamp> =
             sqlx::query_scalar("SELECT heartbeat_at FROM jobs WHERE id = $1")
                 .bind(job.id)
                 .fetch_one(&pool)
@@ -7198,7 +7200,7 @@ mod tests {
                 .any(|programme| programme.title == "Broncos vs Chiefs"),
             "mapped channel did not expose the short EPG programme"
         );
-        let now = chrono::Utc::now();
+        let now = iptv_domain::Timestamp::now();
         assert!(
             mapped_programmes.iter().any(|programme| {
                 programme.title == "Broncos vs Chiefs"

@@ -14,7 +14,7 @@ use argon2::{
 };
 use axum::http::{HeaderMap, header};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Utc};
+use iptv_domain::Timestamp;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -147,7 +147,7 @@ pub(crate) struct OperatorTokenRecord {
     pub id: Uuid,
     pub token_hash: [u8; 32],
     pub scopes: Vec<String>,
-    pub expires_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<Timestamp>,
 }
 
 impl AuthManager {
@@ -416,7 +416,7 @@ impl AuthManager {
         }
         if let Some(token) = bearer_token(headers) {
             let token_hash = digest(token);
-            let now = Utc::now();
+            let now = Timestamp::now();
             let mut operator_tokens = self.lock_operator_tokens();
             operator_tokens
                 .retain(|_, record| record.expires_at.is_none_or(|expires_at| expires_at > now));
@@ -792,7 +792,7 @@ mod tests {
             id: Uuid::now_v7(),
             token_hash: digest(token),
             scopes: vec![OPERATOR_TOKEN_ADMIN_SCOPE.to_owned()],
-            expires_at: Some(Utc::now() - chrono::Duration::seconds(1)),
+            expires_at: Some(Timestamp::now() - jiff::SignedDuration::from_secs(1)),
         });
         assert_eq!(manager.authorize(&headers, false), None);
     }

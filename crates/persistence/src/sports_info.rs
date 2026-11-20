@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use iptv_domain::Timestamp;
 use iptv_sports::{EspnClient, EventMatch, League, MatchQuery, MatchedTeam, Separator};
 use serde::{Deserialize, Serialize};
 
@@ -39,7 +39,7 @@ pub struct SportsInfo {
     /// League key, for example `NHL`.
     pub league: String,
     /// Event date in the template timezone, `YYYY-MM-DD`.
-    pub local_date: NaiveDate,
+    pub local_date: jiff::civil::Date,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,7 +52,7 @@ pub struct SportsInfo {
     pub broadcasters: Vec<String>,
     /// ESPN start time. The programme keeps the parsed time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub espn_start: Option<DateTime<Utc>>,
+    pub espn_start: Option<Timestamp>,
     /// True when the parsed and ESPN start times differ by more than 2 hours.
     #[serde(default)]
     pub time_conflict: bool,
@@ -63,7 +63,7 @@ pub struct SportsInfo {
 impl SportsInfo {
     /// Returns the information for a known league and no ESPN match.
     #[must_use]
-    pub fn league_only(league: League, local_date: NaiveDate) -> Self {
+    pub fn league_only(league: League, local_date: jiff::civil::Date) -> Self {
         Self {
             league: league.key().to_owned(),
             local_date,
@@ -78,7 +78,7 @@ impl SportsInfo {
         }
     }
 
-    fn from_match(league: League, local_date: NaiveDate, found: &EventMatch) -> Self {
+    fn from_match(league: League, local_date: jiff::civil::Date, found: &EventMatch) -> Self {
         Self {
             event_id: Some(found.event_id.clone()),
             home: Some(SportsTeam::from(&found.home)),
@@ -151,7 +151,7 @@ pub fn detect_league(captures: &BTreeMap<String, String>, group: Option<&str>) -
 #[must_use]
 pub fn match_query(
     captures: &BTreeMap<String, String>,
-    parsed_start: Option<DateTime<Utc>>,
+    parsed_start: Option<Timestamp>,
 ) -> Option<MatchQuery> {
     let (first, second, separator) = match (
         captures.get("away"),
@@ -175,9 +175,9 @@ pub fn match_query(
 pub async fn lookup_sports_info(
     client: &EspnClient,
     league: League,
-    local_date: NaiveDate,
+    local_date: jiff::civil::Date,
     captures: &BTreeMap<String, String>,
-    parsed_start: DateTime<Utc>,
+    parsed_start: Timestamp,
 ) -> SportsInfo {
     let Some(query) = match_query(captures, Some(parsed_start)) else {
         return SportsInfo::league_only(league, local_date);

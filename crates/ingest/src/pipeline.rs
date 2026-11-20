@@ -7,9 +7,8 @@ use crate::{
     StagedRows, XtreamStreamEndpointTemplate, download_stream, unpack_artifact,
 };
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
-use iptv_domain::{EpgChannel, Programme};
+use iptv_domain::{EpgChannel, Programme, Timestamp};
 use iptv_parsers::{
     Diagnostic, ParseError, ParseLimits, XmltvParseOptions, parse_m3u_visit,
     parse_xmltv_visit_with_options,
@@ -1170,7 +1169,7 @@ fn prepared_programme(programme: Programme, epg_channel_id: Uuid) -> PreparedPro
     }
 }
 
-fn original_timestamp(value: &str, normalized: DateTime<Utc>) -> String {
+fn original_timestamp(value: &str, normalized: Timestamp) -> String {
     if value.is_empty() {
         normalized.to_rfc3339()
     } else {
@@ -1609,7 +1608,6 @@ fn diagnostics_json(diagnostics: &[Diagnostic]) -> Value {
 mod tests {
     use super::*;
     use crate::{ArtifactLimits, DownloadedArtifact, XtreamEndpoints, XtreamPayloadKind};
-    use chrono::TimeZone;
     use std::{io::Write, sync::Mutex};
 
     #[test]
@@ -2411,7 +2409,7 @@ mod tests {
     fn prepared_programme_uses_untitled_when_no_titles() {
         let programme = Programme {
             channel_id: "ch1".to_owned(),
-            start: chrono::Utc::now(),
+            start: iptv_domain::Timestamp::now(),
             stop: None,
             original_start: String::new(),
             original_stop: None,
@@ -2435,14 +2433,11 @@ mod tests {
 
     #[test]
     fn prepared_programme_preserves_literal_xmltv_timestamps() {
-        let start = chrono::Utc
-            .with_ymd_and_hms(2026, 7, 1, 18, 0, 0)
-            .single()
-            .expect("UTC timestamp");
+        let start: iptv_domain::Timestamp = "2026-07-01T18:00:00Z".parse().expect("UTC timestamp");
         let programme = Programme {
             channel_id: "ch1".to_owned(),
             start,
-            stop: Some(start + chrono::Duration::hours(1)),
+            stop: Some(start + jiff::SignedDuration::from_hours(1)),
             original_start: "20260701120000 America/Denver".to_owned(),
             original_stop: Some("20260701130000 America/Denver".to_owned()),
             titles: Vec::new(),

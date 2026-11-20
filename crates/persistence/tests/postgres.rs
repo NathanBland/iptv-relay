@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chrono::{Duration, TimeZone, Utc};
+use iptv_domain::Timestamp;
 use iptv_persistence::{
     BUILTIN_EVENT_TEMPLATE_ID, CatalogRepository, CreateChannelAliasInput, CreateEventTemplate,
     CreateRecordingInput, CreateRecordingRuleInput, CreateStreamProfileInput, CreateUserInput,
@@ -16,6 +16,7 @@ use iptv_persistence::{
     SourceRefreshScheduleResult, SourceRepository, SourceUpdate, StreamHealthUpdate,
     UpdateUserInput, compile_template_regex,
 };
+use jiff::SignedDuration;
 use serde_json::{Value, json};
 
 fn database_url() -> Option<String> {
@@ -959,7 +960,7 @@ async fn operator_api_tokens_are_hash_only_and_have_audited_lifecycle() {
             "integration token",
             &first_hash,
             &scopes,
-            Some(Utc::now() + Duration::hours(1)),
+            Some(Timestamp::now() + SignedDuration::from_hours(1)),
             "integration-test",
         )
         .await
@@ -999,7 +1000,7 @@ async fn operator_api_tokens_are_hash_only_and_have_audited_lifecycle() {
         .unwrap();
     assert_eq!(rotated.id, second_id);
     assert_eq!(rotated.token_hash, second_hash);
-    let old_revoked: Option<chrono::DateTime<Utc>> =
+    let old_revoked: Option<Timestamp> =
         sqlx::query_scalar("SELECT revoked_at FROM operator_api_tokens WHERE id = $1")
             .bind(first_id)
             .fetch_one(database.pool())
@@ -1136,8 +1137,8 @@ async fn migrations_preserve_conflicting_programme_metadata() {
     let source_id = uuid::Uuid::now_v7();
     let snapshot_id = uuid::Uuid::now_v7();
     let channel_id = uuid::Uuid::now_v7();
-    let start = Utc::now();
-    let stop = start + Duration::hours(1);
+    let start = Timestamp::now();
+    let stop = start + SignedDuration::from_hours(1);
 
     sqlx::query(
         "INSERT INTO epg_sources (id, name, url_template, enabled) VALUES ($1, $2, $3, false)",
@@ -1345,8 +1346,8 @@ async fn reconcile_merges_streams_by_tvg_id_and_maps_epg() {
         .bind(uuid::Uuid::now_v7())
         .bind(epg_snapshot_id)
         .bind(epg_channel_id)
-        .bind(Utc::now())
-        .bind(Utc::now() + Duration::hours(1))
+        .bind(Timestamp::now())
+        .bind(Timestamp::now() + SignedDuration::from_hours(1))
         .bind("start")
         .bind("stop")
         .execute(&mut *transaction)
@@ -1777,8 +1778,8 @@ async fn reconcile_epg_mappings_by_channel_alias() {
         .bind(uuid::Uuid::now_v7())
         .bind(epg_snapshot_id)
         .bind(epg_channel_id)
-        .bind(Utc::now())
-        .bind(Utc::now() + Duration::hours(1))
+        .bind(Timestamp::now())
+        .bind(Timestamp::now() + SignedDuration::from_hours(1))
         .bind("start")
         .bind("stop")
         .execute(&mut *transaction)
@@ -1989,8 +1990,8 @@ async fn reconcile_epg_mappings_by_normalized_name() {
         .bind(uuid::Uuid::now_v7())
         .bind(epg_snapshot_id)
         .bind(epg_channel_id)
-        .bind(Utc::now())
-        .bind(Utc::now() + Duration::hours(1))
+        .bind(Timestamp::now())
+        .bind(Timestamp::now() + SignedDuration::from_hours(1))
         .bind("start")
         .bind("stop")
         .execute(&mut *transaction)
@@ -3112,8 +3113,8 @@ async fn recording_crud_and_stats_work() {
     let rules = catalog.list_recording_rules().await.unwrap();
     assert!(rules.iter().any(|row| row.id == rule.id));
 
-    let start = Utc::now();
-    let end = start + Duration::hours(1);
+    let start = Timestamp::now();
+    let end = start + SignedDuration::from_hours(1);
     let recording = catalog
         .create_recording(&CreateRecordingInput {
             rule_id: Some(rule.id),
@@ -3289,9 +3290,9 @@ async fn catalog_browse_and_manual_mapping_queries_work() {
     let channel_name = format!("Browse channel {suffix}");
     let group_name = format!("Browse group {suffix}");
     let epg_name = format!("Browse guide {suffix}");
-    let reference_now = Utc.with_ymd_and_hms(2026, 7, 1, 18, 0, 0).single().unwrap();
-    let starts_at = reference_now + Duration::minutes(5);
-    let stops_at = starts_at + Duration::hours(1);
+    let reference_now = "2026-07-01T18:00:00Z".parse::<Timestamp>().ok().unwrap();
+    let starts_at = reference_now + SignedDuration::from_mins(5);
+    let stops_at = starts_at + SignedDuration::from_hours(1);
 
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query(
@@ -3362,14 +3363,14 @@ async fn catalog_browse_and_manual_mapping_queries_work() {
     for (id, start, stop, title) in [
         (
             uuid::Uuid::now_v7(),
-            reference_now - Duration::minutes(5),
-            reference_now + Duration::minutes(5),
+            reference_now - SignedDuration::from_mins(5),
+            reference_now + SignedDuration::from_mins(5),
             format!("Current programme {suffix}"),
         ),
         (
             uuid::Uuid::now_v7(),
-            reference_now - Duration::hours(2),
-            reference_now - Duration::hours(1),
+            reference_now - SignedDuration::from_hours(2),
+            reference_now - SignedDuration::from_hours(1),
             format!("Past programme {suffix}"),
         ),
     ] {
@@ -3566,8 +3567,8 @@ async fn event_template_and_channel_lifecycle_work() {
     .execute(database.pool())
     .await
     .unwrap();
-    let start = Utc::now() - Duration::hours(3);
-    let end = start + Duration::hours(1);
+    let start = Timestamp::now() - SignedDuration::from_hours(3);
+    let end = start + SignedDuration::from_hours(1);
     let event = catalog
         .upsert_event_channel(
             template.id,
@@ -3759,10 +3760,8 @@ async fn event_template_partial_update_persists_enabled_and_optional_fields() {
     drop_isolated_schema(&admin, &schema).await;
 }
 
-fn utc(value: &str) -> chrono::DateTime<Utc> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .unwrap()
-        .with_timezone(&Utc)
+fn utc(value: &str) -> Timestamp {
+    value.parse().unwrap()
 }
 
 /// Inserts an active snapshot with one supported stream for each name, and
@@ -3770,7 +3769,7 @@ fn utc(value: &str) -> chrono::DateTime<Utc> {
 async fn seed_event_channels(
     pool: &sqlx::PgPool,
     source_timezone: &str,
-    activated_at: chrono::DateTime<Utc>,
+    activated_at: Timestamp,
     names: &[&str],
 ) -> Vec<uuid::Uuid> {
     let account_id = uuid::Uuid::now_v7();
@@ -3955,7 +3954,7 @@ async fn event_scan_schedules_live_titles_with_stable_names_and_filler() {
         assert_eq!(guide.last().unwrap().title, "Event ended", "{title}");
         assert_eq!(
             guide.last().unwrap().stops_at,
-            utc(stops_at) + Duration::hours(4),
+            utc(stops_at) + SignedDuration::from_hours(4),
             "{title}"
         );
         assert!(
@@ -4408,7 +4407,7 @@ async fn source_configuration_and_job_management_work() {
         Err(PersistenceError::SourceNotFound(id)) if id == missing_id
     ));
 
-    let refreshed_at = Utc::now() - Duration::hours(1);
+    let refreshed_at = Timestamp::now() - SignedDuration::from_hours(1);
     sources
         .mark_source_refreshed(provider.source.id, refreshed_at)
         .await
@@ -4749,7 +4748,7 @@ async fn scheduler_workers_create_one_due_source_refresh_job() {
     jobs.cancel(created.refresh_job.id).await.unwrap();
     sources.update_refresh_interval(source_id, 1).await.unwrap();
     sources
-        .mark_source_refreshed(source_id, Utc::now() - Duration::seconds(2))
+        .mark_source_refreshed(source_id, Timestamp::now() - SignedDuration::from_secs(2))
         .await
         .unwrap();
 
@@ -6706,7 +6705,7 @@ async fn run_scheduler_cycle(
 async fn provider_circuit_state(
     pool: &sqlx::PgPool,
     source_id: uuid::Uuid,
-) -> (i32, Option<chrono::DateTime<Utc>>) {
+) -> (i32, Option<Timestamp>) {
     sqlx::query_as(
         "SELECT cb_consecutive_failures, cb_opened_at \
          FROM provider_accounts WHERE id = $1",
@@ -6718,10 +6717,7 @@ async fn provider_circuit_state(
 }
 
 /// Returns the circuit state of one XMLTV source as `(failures, opened_at)`.
-async fn epg_circuit_state(
-    pool: &sqlx::PgPool,
-    source_id: uuid::Uuid,
-) -> (i32, Option<chrono::DateTime<Utc>>) {
+async fn epg_circuit_state(pool: &sqlx::PgPool, source_id: uuid::Uuid) -> (i32, Option<Timestamp>) {
     sqlx::query_as(
         "SELECT cb_consecutive_failures, cb_opened_at \
          FROM epg_sources WHERE id = $1",
@@ -7141,7 +7137,7 @@ async fn dead_letter_replay_creates_a_fresh_claimable_job_and_marks_resolved() {
     assert_eq!(claimed.attempts, 1, "attempts reset on replay");
 
     // The archive is resolved as replayed and no longer listed unresolved.
-    let resolved: (Option<chrono::DateTime<Utc>>, Option<String>) =
+    let resolved: (Option<Timestamp>, Option<String>) =
         sqlx::query_as("SELECT resolved_at, resolution FROM dead_letter_jobs WHERE id = $1")
             .bind(archived.id)
             .fetch_one(&pool)
@@ -7195,7 +7191,7 @@ async fn dead_letter_close_marks_resolved_without_replaying() {
             .unwrap()
     );
 
-    let resolved: (Option<chrono::DateTime<Utc>>, Option<String>) =
+    let resolved: (Option<Timestamp>, Option<String>) =
         sqlx::query_as("SELECT resolved_at, resolution FROM dead_letter_jobs WHERE id = $1")
             .bind(archived.id)
             .fetch_one(&pool)
@@ -7760,7 +7756,7 @@ async fn event_scan_settings_follow_operator_overrides() {
 
     // Defaults: three hours, and the standard ended title.
     let (length, ended) = scan(&catalog).await;
-    assert_eq!(length, Duration::hours(3));
+    assert_eq!(length, SignedDuration::from_hours(3));
     assert_eq!(ended, "Event ended");
 
     // Changed overrides change the next scan.
@@ -7772,7 +7768,7 @@ async fn event_scan_settings_follow_operator_overrides() {
         .await
         .unwrap();
     let (length, ended) = scan(&catalog).await;
-    assert_eq!(length, Duration::hours(2));
+    assert_eq!(length, SignedDuration::from_hours(2));
     assert_eq!(ended, "Stand by");
 
     // A template with its own duration ignores the operator duration.
@@ -7781,7 +7777,7 @@ async fn event_scan_settings_follow_operator_overrides() {
         .await
         .unwrap();
     let (length, _) = scan(&catalog).await;
-    assert_eq!(length, Duration::hours(4));
+    assert_eq!(length, SignedDuration::from_hours(4));
 
     // Provider capacity counts each enabled pool once.
     assert_eq!(catalog.provider_capacity().await.unwrap(), 1);

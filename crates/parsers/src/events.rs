@@ -1,13 +1,20 @@
 use crate::{Diagnostic, DiagnosticCode, ParseError, ParseLimits, ParseStats};
-use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use chrono_tz::Tz;
 use iptv_domain::{DatePattern, EVENT_TITLE_METADATA_KEY, EventRule, EventRuleSet};
+use iptv_domain::{
+    Timestamp,
+    time::{LocalTime, format_civil, resolve_local, time_zone},
+};
+use jiff::{
+    SignedDuration, Unit,
+    civil::{Date, DateTime, Time},
+    fmt::strtime,
+    tz::TimeZone,
+};
 use regex::Regex;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     io::{BufRead, Read},
-    str::FromStr,
 };
 use thiserror::Error;
 
@@ -30,7 +37,7 @@ pub struct EventCandidate<'a> {
 #[derive(Clone, Debug)]
 pub struct MatchedEvent<'a> {
     pub rule: &'a EventRule,
-    pub starts_at: Option<DateTime<Utc>>,
+    pub starts_at: Option<Timestamp>,
     /// Named values extracted from the title, group, EPG title, and date regexes.
     pub captures: BTreeMap<String, String>,
 }
@@ -43,8 +50,8 @@ pub enum GeneratedProgrammeKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedProgramme {
-    pub starts_at: DateTime<Utc>,
-    pub stops_at: DateTime<Utc>,
+    pub starts_at: Timestamp,
+    pub stops_at: Timestamp,
     pub title: String,
     pub kind: GeneratedProgrammeKind,
     /// Present only for event programmes so imports can update in place.
@@ -190,7 +197,7 @@ pub fn parse_event_rules<R: BufRead>(
             );
             valid = false;
         }
-        if Tz::from_str(&rule.timezone).is_err() {
+        if time_zone(&rule.timezone).is_none() {
             event_rule_diagnostic(
                 &mut document,
                 format!(
@@ -242,7 +249,7 @@ pub fn parse_event_rules<R: BufRead>(
                 }
             }
             if let Some(timezone) = &pattern.timezone
-                && Tz::from_str(timezone).is_err()
+                && time_zone(timezone).is_none()
             {
                 event_rule_diagnostic(
                     &mut document,
@@ -335,7 +342,7 @@ impl CompiledEventRules {
 /// Converts an explicit `stop` capture into a `duration_seconds` capture.
 fn apply_stop_capture(
     compiled: &CompiledRule,
-    starts_at: Option<DateTime<Utc>>,
+    starts_at: Option<Timestamp>,
     captures: &mut BTreeMap<String, String>,
 ) -> Result<(), EventDateError> {
     let (Some(start), Some(stop), Some(pattern)) = (
@@ -351,7 +358,7 @@ fn apply_stop_capture(
         .as_deref()
         .unwrap_or(&compiled.rule.timezone);
     let stop_at = parse_event_local_datetime(&stop, &pattern.definition.format, timezone)?;
-    let seconds = (stop_at - start).num_seconds();
+    let seconds = (stop_at - start).as_secs();
     if seconds <= 0 {
         return Err(EventDateError::InvalidDate {
             value: stop,
@@ -425,8 +432,8 @@ fn collect_regex_captures(
 pub fn generate_event_guide(
     matched: &MatchedEvent<'_>,
     source_title: &str,
-    window_start: DateTime<Utc>,
-    window_end: DateTime<Utc>,
+    window_start: Timestamp,
+    window_end: Timestamp,
 ) -> Result<Vec<GeneratedProgramme>, EventGuideError> {
     if window_end <= window_start {
         return Err(EventGuideError::InvalidWindow);
@@ -484,8 +491,8 @@ pub fn generate_event_guide(
 /// invalid duration, invalid template, or date arithmetic overflow.
 pub fn generate_event_schedule(
     inputs: &[EventGuideInput<'_>],
-    window_start: DateTime<Utc>,
-    window_end: DateTime<Utc>,
+    window_start: Timestamp,
+    window_end: Timestamp,
     filler_title: &str,
 ) -> Result<Vec<GeneratedProgramme>, EventGuideError> {
     if window_end <= window_start {
@@ -549,11 +556,11 @@ fn build_event_programme(
     let duration = signed_seconds(event_duration_seconds(matched)?)?;
     let post_roll = signed_seconds(matched.rule.lifecycle.post_roll_seconds)?;
     let event_start = starts_at
-        .checked_sub_signed(pre_roll)
+        .checked_sub(pre_roll)
         .ok_or(EventGuideError::DateOverflow)?;
     let event_end = starts_at
-        .checked_add_signed(duration)
-        .and_then(|value| value.checked_add_signed(post_roll))
+        .checked_add(duration)
+        .and_then(|value| value.checked_add(post_roll))
         .ok_or(EventGuideError::DateOverflow)?;
     let title =
         render_matched_event_title(matched, source_title, &matched.rule.guide.title_template)?;
@@ -634,15 +641,15 @@ fn parse_duration(value: &str) -> Result<u64, EventGuideError> {
         .ok_or_else(invalid)
 }
 
-fn signed_seconds(seconds: u64) -> Result<Duration, EventGuideError> {
+fn signed_seconds(seconds: u64) -> Result<SignedDuration, EventGuideError> {
     i64::try_from(seconds)
-        .map(Duration::seconds)
+        .map(SignedDuration::from_secs)
         .map_err(|_| EventGuideError::DateOverflow)
 }
 
 fn filler(
-    starts_at: DateTime<Utc>,
-    stops_at: DateTime<Utc>,
+    starts_at: Timestamp,
+    stops_at: Timestamp,
     title: &str,
     source_title: &str,
 ) -> GeneratedProgramme {
@@ -741,7 +748,7 @@ fn render_template(
 fn stable_event_key(
     matched: &MatchedEvent<'_>,
     source_title: &str,
-    starts_at: DateTime<Utc>,
+    starts_at: Timestamp,
 ) -> String {
     let mut identity = ["league", "home", "away", "team_a", "team_b", "event"]
         .into_iter()
@@ -814,7 +821,7 @@ fn matches_rule(compiled: &CompiledRule, candidate: &EventCandidate<'_>) -> bool
 fn parse_candidate_date(
     compiled: &CompiledRule,
     candidate: &EventCandidate<'_>,
-) -> Result<Option<DateTime<Utc>>, EventDateError> {
+) -> Result<Option<Timestamp>, EventDateError> {
     for pattern in &compiled.dates {
         for input in [Some(candidate.name), candidate.epg_title]
             .into_iter()
@@ -856,7 +863,7 @@ const TIME_ONLY_LOOKBACK_HOURS: i64 = 12;
 /// # Errors
 ///
 /// Returns [`EventDateError::InvalidTime`] when the text is not a valid time.
-pub fn parse_clock_time(value: &str) -> Result<NaiveTime, EventDateError> {
+pub fn parse_clock_time(value: &str) -> Result<Time, EventDateError> {
     let invalid = || EventDateError::InvalidTime(value.to_owned());
     let normalized = value.trim().to_ascii_lowercase().replace(' ', "");
     let (digits, meridiem) = if let Some(rest) = normalized.strip_suffix("am") {
@@ -882,7 +889,9 @@ pub fn parse_clock_time(value: &str) -> Result<NaiveTime, EventDateError> {
         }
         None => hour,
     };
-    NaiveTime::from_hms_opt(hour, minute, 0).ok_or_else(invalid)
+    let hour = i8::try_from(hour).map_err(|_| invalid())?;
+    let minute = i8::try_from(minute).map_err(|_| invalid())?;
+    Time::new(hour, minute, 0, 0).map_err(|_| invalid())
 }
 
 /// Resolves a time-only event name to a UTC start instant.
@@ -898,30 +907,16 @@ pub fn parse_clock_time(value: &str) -> Result<NaiveTime, EventDateError> {
 /// local time that does not exist or is ambiguous (daylight saving change).
 pub fn resolve_time_only_start(
     time: &str,
-    reference: DateTime<Utc>,
+    reference: Timestamp,
     timezone: &str,
-) -> Result<DateTime<Utc>, EventDateError> {
+) -> Result<Timestamp, EventDateError> {
     let clock = parse_clock_time(time)?;
-    let tz =
-        Tz::from_str(timezone).map_err(|_| EventDateError::UnknownTimezone(timezone.to_owned()))?;
-    let date = reference.with_timezone(&tz).date_naive();
-    let resolve = |date: NaiveDate| -> Result<DateTime<Utc>, EventDateError> {
-        let naive = date.and_time(clock);
-        match tz.from_local_datetime(&naive) {
-            LocalResult::Single(value) => Ok(value.with_timezone(&Utc)),
-            LocalResult::Ambiguous(_, _) => Err(EventDateError::AmbiguousLocalTime {
-                value: naive.to_string(),
-                timezone: tz.name().to_owned(),
-            }),
-            LocalResult::None => Err(EventDateError::NonexistentLocalTime {
-                value: naive.to_string(),
-                timezone: tz.name().to_owned(),
-            }),
-        }
-    };
+    let tz = lookup_timezone(timezone)?;
+    let date = reference.to_zoned(tz.clone()).date();
+    let resolve = |date: Date| resolve_civil(&tz, date.to_datetime(clock), timezone, None);
     let today = resolve(date)?;
-    if today < reference - Duration::hours(TIME_ONLY_LOOKBACK_HOURS) {
-        let tomorrow = date.succ_opt().ok_or_else(|| EventDateError::InvalidDate {
+    if today < reference - SignedDuration::from_hours(TIME_ONLY_LOOKBACK_HOURS) {
+        let tomorrow = date.tomorrow().map_err(|_| EventDateError::InvalidDate {
             value: date.to_string(),
             format: "next local day".to_owned(),
         })?;
@@ -943,9 +938,9 @@ pub fn resolve_spelled_date_start(
     month: &str,
     day: &str,
     time: &str,
-    reference: DateTime<Utc>,
+    reference: Timestamp,
     timezone: &str,
-) -> Result<DateTime<Utc>, EventDateError> {
+) -> Result<Timestamp, EventDateError> {
     let invalid = |value: String| EventDateError::InvalidDate {
         value,
         format: "month day time".to_owned(),
@@ -958,29 +953,51 @@ pub fn resolve_spelled_date_start(
         .ok_or_else(|| invalid(format!("{month} {day}")))?;
     let day_number: u32 = day.parse().map_err(|_| invalid(format!("{month} {day}")))?;
     let clock = parse_clock_time(time)?;
-    let tz =
-        Tz::from_str(timezone).map_err(|_| EventDateError::UnknownTimezone(timezone.to_owned()))?;
-    let local_reference = reference.with_timezone(&tz).date_naive();
+    let tz = lookup_timezone(timezone)?;
+    let local_reference = reference.to_zoned(tz.clone()).date();
+    let month_number = i8::try_from(month_number).map_err(|_| invalid(format!("{month} {day}")))?;
+    let day_number = i8::try_from(day_number).map_err(|_| invalid(format!("{month} {day}")))?;
     let date = (-1..=1)
         .filter_map(|offset| {
-            NaiveDate::from_ymd_opt(
-                chrono::Datelike::year(&local_reference) + offset,
-                month_number,
-                day_number,
-            )
+            let year = local_reference.year().checked_add(offset)?;
+            Date::new(year, month_number, day_number).ok()
         })
-        .min_by_key(|date| (*date - local_reference).num_days().abs())
+        .min_by_key(|date| days_between(*date, local_reference))
         .ok_or_else(|| invalid(format!("{month} {day}")))?;
-    let naive = date.and_time(clock);
-    match tz.from_local_datetime(&naive) {
-        LocalResult::Single(value) => Ok(value.with_timezone(&Utc)),
-        LocalResult::Ambiguous(_, _) => Err(EventDateError::AmbiguousLocalTime {
-            value: naive.to_string(),
-            timezone: tz.name().to_owned(),
+    resolve_civil(&tz, date.to_datetime(clock), timezone, None)
+}
+
+/// Returns the absolute number of days between two civil dates.
+fn days_between(left: Date, right: Date) -> i64 {
+    left.since((Unit::Day, right))
+        .map_or(i64::MAX, |span| i64::from(span.get_days()).abs())
+}
+
+/// Looks up an IANA timezone name, or returns an unknown timezone error.
+fn lookup_timezone(timezone: &str) -> Result<TimeZone, EventDateError> {
+    time_zone(timezone).ok_or_else(|| EventDateError::UnknownTimezone(timezone.to_owned()))
+}
+
+/// Converts a local date and time to an instant, and fails closed on a
+/// daylight saving gap or fold.
+///
+/// The error value is `raw` when it is set. Otherwise it is the civil value.
+fn resolve_civil(
+    tz: &TimeZone,
+    local: DateTime,
+    timezone: &str,
+    raw: Option<&str>,
+) -> Result<Timestamp, EventDateError> {
+    let value = || raw.map_or_else(|| format_civil(local), str::to_owned);
+    match resolve_local(tz, local) {
+        LocalTime::Single(value) => Ok(value),
+        LocalTime::Ambiguous => Err(EventDateError::AmbiguousLocalTime {
+            value: value(),
+            timezone: timezone.to_owned(),
         }),
-        LocalResult::None => Err(EventDateError::NonexistentLocalTime {
-            value: naive.to_string(),
-            timezone: tz.name().to_owned(),
+        LocalTime::Nonexistent => Err(EventDateError::NonexistentLocalTime {
+            value: value(),
+            timezone: timezone.to_owned(),
         }),
     }
 }
@@ -1012,9 +1029,9 @@ impl MatchedEvent<'_> {
     /// Returns [`EventDateError`] when the time cannot be resolved.
     pub fn resolve_start(
         &self,
-        reference: DateTime<Utc>,
+        reference: Timestamp,
         timezone: &str,
-    ) -> Result<Option<DateTime<Utc>>, EventDateError> {
+    ) -> Result<Option<Timestamp>, EventDateError> {
         if self.starts_at.is_some() {
             return Ok(self.starts_at);
         }
@@ -1034,30 +1051,29 @@ fn parse_event_local_datetime(
     value: &str,
     format: &str,
     timezone: &str,
-) -> Result<DateTime<Utc>, EventDateError> {
-    if let Ok(datetime) = DateTime::parse_from_str(value, format) {
-        return Ok(datetime.with_timezone(&Utc));
-    }
-    let naive = NaiveDateTime::parse_from_str(value, format).or_else(|_| {
-        NaiveDate::parse_from_str(value, format).map(|date| date.and_hms_opt(0, 0, 0).unwrap())
-    });
-    let naive = naive.map_err(|_| EventDateError::InvalidDate {
+) -> Result<Timestamp, EventDateError> {
+    let invalid = || EventDateError::InvalidDate {
         value: value.to_owned(),
         format: format.to_owned(),
-    })?;
-    let timezone =
-        Tz::from_str(timezone).map_err(|_| EventDateError::UnknownTimezone(timezone.to_owned()))?;
-    match timezone.from_local_datetime(&naive) {
-        LocalResult::Single(value) => Ok(value.with_timezone(&Utc)),
-        LocalResult::Ambiguous(_, _) => Err(EventDateError::AmbiguousLocalTime {
-            value: value.to_owned(),
-            timezone: timezone.name().to_owned(),
-        }),
-        LocalResult::None => Err(EventDateError::NonexistentLocalTime {
-            value: value.to_owned(),
-            timezone: timezone.name().to_owned(),
-        }),
+    };
+    let parsed = strtime::parse(format, value)
+        .or_else(|error| {
+            // An operator `%z` also accepts an offset with a colon, such as `+02:00`.
+            if format.contains("%z") {
+                strtime::parse(format.replace("%z", "%:z"), value)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|_| invalid())?;
+    if parsed.offset().is_some()
+        && let Ok(instant) = parsed.to_timestamp()
+    {
+        return Ok(Timestamp::from_jiff(instant));
     }
+    let local = parsed.to_datetime().map_err(|_| invalid())?;
+    let tz = lookup_timezone(timezone)?;
+    resolve_civil(&tz, local, timezone, Some(value))
 }
 
 #[cfg(test)]
@@ -1323,8 +1339,8 @@ mod tests {
                 matched.starts_at.expect("schedule").to_rfc3339(),
                 expected_start
             );
-            let start = matched.starts_at.expect("schedule") - Duration::minutes(30);
-            let end = matched.starts_at.expect("schedule") + Duration::hours(4);
+            let start = matched.starts_at.expect("schedule") - SignedDuration::from_mins(30);
+            let end = matched.starts_at.expect("schedule") + SignedDuration::from_hours(4);
             let programmes =
                 generate_event_guide(&matched, source, start, end).expect("render guide");
             let event = programmes
@@ -1449,7 +1465,10 @@ mod tests {
             .iter()
             .find(|programme| programme.kind == GeneratedProgrammeKind::Event)
             .unwrap();
-        assert_eq!(event.stops_at - event.starts_at, Duration::minutes(90));
+        assert_eq!(
+            event.stops_at - event.starts_at,
+            SignedDuration::from_mins(90)
+        );
     }
 
     #[test]
@@ -1851,7 +1870,7 @@ mod tests {
     fn builtin_rules_match_live_provider_titles() {
         let fixture: serde_json::Value = serde_json::from_str(LIVE_TITLES).unwrap();
         let timezone = fixture["timezone"].as_str().unwrap();
-        let reference: DateTime<Utc> = fixture["reference"].as_str().unwrap().parse().unwrap();
+        let reference: Timestamp = fixture["reference"].as_str().unwrap().parse().unwrap();
         let mut rules = builtin_sports_event_rules();
         for rule in &mut rules.0 {
             rule.timezone = timezone.to_owned();
@@ -1908,8 +1927,7 @@ mod tests {
                     .as_ref(),
                 "{name}"
             );
-            let expected_start: DateTime<Utc> =
-                entry["starts_at"].as_str().unwrap().parse().unwrap();
+            let expected_start: Timestamp = entry["starts_at"].as_str().unwrap().parse().unwrap();
             if entry["time"].is_null() {
                 assert_eq!(matched.starts_at, Some(expected_start), "{name}");
             } else {
@@ -1923,8 +1941,8 @@ mod tests {
             let guide = generate_event_guide(
                 &matched,
                 name,
-                expected_start - Duration::hours(1),
-                expected_start + Duration::hours(4),
+                expected_start - SignedDuration::from_hours(1),
+                expected_start + SignedDuration::from_hours(4),
             )
             .unwrap();
             assert!(guide.iter().any(|item| item.title == title), "{name}");
@@ -2029,7 +2047,10 @@ mod tests {
         ] {
             let time = parse_clock_time(text).unwrap();
             assert_eq!(
-                (time.format("%H").to_string(), time.format("%M").to_string()),
+                (
+                    time.strftime("%H").to_string(),
+                    time.strftime("%M").to_string()
+                ),
                 (format!("{hour:02}"), format!("{minute:02}")),
                 "{text}"
             );
@@ -2105,7 +2126,7 @@ mod tests {
             "2026-03-09T00:00:00+00:00"
         );
         assert!(matches!(
-            resolve_time_only_start("7pm", Utc::now(), "Nowhere/City"),
+            resolve_time_only_start("7pm", Timestamp::now(), "Nowhere/City"),
             Err(EventDateError::UnknownTimezone(_))
         ));
         assert!(matches!(
@@ -2117,7 +2138,7 @@ mod tests {
     #[test]
     fn resolve_start_prefers_explicit_date_and_returns_none_without_time() {
         let compiled = CompiledEventRules::new(builtin_sports_event_rules()).unwrap();
-        let reference: DateTime<Utc> = "2026-11-04T15:00:00Z".parse().unwrap();
+        let reference: Timestamp = "2026-11-04T15:00:00Z".parse().unwrap();
         let dated = EventCandidate {
             name: "Broncos vs Chiefs 2026-09-13 18:20",
             group: None,

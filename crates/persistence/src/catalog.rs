@@ -4,13 +4,12 @@
 //! and binds those channels to active EPG channels. Read queries back the
 //! control API with paginated, real data.
 
-use chrono::{DateTime, Duration, Utc};
-use chrono_tz::Tz;
-use iptv_domain::builtin_sports_event_rules;
+use iptv_domain::{Timestamp, builtin_sports_event_rules};
 use iptv_parsers::{
     CompiledEventRules, EventCandidate, GeneratedProgramme, GeneratedProgrammeKind,
     generate_event_guide,
 };
+use jiff::{SignedDuration, tz::TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool};
@@ -138,18 +137,10 @@ pub struct ProviderReconciliationPartitionResult {
     pub already_completed: bool,
 }
 
-type ProviderReconciliationPartitionRow = (
-    String,
-    String,
-    Uuid,
-    i32,
-    i64,
-    String,
-    Option<DateTime<Utc>>,
-);
+type ProviderReconciliationPartitionRow =
+    (String, String, Uuid, i32, i64, String, Option<Timestamp>);
 
-type ProviderReconciliationSnapshotRow =
-    (String, String, Option<DateTime<Utc>>, DateTime<Utc>, i64);
+type ProviderReconciliationSnapshotRow = (String, String, Option<Timestamp>, Timestamp, i64);
 
 /// Result from one attempt to publish all prepared reconciliation candidates.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,7 +205,7 @@ impl CatalogRepository {
     ) -> Result<Option<ProviderReconciliationRun>, PersistenceError> {
         let partition_count = requested_partitions.clamp(1, 64);
         let mut transaction = self.pool.begin().await?;
-        let snapshot: Option<(Uuid, String, String, Option<DateTime<Utc>>)> = sqlx::query_as(
+        let snapshot: Option<(Uuid, String, String, Option<Timestamp>)> = sqlx::query_as(
             r"
             SELECT provider_account_id, kind, status, staged_at
             FROM source_snapshots
@@ -2024,7 +2015,7 @@ impl CatalogRepository {
             .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
         let offset = query.offset.unwrap_or(0).max(0);
-        let now = query.now.unwrap_or_else(Utc::now);
+        let now = query.now.unwrap_or_else(Timestamp::now);
         let pattern = query.search.as_deref().map(|value| {
             format!(
                 "%{}%",
@@ -3207,8 +3198,8 @@ impl CatalogRepository {
         channel_id: Uuid,
         slot: i32,
         title: Option<&str>,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         raw_name: &str,
         state: &str,
     ) -> Result<EventChannelRow, PersistenceError> {
@@ -3240,7 +3231,11 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn scan_event_channels(&self, template_id: Uuid) -> Result<u64, PersistenceError> {
         Ok(self
-            .scan_event_channels_report(template_id, Utc::now(), &self.event_scan_settings().await)
+            .scan_event_channels_report(
+                template_id,
+                Timestamp::now(),
+                &self.event_scan_settings().await,
+            )
             .await?
             .legacy_count())
     }
@@ -3260,7 +3255,7 @@ impl CatalogRepository {
     pub async fn scan_event_channels_report(
         &self,
         template_id: Uuid,
-        now: DateTime<Utc>,
+        now: Timestamp,
         settings: &EventScanSettings,
     ) -> Result<EventScanReport, PersistenceError> {
         let enabled: Option<bool> =
@@ -3285,7 +3280,7 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn scan_all_event_channels(&self) -> Result<u64, PersistenceError> {
         Ok(self
-            .scan_all_event_channels_at(Utc::now(), &self.event_scan_settings().await)
+            .scan_all_event_channels_at(Timestamp::now(), &self.event_scan_settings().await)
             .await?
             .legacy_count())
     }
@@ -3359,7 +3354,7 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn scan_all_event_channels_at(
         &self,
-        now: DateTime<Utc>,
+        now: Timestamp,
         settings: &EventScanSettings,
     ) -> Result<EventScanReport, PersistenceError> {
         self.run_event_scan(None, now, settings).await
@@ -3375,7 +3370,7 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn refresh_event_guides(
         &self,
-        now: DateTime<Utc>,
+        now: Timestamp,
         settings: &EventScanSettings,
     ) -> Result<EventScanReport, PersistenceError> {
         let mut report = self.scan_all_event_channels_at(now, settings).await?;
@@ -3387,7 +3382,7 @@ impl CatalogRepository {
     async fn run_event_scan(
         &self,
         only_template: Option<Uuid>,
-        now: DateTime<Utc>,
+        now: Timestamp,
         settings: &EventScanSettings,
     ) -> Result<EventScanReport, PersistenceError> {
         let mut templates = self
@@ -3704,7 +3699,7 @@ impl CatalogRepository {
     pub async fn prune_event_channels_for_template(
         &self,
         template_id: Uuid,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<u64, PersistenceError> {
         let grace_hours: i32 =
             sqlx::query_scalar("SELECT past_date_grace_hours FROM event_templates WHERE id = $1")
@@ -3753,7 +3748,7 @@ impl CatalogRepository {
     #[allow(clippy::missing_errors_doc)]
     pub async fn prune_all_event_channels_at(
         &self,
-        now: DateTime<Utc>,
+        now: Timestamp,
     ) -> Result<u64, PersistenceError> {
         let templates = self
             .list_event_templates(EventTemplateQuery::default())
@@ -4363,9 +4358,9 @@ pub struct EpgMappingRow {
     pub evidence: Value,
     pub review_status: String,
     pub reviewed_by: Option<String>,
-    pub reviewed_at: Option<DateTime<Utc>>,
+    pub reviewed_at: Option<Timestamp>,
     pub revision: i64,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: Timestamp,
     pub channel_name: String,
     pub canonical_key: Option<String>,
     pub epg_xmltv_id: Option<String>,
@@ -4400,7 +4395,7 @@ pub struct ReviewCandidateRow {
     pub method: String,
     pub confidence: f32,
     pub evidence: Value,
-    pub created_at: DateTime<Utc>,
+    pub created_at: Timestamp,
     pub epg_xmltv_id: Option<String>,
     pub epg_display_name: Option<String>,
 }
@@ -4444,8 +4439,8 @@ pub struct EventChannelRow {
     pub channel_id: Option<Uuid>,
     pub slot_number: i32,
     pub event_title: Option<String>,
-    pub event_start: Option<DateTime<Utc>>,
-    pub event_end: Option<DateTime<Utc>>,
+    pub event_start: Option<Timestamp>,
+    pub event_end: Option<Timestamp>,
     pub raw_stream_name: Option<String>,
     pub state: String,
     /// Output name of the target channel. Only `list_event_channels` fills it.
@@ -4526,7 +4521,9 @@ fn validate_event_template_timezone(value: &str) -> Result<(), PersistenceError>
             "event template timezone must be a nonblank IANA timezone".to_owned(),
         ));
     }
-    if timezone != "UTC" && (!timezone.contains('/') || timezone.parse::<Tz>().is_err()) {
+    if timezone != "UTC"
+        && (!timezone.contains('/') || iptv_domain::time::time_zone(timezone).is_none())
+    {
         return Err(PersistenceError::InvalidSource(
             "event template timezone must be UTC or a valid IANA timezone".to_owned(),
         ));
@@ -4537,10 +4534,10 @@ fn validate_event_template_timezone(value: &str) -> Result<(), PersistenceError>
 #[derive(Clone, Debug, Default)]
 pub struct ProgrammeQuery {
     pub channel_id: Option<Uuid>,
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<Timestamp>,
     pub search: Option<String>,
     /// Reference instant for deterministic current-then-upcoming ordering.
-    pub now: Option<DateTime<Utc>>,
+    pub now: Option<Timestamp>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -4593,8 +4590,8 @@ pub struct ProgrammeRow {
     pub subtitle: Option<String>,
     pub description: Option<String>,
     pub categories: Value,
-    pub starts_at: DateTime<Utc>,
-    pub stops_at: DateTime<Utc>,
+    pub starts_at: Timestamp,
+    pub stops_at: Timestamp,
     pub source_name: Option<String>,
     /// Metadata of a generated programme. `None` for imported programmes.
     #[sqlx(default)]
@@ -4691,7 +4688,7 @@ struct EventScanCandidate {
     stream_name: String,
     group_name: Option<String>,
     source_timezone: Option<String>,
-    snapshot_at: Option<DateTime<Utc>>,
+    snapshot_at: Option<Timestamp>,
 }
 
 /// The guide that the scan plans for one channel.
@@ -4707,8 +4704,8 @@ struct PlannedEventChannel<'a> {
     programmes: Vec<GeneratedProgramme>,
     captures: BTreeMap<String, String>,
     group_name: Option<String>,
-    timezone: Tz,
-    grace: Duration,
+    timezone: TimeZone,
+    grace: SignedDuration,
     sports: Option<SportsInfo>,
 }
 
@@ -4727,9 +4724,9 @@ struct EventChannelScanner<'a> {
     /// Compiled `matchRegex` of each template. `None` for an invalid regex.
     regexes: Vec<Option<Regex>>,
     /// Compiled built-in rules for each template index and timezone.
-    rules: BTreeMap<(usize, &'static str), Result<CompiledEventRules, String>>,
+    rules: BTreeMap<(usize, String), Result<CompiledEventRules, String>>,
     region_timezone: Option<&'a str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     settings: &'a EventScanSettings,
 }
 
@@ -4759,8 +4756,8 @@ impl<'a> EventChannelScanner<'a> {
                 );
                 let rules = self
                     .rules
-                    .entry((index, timezone.name()))
-                    .or_insert_with(|| compile_template_rules(template, timezone, self.settings));
+                    .entry((index, zone_name(&timezone)))
+                    .or_insert_with(|| compile_template_rules(template, &timezone, self.settings));
                 let rules = match rules {
                     Ok(rules) => &*rules,
                     Err(error) => {
@@ -4833,43 +4830,45 @@ impl<'a> EventChannelScanner<'a> {
 fn plan_event_channel<'a>(
     stream: &EventScanCandidate,
     template: &'a EventTemplateRow,
-    timezone: Tz,
+    timezone: TimeZone,
     mut matched: iptv_parsers::MatchedEvent<'_>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     settings: &EventScanSettings,
 ) -> Result<PlannedEventChannel<'a>, String> {
     // Resolve a time-only or spelled date from the snapshot date.
-    let reference = stream.snapshot_at.unwrap_or(now);
+    let reference = stream.snapshot_at.map_or(now, Timestamp::from);
+    let zone = zone_name(&timezone);
     let starts_at = matched
-        .resolve_start(reference, timezone.name())
+        .resolve_start(reference, &zone)
         .map_err(|error| format!("event time is not valid: {error}"))?
         .ok_or_else(|| "the stream name has no event start time".to_owned())?;
     matched.starts_at = Some(starts_at);
     let window_start = starts_at
-        .checked_sub_signed(Duration::days(1))
+        .checked_sub(SignedDuration::from_hours(24))
         .unwrap_or(starts_at);
     let window_end = starts_at
-        .checked_add_signed(Duration::days(30))
+        .checked_add(SignedDuration::from_hours(30 * 24))
         .unwrap_or(starts_at);
     let event = generate_event_guide(&matched, &stream.stream_name, window_start, window_end)
         .map_err(|error| format!("event guide is not valid: {error}"))?
         .into_iter()
         .find(|programme| programme.kind == GeneratedProgrammeKind::Event)
         .ok_or_else(|| "event guide has no event programme".to_owned())?;
-    let future_limit =
-        now.checked_add_signed(Duration::days(i64::from(template.future_date_days.max(0))));
+    let future_limit = now.checked_add(SignedDuration::from_hours(
+        i64::from(template.future_date_days.max(0)) * 24,
+    ));
     if future_limit.is_some_and(|limit| event.starts_at > limit) {
         return Err(format!(
             "event starts more than {} days in the future",
             template.future_date_days.max(0)
         ));
     }
-    let grace = Duration::hours(i64::from(template.past_date_grace_hours.max(1)));
+    let grace = SignedDuration::from_hours(i64::from(template.past_date_grace_hours.max(1)));
     let state = EventChannelState::at(event.starts_at, event.stops_at, grace, now);
     let programmes = if state == EventChannelState::Hidden {
         Vec::new()
     } else {
-        plan_event_channel_guide(&event, timezone, now, grace, settings)
+        plan_event_channel_guide(&event, &timezone, now, grace, settings)
     };
     Ok(PlannedEventChannel {
         channel_id: stream.channel_id,
@@ -4894,17 +4893,13 @@ fn plan_event_channel<'a>(
 async fn enrich_with_sports(
     plan: &mut PlannedEventChannel<'_>,
     client: &iptv_sports::EspnClient,
-    now: DateTime<Utc>,
+    now: Timestamp,
     settings: &EventScanSettings,
 ) {
     let Some(league) = detect_league(&plan.captures, plan.group_name.as_deref()) else {
         return;
     };
-    let local_date = plan
-        .event
-        .starts_at
-        .with_timezone(&plan.timezone)
-        .date_naive();
+    let local_date = plan.event.starts_at.to_zoned(plan.timezone.clone()).date();
     let info = lookup_sports_info(
         client,
         league,
@@ -4916,7 +4911,7 @@ async fn enrich_with_sports(
     if let Some(matchup) = info.matchup() {
         plan.event.title = matchup;
         plan.programmes =
-            plan_event_channel_guide(&plan.event, plan.timezone, now, plan.grace, settings);
+            plan_event_channel_guide(&plan.event, &plan.timezone, now, plan.grace, settings);
     }
     plan.sports = Some(info);
 }
@@ -4924,7 +4919,7 @@ async fn enrich_with_sports(
 /// Compiles the built-in sports rules with the settings of one template.
 fn compile_template_rules(
     template: &EventTemplateRow,
-    timezone: Tz,
+    timezone: &TimeZone,
     settings: &EventScanSettings,
 ) -> Result<CompiledEventRules, String> {
     let mut rules = builtin_sports_event_rules();
@@ -4942,11 +4937,16 @@ fn compile_template_rules(
         template.channel_name_format.as_str()
     };
     for rule in &mut rules.0 {
-        timezone.name().clone_into(&mut rule.timezone);
+        rule.timezone = zone_name(timezone);
         rule.guide.duration_seconds = duration_seconds;
         title_template.clone_into(&mut rule.guide.title_template);
     }
     CompiledEventRules::new(rules).map_err(|error| error.to_string())
+}
+
+/// Returns the IANA name of an event timezone. The fallback is `UTC`.
+fn zone_name(timezone: &TimeZone) -> String {
+    timezone.iana_name().unwrap_or("UTC").to_owned()
 }
 
 struct EventChannelUpsert<'a> {
@@ -4954,8 +4954,8 @@ struct EventChannelUpsert<'a> {
     channel_id: Uuid,
     slot: i32,
     title: Option<&'a str>,
-    start: Option<DateTime<Utc>>,
-    end: Option<DateTime<Utc>>,
+    start: Option<Timestamp>,
+    end: Option<Timestamp>,
     raw_name: &'a str,
     state: &'a str,
 }
@@ -5552,7 +5552,7 @@ pub struct StreamHealthRow {
     pub stream_name: String,
     pub group_name: Option<String>,
     pub health_status: String,
-    pub health_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub health_checked_at: Option<Timestamp>,
     pub health_error: Option<String>,
     pub video_codec: Option<String>,
     pub video_resolution: Option<String>,
@@ -5617,7 +5617,7 @@ pub struct ChannelStreamCandidateRow {
     pub video_fps: Option<f64>,
     pub video_codec: Option<String>,
     pub failover_count: i32,
-    pub last_failover_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_failover_at: Option<Timestamp>,
     pub url_template: String,
     pub provider_account_id: Uuid,
 }
@@ -6449,9 +6449,9 @@ pub struct UserRow {
     pub display_name: String,
     pub role: String,
     pub enabled: bool,
-    pub last_login_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub last_login_at: Option<Timestamp>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Input for creating a user.
@@ -6711,7 +6711,7 @@ pub struct ChannelAliasRow {
     pub alias: String,
     pub country: Option<String>,
     pub category: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Input for creating a channel alias.
@@ -6925,8 +6925,8 @@ pub struct RecordingRuleRow {
     pub max_recordings: Option<i32>,
     pub keep_until: String,
     pub enabled: bool,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Input for creating a recording rule.
@@ -6952,15 +6952,15 @@ pub struct RecordingRow {
     pub programme_id: Option<Uuid>,
     pub title: String,
     pub description: Option<String>,
-    pub starts_at: chrono::DateTime<chrono::Utc>,
-    pub ends_at: chrono::DateTime<chrono::Utc>,
+    pub starts_at: Timestamp,
+    pub ends_at: Timestamp,
     pub status: String,
     pub file_path: Option<String>,
     pub file_size_bytes: Option<i64>,
     pub duration_seconds: Option<i32>,
     pub error_message: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Input for creating a recording instance.
@@ -6971,8 +6971,8 @@ pub struct CreateRecordingInput {
     pub programme_id: Option<Uuid>,
     pub title: String,
     pub description: Option<String>,
-    pub starts_at: chrono::DateTime<chrono::Utc>,
-    pub ends_at: chrono::DateTime<chrono::Utc>,
+    pub starts_at: Timestamp,
+    pub ends_at: Timestamp,
 }
 
 impl CatalogRepository {
@@ -7235,8 +7235,8 @@ pub struct StreamProfileRow {
     pub user_agent: Option<String>,
     pub referer: Option<String>,
     pub enabled: bool,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// Input for creating a stream profile.
@@ -7909,7 +7909,7 @@ pub struct ReconciliationRevisionRow {
     pub actor: String,
     pub before_value: Option<Value>,
     pub after_value: Value,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Counts produced by a reconciliation rollback.
@@ -7953,7 +7953,7 @@ struct SnapshotEpgMapping {
     evidence: Value,
     review_status: String,
     reviewed_by: Option<String>,
-    reviewed_at: Option<chrono::DateTime<chrono::Utc>>,
+    reviewed_at: Option<Timestamp>,
 }
 
 /// The captured automatic channel, stream link, and EPG mapping state for
@@ -8200,7 +8200,7 @@ pub struct OperatorSettingOverrideRow {
     pub value: Value,
     pub revision: i64,
     pub updated_by: String,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: Timestamp,
 }
 
 /// One revision history row for an operator setting scope.
@@ -8210,7 +8210,7 @@ pub struct OperatorSettingRevisionRow {
     pub actor: String,
     pub before_value: Option<Value>,
     pub after_value: Value,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
 }
 
 /// Region settings row stored in the `region_settings` table.
@@ -8220,8 +8220,8 @@ pub struct RegionSettingsRow {
     pub timezone: String,
     pub enabled_prefixes: Vec<String>,
     pub auto_detected: bool,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
 }
 
 /// A region prefix with group and channel counts.
@@ -8299,8 +8299,8 @@ mod tests {
             subtitle: None,
             description: None,
             categories: serde_json::json!(["News", "Politics"]),
-            starts_at: Utc::now(),
-            stops_at: Utc::now(),
+            starts_at: Timestamp::now(),
+            stops_at: Timestamp::now(),
             source_name: None,
             metadata: None,
         };
@@ -8320,8 +8320,8 @@ mod tests {
             subtitle: None,
             description: None,
             categories: serde_json::json!({}),
-            starts_at: Utc::now(),
-            stops_at: Utc::now(),
+            starts_at: Timestamp::now(),
+            stops_at: Timestamp::now(),
             source_name: None,
             metadata: None,
         };

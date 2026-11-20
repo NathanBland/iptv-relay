@@ -5,10 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# PostgreSQL encoding and decoding of `Timestamp` through jiff-sqlx.
+sqlx = ["dep:jiff-sqlx", "dep:sqlx"]
+
 [dependencies]
-chrono.workspace = true
+jiff.workspace = true
+jiff-sqlx = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+sqlx = { workspace = true, optional = true }
 thiserror.workspace = true
 url.workspace = true
 utoipa.workspace = true

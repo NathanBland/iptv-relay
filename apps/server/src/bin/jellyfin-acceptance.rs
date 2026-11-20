@@ -507,7 +507,7 @@ async fn verify_hdhr(
 }
 
 fn verify_xmltv_import(xmltv: &str, imported: &[PlaylistEntry]) -> Result<()> {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     let mut has_active = false;
     for entry in imported {
         ensure!(
@@ -534,11 +534,11 @@ fn verify_xmltv_import(xmltv: &str, imported: &[PlaylistEntry]) -> Result<()> {
         if let (Some(start), Some(stop)) =
             (attribute(programme, "start"), attribute(programme, "stop"))
             && let (Ok(start), Ok(stop)) = (
-                chrono::DateTime::parse_from_str(&start, "%Y%m%d%H%M%S %z"),
-                chrono::DateTime::parse_from_str(&stop, "%Y%m%d%H%M%S %z"),
+                jiff::Timestamp::strptime("%Y%m%d%H%M%S %z", &start),
+                jiff::Timestamp::strptime("%Y%m%d%H%M%S %z", &stop),
             )
-            && start.with_timezone(&chrono::Utc) <= now
-            && now < stop.with_timezone(&chrono::Utc)
+            && start <= now
+            && now < stop
         {
             has_active = true;
         }

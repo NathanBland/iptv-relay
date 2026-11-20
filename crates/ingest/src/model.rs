@@ -1,6 +1,6 @@
 use crate::IngestError;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::{DateTime, Utc};
+use iptv_domain::Timestamp;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
@@ -149,8 +149,8 @@ pub struct PreparedEpgChannel {
 pub struct PreparedProgramme {
     pub id: Uuid,
     pub epg_channel_id: Uuid,
-    pub starts_at: DateTime<Utc>,
-    pub stops_at: Option<DateTime<Utc>>,
+    pub starts_at: Timestamp,
+    pub stops_at: Option<Timestamp>,
     pub original_start: String,
     pub original_stop: Option<String>,
     pub title: String,

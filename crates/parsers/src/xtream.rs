@@ -3,8 +3,11 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
 };
-use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
-use chrono_tz::Tz;
+use iptv_domain::{
+    Timestamp,
+    time::{LocalTime, resolve_local, time_zone},
+};
+use jiff::{civil::DateTime, tz::TimeZone};
 use serde_json::{Map, Value};
 use std::{collections::BTreeMap, io::Read};
 use url::Url;
@@ -30,13 +33,13 @@ impl<T> Default for XtreamDocument<T> {
 pub struct XtreamAuth {
     pub authenticated: bool,
     pub status: Option<String>,
-    pub expiration: Option<DateTime<Utc>>,
+    pub expiration: Option<Timestamp>,
     pub active_connections: u32,
     pub max_connections: Option<u32>,
     pub allowed_output_formats: Vec<String>,
     pub server_url: Option<Url>,
     pub server_timezone: Option<String>,
-    pub server_timestamp: Option<DateTime<Utc>>,
+    pub server_timestamp: Option<Timestamp>,
     /// Unknown non-secret scalar user/server fields.
     pub metadata: BTreeMap<String, String>,
 }
@@ -58,7 +61,7 @@ pub struct XtreamLiveStream {
     pub icon: Option<Url>,
     pub channel_number: Option<f64>,
     pub stream_type: Option<String>,
-    pub added_at: Option<DateTime<Utc>>,
+    pub added_at: Option<Timestamp>,
     pub is_adult: bool,
     pub has_archive: bool,
     pub archive_duration_days: u32,
@@ -72,8 +75,8 @@ pub struct XtreamShortEpgEntry {
     pub title: String,
     pub description: String,
     pub language: Option<String>,
-    pub start: DateTime<Utc>,
-    pub stop: DateTime<Utc>,
+    pub start: Timestamp,
+    pub stop: Timestamp,
     pub channel_id: Option<String>,
     pub metadata: BTreeMap<String, Value>,
 }
@@ -313,7 +316,7 @@ pub fn parse_xtream_short_epg_in_timezone<R: Read>(
     limits: ParseLimits,
     source_timezone: &str,
 ) -> Result<XtreamDocument<XtreamShortEpgEntry>, ParseError> {
-    let source_timezone = source_timezone.parse::<Tz>().map_err(|_| {
+    let source_timezone = time_zone(source_timezone).ok_or_else(|| {
         ParseError::MalformedXtream("short EPG source timezone is invalid".to_owned())
     })?;
     let (root, bytes) = read_json(reader, limits)?;
@@ -331,7 +334,7 @@ pub fn parse_xtream_short_epg_in_timezone<R: Read>(
             continue;
         };
         let Some(start) =
-            parse_listing_time(object, &["start_timestamp", "start"], source_timezone)
+            parse_listing_time(object, &["start_timestamp", "start"], &source_timezone)
         else {
             invalid_record(&mut document, "short EPG listing has no valid start");
             continue;
@@ -339,7 +342,7 @@ pub fn parse_xtream_short_epg_in_timezone<R: Read>(
         let Some(stop) = parse_listing_time(
             object,
             &["stop_timestamp", "end_timestamp", "end"],
-            source_timezone,
+            &source_timezone,
         ) else {
             invalid_record(&mut document, "short EPG listing has no valid stop");
             continue;
@@ -493,13 +496,13 @@ fn optional_unix_time<T>(
     value: Option<&Value>,
     field: &str,
     document: &mut XtreamDocument<T>,
-) -> Option<DateTime<Utc>> {
+) -> Option<Timestamp> {
     let seconds = value.and_then(|value| match value {
         Value::Number(value) => value.as_i64(),
         Value::String(value) => value.parse().ok(),
         _ => None,
     })?;
-    if let Some(value) = Utc.timestamp_opt(seconds, 0).single() {
+    if let Some(value) = Timestamp::from_second(seconds) {
         Some(value)
     } else {
         push_warning(document, format!("invalid {field} Unix timestamp"));
@@ -566,27 +569,27 @@ fn unknown_fields(object: &Map<String, Value>, known: &[&str]) -> BTreeMap<Strin
 fn parse_listing_time(
     object: &Map<String, Value>,
     keys: &[&str],
-    source_timezone: Tz,
-) -> Option<DateTime<Utc>> {
+    source_timezone: &TimeZone,
+) -> Option<Timestamp> {
     for key in keys {
         let Some(value) = object.get(*key) else {
             continue;
         };
         if let Some(seconds) = value.as_i64().or_else(|| value.as_str()?.parse().ok())
-            && let Some(datetime) = Utc.timestamp_opt(seconds, 0).single()
+            && let Some(datetime) = Timestamp::from_second(seconds)
         {
             return Some(datetime);
         }
         let Some(value) = value.as_str() else {
             continue;
         };
-        if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
-            return Some(datetime.with_timezone(&Utc));
+        if let Ok(datetime) = value.parse::<Timestamp>() {
+            return Some(datetime);
         }
-        if let Ok(datetime) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-            return match source_timezone.from_local_datetime(&datetime) {
-                LocalResult::Single(value) => Some(value.with_timezone(&Utc)),
-                LocalResult::Ambiguous(_, _) | LocalResult::None => None,
+        if let Ok(datetime) = DateTime::strptime("%Y-%m-%d %H:%M:%S", value) {
+            return match resolve_local(source_timezone, datetime) {
+                LocalTime::Single(value) => Some(value),
+                LocalTime::Ambiguous | LocalTime::Nonexistent => None,
             };
         }
     }
@@ -738,6 +741,49 @@ mod tests {
 
         assert!(document.records.is_empty());
         assert_eq!(document.stats.records_skipped, 1);
+    }
+
+    #[test]
+    fn short_epg_local_times_follow_daylight_saving_changes() {
+        let payload = r#"{
+            "epg_listings": [
+                {"title": "QQ==", "start": "2026-03-08 01:59:00", "end": "2026-03-08 03:00:00", "channel_id": "one"},
+                {"title": "Qg==", "start": "2026-03-08 02:30:00", "end": "2026-03-08 03:30:00", "channel_id": "one"},
+                {"title": "Qw==", "start": "2026-11-01 00:59:59", "end": "2026-11-01 02:00:00", "channel_id": "one"},
+                {"title": "RA==", "start": "1772956800", "end": 1772960400, "channel_id": "one"},
+                {"title": "RQ==", "start": "2026-03-08T02:30:00.250-05:00", "end": "2026-03-08T09:00:00Z", "channel_id": "one"}
+            ]
+        }"#;
+        let document = parse_xtream_short_epg_in_timezone(
+            Cursor::new(payload),
+            ParseLimits::default(),
+            "America/New_York",
+        )
+        .expect("short EPG");
+        let times: Vec<(String, String)> = document
+            .records
+            .iter()
+            .map(|record| (record.start.to_rfc3339(), record.stop.to_rfc3339()))
+            .collect();
+        assert_eq!(
+            times,
+            [
+                ("2026-03-08T06:59:00+00:00", "2026-03-08T07:00:00+00:00"),
+                ("2026-11-01T04:59:59+00:00", "2026-11-01T07:00:00+00:00"),
+                ("2026-03-08T08:00:00+00:00", "2026-03-08T09:00:00+00:00"),
+                ("2026-03-08T07:30:00.250+00:00", "2026-03-08T09:00:00+00:00"),
+            ]
+            .map(|(start, end)| (start.to_owned(), end.to_owned()))
+        );
+        assert_eq!(document.stats.records_skipped, 1);
+        assert!(
+            parse_xtream_short_epg_in_timezone(
+                Cursor::new(payload),
+                ParseLimits::default(),
+                "Nowhere/City",
+            )
+            .is_err()
+        );
     }
 
     #[test]

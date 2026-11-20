@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::NaiveDate;
+use jiff::civil::Date;
 use parking_lot::Mutex;
 
 use crate::league::League;
@@ -60,7 +60,7 @@ struct Entry<T> {
 
 #[derive(Default)]
 struct State {
-    scoreboards: HashMap<(League, NaiveDate), Entry<Vec<EspnEvent>>>,
+    scoreboards: HashMap<(League, Date), Entry<Vec<EspnEvent>>>,
     teams: HashMap<League, Entry<Vec<EspnTeam>>>,
     logos: HashMap<String, Entry<Vec<u8>>>,
     failures: u32,
@@ -184,7 +184,7 @@ impl EspnClient {
     pub async fn scoreboard(
         &self,
         league: League,
-        date: NaiveDate,
+        date: Date,
     ) -> Result<Arc<Vec<EspnEvent>>, EspnError> {
         if let Some(e) = self.state.lock().scoreboards.get(&(league, date))
             && e.at.elapsed() < self.config.scoreboard_ttl
@@ -195,7 +195,7 @@ impl EspnClient {
             "{}/{}/scoreboard?dates={}",
             self.config.base_url,
             league.espn_path(),
-            date.format("%Y%m%d")
+            date.strftime("%Y%m%d")
         );
         let body = self.get(&url).await?;
         let value = Arc::new(parse_scoreboard(&body)?);
@@ -247,7 +247,7 @@ impl EspnClient {
     pub async fn lookup(
         &self,
         league: League,
-        local_date: NaiveDate,
+        local_date: Date,
         query: &MatchQuery,
     ) -> Result<Option<EventMatch>, EspnError> {
         let mut events: Vec<EspnEvent> = Vec::new();
@@ -257,7 +257,7 @@ impl EspnClient {
             Ok(v) => events.extend(v.iter().cloned()),
             Err(e) => first_err = Some(e),
         }
-        if let Some(next) = local_date.succ_opt()
+        if let Some(next) = local_date.tomorrow().ok()
             && let Ok(v) = self.scoreboard(league, next).await
         {
             events.extend(v.iter().cloned());
@@ -331,8 +331,8 @@ mod tests {
         }
     }
 
-    fn date() -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 11, 4).unwrap()
+    fn date() -> Date {
+        jiff::civil::date(2026, 11, 4)
     }
 
     #[tokio::test]
