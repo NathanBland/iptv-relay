@@ -3081,6 +3081,8 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use iptv_domain::Timestamp;
+    use jiff::SignedDuration;
 
     #[test]
     fn ingest_limits_follow_the_operator_settings() {
@@ -3565,8 +3567,8 @@ mod tests {
                 // channel_id matches that tvg-id so the catalog tvg-id
                 // reconciliation pass links the short EPG channel to the
                 // canonical channel that the live-stream snapshot produced.
-                let start = chrono::Utc::now() - chrono::Duration::minutes(5);
-                let end = chrono::Utc::now() + chrono::Duration::hours(3);
+                let start = Timestamp::now() - SignedDuration::from_mins(5);
+                let end = Timestamp::now() + SignedDuration::from_hours(3);
                 Json(serde_json::json!({
                     "epg_listings": [
                         {
@@ -6588,7 +6590,7 @@ mod tests {
         let event_group = format!("Worker events {suffix}");
         // The event starts in the future, so that the scan schedules it.
         let event_start =
-            (chrono::Utc::now() + chrono::Duration::hours(12)).format("%Y-%m-%d %H:%M");
+            (Timestamp::now() + SignedDuration::from_hours(12)).format("%Y-%m-%d %H:%M");
         let playlist = format!(
             "#EXTM3U\n#EXTINF:-1 tvg-id=\"coverage-local-{suffix}\" group-title=\"{event_group}\",Event 7: Broncos vs Chiefs {event_start} HD\nhttp://provider.invalid/live.ts\n"
         );
@@ -6945,7 +6947,7 @@ mod tests {
             .checkpoint(&progress)
             .await
             .expect("checkpoint succeeds for active job");
-        let heartbeat: Option<chrono::DateTime<chrono::Utc>> =
+        let heartbeat: Option<Timestamp> =
             sqlx::query_scalar("SELECT heartbeat_at FROM jobs WHERE id = $1")
                 .bind(job.id)
                 .fetch_one(&pool)

@@ -11,12 +11,12 @@ argon2.workspace = true
 axum.workspace = true
 base64.workspace = true
 bytes.workspace = true
-chrono.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 http-body-util.workspace = true
 jsonwebtoken.workspace = true
-iptv-domain = { path = "../domain", version = "0.4.7", features = ["chrono"] }
+iptv-domain = { path = "../domain", version = "0.4.7" }
+jiff.workspace = true
 iptv-media = { path = "../media", version = "0.4.7" }
 iptv-persistence = { path = "../persistence", version = "0.4.7" }
 iptv-sports = { path = "../sports", version = "0.4.7" }

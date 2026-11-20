@@ -28,7 +28,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Utc};
+use iptv_domain::Timestamp;
 use iptv_domain::{
     ApplyRequirement, EffectiveSetting, InheritanceSource, SettingDefinition,
     SettingValidationError, resolve_settings, setting_catalog,
@@ -49,6 +49,7 @@ use iptv_persistence::{
     OutputProfileRow, OutputProfileTokenHash, PersistenceError, ProgrammeQuery, SourceKind,
     SourceRepository, SourceSummary, redact_diagnostics, redact_error,
 };
+use jiff::SignedDuration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
@@ -279,7 +280,7 @@ impl AppState {
                     id: row.id,
                     token_hash,
                     scopes: row.scopes,
-                    expires_at: row.expires_at.map(Into::into),
+                    expires_at: row.expires_at,
                 })
             });
         self.auth.load_operator_tokens(records);
@@ -365,8 +366,8 @@ pub struct ChannelRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProgrammeRecord {
     pub channel_id: Uuid,
-    pub starts_at: DateTime<Utc>,
-    pub stops_at: DateTime<Utc>,
+    pub starts_at: Timestamp,
+    pub stops_at: Timestamp,
     pub title: String,
     pub description: Option<String>,
     pub categories: Vec<String>,
@@ -464,15 +465,15 @@ struct SourceResponse {
     kind: String,
     state: String,
     channels: usize,
-    last_sync: DateTime<Utc>,
+    last_sync: Timestamp,
     endpoint: String,
     refresh_interval_seconds: i32,
-    last_refreshed_at: Option<DateTime<Utc>>,
+    last_refreshed_at: Option<Timestamp>,
     max_connections: i32,
     timezone: String,
     enabled: bool,
     cb_consecutive_failures: i32,
-    cb_opened_at: Option<DateTime<Utc>>,
+    cb_opened_at: Option<Timestamp>,
     alternative_base_urls: Vec<String>,
 }
 
@@ -484,15 +485,15 @@ impl From<&SourceSummary> for SourceResponse {
             kind: source.kind.api_name().to_owned(),
             state: source.state.clone(),
             channels: source.channels,
-            last_sync: source.last_sync.into(),
+            last_sync: source.last_sync,
             endpoint: source.endpoint.clone(),
             refresh_interval_seconds: source.refresh_interval_seconds,
-            last_refreshed_at: source.last_refreshed_at.map(Into::into),
+            last_refreshed_at: source.last_refreshed_at,
             max_connections: source.max_connections,
             timezone: source.timezone.clone(),
             enabled: source.enabled,
             cb_consecutive_failures: source.cb_consecutive_failures,
-            cb_opened_at: source.cb_opened_at.map(Into::into),
+            cb_opened_at: source.cb_opened_at,
             alternative_base_urls: source.alternative_base_urls.clone(),
         }
     }
@@ -508,9 +509,9 @@ struct JobResponse {
     attempts: i32,
     max_attempts: i32,
     last_error: Option<String>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    completed_at: Option<DateTime<Utc>>,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+    completed_at: Option<Timestamp>,
 }
 
 impl From<&JobRecord> for JobResponse {
@@ -523,9 +524,9 @@ impl From<&JobRecord> for JobResponse {
             attempts: job.attempts,
             max_attempts: job.max_attempts,
             last_error: job.last_error.as_deref().map(redact_error),
-            created_at: job.created_at.into(),
-            updated_at: job.updated_at.into(),
-            completed_at: job.completed_at.map(Into::into),
+            created_at: job.created_at,
+            updated_at: job.updated_at,
+            completed_at: job.completed_at,
         }
     }
 }
@@ -540,11 +541,11 @@ struct DeadLetterResponse {
     error_message: String,
     attempt_count: i32,
     max_attempts: i32,
-    first_failed_at: DateTime<Utc>,
-    last_failed_at: DateTime<Utc>,
-    resolved_at: Option<DateTime<Utc>>,
+    first_failed_at: Timestamp,
+    last_failed_at: Timestamp,
+    resolved_at: Option<Timestamp>,
     resolution: Option<String>,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
 }
 
 impl From<&DeadLetterRecord> for DeadLetterResponse {
@@ -558,11 +559,11 @@ impl From<&DeadLetterRecord> for DeadLetterResponse {
             error_message: record.error_message.clone(),
             attempt_count: record.attempt_count,
             max_attempts: record.max_attempts,
-            first_failed_at: record.first_failed_at.into(),
-            last_failed_at: record.last_failed_at.into(),
-            resolved_at: record.resolved_at.map(Into::into),
+            first_failed_at: record.first_failed_at,
+            last_failed_at: record.last_failed_at,
+            resolved_at: record.resolved_at,
             resolution: record.resolution.clone(),
-            created_at: record.created_at.into(),
+            created_at: record.created_at,
         }
     }
 }
@@ -594,8 +595,8 @@ struct ProgrammeResponse {
     id: String,
     channel: String,
     title: String,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
+    start: Timestamp,
+    end: Timestamp,
     source: String,
     confidence: u8,
 }
@@ -654,8 +655,8 @@ struct DynamicEventResponse {
     channel_id: Option<String>,
     /// Output name of the target channel.
     output_name: Option<String>,
-    start: Option<DateTime<Utc>>,
-    end: Option<DateTime<Utc>>,
+    start: Option<Timestamp>,
+    end: Option<Timestamp>,
     state: String,
     template: String,
 }
@@ -774,8 +775,8 @@ struct EventChannelResponse {
     channel_id: Option<String>,
     slot_number: i32,
     event_title: Option<String>,
-    event_start: Option<DateTime<Utc>>,
-    event_end: Option<DateTime<Utc>>,
+    event_start: Option<Timestamp>,
+    event_end: Option<Timestamp>,
     raw_stream_name: Option<String>,
     /// Output name of the target channel.
     output_name: Option<String>,
@@ -895,7 +896,7 @@ struct SaveResult {
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SupportLogEntry {
-    timestamp: DateTime<Utc>,
+    timestamp: Timestamp,
     level: String,
     message: String,
     context: serde_json::Value,
@@ -905,7 +906,7 @@ struct SupportLogEntry {
 #[serde(rename_all = "camelCase")]
 struct SupportBundleResponse {
     schema_version: String,
-    generated_at: DateTime<Utc>,
+    generated_at: Timestamp,
     redaction: String,
     system: SystemInfo,
     jobs: Vec<JobResponse>,
@@ -957,11 +958,11 @@ struct OperatorApiTokenResponse {
     id: String,
     name: String,
     scopes: Vec<String>,
-    expires_at: Option<DateTime<Utc>>,
-    revoked_at: Option<DateTime<Utc>>,
+    expires_at: Option<Timestamp>,
+    revoked_at: Option<Timestamp>,
     created_by: String,
-    created_at: DateTime<Utc>,
-    last_used_at: Option<DateTime<Utc>>,
+    created_at: Timestamp,
+    last_used_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -979,7 +980,7 @@ struct CreateOperatorApiTokenRequest {
     name: String,
     scopes: Vec<String>,
     #[serde(alias = "expires_at")]
-    expires_at: Option<DateTime<Utc>>,
+    expires_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, ToSchema)]
@@ -993,7 +994,7 @@ struct RotateOperatorApiTokenRequest {
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(transparent)]
-struct OperatorTokenExpiration(Option<DateTime<Utc>>);
+struct OperatorTokenExpiration(Option<Timestamp>);
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ProblemDetails {
@@ -2068,14 +2069,7 @@ async fn create_operator_api_token(
     let id = Uuid::now_v7();
     let actor = state.auth.operator_token_actor(&headers);
     let row = match database
-        .create_operator_api_token(
-            id,
-            &name,
-            &token_hash,
-            &scopes,
-            request.expires_at.map(Into::into),
-            &actor,
-        )
+        .create_operator_api_token(id, &name, &token_hash, &scopes, request.expires_at, &actor)
         .await
     {
         Ok(row) => row,
@@ -2085,7 +2079,7 @@ async fn create_operator_api_token(
         id,
         token_hash,
         scopes: row.scopes.clone(),
-        expires_at: row.expires_at.map(Into::into),
+        expires_at: row.expires_at,
     });
     no_store_response(
         (
@@ -2147,7 +2141,7 @@ async fn rotate_operator_api_token(
     };
     let expires_at = request
         .expires_at
-        .map_or(existing.expires_at, |value| value.0.map(Into::into));
+        .map_or(existing.expires_at, |value| value.0);
     let Ok(plaintext) = AuthManager::generate_operator_token() else {
         return persistence_unavailable();
     };
@@ -2176,7 +2170,7 @@ async fn rotate_operator_api_token(
         id: new_id,
         token_hash,
         scopes: row.scopes.clone(),
-        expires_at: row.expires_at.map(Into::into),
+        expires_at: row.expires_at,
     });
     no_store_response(
         Json(IssuedOperatorApiTokenResponse {
@@ -2228,11 +2222,11 @@ impl From<iptv_persistence::OperatorApiTokenRow> for OperatorApiTokenResponse {
             id: row.id.to_string(),
             name: row.name,
             scopes: row.scopes,
-            expires_at: row.expires_at.map(Into::into),
-            revoked_at: row.revoked_at.map(Into::into),
+            expires_at: row.expires_at,
+            revoked_at: row.revoked_at,
             created_by: row.created_by,
-            created_at: row.created_at.into(),
-            last_used_at: row.last_used_at.map(Into::into),
+            created_at: row.created_at,
+            last_used_at: row.last_used_at,
         }
     }
 }
@@ -2546,7 +2540,7 @@ async fn system_info_value(state: &AppState) -> SystemInfo {
 
 fn support_log_from_audit(record: AuditEventRecord) -> SupportLogEntry {
     SupportLogEntry {
-        timestamp: record.created_at.into(),
+        timestamp: record.created_at,
         level: "info".to_owned(),
         message: record.action,
         context: redact_diagnostics(&serde_json::json!({
@@ -2561,7 +2555,7 @@ fn support_log_from_audit(record: AuditEventRecord) -> SupportLogEntry {
 
 fn support_log_from_job(job: &JobRecord) -> Option<SupportLogEntry> {
     job.last_error.as_ref().map(|error| SupportLogEntry {
-        timestamp: job.updated_at.into(),
+        timestamp: job.updated_at,
         level: "error".to_owned(),
         message: redact_error(error),
         context: redact_diagnostics(&serde_json::json!({
@@ -2639,7 +2633,7 @@ async fn support_bundle(State(state): State<AppState>, headers: HeaderMap) -> Re
     };
     let bundle = SupportBundleResponse {
         schema_version: "1".to_owned(),
-        generated_at: Utc::now(),
+        generated_at: Timestamp::now(),
         redaction:
             "Secrets, tokens, credentials, URLs, and sensitive diagnostic fields are redacted."
                 .to_owned(),
@@ -2743,7 +2737,7 @@ struct ReplaceOperatorScopeRequest {
 struct OperatorRevisionResponse {
     revision: i64,
     actor: String,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     before_value: Option<serde_json::Value>,
     after_value: serde_json::Value,
 }
@@ -3077,7 +3071,7 @@ async fn list_operator_revisions(
                 .map(|row| OperatorRevisionResponse {
                     revision: row.revision,
                     actor: row.actor,
-                    created_at: row.created_at.into(),
+                    created_at: row.created_at,
                     before_value: row.before_value,
                     after_value: row.after_value,
                 })
@@ -3784,8 +3778,8 @@ struct SourceSyncStatusResponse {
     message: String,
     bytes_downloaded: u64,
     records_processed: u64,
-    started_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    started_at: Timestamp,
+    updated_at: Timestamp,
 }
 
 impl SourceSyncStatusResponse {
@@ -3821,8 +3815,8 @@ impl SourceSyncStatusResponse {
             message,
             bytes_downloaded,
             records_processed,
-            started_at: job.created_at.into(),
-            updated_at: job.updated_at.into(),
+            started_at: job.created_at,
+            updated_at: job.updated_at,
         }
     }
 }
@@ -4891,7 +4885,7 @@ async fn list_programmes(
             channel_id: query.channel_id,
             from: None,
             search: query.search,
-            now: Some(Utc::now().into()),
+            now: Some(Timestamp::now()),
             limit: query.limit,
             offset: query.offset,
         };
@@ -4919,7 +4913,7 @@ async fn list_programmes(
             id: format!(
                 "{}:{}",
                 programme.channel_id,
-                programme.starts_at.timestamp()
+                programme.starts_at.as_second()
             ),
             channel: channel_names
                 .get(&programme.channel_id)
@@ -4948,8 +4942,8 @@ fn programme_response_from_row(row: &iptv_persistence::ProgrammeRow) -> Programm
         id: row.id.clone(),
         channel: row.channel_name.clone(),
         title: row.title.clone(),
-        start: row.starts_at.into(),
-        end: row.stops_at.into(),
+        start: row.starts_at,
+        end: row.stops_at,
         source: row
             .source_name
             .clone()
@@ -4968,9 +4962,9 @@ struct EpgMappingResponse {
     evidence: serde_json::Value,
     review_status: String,
     reviewed_by: Option<String>,
-    reviewed_at: Option<DateTime<Utc>>,
+    reviewed_at: Option<Timestamp>,
     revision: i64,
-    updated_at: DateTime<Utc>,
+    updated_at: Timestamp,
     channel_name: String,
     canonical_key: Option<String>,
     epg_xmltv_id: Option<String>,
@@ -4987,9 +4981,9 @@ impl From<&iptv_persistence::EpgMappingRow> for EpgMappingResponse {
             evidence: row.evidence.clone(),
             review_status: row.review_status.clone(),
             reviewed_by: row.reviewed_by.clone(),
-            reviewed_at: row.reviewed_at.map(Into::into),
+            reviewed_at: row.reviewed_at,
             revision: row.revision,
-            updated_at: row.updated_at.into(),
+            updated_at: row.updated_at,
             channel_name: row.channel_name.clone(),
             canonical_key: row.canonical_key.clone(),
             epg_xmltv_id: row.epg_xmltv_id.clone(),
@@ -5045,7 +5039,7 @@ struct ReviewCandidateResponse {
     method: String,
     confidence: f32,
     evidence: serde_json::Value,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     epg_xmltv_id: Option<String>,
     epg_display_name: Option<String>,
 }
@@ -5059,7 +5053,7 @@ impl From<&iptv_persistence::ReviewCandidateRow> for ReviewCandidateResponse {
             method: row.method.clone(),
             confidence: row.confidence,
             evidence: row.evidence.clone(),
-            created_at: row.created_at.into(),
+            created_at: row.created_at,
             epg_xmltv_id: row.epg_xmltv_id.clone(),
             epg_display_name: row.epg_display_name.clone(),
         }
@@ -5097,7 +5091,7 @@ struct EpgReconcileResponse {
 struct ReconciliationRevisionResponse {
     revision: i64,
     actor: String,
-    created_at: DateTime<Utc>,
+    created_at: Timestamp,
     before_value: Option<serde_json::Value>,
     after_value: serde_json::Value,
 }
@@ -5192,7 +5186,7 @@ async fn list_reconciliation_revisions(
                 .map(|row| ReconciliationRevisionResponse {
                     revision: row.revision,
                     actor: row.actor,
-                    created_at: row.created_at.into(),
+                    created_at: row.created_at,
                     before_value: row.before_value,
                     after_value: row.after_value,
                 })
@@ -5627,8 +5621,8 @@ fn dynamic_event_from_row(
         channel_slot: format!("{}", row.slot_number),
         channel_id: row.channel_id.map(|id| id.to_string()),
         output_name: row.output_name.clone(),
-        start: row.event_start.map(Into::into),
-        end: row.event_end.map(Into::into),
+        start: row.event_start,
+        end: row.event_end,
         state: row.state.clone(),
         template: template_names
             .get(&row.template_id)
@@ -5866,7 +5860,7 @@ async fn scan_event_channels(
     let mut settings = catalog.event_scan_settings().await;
     settings.sports.clone_from(&state.sports);
     match catalog
-        .scan_event_channels_report(id, Utc::now().into(), &settings)
+        .scan_event_channels_report(id, Timestamp::now(), &settings)
         .await
     {
         Ok(report) => Json(event_scan_response(report)).into_response(),
@@ -5929,7 +5923,7 @@ async fn prune_event_channels(
         return persistence_unavailable();
     };
     match catalog
-        .prune_event_channels_for_template(id, Utc::now().into())
+        .prune_event_channels_for_template(id, Timestamp::now())
         .await
     {
         Ok(count) => Json(SaveResult {
@@ -6025,8 +6019,8 @@ fn event_channel_response_from_row(
         channel_id: row.channel_id.map(|id| id.to_string()),
         slot_number: row.slot_number,
         event_title: row.event_title.clone(),
-        event_start: row.event_start.map(Into::into),
-        event_end: row.event_end.map(Into::into),
+        event_start: row.event_start,
+        event_end: row.event_end,
         raw_stream_name: row.raw_stream_name.clone(),
         output_name: row.output_name.clone(),
         state: row.state.clone(),
@@ -6123,7 +6117,7 @@ async fn session_events(State(state): State<AppState>, headers: HeaderMap) -> Re
 #[serde(rename_all = "camelCase")]
 struct CatalogEvent {
     event: &'static str,
-    timestamp: DateTime<Utc>,
+    timestamp: Timestamp,
 }
 
 fn latest_source_refresh_job<'a>(jobs: &'a [JobRecord], source_id: &str) -> Option<&'a JobRecord> {
@@ -6175,7 +6169,7 @@ fn select_source_sync_job<'a>(jobs: &'a [JobRecord], source_id: &str) -> Option<
 /// Terminal jobs are only included for 60 seconds after their last
 /// update so the UI can clear stale progress bars.
 fn dedup_sync_progress(jobs: &[JobRecord]) -> Vec<(&str, &JobRecord)> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let priority = |status: &str| -> u8 {
         match status {
             "running" => 4,
@@ -6204,9 +6198,7 @@ fn dedup_sync_progress(jobs: &[JobRecord]) -> Vec<(&str, &JobRecord)> {
     let mut seen: std::collections::HashMap<&str, &JobRecord> = std::collections::HashMap::new();
     for job in jobs.iter().filter(|job| match job.status.as_str() {
         "queued" | "running" => true,
-        "succeeded" | "failed" | "cancelled" => {
-            (now - chrono::DateTime::<Utc>::from(job.updated_at)).num_seconds() < 60
-        }
+        "succeeded" | "failed" | "cancelled" => (now - job.updated_at).as_secs() < 60,
         _ => false,
     }) {
         let source_id = job
@@ -6281,7 +6273,7 @@ async fn catalog_events(State(state): State<AppState>, headers: HeaderMap) -> Re
             }
             let event = serde_json::to_string(&CatalogEvent {
                 event: "heartbeat",
-                timestamp: Utc::now(),
+                timestamp: Timestamp::now(),
             })
             .expect("catalog event serializes");
             yield Ok::<Event, Infallible>(Event::default().event("heartbeat").data(event));
@@ -7121,10 +7113,10 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
             spans_by_channel
                 .entry(channel.id)
                 .or_default()
-                .push((programme.starts_at.into(), programme.stops_at.into()));
+                .push((programme.starts_at, programme.stops_at));
             write_programme_row(&mut body, channel.id, programme, Some(&art_base));
         }
-        let now = Utc::now();
+        let now = Timestamp::now();
         for channel in &channels {
             let spans = spans_by_channel
                 .get(&channel.id)
@@ -7191,7 +7183,7 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
         }
         body.push_str("</programme>\n");
     }
-    let now = Utc::now();
+    let now = Timestamp::now();
     for channel in catalog.channels.iter().filter(|channel| channel.enabled) {
         let spans = spans_by_channel
             .get(&channel.id)
@@ -9474,7 +9466,7 @@ async fn create_recording(
     };
     let rule_id = body.rule_id.and_then(|s| s.parse::<Uuid>().ok());
     let programme_id = body.programme_id.and_then(|s| s.parse::<Uuid>().ok());
-    let Ok(starts_at) = body.starts_at.parse::<chrono::DateTime<chrono::Utc>>() else {
+    let Ok(starts_at) = body.starts_at.parse::<Timestamp>() else {
         return ProblemDetails::new(
             StatusCode::BAD_REQUEST,
             "invalid-starts-at",
@@ -9483,7 +9475,7 @@ async fn create_recording(
         )
         .response();
     };
-    let Ok(ends_at) = body.ends_at.parse::<chrono::DateTime<chrono::Utc>>() else {
+    let Ok(ends_at) = body.ends_at.parse::<Timestamp>() else {
         return ProblemDetails::new(
             StatusCode::BAD_REQUEST,
             "invalid-ends-at",
@@ -9498,8 +9490,8 @@ async fn create_recording(
         programme_id,
         title: body.title,
         description: body.description,
-        starts_at: starts_at.into(),
-        ends_at: ends_at.into(),
+        starts_at,
+        ends_at,
     };
     match repo.create_recording(&input).await {
         Ok(recording) => (
@@ -9939,16 +9931,16 @@ const GUIDE_WINDOW_FUTURE_HOURS: i64 = 48;
 const NO_PROGRAM_MAX_BLOCK_HOURS: i64 = 2;
 
 /// A start and stop time of one guide programme.
-type GuideSpan = (DateTime<Utc>, DateTime<Utc>);
+type GuideSpan = (Timestamp, Timestamp);
 
 /// Returns the placeholder blocks that fill the guide gaps in `spans`.
 ///
 /// Only gaps of one minute or more get a placeholder. Each block is at most
 /// two hours long and ends on a whole hour, or at the end of its gap. Real
 /// programmes in `spans` are never covered.
-fn no_program_blocks(now: DateTime<Utc>, spans: &[GuideSpan]) -> Vec<GuideSpan> {
-    let window_start = now - chrono::Duration::hours(GUIDE_WINDOW_PAST_HOURS);
-    let window_end = now + chrono::Duration::hours(GUIDE_WINDOW_FUTURE_HOURS);
+fn no_program_blocks(now: Timestamp, spans: &[GuideSpan]) -> Vec<GuideSpan> {
+    let window_start = now - SignedDuration::from_hours(GUIDE_WINDOW_PAST_HOURS);
+    let window_end = now + SignedDuration::from_hours(GUIDE_WINDOW_FUTURE_HOURS);
     let mut sorted = spans.to_vec();
     sorted.sort_by_key(|(start, _)| *start);
 
@@ -9967,8 +9959,8 @@ fn no_program_blocks(now: DateTime<Utc>, spans: &[GuideSpan]) -> Vec<GuideSpan> 
         gaps.push((cursor, window_end));
     }
 
-    let minimum_gap = chrono::Duration::minutes(1);
-    let maximum_block = chrono::Duration::hours(NO_PROGRAM_MAX_BLOCK_HOURS);
+    let minimum_gap = SignedDuration::from_mins(1);
+    let maximum_block = SignedDuration::from_hours(NO_PROGRAM_MAX_BLOCK_HOURS);
     let mut blocks = Vec::new();
     for (gap_start, gap_end) in gaps {
         let mut block_start = gap_start;
@@ -9985,9 +9977,8 @@ fn no_program_blocks(now: DateTime<Utc>, spans: &[GuideSpan]) -> Vec<GuideSpan> 
 }
 
 /// Returns the whole hour at or before `value`.
-fn floor_to_hour(value: DateTime<Utc>) -> DateTime<Utc> {
-    let seconds = value.timestamp();
-    DateTime::from_timestamp(seconds - seconds.rem_euclid(3600), 0).unwrap_or(value)
+fn floor_to_hour(value: Timestamp) -> Timestamp {
+    value.floor(jiff::Unit::Hour).unwrap_or(value)
 }
 
 /// Returns the matchup image URL when both team logos are known.
@@ -10123,7 +10114,7 @@ fn write_programme_row(
 fn write_no_program_placeholders(
     body: &mut String,
     channel_id: Uuid,
-    now: DateTime<Utc>,
+    now: Timestamp,
     spans: &[GuideSpan],
 ) {
     for (start, stop) in no_program_blocks(now, spans) {
@@ -12972,7 +12963,7 @@ mod tests {
     async fn management_contract_returns_ui_shapes_and_validates_jellyfin() {
         let app_state = state();
         let channel_id = Uuid::now_v7();
-        let starts_at = Utc::now();
+        let starts_at = Timestamp::now();
         {
             let mut catalog = app_state.catalog.write().await;
             catalog.channels.push(ChannelRecord {
@@ -12986,7 +12977,7 @@ mod tests {
             catalog.programmes.push(ProgrammeRecord {
                 channel_id,
                 starts_at,
-                stops_at: starts_at + chrono::Duration::hours(1),
+                stops_at: starts_at + SignedDuration::from_hours(1),
                 title: "Test programme".into(),
                 description: None,
                 categories: vec!["Testing".into()],
@@ -13401,8 +13392,8 @@ mod tests {
         .await
         .unwrap();
         // The event starts in the future, so that the scan schedules it.
-        let start = (Utc::now() + chrono::Duration::hours(12)).format("%Y-%m-%d %H:%M:%S");
-        let stop = (Utc::now() + chrono::Duration::hours(15)).format("%Y-%m-%d %H:%M:%S");
+        let start = (Timestamp::now() + SignedDuration::from_hours(12)).format("%Y-%m-%d %H:%M:%S");
+        let stop = (Timestamp::now() + SignedDuration::from_hours(15)).format("%Y-%m-%d %H:%M:%S");
         let name = format!("MLB 01:  Brewers x Rays start:{start} stop:{stop} [1080p]");
         let stream_id = Uuid::now_v7();
         let channel_id = Uuid::now_v7();
@@ -14307,7 +14298,7 @@ mod tests {
             template_ids.push(Uuid::parse_str(value["id"].as_str().unwrap()).unwrap());
         }
         // Both events ended three hours ago. Only the short grace hides one.
-        let ended = Utc::now() - chrono::Duration::hours(3);
+        let ended = Timestamp::now() - SignedDuration::from_hours(3);
         for (template_id, slot) in template_ids.iter().zip([1_i32, 2]) {
             sqlx::query(
                 "INSERT INTO event_channels (template_id, channel_id, slot_number, event_title, event_start, event_end, raw_stream_name, state) VALUES ($1, $2, $3, 'Old game', $4, $5, 'Raw name', 'ended')",
@@ -14315,7 +14306,7 @@ mod tests {
             .bind(template_id)
             .bind(channel_id)
             .bind(slot)
-            .bind(ended - chrono::Duration::hours(2))
+            .bind(ended - SignedDuration::from_hours(2))
             .bind(ended)
             .execute(&pool)
             .await
@@ -14947,7 +14938,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn api_response_models_serialize_all_optional_and_populated_fields() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let id = Uuid::now_v7().to_string();
         let channel = ChannelResponse {
             id: id.clone(),
@@ -15582,8 +15573,8 @@ mod tests {
             });
             catalog.programmes.push(ProgrammeRecord {
                 channel_id,
-                starts_at: Utc::now(),
-                stops_at: Utc::now() + chrono::Duration::hours(1),
+                starts_at: Timestamp::now(),
+                stops_at: Timestamp::now() + SignedDuration::from_hours(1),
                 title: "Discovery programme".to_owned(),
                 description: Some("A test programme".to_owned()),
                 categories: vec!["Documentary".to_owned()],
@@ -15702,7 +15693,7 @@ mod tests {
         let source_id = Uuid::now_v7();
         let parent_id = Uuid::now_v7();
         let child_id = Uuid::now_v7();
-        let now = Utc::now();
+        let now = Timestamp::now();
         let parent = JobRecord {
             id: parent_id,
             kind: "refresh-source".to_owned(),
@@ -15717,13 +15708,13 @@ mod tests {
             }),
             attempts: 1,
             max_attempts: 3,
-            available_at: now.into(),
+            available_at: now,
             locked_by: Some("worker".to_owned()),
-            locked_at: Some(now.into()),
-            heartbeat_at: Some(now.into()),
+            locked_at: Some(now),
+            heartbeat_at: Some(now),
             last_error: None,
-            created_at: now.into(),
-            updated_at: now.into(),
+            created_at: now,
+            updated_at: now,
             completed_at: None,
         };
         let child = JobRecord {
@@ -15738,13 +15729,13 @@ mod tests {
             progress: serde_json::json!({"stage": "reconciling-partition", "percent": 92}),
             attempts: 1,
             max_attempts: 3,
-            available_at: now.into(),
+            available_at: now,
             locked_by: Some("worker".to_owned()),
-            locked_at: Some(now.into()),
-            heartbeat_at: Some(now.into()),
+            locked_at: Some(now),
+            heartbeat_at: Some(now),
             last_error: None,
-            created_at: (now + chrono::Duration::milliseconds(1)).into(),
-            updated_at: (now + chrono::Duration::milliseconds(1)).into(),
+            created_at: (now + SignedDuration::from_millis(1)),
+            updated_at: (now + SignedDuration::from_millis(1)),
             completed_at: None,
         };
         let mut jobs = vec![child, parent];
@@ -15776,27 +15767,25 @@ mod tests {
         assert_eq!(completed.records_processed, 7);
     }
 
-    fn guide_time(value: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(value)
-            .expect("valid RFC 3339 test time")
-            .with_timezone(&Utc)
+    fn guide_time(value: &str) -> Timestamp {
+        value.parse().expect("valid RFC 3339 test time")
     }
 
     /// Fixed "now" that is not on the hour: the window is 06:30Z to 12:30Z + 48h.
-    fn guide_now() -> DateTime<Utc> {
+    fn guide_now() -> Timestamp {
         guide_time("2026-11-05T12:30:00Z")
     }
 
-    fn assert_blocks_are_valid(blocks: &[(DateTime<Utc>, DateTime<Utc>)]) {
+    fn assert_blocks_are_valid(blocks: &[(Timestamp, Timestamp)]) {
         for (start, stop) in blocks {
             let length = *stop - *start;
             assert!(
-                length >= chrono::Duration::minutes(1),
-                "block too short: {start} {stop}"
+                length >= SignedDuration::from_mins(1),
+                "block too short: {start:?} {stop:?}"
             );
             assert!(
-                length <= chrono::Duration::hours(2),
-                "block too long: {start} {stop}"
+                length <= SignedDuration::from_hours(2),
+                "block too long: {start:?} {stop:?}"
             );
             assert!(*start < *stop);
         }
@@ -15827,8 +15816,8 @@ mod tests {
         }
         let covered = blocks
             .iter()
-            .fold(chrono::Duration::zero(), |total, (s, e)| total + (*e - *s));
-        assert_eq!(covered, chrono::Duration::hours(54));
+            .fold(SignedDuration::ZERO, |total, (s, e)| total + (*e - *s));
+        assert_eq!(covered, SignedDuration::from_hours(54));
     }
 
     #[test]
@@ -15841,9 +15830,9 @@ mod tests {
         for (_, stop) in &blocks {
             if *stop != window_end {
                 assert_eq!(
-                    stop.timestamp().rem_euclid(3600),
+                    stop.as_second().rem_euclid(3600),
                     0,
-                    "block end not on the hour: {stop}"
+                    "block end not on the hour: {stop:?}"
                 );
             }
         }
@@ -15879,7 +15868,7 @@ mod tests {
             let overlaps = *start < programme.1 && programme.0 < *stop;
             assert!(
                 !overlaps,
-                "placeholder overlaps the real programme: {start} {stop}"
+                "placeholder overlaps the real programme: {start:?} {stop:?}"
             );
         }
     }
