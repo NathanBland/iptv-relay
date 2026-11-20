@@ -14,6 +14,7 @@ pub mod process;
 mod psi;
 pub mod recovery;
 pub mod registry;
+pub mod remux;
 pub mod ring;
 pub mod session;
 pub mod slate;
@@ -39,6 +40,7 @@ pub use recovery::{
     RecoveryPolicy, SessionFailureKind, SessionState,
 };
 pub use registry::SharedSessionRegistry;
+pub use remux::{MatroskaBitrates, MatroskaByteStream, spawn_matroska_remux};
 pub use ring::{
     DEFAULT_PRE_ROLL, MPEG_TS_PACKET_SIZE, MpegTsRing, MpegTsRingConfig, RingCloseReason,
     RingConfigError, RingCursor, RingRateReader, RingRead, RingReadError, RingSnapshot,

@@ -255,6 +255,18 @@ pub fn setting_catalog() -> Vec<SettingDefinition> {
             true,
             false,
         ),
+        choice_setting(
+            "output.stream_container",
+            "Playlist stream container",
+            "Selects the container of the stream URLs in the M3U playlist. Matroska carries the measured bitrate for client probes.",
+            "ts",
+            &["ts", "mkv"],
+            "Matroska output starts one FFmpeg remux for each viewer and encodes the audio again to AAC.",
+            SettingRisk::Compatibility,
+            ApplyRequirement::Immediate,
+            false,
+            false,
+        ),
         integer_setting(
             "events.inferred_duration_seconds",
             "Inferred event duration",
@@ -465,6 +477,7 @@ mod tests {
         assert_eq!(by_key(&settings, "media.ring.duration_seconds").value, 8);
         assert_eq!(by_key(&settings, "media.ring.max_bytes").value, 67_108_864);
         assert_eq!(by_key(&settings, "media.adapter").value, "auto");
+        assert_eq!(by_key(&settings, "output.stream_container").value, "ts");
         assert_eq!(
             by_key(&settings, "ingest.max_download_bytes").value,
             2_147_483_648_i64
