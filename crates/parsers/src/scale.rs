@@ -386,6 +386,27 @@ mod tests {
     }
 
     #[test]
+    fn xmltv_generator_writes_compact_utc_timestamps() {
+        let config = ScaleXmltvConfig {
+            channels: 2,
+            programmes: 50,
+            seed: ScaleXmltvConfig::DEFAULT_SEED,
+        };
+        let mut output = Vec::new();
+        generate_xmltv(config, &mut output).expect("generate");
+        let text = String::from_utf8(output).expect("utf-8");
+        assert!(text.contains(
+            "<programme channel=\"ch-00000\" start=\"20260101000000 +0000\" stop=\"20260101010000 +0000\">"
+        ));
+        assert!(text.contains(
+            "<programme channel=\"ch-00001\" start=\"20260101230000 +0000\" stop=\"20260102000000 +0000\">"
+        ));
+        assert!(text.contains(
+            "<programme channel=\"ch-00001\" start=\"20260102000000 +0000\" stop=\"20260102010000 +0000\">"
+        ));
+    }
+
+    #[test]
     fn xmltv_generator_is_byte_stable_for_a_fixed_seed() {
         let config = ScaleXmltvConfig {
             channels: 10,

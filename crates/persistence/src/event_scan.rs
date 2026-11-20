@@ -505,4 +505,53 @@ mod tests {
         assert_eq!(live.len(), 2);
         assert_eq!(live[0].kind, GeneratedProgrammeKind::Event);
     }
+
+    #[test]
+    fn upcoming_title_uses_local_abbreviation_across_daylight_saving_changes() {
+        let denver = resolve_event_timezone("America/Denver", None, None);
+        let new_york = resolve_event_timezone("UTC", Some("America/New_York"), None);
+        let utc = resolve_event_timezone("UTC", None, None);
+        let cases = [
+            ("2026-03-08T08:59:00Z", denver, "Mar 8 1:59 AM MST"),
+            ("2026-03-08T09:00:00Z", denver, "Mar 8 3:00 AM MDT"),
+            ("2026-11-01T07:30:00Z", denver, "Nov 1 1:30 AM MDT"),
+            ("2026-11-01T08:30:00Z", denver, "Nov 1 1:30 AM MST"),
+            ("2026-03-08T06:59:00Z", new_york, "Mar 8 1:59 AM EST"),
+            ("2026-03-08T07:00:00Z", new_york, "Mar 8 3:00 AM EDT"),
+            ("2026-11-01T05:30:00Z", new_york, "Nov 1 1:30 AM EDT"),
+            ("2026-11-01T06:30:00Z", new_york, "Nov 1 1:30 AM EST"),
+            ("2026-12-31T23:05:00.5Z", utc, "Dec 31 11:05 PM UTC"),
+            ("2026-07-04T12:00:00Z", utc, "Jul 4 12:00 PM UTC"),
+        ];
+        for (starts_at, timezone, expected) in cases {
+            assert_eq!(
+                upcoming_title("Upcoming", "Game", at(starts_at), timezone),
+                format!("Upcoming: Game, {expected}"),
+                "{starts_at}"
+            );
+        }
+    }
+
+    #[test]
+    fn upcoming_filler_starts_at_the_hour_across_daylight_saving_changes() {
+        let event = GeneratedProgramme {
+            starts_at: at("2026-03-08T09:30:00Z"),
+            stops_at: at("2026-03-08T12:30:00Z"),
+            title: "Game".to_owned(),
+            kind: GeneratedProgrammeKind::Event,
+            stable_event_key: None,
+            source_title: "Game".to_owned(),
+        };
+        let guide = plan_event_channel_guide(
+            &event,
+            resolve_event_timezone("America/Denver", None, None),
+            at("2026-03-08T08:59:59.999Z"),
+            Duration::hours(1),
+            &EventScanSettings::default(),
+        );
+        assert_eq!(guide.len(), 3);
+        assert_eq!(guide[0].starts_at.to_rfc3339(), "2026-03-08T08:00:00+00:00");
+        assert_eq!(guide[0].title, "Upcoming: Game, Mar 8 3:30 AM MDT");
+        assert_eq!(guide[2].stops_at.to_rfc3339(), "2026-03-08T13:30:00+00:00");
+    }
 }

@@ -60,6 +60,7 @@ nav:
       - Live Job Diagnostics: development/live-job-diagnostics.md
       - Stream Slate Acceptance: development/stream-slate-acceptance.md
       - Release Images: development/releasing.md
+      - Chrono Migration Plan: development/chrono-migration.md
 plugins:
   - search
 markdown_extensions:

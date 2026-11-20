@@ -15936,7 +15936,7 @@ mod tests {
         assert!(body.contains("start=\"20261105063000 +0000\""));
     }
 
-    fn nhl_programme_row() -> iptv_persistence::ProgrammeRow {
+    pub(super) fn nhl_programme_row() -> iptv_persistence::ProgrammeRow {
         let info = serde_json::json!({
             "league": "NHL",
             "localDate": "2026-11-04",
@@ -16096,5 +16096,267 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// Tests that lock the wire format of time values.
+///
+/// The chrono to jiff migration must keep each expected value unchanged. The
+/// inputs include whole seconds, milliseconds, microseconds, nanoseconds, and
+/// a value with a nonzero offset.
+#[cfg(test)]
+mod time_wire_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn job_response_times_serialize_as_rfc3339_with_z() {
+        let response = JobResponse {
+            id: "job".to_owned(),
+            kind: "refresh".to_owned(),
+            status: "succeeded".to_owned(),
+            progress: json!({}),
+            attempts: 1,
+            max_attempts: 3,
+            last_error: None,
+            created_at: "2026-03-08T09:00:00Z".parse().unwrap(),
+            updated_at: "2026-03-08T09:00:00.120Z".parse().unwrap(),
+            completed_at: Some("2026-03-08T09:00:00.123456Z".parse().unwrap()),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["createdAt"], json!("2026-03-08T09:00:00Z"));
+        assert_eq!(value["updatedAt"], json!("2026-03-08T09:00:00.120Z"));
+        assert_eq!(value["completedAt"], json!("2026-03-08T09:00:00.123456Z"));
+    }
+
+    #[test]
+    fn source_response_times_serialize_with_each_precision() {
+        let response = SourceResponse {
+            id: "source".to_owned(),
+            name: "Source".to_owned(),
+            kind: "m3u".to_owned(),
+            state: "healthy".to_owned(),
+            channels: 1,
+            last_sync: "2026-11-01T06:30:00.123456789Z".parse().unwrap(),
+            endpoint: "https://provider.test".to_owned(),
+            refresh_interval_seconds: 3600,
+            last_refreshed_at: Some("2026-11-01T01:30:00.5-05:00".parse().unwrap()),
+            max_connections: 1,
+            timezone: "America/New_York".to_owned(),
+            enabled: true,
+            cb_consecutive_failures: 0,
+            cb_opened_at: None,
+            alternative_base_urls: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            concat!(
+                r#"{"id":"source","name":"Source","kind":"m3u","state":"healthy","channels":1,"#,
+                r#""lastSync":"2026-11-01T06:30:00.123456789Z","endpoint":"https://provider.test","#,
+                r#""refreshIntervalSeconds":3600,"lastRefreshedAt":"2026-11-01T06:30:00.500Z","#,
+                r#""maxConnections":1,"timezone":"America/New_York","enabled":true,"#,
+                r#""cbConsecutiveFailures":0,"cbOpenedAt":null,"alternativeBaseUrls":[]}"#
+            )
+        );
+    }
+
+    #[test]
+    fn operator_token_times_serialize_and_deserialize() {
+        let response = OperatorApiTokenResponse {
+            id: "token".to_owned(),
+            name: "CI".to_owned(),
+            scopes: vec!["catalog:read".to_owned()],
+            expires_at: Some("2027-01-01T00:00:00Z".parse().unwrap()),
+            revoked_at: None,
+            created_by: "admin".to_owned(),
+            created_at: "2026-03-08T09:00:00.001Z".parse().unwrap(),
+            last_used_at: Some("2026-03-08T09:00:00.000001Z".parse().unwrap()),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["expiresAt"], json!("2027-01-01T00:00:00Z"));
+        assert_eq!(value["revokedAt"], json!(null));
+        assert_eq!(value["createdAt"], json!("2026-03-08T09:00:00.001Z"));
+        assert_eq!(value["lastUsedAt"], json!("2026-03-08T09:00:00.000001Z"));
+
+        let request: CreateOperatorApiTokenRequest = serde_json::from_value(json!({
+            "name": "CI",
+            "scopes": [],
+            "expiresAt": "2027-01-01T02:00:00.25+02:00"
+        }))
+        .unwrap();
+        assert_eq!(
+            request.expires_at.map(|value| value.to_rfc3339()),
+            Some("2027-01-01T00:00:00.250+00:00".to_owned())
+        );
+        let request: CreateOperatorApiTokenRequest =
+            serde_json::from_value(json!({"name": "CI", "scopes": [], "expires_at": null}))
+                .unwrap();
+        assert!(request.expires_at.is_none());
+        assert!(
+            serde_json::from_value::<CreateOperatorApiTokenRequest>(json!({
+                "name": "CI",
+                "scopes": [],
+                "expiresAt": "tomorrow"
+            }))
+            .is_err()
+        );
+
+        let rotate: RotateOperatorApiTokenRequest =
+            serde_json::from_value(json!({"expiresAt": null})).unwrap();
+        assert!(rotate.expires_at.is_none());
+        let rotate: RotateOperatorApiTokenRequest =
+            serde_json::from_value(json!({"expiresAt": "2027-06-01T00:00:00Z"})).unwrap();
+        assert_eq!(
+            rotate
+                .expires_at
+                .and_then(|value| value.0)
+                .map(|value| value.to_rfc3339()),
+            Some("2027-06-01T00:00:00+00:00".to_owned())
+        );
+    }
+
+    #[test]
+    fn support_log_entry_timestamp_serializes_with_z() {
+        let entry = SupportLogEntry {
+            timestamp: "2026-11-01T06:59:59.999Z".parse().unwrap(),
+            level: "info".to_owned(),
+            message: "ok".to_owned(),
+            context: json!({}),
+        };
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"timestamp":"2026-11-01T06:59:59.999Z","level":"info","message":"ok","context":{}}"#
+        );
+    }
+
+    #[test]
+    fn programme_record_round_trips_through_json() {
+        let record: ProgrammeRecord = serde_json::from_value(json!({
+            "channel_id": Uuid::nil(),
+            "starts_at": "2026-03-08T01:30:00-07:00",
+            "stops_at": "2026-03-08T10:00:00.010Z",
+            "title": "Show",
+            "description": null,
+            "categories": []
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            json!({
+                "channel_id": Uuid::nil(),
+                "starts_at": "2026-03-08T08:30:00Z",
+                "stops_at": "2026-03-08T10:00:00.010Z",
+                "title": "Show",
+                "description": null,
+                "categories": []
+            })
+        );
+    }
+
+    fn user_row() -> iptv_persistence::UserRow {
+        iptv_persistence::UserRow {
+            id: Uuid::nil(),
+            username: "admin".to_owned(),
+            display_name: "Admin".to_owned(),
+            role: "admin".to_owned(),
+            enabled: true,
+            last_login_at: Some("2026-11-01T06:30:00.120Z".parse().unwrap()),
+            created_at: "2026-03-08T09:00:00Z".parse().unwrap(),
+            updated_at: "2026-03-08T09:00:00.123456Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn persistence_rows_serialize_times_with_z() {
+        let value = serde_json::to_value(user_row()).unwrap();
+        assert_eq!(value["last_login_at"], json!("2026-11-01T06:30:00.120Z"));
+        assert_eq!(value["created_at"], json!("2026-03-08T09:00:00Z"));
+        assert_eq!(value["updated_at"], json!("2026-03-08T09:00:00.123456Z"));
+    }
+
+    #[test]
+    fn mapped_string_times_use_rfc3339_with_numeric_offset() {
+        let user = serde_json::to_value(UserResponse::from(user_row())).unwrap();
+        assert_eq!(user["lastLoginAt"], json!("2026-11-01T06:30:00.120+00:00"));
+        assert_eq!(user["createdAt"], json!("2026-03-08T09:00:00+00:00"));
+        assert_eq!(user["updatedAt"], json!("2026-03-08T09:00:00.123456+00:00"));
+
+        let recording = RecordingResponse::from(iptv_persistence::RecordingRow {
+            id: Uuid::nil(),
+            rule_id: None,
+            channel_id: Uuid::nil(),
+            programme_id: None,
+            title: "Game".to_owned(),
+            description: None,
+            starts_at: "2026-03-08T01:59:00-07:00".parse().unwrap(),
+            ends_at: "2026-03-08T03:00:00.000000001-06:00".parse().unwrap(),
+            status: "scheduled".to_owned(),
+            file_path: None,
+            file_size_bytes: None,
+            duration_seconds: None,
+            error_message: None,
+            created_at: "2026-03-08T09:00:00Z".parse().unwrap(),
+            updated_at: "2026-03-08T09:00:00Z".parse().unwrap(),
+        });
+        let recording = serde_json::to_value(recording).unwrap();
+        assert_eq!(recording["startsAt"], json!("2026-03-08T08:59:00+00:00"));
+        assert_eq!(
+            recording["endsAt"],
+            json!("2026-03-08T09:00:00.000000001+00:00")
+        );
+    }
+
+    #[test]
+    fn xmltv_programme_times_drop_fractions_and_use_utc_offset() {
+        let mut row = tests::nhl_programme_row();
+        row.starts_at = "2026-03-08T01:59:59.999-07:00".parse().unwrap();
+        row.stops_at = "2026-11-01T01:30:00.5-04:00".parse().unwrap();
+        row.metadata = None;
+        row.description = None;
+        row.categories = json!([]);
+        let mut body = String::new();
+        write_programme_row(&mut body, Uuid::nil(), &row, None);
+        assert_eq!(
+            body,
+            "  <programme channel=\"00000000-0000-0000-0000-000000000000\" start=\"20260308085959 +0000\" stop=\"20261101053000 +0000\"><title>Ottawa Senators at Buffalo Sabres</title></programme>\n"
+        );
+    }
+
+    #[test]
+    fn xmltv_placeholders_for_a_fixed_now_are_stable() {
+        let now = "2026-11-05T12:30:00Z".parse().unwrap();
+        let spans = [(
+            "2026-11-05T14:15:00Z".parse().unwrap(),
+            "2026-11-05T16:45:30.5Z".parse().unwrap(),
+        )];
+        let mut body = String::new();
+        write_no_program_placeholders(&mut body, Uuid::nil(), now, &spans);
+        let starts: Vec<&str> = body
+            .lines()
+            .map(|line| {
+                line.split("start=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap()
+            })
+            .collect();
+        let stops: Vec<&str> = body
+            .lines()
+            .map(|line| {
+                line.split("stop=\"")
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(starts.first(), Some(&"20261105063000 +0000"));
+        assert!(starts.contains(&"20261105164530 +0000"), "{starts:?}");
+        assert!(stops.contains(&"20261105141500 +0000"), "{stops:?}");
+        assert!(
+            starts
+                .iter()
+                .chain(&stops)
+                .all(|value| value.len() == 20 && value.ends_with(" +0000"))
+        );
     }
 }

@@ -741,6 +741,49 @@ mod tests {
     }
 
     #[test]
+    fn short_epg_local_times_follow_daylight_saving_changes() {
+        let payload = r#"{
+            "epg_listings": [
+                {"title": "QQ==", "start": "2026-03-08 01:59:00", "end": "2026-03-08 03:00:00", "channel_id": "one"},
+                {"title": "Qg==", "start": "2026-03-08 02:30:00", "end": "2026-03-08 03:30:00", "channel_id": "one"},
+                {"title": "Qw==", "start": "2026-11-01 00:59:59", "end": "2026-11-01 02:00:00", "channel_id": "one"},
+                {"title": "RA==", "start": "1772956800", "end": 1772960400, "channel_id": "one"},
+                {"title": "RQ==", "start": "2026-03-08T02:30:00.250-05:00", "end": "2026-03-08T09:00:00Z", "channel_id": "one"}
+            ]
+        }"#;
+        let document = parse_xtream_short_epg_in_timezone(
+            Cursor::new(payload),
+            ParseLimits::default(),
+            "America/New_York",
+        )
+        .expect("short EPG");
+        let times: Vec<(String, String)> = document
+            .records
+            .iter()
+            .map(|record| (record.start.to_rfc3339(), record.stop.to_rfc3339()))
+            .collect();
+        assert_eq!(
+            times,
+            [
+                ("2026-03-08T06:59:00+00:00", "2026-03-08T07:00:00+00:00"),
+                ("2026-11-01T04:59:59+00:00", "2026-11-01T07:00:00+00:00"),
+                ("2026-03-08T08:00:00+00:00", "2026-03-08T09:00:00+00:00"),
+                ("2026-03-08T07:30:00.250+00:00", "2026-03-08T09:00:00+00:00"),
+            ]
+            .map(|(start, end)| (start.to_owned(), end.to_owned()))
+        );
+        assert_eq!(document.stats.records_skipped, 1);
+        assert!(
+            parse_xtream_short_epg_in_timezone(
+                Cursor::new(payload),
+                ParseLimits::default(),
+                "Nowhere/City",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn enforces_xtream_byte_record_and_text_limits() {
         let bytes = ParseLimits {
             max_input_bytes: 8,
