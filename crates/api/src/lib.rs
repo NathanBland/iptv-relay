@@ -35,9 +35,11 @@ use iptv_domain::{
 };
 use iptv_media::{
     AcquireError, HttpTsEndpoint, HttpTsSessionKey, HttpTsSessionManager, HttpTsSessionSnapshot,
-    HttpTsSourceSpec, InputAdapterPolicy, MpegTsRingConfig, PoolSnapshot, ProviderSpec,
-    RecoveryPolicy, SessionFailureKind, SessionStartError, SessionState, SlotLease, ViewerHandle,
+    HttpTsSourceSpec, InputAdapterPolicy, MatroskaBitrates, MpegTsRingConfig, PoolSnapshot,
+    ProviderSpec, RecoveryPolicy, SessionFailureKind, SessionStartError, SessionState, SlotLease,
+    ViewerHandle,
     slate::{MeasuredStreamProfile, SlateOptions, SlateProfile, SlatedOpen, open_with_slates},
+    spawn_matroska_remux,
 };
 use iptv_persistence::{
     AuditEventRecord, CatalogRepository, ChannelPlaybackCandidateRow, ChannelPlaybackPlan,
@@ -4584,7 +4586,7 @@ async fn channel_stream(
     let Some(uuid) = Uuid::parse_str(&channel_id).ok() else {
         return not_found();
     };
-    open_channel_response(&state, uuid).await
+    open_channel_response(&state, uuid, OutputContainer::MpegTs).await
 }
 
 #[utoipa::path(
@@ -6972,6 +6974,7 @@ async fn playlist(State(state): State<AppState>, Path(token): Path<String>) -> R
         Ok(access) => access,
         Err(response) => return response,
     };
+    let extension = playlist_container(&state).await.extension();
     // Use the database catalog when available (production mode).
     if let Some(catalog_repo) = &state.catalog_repository {
         let profile = access
@@ -6992,7 +6995,7 @@ async fn playlist(State(state): State<AppState>, Path(token): Path<String>) -> R
         for channel in channels {
             write!(
                 &mut body,
-                "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{}\" tvg-logo=\"{}\" tvg-chno=\"{}\" group-title=\"{}\",{}\n{}/out/{}/stream/{}.ts\n",
+                "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{}\" tvg-logo=\"{}\" tvg-chno=\"{}\" group-title=\"{}\",{}\n{}/out/{}/stream/{}.{}\n",
                 channel.id,
                 m3u_escape(&channel.name),
                 m3u_escape(channel.logo_url.as_deref().unwrap_or_default()),
@@ -7002,6 +7005,7 @@ async fn playlist(State(state): State<AppState>, Path(token): Path<String>) -> R
                 state.public_base_url,
                 token,
                 channel.id,
+                extension,
             )
             .expect("writing to a String cannot fail");
         }
@@ -7020,7 +7024,7 @@ async fn playlist(State(state): State<AppState>, Path(token): Path<String>) -> R
         let logo = channel.logo_url.as_deref().unwrap_or_default();
         write!(
             &mut body,
-            "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{}\" tvg-logo=\"{}\" tvg-chno=\"{}\" group-title=\"{}\",{}\n{}/out/{}/stream/{}.ts\n",
+            "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{}\" tvg-logo=\"{}\" tvg-chno=\"{}\" group-title=\"{}\",{}\n{}/out/{}/stream/{}.{}\n",
             channel.id,
             m3u_escape(&channel.name),
             m3u_escape(logo),
@@ -7030,6 +7034,7 @@ async fn playlist(State(state): State<AppState>, Path(token): Path<String>) -> R
             state.public_base_url,
             token,
             channel.id,
+            extension,
         )
         .expect("writing to a String cannot fail");
     }
@@ -7196,10 +7201,7 @@ async fn stream_channel(
         Ok(access) => access,
         Err(response) => return response,
     };
-    let Some(channel_id) = channel_path
-        .strip_suffix(".ts")
-        .and_then(|value| Uuid::parse_str(value).ok())
-    else {
+    let Some((channel_id, container)) = OutputContainer::parse_channel_path(&channel_path) else {
         return not_found();
     };
     if let (Some(catalog), Some(profile)) = (&state.catalog_repository, access.profile.as_ref()) {
@@ -7212,17 +7214,102 @@ async fn stream_channel(
             Err(error) => return persistence_error_response(error),
         }
     }
-    open_channel_response(&state, channel_id).await
+    open_channel_response(&state, channel_id, container).await
 }
 
 type StreamResult<T> = Result<T, Box<Response>>;
 
-async fn open_channel_response(state: &AppState, channel_id: Uuid) -> Response {
-    let (spec, provider_stream_id) = match channel_source_spec(state, channel_id).await {
+/// The container of one output stream response.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum OutputContainer {
+    /// The relay MPEG-TS stream without change.
+    #[default]
+    MpegTs,
+    /// A live Matroska remux with measured bitrate tags.
+    Matroska,
+}
+
+impl OutputContainer {
+    /// Returns the file extension of a stream URL in this container.
+    fn extension(self) -> &'static str {
+        match self {
+            Self::MpegTs => "ts",
+            Self::Matroska => "mkv",
+        }
+    }
+
+    /// Parses `{channel_id}.ts` or `{channel_id}.mkv`.
+    fn parse_channel_path(channel_path: &str) -> Option<(Uuid, Self)> {
+        let (id, container) = if let Some(id) = channel_path.strip_suffix(".ts") {
+            (id, Self::MpegTs)
+        } else {
+            (channel_path.strip_suffix(".mkv")?, Self::Matroska)
+        };
+        Uuid::parse_str(id).ok().map(|id| (id, container))
+    }
+
+    fn from_setting(value: &str) -> Option<Self> {
+        match value {
+            "ts" => Some(Self::MpegTs),
+            "mkv" => Some(Self::Matroska),
+            _ => None,
+        }
+    }
+}
+
+/// Reads the global `output.stream_container` setting for the M3U playlist.
+///
+/// A settings failure must not stop the playlist, so this falls back to
+/// MPEG-TS.
+async fn playlist_container(state: &AppState) -> OutputContainer {
+    let Some(catalog) = &state.catalog_repository else {
+        return OutputContainer::default();
+    };
+    let overrides = match catalog.load_operator_setting_overrides().await {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            warn!(%error, "cannot load output settings; the playlist uses MPEG-TS");
+            return OutputContainer::default();
+        }
+    };
+    match resolve_settings(&overrides.to_domain("", ""), "", "") {
+        Ok(settings) => settings
+            .iter()
+            .find(|setting| setting.definition.key == "output.stream_container")
+            .and_then(|setting| setting.value.as_str())
+            .and_then(OutputContainer::from_setting)
+            .unwrap_or_default(),
+        Err(error) => {
+            warn!(%error, "invalid output settings; the playlist uses MPEG-TS");
+            OutputContainer::default()
+        }
+    }
+}
+
+/// The source of one channel and what the relay knows about its primary
+/// provider stream.
+struct ChannelSource {
+    spec: HttpTsSourceSpec,
+    provider_stream_id: Option<Uuid>,
+    /// The mean bitrate measured from live sessions, or the probe value.
+    measured_bits_per_second: Option<u64>,
+}
+
+async fn open_channel_response(
+    state: &AppState,
+    channel_id: Uuid,
+    container: OutputContainer,
+) -> Response {
+    let ChannelSource {
+        spec,
+        provider_stream_id,
+        measured_bits_per_second,
+    } = match channel_source_spec(state, channel_id).await {
         Ok(source) => source,
         Err(response) => return *response,
     };
     let profile = slate_profile(state, provider_stream_id).await;
+    let audio_channels = profile.audio_channels;
     let catalog = state.catalog_repository.clone();
     let hook: iptv_media::slate::ViewerHook = Arc::new(move |viewer: &ViewerHandle| {
         passive_capture::spawn_passive_capture(catalog.as_ref(), channel_id, viewer);
@@ -7231,10 +7318,33 @@ async fn open_channel_response(state: &AppState, channel_id: Uuid) -> Response {
     let options = SlateOptions::new(profile).with_viewer_hook(hook);
     // A provider problem never becomes an HTTP error. The client receives a
     // slate and the relay retries within the provider pool limit.
-    match open_with_slates(state.media.clone(), spec, options).await {
-        SlatedOpen::Direct(viewer) => mpeg_ts_response(viewer),
-        SlatedOpen::Slated(stream) => mpeg_ts_body_response(Body::from_stream(stream)),
-        SlatedOpen::Failed(error) => session_start_response(error),
+    let stream: iptv_media::MatroskaByteStream =
+        match open_with_slates(state.media.clone(), spec, options).await {
+            SlatedOpen::Direct(viewer) if container == OutputContainer::MpegTs => {
+                return mpeg_ts_response(viewer);
+            }
+            SlatedOpen::Slated(stream) if container == OutputContainer::MpegTs => {
+                return mpeg_ts_body_response(Body::from_stream(stream));
+            }
+            SlatedOpen::Direct(viewer) => Box::pin(futures_util::StreamExt::map(
+                viewer.into_byte_stream(),
+                |chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())),
+            )),
+            SlatedOpen::Slated(stream) => Box::pin(stream),
+            SlatedOpen::Failed(error) => return session_start_response(error),
+        };
+    let bitrates = MatroskaBitrates::from_measured(measured_bits_per_second, audio_channels);
+    match spawn_matroska_remux(stream, bitrates) {
+        Ok(output) => matroska_body_response(Body::from_stream(output)),
+        Err(error) => {
+            warn!(%error, "the matroska remux cannot start");
+            retryable_problem(
+                StatusCode::BAD_GATEWAY,
+                "matroska-remux-failed",
+                "Matroska remux failed to start",
+                "the relay could not start the matroska remux",
+            )
+        }
     }
 }
 
@@ -7266,10 +7376,7 @@ async fn slate_profile(state: &AppState, provider_stream_id: Option<Uuid>) -> Sl
 
 /// Returns the source of a channel and the primary provider stream, if the
 /// catalog database supplies the channel.
-async fn channel_source_spec(
-    state: &AppState,
-    channel_id: Uuid,
-) -> StreamResult<(HttpTsSourceSpec, Option<Uuid>)> {
+async fn channel_source_spec(state: &AppState, channel_id: Uuid) -> StreamResult<ChannelSource> {
     let memory_source = {
         let catalog = state.catalog.read().await;
         catalog
@@ -7285,7 +7392,12 @@ async fn channel_source_spec(
             })
     };
     if let Some((source, channel_name)) = memory_source {
-        return in_memory_source_spec(state, &source, &channel_name).map(|spec| (spec, None));
+        let measured_bits_per_second = Some(source.estimated_bitrate_bits_per_second);
+        return in_memory_source_spec(state, &source, &channel_name).map(|spec| ChannelSource {
+            spec,
+            provider_stream_id: None,
+            measured_bits_per_second,
+        });
     }
 
     let Some(catalog) = &state.catalog_repository else {
@@ -7304,7 +7416,17 @@ async fn channel_source_spec(
         .candidates
         .first()
         .map(|primary| primary.provider_stream_id);
-    database_source_spec(state, &plan, policy).map(|spec| (spec, provider_stream_id))
+    let measured_bits_per_second = plan
+        .candidates
+        .first()
+        .and_then(|primary| primary.bitrate_kbps)
+        .and_then(|kbps| u64::try_from(kbps).ok())
+        .and_then(|kbps| kbps.checked_mul(1_000));
+    database_source_spec(state, &plan, policy).map(|spec| ChannelSource {
+        spec,
+        provider_stream_id,
+        measured_bits_per_second,
+    })
 }
 
 fn in_memory_source_spec(
@@ -7478,6 +7600,18 @@ fn playback_generation(plan: &ChannelPlaybackPlan) -> u64 {
 
 fn mpeg_ts_response(viewer: ViewerHandle) -> Response {
     mpeg_ts_body_response(Body::from_stream(viewer.into_byte_stream()))
+}
+
+fn matroska_body_response(body: Body) -> Response {
+    let mut response = Response::new(body);
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("video/x-matroska"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
 }
 
 fn mpeg_ts_body_response(body: Body) -> Response {
@@ -11654,6 +11788,33 @@ mod tests {
         assert!(!playlist_body.contains("Excluded channel"));
         assert!(playlist_body.contains(&included_channel_id.to_string()));
         assert!(!playlist_body.contains(&excluded_channel_id.to_string()));
+        assert!(playlist_body.contains(&format!("/stream/{included_channel_id}.ts\n")));
+
+        // The global setting `output.stream_container` selects Matroska URLs.
+        catalog
+            .replace_operator_setting_scope(
+                "global",
+                "",
+                &std::collections::BTreeMap::from([(
+                    "output.stream_container".to_owned(),
+                    serde_json::json!("mkv"),
+                )]),
+                None,
+                "test",
+            )
+            .await
+            .unwrap();
+        let mkv_playlist = output_response(&app, "/out/output-secret/playlist.m3u").await;
+        assert_eq!(mkv_playlist.status(), StatusCode::OK);
+        let mkv_playlist = response_text(mkv_playlist).await;
+        assert!(mkv_playlist.contains(&format!("/stream/{included_channel_id}.mkv\n")));
+        assert!(!mkv_playlist.contains(".ts\n"));
+        let excluded_mkv = output_response(
+            &app,
+            &format!("/out/output-secret/stream/{excluded_channel_id}.mkv"),
+        )
+        .await;
+        assert_eq!(excluded_mkv.status(), StatusCode::NOT_FOUND);
 
         let excluded_stream = app
             .clone()
@@ -12544,6 +12705,159 @@ mod tests {
         for value in response.headers().values() {
             assert!(!value.to_str().unwrap_or_default().contains("super-secret"));
         }
+    }
+
+    #[test]
+    fn output_container_parses_channel_paths_and_settings() {
+        let id = Uuid::from_u128(7);
+        assert_eq!(
+            OutputContainer::parse_channel_path(&format!("{id}.ts")),
+            Some((id, OutputContainer::MpegTs))
+        );
+        assert_eq!(
+            OutputContainer::parse_channel_path(&format!("{id}.mkv")),
+            Some((id, OutputContainer::Matroska))
+        );
+        assert_eq!(
+            OutputContainer::parse_channel_path(&format!("{id}.mp4")),
+            None
+        );
+        assert_eq!(OutputContainer::parse_channel_path("not-a-uuid.mkv"), None);
+        assert_eq!(
+            OutputContainer::from_setting("mkv"),
+            Some(OutputContainer::Matroska)
+        );
+        assert_eq!(
+            OutputContainer::from_setting("ts"),
+            Some(OutputContainer::MpegTs)
+        );
+        assert_eq!(OutputContainer::from_setting("mp4"), None);
+        assert_eq!(OutputContainer::Matroska.extension(), "mkv");
+        assert_eq!(OutputContainer::MpegTs.extension(), "ts");
+    }
+
+    /// Serves an `FFmpeg` MPEG-TS fixture as an endless live upstream.
+    #[cfg(unix)]
+    async fn spawn_live_ts_upstream() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x64:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-t",
+                "4",
+                "-c:v",
+                "libx264",
+                "-g",
+                "10",
+                "-c:a",
+                "aac",
+                "-f",
+                "mpegts",
+                "pipe:1",
+            ])
+            .output()
+            .expect("ffmpeg makes the MPEG-TS fixture");
+        assert!(output.status.success());
+        let fixture = Arc::new(output.stdout);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let fixture = Arc::clone(&fixture);
+                tokio::spawn(async move {
+                    let mut buffer = vec![0_u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    if socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: video/mp2t\r\nconnection: close\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    loop {
+                        for chunk in fixture.chunks(188 * 70) {
+                            if socket.write_all(chunk).await.is_err() {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{address}/live.ts")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn matroska_stream_remuxes_live_media() {
+        let upstream = spawn_live_ts_upstream().await;
+        let app_state = state();
+        let channel_id = Uuid::now_v7();
+        app_state
+            .catalog
+            .write()
+            .await
+            .channels
+            .push(ChannelRecord {
+                id: channel_id,
+                number: "1".into(),
+                name: "Live source".into(),
+                group: None,
+                logo_url: None,
+                enabled: true,
+            });
+        app_state
+            .set_stream_source(ChannelStreamSource {
+                channel_id,
+                provider_pool_id: "provider".into(),
+                source_id: "live".into(),
+                generation: 1,
+                upstream_url: upstream.into(),
+                max_connections: 1,
+                estimated_bitrate_bits_per_second: 3_700_000,
+            })
+            .await;
+
+        let response = router(app_state)
+            .oneshot(
+                Request::get(format!("/out/output-secret/stream/{channel_id}.mkv"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "video/x-matroska");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        // The live stream does not end. Read until the EBML header arrives.
+        let mut body = response.into_body().into_data_stream();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while received.len() < 4 {
+                let chunk = futures_util::StreamExt::next(&mut body)
+                    .await
+                    .expect("the remux sends data")
+                    .expect("the body reads");
+                received.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("the remux sends the header in time");
+        assert_eq!(&received[..4], &[0x1a, 0x45, 0xdf, 0xa3]);
     }
 
     #[tokio::test]
