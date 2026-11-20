@@ -368,65 +368,50 @@ mod sqlx_support {
     }
 }
 
-/// Temporary conversions to and from chrono.
+/// Checks the Postgres wire form of `Timestamp`.
 ///
-/// Crates that still use chrono use these conversions at the boundary.
-/// Remove this module when the chrono to jiff migration ends.
-#[cfg(feature = "chrono")]
-mod chrono_compat {
+/// Before the move to jiff, the relay wrote `timestamptz` values through the
+/// `sqlx` chrono support. That form is a big-endian `i64` count of
+/// microseconds since 2000-01-01 UTC. This test makes sure that the form did
+/// not change.
+#[cfg(all(test, feature = "sqlx"))]
+mod sqlx_tests {
     use super::Timestamp;
+    use sqlx::{
+        Encode, Postgres, Type,
+        postgres::{PgArgumentBuffer, types::Oid},
+    };
 
-    impl From<Timestamp> for chrono::DateTime<chrono::Utc> {
-        fn from(value: Timestamp) -> Self {
-            let mut seconds = value.0.as_second();
-            let mut nanos = value.0.subsec_nanosecond();
-            if nanos < 0 {
-                seconds -= 1;
-                nanos += 1_000_000_000;
-            }
-            let nanos = u32::try_from(nanos).unwrap_or(0);
-            // A jiff timestamp is always in the chrono range.
-            Self::from_timestamp(seconds, nanos).unwrap_or_default()
-        }
+    const POSTGRES_EPOCH_MICROS: i64 = 946_684_800_000_000;
+
+    fn encoded(value: &Timestamp) -> Vec<u8> {
+        let mut buffer = PgArgumentBuffer::default();
+        let _ = value.encode_by_ref(&mut buffer).unwrap();
+        buffer.to_vec()
     }
 
-    impl From<chrono::DateTime<chrono::Utc>> for Timestamp {
-        fn from(value: chrono::DateTime<chrono::Utc>) -> Self {
-            let nanos = i32::try_from(value.timestamp_subsec_nanos()).unwrap_or(0);
-            jiff::Timestamp::new(value.timestamp(), nanos).map_or(Self::UNIX_EPOCH, Self)
-        }
-    }
-
-    #[cfg(all(test, feature = "sqlx"))]
-    mod tests {
-        use super::Timestamp;
-        use sqlx::{Encode, Postgres, Type, postgres::PgArgumentBuffer};
-
-        fn encoded<T: for<'q> Encode<'q, Postgres>>(value: &T) -> Vec<u8> {
-            let mut buffer = PgArgumentBuffer::default();
-            let _ = value.encode_by_ref(&mut buffer).unwrap();
-            buffer.to_vec()
-        }
-
-        #[test]
-        fn postgres_encoding_matches_chrono() {
+    #[test]
+    fn postgres_encoding_is_microseconds_since_2000() {
+        // OID 1184 is the Postgres `timestamptz` type.
+        assert_eq!(
+            <Timestamp as Type<Postgres>>::type_info().oid(),
+            Some(Oid(1184))
+        );
+        for (text, micros) in [
+            ("2000-01-01T00:00:00Z", 0_i64),
+            ("1999-12-31T23:59:59.999999Z", -1),
+            ("1970-01-01T00:00:00Z", -POSTGRES_EPOCH_MICROS),
+            ("2026-03-08T09:00:00.5Z", 826_275_600_500_000),
+            ("2026-11-01T08:30:00.123456Z", 846_837_000_123_456),
+            ("2038-01-19T03:14:08Z", 1_200_798_848_000_000),
+        ] {
+            let value: Timestamp = text.parse().unwrap();
             assert_eq!(
-                <Timestamp as Type<Postgres>>::type_info(),
-                <chrono::DateTime<chrono::Utc> as Type<Postgres>>::type_info()
+                value.as_jiff().as_microsecond() - POSTGRES_EPOCH_MICROS,
+                micros,
+                "{text}"
             );
-            for text in [
-                "2000-01-01T00:00:00Z",
-                "1999-12-31T23:59:59.999999Z",
-                "1970-01-01T00:00:00Z",
-                "2026-03-08T09:00:00.5Z",
-                "2026-11-01T08:30:00.123456Z",
-                "2038-01-19T03:14:08Z",
-            ] {
-                let value: Timestamp = text.parse().unwrap();
-                let chrono_value = chrono::DateTime::<chrono::Utc>::from(value);
-                assert_eq!(encoded(&value), encoded(&chrono_value), "{text}");
-                assert_eq!(Timestamp::from(chrono_value), value, "{text}");
-            }
+            assert_eq!(encoded(&value), micros.to_be_bytes(), "{text}");
         }
     }
 }
