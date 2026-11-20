@@ -330,6 +330,24 @@ impl SessionDiagnostics {
         })
     }
 
+    /// Measures how far the viewers have read toward a drain target.
+    ///
+    /// The value changes when a viewer reads, joins or leaves. A value that
+    /// stays the same means that no viewer moved toward the target.
+    pub(crate) fn drain_progress(&self, generation: u64, target_sequence: u64) -> (usize, u64) {
+        let inner = self.inner.lock();
+        let read = inner
+            .viewers
+            .values()
+            .map(|viewer| match viewer.generation.cmp(&generation) {
+                std::cmp::Ordering::Greater => target_sequence,
+                std::cmp::Ordering::Equal => viewer.next_sequence.min(target_sequence),
+                std::cmp::Ordering::Less => 0,
+            })
+            .fold(0_u64, u64::saturating_add);
+        (inner.viewers.len(), read)
+    }
+
     pub(crate) fn snapshot(&self, ring: RingSnapshot) -> HttpTsSessionSnapshot {
         let inner = self.inner.lock();
         HttpTsSessionSnapshot {
