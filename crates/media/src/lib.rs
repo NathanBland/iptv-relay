@@ -40,7 +40,10 @@ pub use recovery::{
     RecoveryPolicy, SessionFailureKind, SessionState,
 };
 pub use registry::SharedSessionRegistry;
-pub use remux::{MatroskaBitrates, MatroskaByteStream, spawn_matroska_remux};
+pub use remux::{
+    MatroskaBitrates, MatroskaByteStream, RemuxExit, RemuxInputEnd, RemuxOutputEnd, RemuxReport,
+    RemuxSide, RemuxSummary, spawn_matroska_remux, spawn_matroska_remux_with_report,
+};
 pub use ring::{
     DEFAULT_PRE_ROLL, MPEG_TS_PACKET_SIZE, MpegTsRing, MpegTsRingConfig, RingCloseReason,
     RingConfigError, RingCursor, RingRateReader, RingRead, RingReadError, RingSnapshot,

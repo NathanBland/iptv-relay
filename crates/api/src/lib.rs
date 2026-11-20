@@ -4,6 +4,7 @@ mod auth;
 mod oidc;
 mod passive_capture;
 mod rate_capture;
+mod stream_sessions;
 
 pub use auth::hash_admin_password;
 pub use oidc::OidcConfig;
@@ -39,7 +40,7 @@ use iptv_media::{
     ProviderSpec, RecoveryPolicy, SessionFailureKind, SessionStartError, SessionState, SlotLease,
     ViewerHandle,
     slate::{MeasuredStreamProfile, SlateOptions, SlateProfile, SlatedOpen, open_with_slates},
-    spawn_matroska_remux,
+    spawn_matroska_remux_with_report,
 };
 use iptv_persistence::{
     AuditEventRecord, CatalogRepository, ChannelPlaybackCandidateRow, ChannelPlaybackPlan,
@@ -130,6 +131,8 @@ pub struct AppState {
     master_key: MasterKey,
     /// ESPN client for the manual event scan. `None` in tests.
     sports: Option<iptv_sports::EspnClient>,
+    /// Recent ended viewer stream sessions.
+    stream_sessions: Arc<stream_sessions::StreamSessionLog>,
 }
 
 impl fmt::Debug for AppState {
@@ -154,6 +157,7 @@ impl fmt::Debug for AppState {
             .field("jellyfin_setup", &self.jellyfin_setup)
             .field("master_key", &self.master_key)
             .field("sports", &self.sports)
+            .field("stream_sessions", &self.stream_sessions)
             .finish()
     }
 }
@@ -202,6 +206,7 @@ impl AppState {
             ))),
             master_key: config.master_key,
             sports: None,
+            stream_sessions: Arc::default(),
         }
     }
 
@@ -1030,8 +1035,8 @@ impl ProblemDetails {
 
 #[derive(Debug, OpenApi)]
 #[openapi(
-    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, reset_source_circuit_breaker, list_groups, list_jobs, cancel_job, list_dead_letters, get_dead_letter, replay_dead_letter, close_dead_letter, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_channel_name, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, terminate_session, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
-    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SupportLogEntry, SupportBundleResponse, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, SetChannelNameRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventScanResponse, EventScanSkipResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
+    paths(auth_status, login, logout, oidc_start, oidc_callback, list_operator_api_tokens, create_operator_api_token, rotate_operator_api_token, revoke_operator_api_token, system_info, support_bundle, support_logs, support_stream_sessions, settings_schema, get_effective_settings, list_operator_overrides, get_operator_scope_global, replace_operator_scope_global, list_operator_revisions_global, rollback_operator_scope_global, get_operator_scope_provider, replace_operator_scope_provider, list_operator_revisions_provider, rollback_operator_scope_provider, get_operator_scope_group, replace_operator_scope_group, list_operator_revisions_group, rollback_operator_scope_group, list_sources, create_source, delete_source, update_source, update_source_refresh_interval, trigger_source_sync, source_sync_status, cancel_source_sync, reset_source_circuit_breaker, list_groups, list_jobs, cancel_job, list_dead_letters, get_dead_letter, replay_dead_letter, close_dead_letter, list_channels, create_channel, channel_preview, channel_stream, set_channel_enabled, set_channel_name, set_group_enabled, set_all_groups_enabled, list_programmes, reconcile_epg_mappings, list_reconciliation_revisions, rollback_reconciliation, list_epg_mappings, list_unmapped_channels, list_review_candidates, search_epg_channels, set_channel_epg_mapping, remove_channel_epg_mapping, resolve_review, list_events, list_event_templates, create_event_template, update_event_template, delete_event_template, list_event_channels, scan_event_channels, prune_event_channels, suggest_event_templates, list_sessions, terminate_session, session_events, catalog_events, jellyfin_setup, rotate_jellyfin_token, list_lineup_templates, create_lineup_template, delete_lineup_template, list_lineup_categories, list_lineup_template_channels, apply_lineup_template, list_stream_health, stream_health_stats, trigger_health_check, rank_all_streams, best_stream_for_channel, list_users, create_user, update_user, delete_user, list_channel_aliases, create_channel_alias, delete_channel_alias, resolve_channel_alias, list_recording_rules, create_recording_rule, delete_recording_rule, list_recordings, create_recording, delete_recording, recording_stats, list_stream_profiles, create_stream_profile, delete_stream_profile, assign_stream_profile, remove_stream_profile, get_region_settings, update_region_settings, apply_region_filter),
+    components(schemas(LoginRequest, LogoutRequest, OidcCallbackQuery, AuthUser, AuthStatus, OperatorApiTokenResponse, IssuedOperatorApiTokenResponse, CreateOperatorApiTokenRequest, RotateOperatorApiTokenRequest, AuthUser, RuntimeVersions, SystemInfo, SupportLogEntry, stream_sessions::StreamSessionRecord, stream_sessions::StreamSessionEndReason, stream_sessions::RemuxSessionSummary, SupportBundleResponse, SettingDefinition, EffectiveSetting, InheritanceSource, ApplyRequirement, EffectiveSettingsResponse, OperatorSettingScope, OperatorOverridesResponse, OperatorScopeResponse, ReplaceOperatorScopeRequest, OperatorRevisionResponse, RollbackOperatorScopeRequest, SourceResponse, CreateSourceRequest, UpdateSourceRequest, UpdateRefreshIntervalRequest, SourceSyncResponse, SourceSyncStatusResponse, GroupResponse, JobResponse, ChannelRecord, ChannelResponse, ChannelPageResponse, CreateChannelRequest, SetChannelNameRequest, ProgrammeResponse, ProgrammePageResponse, PageQuery, DynamicEventResponse, EventScanResponse, EventScanSkipResponse, EventTemplateResponse, CreateEventTemplateRequest, UpdateEventTemplateRequest, EventChannelResponse, EventTemplateSuggestionResponse, SessionResponse, JellyfinSetup, RotateJellyfinTokenRequest, SaveResult, ProblemDetails, LineupTemplateResponse, CreateLineupTemplateRequest, LineupCategoryResponse, LineupChannelResponse, LineupApplyStatsResponse, EpgMappingResponse, EpgMappingPageResponse, UnmappedChannelResponse, UnmappedChannelPageResponse, ReviewCandidateResponse, EpgChannelSearchResponse, EpgReconcileResponse, ReconciliationRevisionResponse, ReconciliationRollbackResponse, RollbackReconciliationRequest, SetEpgMappingRequest, ResolveReviewRequest, StreamHealthResponse, StreamHealthItem, StreamHealthStatsResponse, HealthCheckTriggerResponse, StreamRankResponse, BestStreamResponse, UserResponse, CreateUserRequest, UpdateUserRequest, ChannelAliasResponse, ChannelAliasPageResponse, CreateChannelAliasRequest, ResolveAliasResponse, RecordingRuleResponse, CreateRecordingRuleRequest, RecordingResponse, RecordingPageResponse, CreateRecordingRequest, RecordingStatsResponse, StreamProfileResponse, CreateStreamProfileRequest, AssignStreamProfileRequest, RegionSettingsResponse, RegionSettingsDto, RegionPrefixResponse, UpdateRegionSettingsRequest, ApplyRegionFilterRequest, RegionFilterResponse)),
     tags((name = "authentication"), (name = "system"), (name = "settings"), (name = "sources"), (name = "jobs"), (name = "channels"), (name = "guide"), (name = "sessions"), (name = "configuration"), (name = "lineups"), (name = "streams"), (name = "users"), (name = "aliases"), (name = "recordings"), (name = "stream-profiles"))
 )]
 pub struct ApiDoc;
@@ -1348,6 +1353,10 @@ fn operations_control_routes() -> Router<AppState> {
         )
         .route("/api/v1/support/bundle", get(support_bundle))
         .route("/api/v1/support/logs", get(support_logs))
+        .route(
+            "/api/v1/support/stream-sessions",
+            get(support_stream_sessions),
+        )
         .route("/api/v1/jellyfin/setup", get(jellyfin_setup))
         .route("/api/v1/jellyfin/setup/rotate", post(rotate_jellyfin_token))
         .route(
@@ -2671,6 +2680,26 @@ async fn support_logs(State(state): State<AppState>, headers: HeaderMap) -> Resp
         .into_response(),
         Err(error) => persistence_error_response(error),
     }
+}
+
+/// Returns the most recent ended viewer stream sessions, the newest first.
+///
+/// The relay keeps the sessions in memory. A restart clears the list.
+#[utoipa::path(
+    get,
+    path = "/api/v1/support/stream-sessions",
+    tag = "system",
+    responses(
+        (status = 200, description = "Recent ended stream sessions, the newest first", body = [stream_sessions::StreamSessionRecord]),
+        (status = 401, body = ProblemDetails),
+        (status = 403, body = ProblemDetails),
+    )
+)]
+async fn support_stream_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = require_admin(&state, &headers) {
+        return response;
+    }
+    Json(state.stream_sessions.recent()).into_response()
 }
 
 #[utoipa::path(get, path = "/api/v1/settings/schema", tag = "settings", responses((status = 200, body = [SettingDefinition]), (status = 401, body = ProblemDetails)))]
@@ -7317,28 +7346,43 @@ async fn open_channel_response(
         rate_capture::spawn_rate_capture(catalog.as_ref(), provider_stream_id, viewer);
     });
     let options = SlateOptions::new(profile).with_viewer_hook(hook);
+    let tracker = stream_sessions::StreamSessionTracker::start(
+        Arc::clone(&state.stream_sessions),
+        channel_id,
+        container.extension(),
+        provider_stream_id,
+    );
     // A provider problem never becomes an HTTP error. The client receives a
     // slate and the relay retries within the provider pool limit.
     let stream: iptv_media::MatroskaByteStream =
         match open_with_slates(state.media.clone(), spec, options).await {
             SlatedOpen::Direct(viewer) if container == OutputContainer::MpegTs => {
-                return mpeg_ts_response(viewer);
+                let stream = tracker.tap_viewer(viewer.into_byte_stream());
+                return mpeg_ts_body_response(Body::from_stream(tracker.body(stream)));
             }
             SlatedOpen::Slated(stream) if container == OutputContainer::MpegTs => {
-                return mpeg_ts_body_response(Body::from_stream(stream));
+                let stream = tracker.tap_slated(stream);
+                return mpeg_ts_body_response(Body::from_stream(tracker.body(stream)));
             }
             SlatedOpen::Direct(viewer) => Box::pin(futures_util::StreamExt::map(
-                viewer.into_byte_stream(),
+                tracker.tap_viewer(viewer.into_byte_stream()),
                 |chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())),
             )),
-            SlatedOpen::Slated(stream) => Box::pin(stream),
-            SlatedOpen::Failed(error) => return session_start_response(error),
+            SlatedOpen::Slated(stream) => Box::pin(tracker.tap_slated(stream)),
+            SlatedOpen::Failed(error) => {
+                tracker.fail(&error.to_string());
+                return session_start_response(error);
+            }
         };
     let bitrates = MatroskaBitrates::from_measured(measured_bits_per_second, audio_channels);
-    match spawn_matroska_remux(stream, bitrates) {
-        Ok(output) => matroska_body_response(Body::from_stream(output)),
+    match spawn_matroska_remux_with_report(stream, bitrates) {
+        Ok((output, report)) => {
+            tracker.set_remux(report);
+            matroska_body_response(Body::from_stream(tracker.body(output)))
+        }
         Err(error) => {
             warn!(%error, "the matroska remux cannot start");
+            tracker.fail(&format!("the matroska remux cannot start: {error}"));
             retryable_problem(
                 StatusCode::BAD_GATEWAY,
                 "matroska-remux-failed",
@@ -7597,10 +7641,6 @@ fn playback_generation(plan: &ChannelPlaybackPlan) -> u64 {
             .try_into()
             .expect("SHA-256 output has eight bytes"),
     )
-}
-
-fn mpeg_ts_response(viewer: ViewerHandle) -> Response {
-    mpeg_ts_body_response(Body::from_stream(viewer.into_byte_stream()))
 }
 
 fn matroska_body_response(body: Body) -> Response {
@@ -10835,6 +10875,12 @@ mod tests {
         let openapi = ApiDoc::openapi();
         assert!(openapi.paths.paths.contains_key("/api/v1/support/bundle"));
         assert!(openapi.paths.paths.contains_key("/api/v1/support/logs"));
+        assert!(
+            openapi
+                .paths
+                .paths
+                .contains_key("/api/v1/support/stream-sessions")
+        );
     }
 
     #[tokio::test]

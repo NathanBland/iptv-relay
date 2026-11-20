@@ -2399,6 +2399,42 @@
         ],
         "type": "object"
       },
+      "RemuxSessionSummary": {
+        "description": "How the Matroska remux of a session ended.",
+        "properties": {
+          "exitCode": {
+            "description": "The `FFmpeg` exit code.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "exitSignal": {
+            "description": "The signal that stopped `FFmpeg`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstEnd": {
+            "description": "The remux side that ended first: `input` or `output`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "inputError": {
+            "description": "The redacted input error message.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ReplaceOperatorScopeRequest": {
         "properties": {
           "overrides": {
@@ -2616,6 +2652,14 @@
               "null"
             ]
           },
+          "burstSeconds": {
+            "description": "How far ahead of real time the provider has delivered media, in seconds.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "capacityPackets": {
             "minimum": 0,
             "type": "integer"
@@ -2647,6 +2691,14 @@
               "null"
             ]
           },
+          "frameRate": {
+            "description": "Video frame rate measured from the video timestamps.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "lagEvents": {
             "format": "int64",
             "minimum": 0,
@@ -2666,10 +2718,28 @@
             },
             "type": "array"
           },
+          "measuredBitrateKbps": {
+            "description": "Mean bitrate measured from the stream clock, in kilobits per second.\nAbsent until the session has about 10 s of media.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "overwrittenPackets": {
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "peakBitrateKbps": {
+            "description": "Highest bitrate over any 5 s of media, in kilobits per second.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "providerActiveSessions": {
             "minimum": 0,
@@ -2698,6 +2768,14 @@
           "retainedPackets": {
             "minimum": 0,
             "type": "integer"
+          },
+          "ringSeconds": {
+            "description": "Media seconds that the ring holds at the measured peak bitrate.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
           },
           "sourceId": {
             "type": "string"
@@ -3234,6 +3312,102 @@
         ],
         "type": "object"
       },
+      "StreamSessionEndReason": {
+        "description": "Why a viewer stream session ended.",
+        "enum": [
+          "client_disconnect",
+          "upstream_ended",
+          "upstream_error",
+          "recovery_expired",
+          "viewer_lagged",
+          "stream_restarted",
+          "buffer_error",
+          "remux_input_error",
+          "remux_exited",
+          "remux_output_error",
+          "start_failed"
+        ],
+        "type": "string"
+      },
+      "StreamSessionRecord": {
+        "description": "One ended viewer stream session.",
+        "properties": {
+          "bytesSent": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "channelId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "container": {
+            "description": "The output container: `ts` or `mkv`.",
+            "type": "string"
+          },
+          "detail": {
+            "description": "The redacted message that goes with the end reason.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "durationMs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "endReason": {
+            "$ref": "#/components/schemas/StreamSessionEndReason"
+          },
+          "endedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "providerStreamId": {
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remux": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RemuxSessionSummary",
+                "description": "How the Matroska remux ended. Only `mkv` sessions have this value."
+              }
+            ]
+          },
+          "slated": {
+            "description": "True when the response started with a slate.",
+            "type": "boolean"
+          },
+          "startedAt": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "channelId",
+          "container",
+          "slated",
+          "startedAt",
+          "endedAt",
+          "durationMs",
+          "bytesSent",
+          "endReason"
+        ],
+        "type": "object"
+      },
       "SupportBundleResponse": {
         "properties": {
           "generatedAt": {
@@ -3642,7 +3816,7 @@
       "name": "MIT"
     },
     "title": "iptv-api",
-    "version": "0.3.1"
+    "version": "0.4.7"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -9526,6 +9700,51 @@
             "description": ""
           }
         },
+        "tags": [
+          "system"
+        ]
+      }
+    },
+    "/api/v1/support/stream-sessions": {
+      "get": {
+        "description": "The relay keeps the sessions in memory. A restart clears the list.",
+        "operationId": "support_stream_sessions",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/StreamSessionRecord"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Recent ended stream sessions, the newest first"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "summary": "Returns the most recent ended viewer stream sessions, the newest first.",
         "tags": [
           "system"
         ]
