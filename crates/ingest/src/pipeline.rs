@@ -7,9 +7,8 @@ use crate::{
     StagedRows, XtreamStreamEndpointTemplate, download_stream, unpack_artifact,
 };
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
-use iptv_domain::{EpgChannel, Programme};
+use iptv_domain::{EpgChannel, Programme, Timestamp};
 use iptv_parsers::{
     Diagnostic, ParseError, ParseLimits, XmltvParseOptions, parse_m3u_visit,
     parse_xmltv_visit_with_options,
@@ -1136,7 +1135,7 @@ fn prepared_epg_channel(channel: EpgChannel, id: Uuid) -> PreparedEpgChannel {
 }
 
 fn prepared_programme(programme: Programme, epg_channel_id: Uuid) -> PreparedProgramme {
-    let original_start = original_timestamp(&programme.original_start, programme.start.into());
+    let original_start = original_timestamp(&programme.original_start, programme.start);
     let original_stop = programme
         .original_stop
         .clone()
@@ -1148,8 +1147,8 @@ fn prepared_programme(programme: Programme, epg_channel_id: Uuid) -> PreparedPro
     PreparedProgramme {
         id: Uuid::now_v7(),
         epg_channel_id,
-        starts_at: programme.start.into(),
-        stops_at: programme.stop.map(Into::into),
+        starts_at: programme.start,
+        stops_at: programme.stop,
         original_start,
         original_stop,
         title,
@@ -1170,7 +1169,7 @@ fn prepared_programme(programme: Programme, epg_channel_id: Uuid) -> PreparedPro
     }
 }
 
-fn original_timestamp(value: &str, normalized: DateTime<Utc>) -> String {
+fn original_timestamp(value: &str, normalized: Timestamp) -> String {
     if value.is_empty() {
         normalized.to_rfc3339()
     } else {
@@ -1281,8 +1280,7 @@ pub fn prepare_snapshot<P: EndpointProtector>(
                 let Some(epg_channel_id) = ids.get(&programme.channel_id).copied() else {
                     continue;
                 };
-                let original_start =
-                    original_timestamp(&programme.original_start, programme.start.into());
+                let original_start = original_timestamp(&programme.original_start, programme.start);
                 let original_stop = programme
                     .original_stop
                     .clone()
@@ -1294,8 +1292,8 @@ pub fn prepare_snapshot<P: EndpointProtector>(
                 snapshot.programmes.push(PreparedProgramme {
                     id: Uuid::now_v7(),
                     epg_channel_id,
-                    starts_at: programme.start.into(),
-                    stops_at: programme.stop.map(Into::into),
+                    starts_at: programme.start,
+                    stops_at: programme.stop,
                     original_start,
                     original_stop,
                     title,
@@ -1385,8 +1383,8 @@ pub fn prepare_snapshot<P: EndpointProtector>(
                 snapshot.programmes.push(PreparedProgramme {
                     id: Uuid::now_v7(),
                     epg_channel_id,
-                    starts_at: entry.start.into(),
-                    stops_at: Some(entry.stop.into()),
+                    starts_at: entry.start,
+                    stops_at: Some(entry.stop),
                     original_start: entry.start.to_rfc3339(),
                     original_stop: Some(entry.stop.to_rfc3339()),
                     title: sanitize_text(&entry.title),
@@ -2455,7 +2453,7 @@ mod tests {
             extensions: Vec::new(),
         };
         let prepared = prepared_programme(programme, Uuid::now_v7());
-        assert_eq!(iptv_domain::Timestamp::from(prepared.starts_at), start);
+        assert_eq!(prepared.starts_at, start);
         assert_eq!(prepared.original_start, "20260701120000 America/Denver");
         assert_eq!(
             prepared.original_stop.as_deref(),

@@ -1178,8 +1178,10 @@ version = "0.4.7"
 dependencies = [
  "chrono",
  "jiff",
+ "jiff-sqlx",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "url",
  "utoipa",
@@ -1223,7 +1225,6 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
- "chrono",
  "flate2",
  "futures-util",
  "iptv-domain",
@@ -1303,8 +1304,6 @@ version = "0.4.7"
 dependencies = [
  "base64",
  "chacha20poly1305",
- "chrono",
- "chrono-tz",
  "getrandom 0.4.3",
  "iptv-domain",
  "iptv-parsers",
@@ -1368,6 +1367,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e599b80292e597019b8b3e392de3f4bea2959ddfb8c7dff60e035e9e311a2c1b"
 dependencies = [
  "log",
+]
+
+[[package]]
+name = "jiff-sqlx"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cad0aaf716e798876e02217ae420bd730370a175ffd59870018c4aa4daa1513e"
+dependencies = [
+ "jiff",
+ "sqlx-core",
+ "sqlx-postgres",
 ]
 
 [[package]]

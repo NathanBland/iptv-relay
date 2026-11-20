@@ -709,7 +709,7 @@ async fn run_refresh_job(
             if execution.deferred {
                 if let Some(source_id) = source_id_from_payload(&job.payload) {
                     if let Err(error) = sources
-                        .mark_source_refreshed(source_id, chrono::Utc::now())
+                        .mark_source_refreshed(source_id, iptv_domain::Timestamp::now())
                         .await
                     {
                         warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
@@ -735,7 +735,7 @@ async fn run_refresh_job(
             jobs.succeed(job.id, worker_id).await?;
             if source_refresh && let Some(source_id) = source_id_from_payload(&job.payload) {
                 if let Err(error) = sources
-                    .mark_source_refreshed(source_id, chrono::Utc::now())
+                    .mark_source_refreshed(source_id, iptv_domain::Timestamp::now())
                     .await
                 {
                     warn!(job_id = %job.id, source_id = %source_id, error = %error, "failed to mark source refreshed");
@@ -1285,7 +1285,7 @@ async fn ingest_limits(catalog: &CatalogRepository, provider_id: Uuid) -> Ingest
 async fn refresh_event_guides_after_publication(catalog: &CatalogRepository) {
     let settings = catalog.event_scan_settings().await;
     match catalog
-        .refresh_event_guides(chrono::Utc::now(), &settings)
+        .refresh_event_guides(iptv_domain::Timestamp::now(), &settings)
         .await
     {
         Ok(report) => info!(
@@ -7198,7 +7198,7 @@ mod tests {
                 .any(|programme| programme.title == "Broncos vs Chiefs"),
             "mapped channel did not expose the short EPG programme"
         );
-        let now = chrono::Utc::now();
+        let now = iptv_domain::Timestamp::now();
         assert!(
             mapped_programmes.iter().any(|programme| {
                 programme.title == "Broncos vs Chiefs"

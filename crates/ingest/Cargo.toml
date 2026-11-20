@@ -8,10 +8,9 @@ license.workspace = true
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
-chrono.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
-iptv-domain = { path = "../domain", version = "0.4.7", features = ["chrono"] }
+iptv-domain = { path = "../domain", version = "0.4.7", features = ["sqlx"] }
 iptv-parsers = { path = "../parsers", version = "0.4.7" }
 reqwest.workspace = true
 serde.workspace = true

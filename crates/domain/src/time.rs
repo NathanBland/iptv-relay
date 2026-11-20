@@ -326,6 +326,48 @@ fn fraction(nanos: i32) -> String {
     }
 }
 
+/// Postgres support for [`Timestamp`] through the `jiff-sqlx` wrappers.
+///
+/// `sqlx` 0.8 has no `jiff` feature. The column type is `timestamptz`.
+#[cfg(feature = "sqlx")]
+mod sqlx_support {
+    use super::Timestamp;
+    use sqlx::{
+        Decode, Encode, Postgres, Type,
+        encode::IsNull,
+        error::BoxDynError,
+        postgres::{PgArgumentBuffer, PgHasArrayType, PgTypeInfo, PgValueRef},
+    };
+
+    impl Type<Postgres> for Timestamp {
+        fn type_info() -> PgTypeInfo {
+            <jiff_sqlx::Timestamp as Type<Postgres>>::type_info()
+        }
+
+        fn compatible(ty: &PgTypeInfo) -> bool {
+            <jiff_sqlx::Timestamp as Type<Postgres>>::compatible(ty)
+        }
+    }
+
+    impl PgHasArrayType for Timestamp {
+        fn array_type_info() -> PgTypeInfo {
+            <jiff_sqlx::Timestamp as PgHasArrayType>::array_type_info()
+        }
+    }
+
+    impl Encode<'_, Postgres> for Timestamp {
+        fn encode_by_ref(&self, buf: &mut PgArgumentBuffer) -> Result<IsNull, BoxDynError> {
+            jiff_sqlx::Timestamp::from(self.0).encode_by_ref(buf)
+        }
+    }
+
+    impl<'r> Decode<'r, Postgres> for Timestamp {
+        fn decode(value: PgValueRef<'r>) -> Result<Self, BoxDynError> {
+            Ok(Self(jiff_sqlx::Timestamp::decode(value)?.to_jiff()))
+        }
+    }
+}
+
 /// Temporary conversions to and from chrono.
 ///
 /// Crates that still use chrono use these conversions at the boundary.
@@ -352,6 +394,39 @@ mod chrono_compat {
         fn from(value: chrono::DateTime<chrono::Utc>) -> Self {
             let nanos = i32::try_from(value.timestamp_subsec_nanos()).unwrap_or(0);
             jiff::Timestamp::new(value.timestamp(), nanos).map_or(Self::UNIX_EPOCH, Self)
+        }
+    }
+
+    #[cfg(all(test, feature = "sqlx"))]
+    mod tests {
+        use super::Timestamp;
+        use sqlx::{Encode, Postgres, Type, postgres::PgArgumentBuffer};
+
+        fn encoded<T: for<'q> Encode<'q, Postgres>>(value: &T) -> Vec<u8> {
+            let mut buffer = PgArgumentBuffer::default();
+            let _ = value.encode_by_ref(&mut buffer).unwrap();
+            buffer.to_vec()
+        }
+
+        #[test]
+        fn postgres_encoding_matches_chrono() {
+            assert_eq!(
+                <Timestamp as Type<Postgres>>::type_info(),
+                <chrono::DateTime<chrono::Utc> as Type<Postgres>>::type_info()
+            );
+            for text in [
+                "2000-01-01T00:00:00Z",
+                "1999-12-31T23:59:59.999999Z",
+                "1970-01-01T00:00:00Z",
+                "2026-03-08T09:00:00.5Z",
+                "2026-11-01T08:30:00.123456Z",
+                "2038-01-19T03:14:08Z",
+            ] {
+                let value: Timestamp = text.parse().unwrap();
+                let chrono_value = chrono::DateTime::<chrono::Utc>::from(value);
+                assert_eq!(encoded(&value), encoded(&chrono_value), "{text}");
+                assert_eq!(Timestamp::from(chrono_value), value, "{text}");
+            }
         }
     }
 }

@@ -40,6 +40,7 @@ futures-util = "0.3"
 flate2 = "1.1"
 getrandom = "0.4"
 jiff = { version = "0.2.46", features = ["serde", "tzdb-bundle-always"] }
+jiff-sqlx = { version = "0.1.1", features = ["postgres"] }
 http-body-util = "0.1"
 jsonwebtoken = "10.3"
 parking_lot = "0.12"

@@ -279,7 +279,7 @@ impl AppState {
                     id: row.id,
                     token_hash,
                     scopes: row.scopes,
-                    expires_at: row.expires_at,
+                    expires_at: row.expires_at.map(Into::into),
                 })
             });
         self.auth.load_operator_tokens(records);
@@ -484,15 +484,15 @@ impl From<&SourceSummary> for SourceResponse {
             kind: source.kind.api_name().to_owned(),
             state: source.state.clone(),
             channels: source.channels,
-            last_sync: source.last_sync,
+            last_sync: source.last_sync.into(),
             endpoint: source.endpoint.clone(),
             refresh_interval_seconds: source.refresh_interval_seconds,
-            last_refreshed_at: source.last_refreshed_at,
+            last_refreshed_at: source.last_refreshed_at.map(Into::into),
             max_connections: source.max_connections,
             timezone: source.timezone.clone(),
             enabled: source.enabled,
             cb_consecutive_failures: source.cb_consecutive_failures,
-            cb_opened_at: source.cb_opened_at,
+            cb_opened_at: source.cb_opened_at.map(Into::into),
             alternative_base_urls: source.alternative_base_urls.clone(),
         }
     }
@@ -523,9 +523,9 @@ impl From<&JobRecord> for JobResponse {
             attempts: job.attempts,
             max_attempts: job.max_attempts,
             last_error: job.last_error.as_deref().map(redact_error),
-            created_at: job.created_at,
-            updated_at: job.updated_at,
-            completed_at: job.completed_at,
+            created_at: job.created_at.into(),
+            updated_at: job.updated_at.into(),
+            completed_at: job.completed_at.map(Into::into),
         }
     }
 }
@@ -558,11 +558,11 @@ impl From<&DeadLetterRecord> for DeadLetterResponse {
             error_message: record.error_message.clone(),
             attempt_count: record.attempt_count,
             max_attempts: record.max_attempts,
-            first_failed_at: record.first_failed_at,
-            last_failed_at: record.last_failed_at,
-            resolved_at: record.resolved_at,
+            first_failed_at: record.first_failed_at.into(),
+            last_failed_at: record.last_failed_at.into(),
+            resolved_at: record.resolved_at.map(Into::into),
             resolution: record.resolution.clone(),
-            created_at: record.created_at,
+            created_at: record.created_at.into(),
         }
     }
 }
@@ -2068,7 +2068,14 @@ async fn create_operator_api_token(
     let id = Uuid::now_v7();
     let actor = state.auth.operator_token_actor(&headers);
     let row = match database
-        .create_operator_api_token(id, &name, &token_hash, &scopes, request.expires_at, &actor)
+        .create_operator_api_token(
+            id,
+            &name,
+            &token_hash,
+            &scopes,
+            request.expires_at.map(Into::into),
+            &actor,
+        )
         .await
     {
         Ok(row) => row,
@@ -2078,7 +2085,7 @@ async fn create_operator_api_token(
         id,
         token_hash,
         scopes: row.scopes.clone(),
-        expires_at: row.expires_at,
+        expires_at: row.expires_at.map(Into::into),
     });
     no_store_response(
         (
@@ -2140,7 +2147,7 @@ async fn rotate_operator_api_token(
     };
     let expires_at = request
         .expires_at
-        .map_or(existing.expires_at, |value| value.0);
+        .map_or(existing.expires_at, |value| value.0.map(Into::into));
     let Ok(plaintext) = AuthManager::generate_operator_token() else {
         return persistence_unavailable();
     };
@@ -2169,7 +2176,7 @@ async fn rotate_operator_api_token(
         id: new_id,
         token_hash,
         scopes: row.scopes.clone(),
-        expires_at: row.expires_at,
+        expires_at: row.expires_at.map(Into::into),
     });
     no_store_response(
         Json(IssuedOperatorApiTokenResponse {
@@ -2221,11 +2228,11 @@ impl From<iptv_persistence::OperatorApiTokenRow> for OperatorApiTokenResponse {
             id: row.id.to_string(),
             name: row.name,
             scopes: row.scopes,
-            expires_at: row.expires_at,
-            revoked_at: row.revoked_at,
+            expires_at: row.expires_at.map(Into::into),
+            revoked_at: row.revoked_at.map(Into::into),
             created_by: row.created_by,
-            created_at: row.created_at,
-            last_used_at: row.last_used_at,
+            created_at: row.created_at.into(),
+            last_used_at: row.last_used_at.map(Into::into),
         }
     }
 }
@@ -2539,7 +2546,7 @@ async fn system_info_value(state: &AppState) -> SystemInfo {
 
 fn support_log_from_audit(record: AuditEventRecord) -> SupportLogEntry {
     SupportLogEntry {
-        timestamp: record.created_at,
+        timestamp: record.created_at.into(),
         level: "info".to_owned(),
         message: record.action,
         context: redact_diagnostics(&serde_json::json!({
@@ -2554,7 +2561,7 @@ fn support_log_from_audit(record: AuditEventRecord) -> SupportLogEntry {
 
 fn support_log_from_job(job: &JobRecord) -> Option<SupportLogEntry> {
     job.last_error.as_ref().map(|error| SupportLogEntry {
-        timestamp: job.updated_at,
+        timestamp: job.updated_at.into(),
         level: "error".to_owned(),
         message: redact_error(error),
         context: redact_diagnostics(&serde_json::json!({
@@ -3070,7 +3077,7 @@ async fn list_operator_revisions(
                 .map(|row| OperatorRevisionResponse {
                     revision: row.revision,
                     actor: row.actor,
-                    created_at: row.created_at,
+                    created_at: row.created_at.into(),
                     before_value: row.before_value,
                     after_value: row.after_value,
                 })
@@ -3814,8 +3821,8 @@ impl SourceSyncStatusResponse {
             message,
             bytes_downloaded,
             records_processed,
-            started_at: job.created_at,
-            updated_at: job.updated_at,
+            started_at: job.created_at.into(),
+            updated_at: job.updated_at.into(),
         }
     }
 }
@@ -4884,7 +4891,7 @@ async fn list_programmes(
             channel_id: query.channel_id,
             from: None,
             search: query.search,
-            now: Some(Utc::now()),
+            now: Some(Utc::now().into()),
             limit: query.limit,
             offset: query.offset,
         };
@@ -4941,8 +4948,8 @@ fn programme_response_from_row(row: &iptv_persistence::ProgrammeRow) -> Programm
         id: row.id.clone(),
         channel: row.channel_name.clone(),
         title: row.title.clone(),
-        start: row.starts_at,
-        end: row.stops_at,
+        start: row.starts_at.into(),
+        end: row.stops_at.into(),
         source: row
             .source_name
             .clone()
@@ -4980,9 +4987,9 @@ impl From<&iptv_persistence::EpgMappingRow> for EpgMappingResponse {
             evidence: row.evidence.clone(),
             review_status: row.review_status.clone(),
             reviewed_by: row.reviewed_by.clone(),
-            reviewed_at: row.reviewed_at,
+            reviewed_at: row.reviewed_at.map(Into::into),
             revision: row.revision,
-            updated_at: row.updated_at,
+            updated_at: row.updated_at.into(),
             channel_name: row.channel_name.clone(),
             canonical_key: row.canonical_key.clone(),
             epg_xmltv_id: row.epg_xmltv_id.clone(),
@@ -5052,7 +5059,7 @@ impl From<&iptv_persistence::ReviewCandidateRow> for ReviewCandidateResponse {
             method: row.method.clone(),
             confidence: row.confidence,
             evidence: row.evidence.clone(),
-            created_at: row.created_at,
+            created_at: row.created_at.into(),
             epg_xmltv_id: row.epg_xmltv_id.clone(),
             epg_display_name: row.epg_display_name.clone(),
         }
@@ -5185,7 +5192,7 @@ async fn list_reconciliation_revisions(
                 .map(|row| ReconciliationRevisionResponse {
                     revision: row.revision,
                     actor: row.actor,
-                    created_at: row.created_at,
+                    created_at: row.created_at.into(),
                     before_value: row.before_value,
                     after_value: row.after_value,
                 })
@@ -5620,8 +5627,8 @@ fn dynamic_event_from_row(
         channel_slot: format!("{}", row.slot_number),
         channel_id: row.channel_id.map(|id| id.to_string()),
         output_name: row.output_name.clone(),
-        start: row.event_start,
-        end: row.event_end,
+        start: row.event_start.map(Into::into),
+        end: row.event_end.map(Into::into),
         state: row.state.clone(),
         template: template_names
             .get(&row.template_id)
@@ -5859,7 +5866,7 @@ async fn scan_event_channels(
     let mut settings = catalog.event_scan_settings().await;
     settings.sports.clone_from(&state.sports);
     match catalog
-        .scan_event_channels_report(id, Utc::now(), &settings)
+        .scan_event_channels_report(id, Utc::now().into(), &settings)
         .await
     {
         Ok(report) => Json(event_scan_response(report)).into_response(),
@@ -5922,7 +5929,7 @@ async fn prune_event_channels(
         return persistence_unavailable();
     };
     match catalog
-        .prune_event_channels_for_template(id, Utc::now())
+        .prune_event_channels_for_template(id, Utc::now().into())
         .await
     {
         Ok(count) => Json(SaveResult {
@@ -6018,8 +6025,8 @@ fn event_channel_response_from_row(
         channel_id: row.channel_id.map(|id| id.to_string()),
         slot_number: row.slot_number,
         event_title: row.event_title.clone(),
-        event_start: row.event_start,
-        event_end: row.event_end,
+        event_start: row.event_start.map(Into::into),
+        event_end: row.event_end.map(Into::into),
         raw_stream_name: row.raw_stream_name.clone(),
         output_name: row.output_name.clone(),
         state: row.state.clone(),
@@ -6197,7 +6204,9 @@ fn dedup_sync_progress(jobs: &[JobRecord]) -> Vec<(&str, &JobRecord)> {
     let mut seen: std::collections::HashMap<&str, &JobRecord> = std::collections::HashMap::new();
     for job in jobs.iter().filter(|job| match job.status.as_str() {
         "queued" | "running" => true,
-        "succeeded" | "failed" | "cancelled" => (now - job.updated_at).num_seconds() < 60,
+        "succeeded" | "failed" | "cancelled" => {
+            (now - chrono::DateTime::<Utc>::from(job.updated_at)).num_seconds() < 60
+        }
         _ => false,
     }) {
         let source_id = job
@@ -7112,7 +7121,7 @@ async fn xmltv(State(state): State<AppState>, Path(token): Path<String>) -> Resp
             spans_by_channel
                 .entry(channel.id)
                 .or_default()
-                .push((programme.starts_at, programme.stops_at));
+                .push((programme.starts_at.into(), programme.stops_at.into()));
             write_programme_row(&mut body, channel.id, programme, Some(&art_base));
         }
         let now = Utc::now();
@@ -9489,8 +9498,8 @@ async fn create_recording(
         programme_id,
         title: body.title,
         description: body.description,
-        starts_at,
-        ends_at,
+        starts_at: starts_at.into(),
+        ends_at: ends_at.into(),
     };
     match repo.create_recording(&input).await {
         Ok(recording) => (
@@ -15708,13 +15717,13 @@ mod tests {
             }),
             attempts: 1,
             max_attempts: 3,
-            available_at: now,
+            available_at: now.into(),
             locked_by: Some("worker".to_owned()),
-            locked_at: Some(now),
-            heartbeat_at: Some(now),
+            locked_at: Some(now.into()),
+            heartbeat_at: Some(now.into()),
             last_error: None,
-            created_at: now,
-            updated_at: now,
+            created_at: now.into(),
+            updated_at: now.into(),
             completed_at: None,
         };
         let child = JobRecord {
@@ -15729,13 +15738,13 @@ mod tests {
             progress: serde_json::json!({"stage": "reconciling-partition", "percent": 92}),
             attempts: 1,
             max_attempts: 3,
-            available_at: now,
+            available_at: now.into(),
             locked_by: Some("worker".to_owned()),
-            locked_at: Some(now),
-            heartbeat_at: Some(now),
+            locked_at: Some(now.into()),
+            heartbeat_at: Some(now.into()),
             last_error: None,
-            created_at: now + chrono::Duration::milliseconds(1),
-            updated_at: now + chrono::Duration::milliseconds(1),
+            created_at: (now + chrono::Duration::milliseconds(1)).into(),
+            updated_at: (now + chrono::Duration::milliseconds(1)).into(),
             completed_at: None,
         };
         let mut jobs = vec![child, parent];
