@@ -4,13 +4,14 @@
 //! and binds those channels to active EPG channels. Read queries back the
 //! control API with paginated, real data.
 
-use chrono::{DateTime, Duration, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, Utc};
+use iptv_domain::Timestamp;
 use iptv_domain::builtin_sports_event_rules;
 use iptv_parsers::{
     CompiledEventRules, EventCandidate, GeneratedProgramme, GeneratedProgrammeKind,
     generate_event_guide,
 };
+use jiff::{SignedDuration, tz::TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool};
@@ -3430,7 +3431,7 @@ impl CatalogRepository {
             regexes: Vec::with_capacity(templates.len()),
             rules: BTreeMap::new(),
             region_timezone: region_timezone.as_deref(),
-            now,
+            now: now.into(),
             settings,
         };
         for template in &templates {
@@ -3474,7 +3475,7 @@ impl CatalogRepository {
         if let Some(client) = settings.sports.as_ref().or(self.sports.as_ref()) {
             for plan in &mut planned {
                 if in_scope(plan.template.id) && plan.state != EventChannelState::Hidden {
-                    enrich_with_sports(plan, client, now, settings).await;
+                    enrich_with_sports(plan, client, now.into(), settings).await;
                 }
             }
         }
@@ -3582,8 +3583,8 @@ impl CatalogRepository {
                 channel_id: plan.channel_id,
                 slot: plan.slot,
                 title: Some(&plan.event.title),
-                start: Some(plan.event.starts_at),
-                end: Some(plan.event.stops_at),
+                start: Some(plan.event.starts_at.into()),
+                end: Some(plan.event.stops_at.into()),
                 raw_name: &plan.raw_stream_name,
                 state: plan.state.as_str(),
             },
@@ -3635,8 +3636,8 @@ impl CatalogRepository {
             .bind(&programme.stable_event_key)
             .bind(&programme.source_title)
             .bind(kind)
-            .bind(programme.starts_at)
-            .bind(programme.stops_at)
+            .bind(DateTime::<Utc>::from(programme.starts_at))
+            .bind(DateTime::<Utc>::from(programme.stops_at))
             .bind(&programme.title)
             .bind(match sports {
                 Some(info) => json!(info.categories()),
@@ -4526,7 +4527,9 @@ fn validate_event_template_timezone(value: &str) -> Result<(), PersistenceError>
             "event template timezone must be a nonblank IANA timezone".to_owned(),
         ));
     }
-    if timezone != "UTC" && (!timezone.contains('/') || timezone.parse::<Tz>().is_err()) {
+    if timezone != "UTC"
+        && (!timezone.contains('/') || iptv_domain::time::time_zone(timezone).is_none())
+    {
         return Err(PersistenceError::InvalidSource(
             "event template timezone must be UTC or a valid IANA timezone".to_owned(),
         ));
@@ -4707,8 +4710,8 @@ struct PlannedEventChannel<'a> {
     programmes: Vec<GeneratedProgramme>,
     captures: BTreeMap<String, String>,
     group_name: Option<String>,
-    timezone: Tz,
-    grace: Duration,
+    timezone: TimeZone,
+    grace: SignedDuration,
     sports: Option<SportsInfo>,
 }
 
@@ -4727,9 +4730,9 @@ struct EventChannelScanner<'a> {
     /// Compiled `matchRegex` of each template. `None` for an invalid regex.
     regexes: Vec<Option<Regex>>,
     /// Compiled built-in rules for each template index and timezone.
-    rules: BTreeMap<(usize, &'static str), Result<CompiledEventRules, String>>,
+    rules: BTreeMap<(usize, String), Result<CompiledEventRules, String>>,
     region_timezone: Option<&'a str>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     settings: &'a EventScanSettings,
 }
 
@@ -4759,8 +4762,8 @@ impl<'a> EventChannelScanner<'a> {
                 );
                 let rules = self
                     .rules
-                    .entry((index, timezone.name()))
-                    .or_insert_with(|| compile_template_rules(template, timezone, self.settings));
+                    .entry((index, zone_name(&timezone)))
+                    .or_insert_with(|| compile_template_rules(template, &timezone, self.settings));
                 let rules = match rules {
                     Ok(rules) => &*rules,
                     Err(error) => {
@@ -4833,43 +4836,45 @@ impl<'a> EventChannelScanner<'a> {
 fn plan_event_channel<'a>(
     stream: &EventScanCandidate,
     template: &'a EventTemplateRow,
-    timezone: Tz,
+    timezone: TimeZone,
     mut matched: iptv_parsers::MatchedEvent<'_>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     settings: &EventScanSettings,
 ) -> Result<PlannedEventChannel<'a>, String> {
     // Resolve a time-only or spelled date from the snapshot date.
-    let reference = stream.snapshot_at.unwrap_or(now);
+    let reference = stream.snapshot_at.map_or(now, Timestamp::from);
+    let zone = zone_name(&timezone);
     let starts_at = matched
-        .resolve_start(reference, timezone.name())
+        .resolve_start(reference, &zone)
         .map_err(|error| format!("event time is not valid: {error}"))?
         .ok_or_else(|| "the stream name has no event start time".to_owned())?;
     matched.starts_at = Some(starts_at);
     let window_start = starts_at
-        .checked_sub_signed(Duration::days(1))
+        .checked_sub(SignedDuration::from_hours(24))
         .unwrap_or(starts_at);
     let window_end = starts_at
-        .checked_add_signed(Duration::days(30))
+        .checked_add(SignedDuration::from_hours(30 * 24))
         .unwrap_or(starts_at);
     let event = generate_event_guide(&matched, &stream.stream_name, window_start, window_end)
         .map_err(|error| format!("event guide is not valid: {error}"))?
         .into_iter()
         .find(|programme| programme.kind == GeneratedProgrammeKind::Event)
         .ok_or_else(|| "event guide has no event programme".to_owned())?;
-    let future_limit =
-        now.checked_add_signed(Duration::days(i64::from(template.future_date_days.max(0))));
+    let future_limit = now.checked_add(SignedDuration::from_hours(
+        i64::from(template.future_date_days.max(0)) * 24,
+    ));
     if future_limit.is_some_and(|limit| event.starts_at > limit) {
         return Err(format!(
             "event starts more than {} days in the future",
             template.future_date_days.max(0)
         ));
     }
-    let grace = Duration::hours(i64::from(template.past_date_grace_hours.max(1)));
+    let grace = SignedDuration::from_hours(i64::from(template.past_date_grace_hours.max(1)));
     let state = EventChannelState::at(event.starts_at, event.stops_at, grace, now);
     let programmes = if state == EventChannelState::Hidden {
         Vec::new()
     } else {
-        plan_event_channel_guide(&event, timezone, now, grace, settings)
+        plan_event_channel_guide(&event, &timezone, now, grace, settings)
     };
     Ok(PlannedEventChannel {
         channel_id: stream.channel_id,
@@ -4894,17 +4899,13 @@ fn plan_event_channel<'a>(
 async fn enrich_with_sports(
     plan: &mut PlannedEventChannel<'_>,
     client: &iptv_sports::EspnClient,
-    now: DateTime<Utc>,
+    now: Timestamp,
     settings: &EventScanSettings,
 ) {
     let Some(league) = detect_league(&plan.captures, plan.group_name.as_deref()) else {
         return;
     };
-    let local_date = plan
-        .event
-        .starts_at
-        .with_timezone(&plan.timezone)
-        .date_naive();
+    let local_date = plan.event.starts_at.to_zoned(plan.timezone.clone()).date();
     let info = lookup_sports_info(
         client,
         league,
@@ -4916,7 +4917,7 @@ async fn enrich_with_sports(
     if let Some(matchup) = info.matchup() {
         plan.event.title = matchup;
         plan.programmes =
-            plan_event_channel_guide(&plan.event, plan.timezone, now, plan.grace, settings);
+            plan_event_channel_guide(&plan.event, &plan.timezone, now, plan.grace, settings);
     }
     plan.sports = Some(info);
 }
@@ -4924,7 +4925,7 @@ async fn enrich_with_sports(
 /// Compiles the built-in sports rules with the settings of one template.
 fn compile_template_rules(
     template: &EventTemplateRow,
-    timezone: Tz,
+    timezone: &TimeZone,
     settings: &EventScanSettings,
 ) -> Result<CompiledEventRules, String> {
     let mut rules = builtin_sports_event_rules();
@@ -4942,11 +4943,16 @@ fn compile_template_rules(
         template.channel_name_format.as_str()
     };
     for rule in &mut rules.0 {
-        timezone.name().clone_into(&mut rule.timezone);
+        rule.timezone = zone_name(timezone);
         rule.guide.duration_seconds = duration_seconds;
         title_template.clone_into(&mut rule.guide.title_template);
     }
     CompiledEventRules::new(rules).map_err(|error| error.to_string())
+}
+
+/// Returns the IANA name of an event timezone. The fallback is `UTC`.
+fn zone_name(timezone: &TimeZone) -> String {
+    timezone.iana_name().unwrap_or("UTC").to_owned()
 }
 
 struct EventChannelUpsert<'a> {

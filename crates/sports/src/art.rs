@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-use chrono::NaiveDate;
 use image::imageops::{self, FilterType};
 use image::{ImageFormat, Rgba, RgbaImage};
+use jiff::civil::Date;
 
 use crate::client::{EspnClient, EspnError};
 use crate::league::League;
@@ -64,23 +64,23 @@ impl From<image::ImageError> for ArtError {
 ///
 /// Returns `None` when the event id has a character other than a digit or a letter.
 #[must_use]
-pub fn event_key(league: &str, local_date: NaiveDate, event_id: &str) -> Option<String> {
+pub fn event_key(league: &str, local_date: Date, event_id: &str) -> Option<String> {
     let valid = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric());
     if !valid(league) || !valid(event_id) {
         return None;
     }
     Some(format!(
         "{league}-{}-{event_id}",
-        local_date.format("%Y%m%d")
+        local_date.strftime("%Y%m%d")
     ))
 }
 
 /// Parses an event key into the league, the local date, and the event id.
 #[must_use]
-pub fn parse_event_key(key: &str) -> Option<(League, NaiveDate, String)> {
+pub fn parse_event_key(key: &str) -> Option<(League, Date, String)> {
     let mut parts = key.splitn(3, '-');
     let league = League::from_key(parts.next()?)?;
-    let date = NaiveDate::parse_from_str(parts.next()?, "%Y%m%d").ok()?;
+    let date = Date::strptime("%Y%m%d", parts.next()?).ok()?;
     let id = parts.next()?;
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn event_key_round_trips_and_rejects_bad_input() {
-        let date = NaiveDate::from_ymd_opt(2026, 11, 4).unwrap();
+        let date = jiff::civil::date(2026, 11, 4);
         let key = event_key("NHL", date, "401").unwrap();
         assert_eq!(key, "NHL-20261104-401");
         assert_eq!(

@@ -1136,7 +1136,7 @@ fn prepared_epg_channel(channel: EpgChannel, id: Uuid) -> PreparedEpgChannel {
 }
 
 fn prepared_programme(programme: Programme, epg_channel_id: Uuid) -> PreparedProgramme {
-    let original_start = original_timestamp(&programme.original_start, programme.start);
+    let original_start = original_timestamp(&programme.original_start, programme.start.into());
     let original_stop = programme
         .original_stop
         .clone()
@@ -1148,8 +1148,8 @@ fn prepared_programme(programme: Programme, epg_channel_id: Uuid) -> PreparedPro
     PreparedProgramme {
         id: Uuid::now_v7(),
         epg_channel_id,
-        starts_at: programme.start,
-        stops_at: programme.stop,
+        starts_at: programme.start.into(),
+        stops_at: programme.stop.map(Into::into),
         original_start,
         original_stop,
         title,
@@ -1281,7 +1281,8 @@ pub fn prepare_snapshot<P: EndpointProtector>(
                 let Some(epg_channel_id) = ids.get(&programme.channel_id).copied() else {
                     continue;
                 };
-                let original_start = original_timestamp(&programme.original_start, programme.start);
+                let original_start =
+                    original_timestamp(&programme.original_start, programme.start.into());
                 let original_stop = programme
                     .original_stop
                     .clone()
@@ -1293,8 +1294,8 @@ pub fn prepare_snapshot<P: EndpointProtector>(
                 snapshot.programmes.push(PreparedProgramme {
                     id: Uuid::now_v7(),
                     epg_channel_id,
-                    starts_at: programme.start,
-                    stops_at: programme.stop,
+                    starts_at: programme.start.into(),
+                    stops_at: programme.stop.map(Into::into),
                     original_start,
                     original_stop,
                     title,
@@ -1384,8 +1385,8 @@ pub fn prepare_snapshot<P: EndpointProtector>(
                 snapshot.programmes.push(PreparedProgramme {
                     id: Uuid::now_v7(),
                     epg_channel_id,
-                    starts_at: entry.start,
-                    stops_at: Some(entry.stop),
+                    starts_at: entry.start.into(),
+                    stops_at: Some(entry.stop.into()),
                     original_start: entry.start.to_rfc3339(),
                     original_stop: Some(entry.stop.to_rfc3339()),
                     title: sanitize_text(&entry.title),
@@ -1609,7 +1610,6 @@ fn diagnostics_json(diagnostics: &[Diagnostic]) -> Value {
 mod tests {
     use super::*;
     use crate::{ArtifactLimits, DownloadedArtifact, XtreamEndpoints, XtreamPayloadKind};
-    use chrono::TimeZone;
     use std::{io::Write, sync::Mutex};
 
     #[test]
@@ -2411,7 +2411,7 @@ mod tests {
     fn prepared_programme_uses_untitled_when_no_titles() {
         let programme = Programme {
             channel_id: "ch1".to_owned(),
-            start: chrono::Utc::now(),
+            start: iptv_domain::Timestamp::now(),
             stop: None,
             original_start: String::new(),
             original_stop: None,
@@ -2435,14 +2435,11 @@ mod tests {
 
     #[test]
     fn prepared_programme_preserves_literal_xmltv_timestamps() {
-        let start = chrono::Utc
-            .with_ymd_and_hms(2026, 7, 1, 18, 0, 0)
-            .single()
-            .expect("UTC timestamp");
+        let start: iptv_domain::Timestamp = "2026-07-01T18:00:00Z".parse().expect("UTC timestamp");
         let programme = Programme {
             channel_id: "ch1".to_owned(),
             start,
-            stop: Some(start + chrono::Duration::hours(1)),
+            stop: Some(start + jiff::SignedDuration::from_hours(1)),
             original_start: "20260701120000 America/Denver".to_owned(),
             original_stop: Some("20260701130000 America/Denver".to_owned()),
             titles: Vec::new(),
@@ -2458,7 +2455,7 @@ mod tests {
             extensions: Vec::new(),
         };
         let prepared = prepared_programme(programme, Uuid::now_v7());
-        assert_eq!(prepared.starts_at, start);
+        assert_eq!(iptv_domain::Timestamp::from(prepared.starts_at), start);
         assert_eq!(prepared.original_start, "20260701120000 America/Denver");
         assert_eq!(
             prepared.original_stop.as_deref(),

@@ -1,5 +1,4 @@
-use chrono::{TimeZone, Utc};
-use iptv_domain::builtin_sports_event_rules;
+use iptv_domain::{Timestamp, builtin_sports_event_rules};
 use iptv_parsers::{
     CompiledEventRules, EventCandidate, GeneratedProgrammeKind, generate_event_guide,
 };
@@ -35,11 +34,11 @@ fn built_in_vs_rule_removes_prefix_and_quality_and_honors_group_timezone() {
     );
     assert_eq!(
         matched.starts_at,
-        Some(Utc.with_ymd_and_hms(2026, 9, 14, 0, 20, 0).unwrap())
+        Some("2026-09-14T00:20:00Z".parse::<Timestamp>().unwrap())
     );
 
-    let window_start = Utc.with_ymd_and_hms(2026, 9, 14, 0, 0, 0).unwrap();
-    let window_end = Utc.with_ymd_and_hms(2026, 9, 14, 4, 0, 0).unwrap();
+    let window_start = "2026-09-14T00:00:00Z".parse::<Timestamp>().unwrap();
+    let window_end = "2026-09-14T04:00:00Z".parse::<Timestamp>().unwrap();
     let guide = generate_event_guide(&matched, candidate.name, window_start, window_end)
         .expect("generated guide");
     assert_eq!(guide.len(), 3);
@@ -80,7 +79,7 @@ fn built_in_at_rule_supports_us_twelve_hour_time() {
     );
     assert_eq!(
         matched.starts_at,
-        Some(Utc.with_ymd_and_hms(2026, 8, 19, 19, 10, 0).unwrap())
+        Some("2026-08-19T19:10:00Z".parse::<Timestamp>().unwrap())
     );
     assert_eq!(matched.rule.guide.title_template, "{away} @ {home}");
 }

@@ -11,6 +11,7 @@ mod events;
 mod ids;
 mod reconcile;
 mod regions;
+pub mod time;
 
 pub use catalog::{
     Channel, ChannelGroup, ChannelNumber, ChannelNumberError, Provider, ProviderError, Source,
@@ -35,3 +36,4 @@ pub use reconcile::{
     apply_non_destructive, reconcile_epg,
 };
 pub use regions::{REGION_PREFIXES, suggested_prefixes_for_timezone};
+pub use time::Timestamp;

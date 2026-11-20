@@ -1,6 +1,7 @@
 //! Parsed ESPN data. Parsing is tolerant: unknown fields are ignored.
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use iptv_domain::Timestamp;
+use jiff::{civil::DateTime, tz::TimeZone};
 use serde::Deserialize;
 
 /// A team as seen in a scoreboard or team list.
@@ -20,7 +21,7 @@ pub struct EspnTeam {
 pub struct EspnEvent {
     pub id: String,
     pub name: String,
-    pub start_utc: DateTime<Utc>,
+    pub start_utc: Timestamp,
     pub home: EspnTeam,
     pub away: EspnTeam,
     pub venue: Option<String>,
@@ -146,13 +147,14 @@ impl RawTeam {
 
 /// Parse an ESPN date such as `2026-11-05T00:30Z` or an RFC 3339 date.
 #[must_use]
-pub fn parse_espn_date(text: &str) -> Option<DateTime<Utc>> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(text) {
-        return Some(dt.with_timezone(&Utc));
+pub fn parse_espn_date(text: &str) -> Option<Timestamp> {
+    if let Ok(value) = text.parse() {
+        return Some(value);
     }
-    NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%MZ")
+    DateTime::strptime("%Y-%m-%dT%H:%MZ", text)
         .ok()
-        .map(|n| n.and_utc())
+        .and_then(|value| TimeZone::UTC.to_timestamp(value).ok())
+        .map(Timestamp::from_jiff)
 }
 
 /// Parse a scoreboard body. An event without two competitors or a valid date is skipped.
