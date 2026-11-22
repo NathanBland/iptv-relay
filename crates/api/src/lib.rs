@@ -7296,6 +7296,33 @@ struct ChannelSource {
     measured_bits_per_second: Option<u64>,
 }
 
+/// The longest time that a Matroska open waits for the live ring to measure
+/// its bitrate when no stored measurement exists.
+const LIVE_RATE_WAIT: Duration = Duration::from_secs(3);
+/// How often a Matroska open reads the live ring while it waits.
+const LIVE_RATE_POLL: Duration = Duration::from_millis(100);
+
+/// Returns the mean bitrate that the live ring measured, or `None` when the
+/// ring has no measurement within `wait`.
+///
+/// A client probe caches the first `BPS` tag that it reads. Jellyfin keeps that
+/// probe for the channel, so a first open without a tag makes Jellyfin use its
+/// width estimate (20 Mbit/s at 1080p) for every later open. Providers send
+/// media ahead of real time at connect, so the ring usually measures within
+/// one second.
+async fn live_bits_per_second(reader: &iptv_media::RingRateReader, wait: Duration) -> Option<u64> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if let Some(rates) = reader.rates() {
+            return Some(rates.average_bits_per_second).filter(|bits| *bits > 0);
+        }
+        if reader.is_gone() || tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(LIVE_RATE_POLL).await;
+    }
+}
+
 async fn open_channel_response(
     state: &AppState,
     channel_id: Uuid,
@@ -7304,7 +7331,7 @@ async fn open_channel_response(
     let ChannelSource {
         spec,
         provider_stream_id,
-        measured_bits_per_second,
+        mut measured_bits_per_second,
     } = match channel_source_spec(state, channel_id).await {
         Ok(source) => source,
         Err(response) => return *response,
@@ -7327,10 +7354,16 @@ async fn open_channel_response(
             SlatedOpen::Slated(stream) if container == OutputContainer::MpegTs => {
                 return mpeg_ts_body_response(Body::from_stream(stream));
             }
-            SlatedOpen::Direct(viewer) => Box::pin(futures_util::StreamExt::map(
-                viewer.into_byte_stream(),
-                |chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())),
-            )),
+            SlatedOpen::Direct(viewer) => {
+                if measured_bits_per_second.is_none() {
+                    measured_bits_per_second =
+                        live_bits_per_second(&viewer.rate_reader(), LIVE_RATE_WAIT).await;
+                }
+                Box::pin(futures_util::StreamExt::map(
+                    viewer.into_byte_stream(),
+                    |chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())),
+                ))
+            }
             SlatedOpen::Slated(stream) => Box::pin(stream),
             SlatedOpen::Failed(error) => return session_start_response(error),
         };
@@ -16356,5 +16389,31 @@ mod time_wire_format_tests {
                 .chain(&stops)
                 .all(|value| value.len() == 20 && value.ends_with(" +0000"))
         );
+    }
+}
+
+#[cfg(test)]
+mod live_rate_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn live_rate_gives_up_after_the_wait() {
+        let ring = iptv_media::MpegTsRing::new(iptv_media::MpegTsRingConfig::new(16, 0).unwrap());
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            live_bits_per_second(&ring.rate_reader(), LIVE_RATE_WAIT).await,
+            None
+        );
+        assert!(started.elapsed() >= LIVE_RATE_WAIT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_rate_of_a_closed_ring_returns_at_once() {
+        let ring = iptv_media::MpegTsRing::new(iptv_media::MpegTsRingConfig::new(16, 0).unwrap());
+        let reader = ring.rate_reader();
+        drop(ring);
+        let started = tokio::time::Instant::now();
+        assert_eq!(live_bits_per_second(&reader, LIVE_RATE_WAIT).await, None);
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 }

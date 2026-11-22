@@ -52,6 +52,20 @@ fn claim_capture_slot(provider_stream_id: Uuid, now: Instant) -> bool {
     true
 }
 
+/// Gives back a slot that a capture claimed at `claimed_at` and could not use.
+///
+/// A short probe session often claims the slot first. Its ring closes when
+/// the probe disconnects, so its capture measures nothing. The release lets
+/// the next viewer of the stream capture without a wait for the interval.
+fn release_capture_slot(provider_stream_id: Uuid, claimed_at: Instant) {
+    let Ok(mut map) = LAST_CAPTURE.lock() else {
+        return;
+    };
+    if map.get(&provider_stream_id) == Some(&claimed_at) {
+        map.remove(&provider_stream_id);
+    }
+}
+
 /// Starts a background capture of the session's measured rates when the
 /// stream is due.
 pub(crate) fn spawn_rate_capture(
@@ -62,16 +76,19 @@ pub(crate) fn spawn_rate_capture(
     let (Some(catalog), Some(provider_stream_id)) = (catalog.cloned(), provider_stream_id) else {
         return;
     };
-    if !claim_capture_slot(provider_stream_id, Instant::now()) {
+    let claimed_at = Instant::now();
+    if !claim_capture_slot(provider_stream_id, claimed_at) {
         return;
     }
     let reader = viewer.rate_reader();
     tokio::spawn(async move {
         let Some(rates) = watch_rates(&reader, POLL_INTERVAL, MAX_CAPTURE).await else {
             debug!(%provider_stream_id, "rate capture ended before enough media was measured");
+            release_capture_slot(provider_stream_id, claimed_at);
             return;
         };
         let Some(measurement) = measurement(provider_stream_id, &rates) else {
+            release_capture_slot(provider_stream_id, claimed_at);
             return;
         };
         match catalog.record_stream_measurement(&measurement).await {
@@ -92,7 +109,8 @@ pub(crate) fn spawn_rate_capture(
 }
 
 /// Reads the ring until `max_wait` passes or the measurement stops (the
-/// session ended or the upstream reconnected). Returns the newest rates that
+/// session ended or the upstream reconnected). A ring that closes before it
+/// measures enough media ends the capture at the next poll. Returns the newest rates that
 /// cover at least [`MIN_MEASURED`] of media.
 async fn watch_rates(
     reader: &RingRateReader,
@@ -108,7 +126,7 @@ async fn watch_rates(
                 best = Some(rates);
             }
             Some(_) => break,
-            None if best.is_some() => break,
+            None if best.is_some() || reader.is_gone() => break,
             None => {}
         }
     }
@@ -180,5 +198,36 @@ mod tests {
         );
         drop(ring);
         assert_eq!(reader.rates(), None);
+    }
+
+    #[test]
+    fn released_slot_lets_the_next_viewer_capture() {
+        let stream = Uuid::new_v4();
+        let start = Instant::now();
+        assert!(claim_capture_slot(stream, start));
+        release_capture_slot(stream, start);
+        let next = start + Duration::from_secs(2);
+        assert!(claim_capture_slot(stream, next));
+    }
+
+    #[test]
+    fn stale_release_keeps_a_newer_claim() {
+        let stream = Uuid::new_v4();
+        let start = Instant::now();
+        assert!(claim_capture_slot(stream, start));
+        // A release from a different claim time does not free the slot.
+        release_capture_slot(stream, start + Duration::from_secs(1));
+        assert!(!claim_capture_slot(stream, start + Duration::from_secs(2)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_of_a_closed_ring_ends_at_the_next_poll() {
+        let ring = iptv_media::MpegTsRing::new(iptv_media::MpegTsRingConfig::new(16, 0).unwrap());
+        let reader = ring.rate_reader();
+        drop(ring);
+        assert!(reader.is_gone());
+        let started = tokio::time::Instant::now();
+        assert_eq!(watch_rates(&reader, POLL_INTERVAL, MAX_CAPTURE).await, None);
+        assert_eq!(started.elapsed(), POLL_INTERVAL);
     }
 }
