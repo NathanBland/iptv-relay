@@ -12,7 +12,7 @@ scale = []
 
 [dependencies]
 base64.workspace = true
-iptv-domain = { path = "../domain", version = "0.4.10" }
+iptv-domain = { path = "../domain", version = "0.4.11" }
 jiff.workspace = true
 quick-xml.workspace = true
 regex.workspace = true

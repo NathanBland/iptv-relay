@@ -10,8 +10,8 @@ base64.workspace = true
 bytes.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
-iptv-domain = { path = "../domain", version = "0.4.10", features = ["sqlx"] }
-iptv-parsers = { path = "../parsers", version = "0.4.10" }
+iptv-domain = { path = "../domain", version = "0.4.11", features = ["sqlx"] }
+iptv-parsers = { path = "../parsers", version = "0.4.11" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,7 +28,7 @@ zip.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-iptv-persistence = { path = "../persistence", version = "0.4.10" }
+iptv-persistence = { path = "../persistence", version = "0.4.11" }
 jiff.workspace = true
 tower.workspace = true
 

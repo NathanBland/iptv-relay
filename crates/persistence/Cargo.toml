@@ -9,10 +9,10 @@ license.workspace = true
 base64.workspace = true
 chacha20poly1305.workspace = true
 getrandom.workspace = true
-iptv-domain = { path = "../domain", version = "0.4.10", features = ["sqlx"] }
+iptv-domain = { path = "../domain", version = "0.4.11", features = ["sqlx"] }
 jiff.workspace = true
-iptv-parsers = { path = "../parsers", version = "0.4.10" }
-iptv-sports = { path = "../sports", version = "0.4.10" }
+iptv-parsers = { path = "../parsers", version = "0.4.11" }
+iptv-sports = { path = "../sports", version = "0.4.11" }
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
