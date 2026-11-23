@@ -7298,18 +7298,27 @@ struct ChannelSource {
 
 /// The longest time that a Matroska open waits for the live ring to measure
 /// its bitrate when no stored measurement exists.
-const LIVE_RATE_WAIT: Duration = Duration::from_secs(3);
+const LIVE_RATE_WAIT: Duration = Duration::from_secs(5);
+/// The least media that the early bitrate estimate needs at the end of the
+/// wait. A full measurement needs about 10 media seconds, and a cold provider
+/// connection often sends less than that in the wait.
+const LIVE_RATE_MIN_MEDIA: Duration = Duration::from_secs(2);
+/// The total bitrate that a direct Matroska open tags when the ring measures
+/// nothing in the wait. This value is less than the Jellyfin width estimate
+/// (20 Mbit/s at 1080p), so Jellyfin does not transcode for bandwidth.
+const LIVE_RATE_FALLBACK_BITS_PER_SECOND: u64 = 8_000_000;
 /// How often a Matroska open reads the live ring while it waits.
 const LIVE_RATE_POLL: Duration = Duration::from_millis(100);
 
-/// Returns the mean bitrate that the live ring measured, or `None` when the
-/// ring has no measurement within `wait`.
+/// Returns the mean bitrate that the live ring measured within `wait`. At the
+/// end of the wait, returns the early estimate of the ring. Returns `None`
+/// when the ring has less than [`LIVE_RATE_MIN_MEDIA`] of media.
 ///
 /// A client probe caches the first `BPS` tag that it reads. Jellyfin keeps that
 /// probe for the channel, so a first open without a tag makes Jellyfin use its
-/// width estimate (20 Mbit/s at 1080p) for every later open. Providers send
-/// media ahead of real time at connect, so the ring usually measures within
-/// one second.
+/// width estimate (20 Mbit/s at 1080p) for every later open. Some providers
+/// send media at real time from connect, so a full measurement can take about
+/// 10 seconds.
 async fn live_bits_per_second(reader: &iptv_media::RingRateReader, wait: Duration) -> Option<u64> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
@@ -7317,7 +7326,7 @@ async fn live_bits_per_second(reader: &iptv_media::RingRateReader, wait: Duratio
             return Some(rates.average_bits_per_second).filter(|bits| *bits > 0);
         }
         if reader.is_gone() || tokio::time::Instant::now() >= deadline {
-            return None;
+            return reader.early_bits_per_second(LIVE_RATE_MIN_MEDIA);
         }
         tokio::time::sleep(LIVE_RATE_POLL).await;
     }
@@ -7356,8 +7365,11 @@ async fn open_channel_response(
             }
             SlatedOpen::Direct(viewer) => {
                 if measured_bits_per_second.is_none() {
-                    measured_bits_per_second =
-                        live_bits_per_second(&viewer.rate_reader(), LIVE_RATE_WAIT).await;
+                    measured_bits_per_second = Some(
+                        live_bits_per_second(&viewer.rate_reader(), LIVE_RATE_WAIT)
+                            .await
+                            .unwrap_or(LIVE_RATE_FALLBACK_BITS_PER_SECOND),
+                    );
                 }
                 Box::pin(futures_util::StreamExt::map(
                     viewer.into_byte_stream(),

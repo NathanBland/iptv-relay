@@ -197,6 +197,27 @@ impl RateMeter {
         })
     }
 
+    /// A rough mean bitrate over all media seen, or `None` when the meter has
+    /// seen less than `min_media` of media.
+    ///
+    /// This value needs less media than [`Self::rates`]. Use it only when no
+    /// full measurement is available.
+    pub(crate) fn early_bits_per_second(&self, min_media: Duration) -> Option<u64> {
+        let min_ticks = u64::try_from(min_media.as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(PCR_TICKS_PER_SECOND / 1_000);
+        if self.measured_ticks == 0 || self.measured_ticks < min_ticks {
+            return None;
+        }
+        let packets: u64 = self.seconds.iter().sum();
+        let bits = u128::from(packets) * (MPEG_TS_PACKET_SIZE as u128) * 8;
+        let bits_per_second =
+            bits * u128::from(PCR_TICKS_PER_SECOND) / u128::from(self.measured_ticks);
+        u64::try_from(bits_per_second)
+            .ok()
+            .filter(|value| *value > 0)
+    }
+
     fn frame_rate_millihertz(&self) -> Option<u32> {
         if self.frame_gaps.len() < MIN_FRAME_SAMPLES {
             return None;
@@ -369,6 +390,19 @@ mod tests {
         let mut meter = RateMeter::default();
         feed(&mut meter, Instant::now(), 5, 5_000, 1);
         assert_eq!(meter.rates(), None);
+    }
+
+    #[test]
+    fn early_rate_needs_less_media_than_the_full_rate() {
+        let mut meter = RateMeter::default();
+        assert_eq!(meter.early_bits_per_second(Duration::from_secs(2)), None);
+        feed(&mut meter, Instant::now(), 3, 5_000, 1);
+        assert_eq!(meter.rates(), None);
+        assert_eq!(
+            meter.early_bits_per_second(Duration::from_secs(2)),
+            Some(5_000 * 188 * 8)
+        );
+        assert_eq!(meter.early_bits_per_second(Duration::from_secs(4)), None);
     }
 
     #[test]
