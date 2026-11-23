@@ -225,6 +225,17 @@ impl RingRateReader {
         self.inner.upgrade()?.state.lock().meter.rates()
     }
 
+    /// A rough mean bitrate over all media in the ring. `None` when the ring
+    /// is gone or has less than `min_media` of media.
+    pub fn early_bits_per_second(&self, min_media: Duration) -> Option<u64> {
+        self.inner
+            .upgrade()?
+            .state
+            .lock()
+            .meter
+            .early_bits_per_second(min_media)
+    }
+
     /// Returns true when the ring is gone. A gone ring never reports rates
     /// again.
     #[must_use]
