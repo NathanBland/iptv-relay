@@ -224,6 +224,13 @@ impl RingRateReader {
     pub fn rates(&self) -> Option<StreamRates> {
         self.inner.upgrade()?.state.lock().meter.rates()
     }
+
+    /// Returns true when the ring is gone. A gone ring never reports rates
+    /// again.
+    #[must_use]
+    pub fn is_gone(&self) -> bool {
+        self.inner.strong_count() == 0
+    }
 }
 
 /// One reader's independent position in the ring.
